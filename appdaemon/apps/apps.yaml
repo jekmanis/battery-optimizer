@@ -1,0 +1,173 @@
+# AppDaemon Apps Configuration
+# Battery Optimizer - Nord Pool price-based charge/discharge scheduling
+
+battery_optimizer:
+  module: battery_optimizer
+  class: BatteryOptimizer
+
+  # ==========================================================================
+  # Home Assistant Connection (required for built-in Nord Pool integration)
+  # ==========================================================================
+
+  # Your Home Assistant URL (internal)
+  ha_url: "http://homeassistant.local:8123"
+
+  # Long-lived access token from HA
+  # Create at: Profile (bottom left) > Security > Long-Lived Access Tokens > Create Token
+  ha_token: "REPLACE_WITH_YOUR_HA_LONG_LIVED_TOKEN
+
+  # ==========================================================================
+  # Nord Pool Configuration
+  # ==========================================================================
+
+  # Config entry ID from diagnostics file
+  # Find it in: Settings > Devices > Nord Pool > 3-dot menu > Download diagnostics
+  nordpool_config_entry: "01KB8MP9Q5PD24QG015ABXBQTS"
+  nordpool_area: LV
+
+  # Hour when tomorrow's prices become available (in YOUR local timezone)
+  # Nord Pool publishes at 13:00 CET. Convert to your timezone:
+  # - CET (Germany, France, etc.): 13
+  # - EET (Latvia, Lithuania, Estonia, Finland): 14
+  # - UK/Ireland: 12
+  tomorrow_prices_hour: 14
+
+  # For HACS custom component (not needed if using built-in):
+  # nordpool_sensor: sensor.nordpool_kwh_lv_eur_3_10
+
+  # Growatt battery state of charge sensor
+  soc_sensor: sensor.growatt_battery_soc
+
+  # Growatt PV power production sensor (for solar-aware adjustments)
+  pv_power_sensor: sensor.growatt_pv_power
+
+  # ==========================================================================
+  # Device Control
+  # ==========================================================================
+
+  # Growatt WIT device ID for Modbus control
+  # Find this in Home Assistant Developer Tools > States > growatt entities
+  device_id: ""  # <-- Set your device_id here
+
+  # ==========================================================================
+  # TOU Schedule Sync (Optional)
+  # ==========================================================================
+  # When configured, the optimizer writes the full schedule to inverter TOU
+  # registers via the HA Modbus integration. This enables autonomous operation
+  # even if Home Assistant goes offline.
+  #
+  # Set to the modbus hub name defined in battery_optimizer.yaml
+  # Leave empty to disable TOU sync (uses hourly mode commands only)
+  modbus_hub: "wit_inverter"  # <-- Set to "wit_inverter" to enable TOU sync
+
+  # ==========================================================================
+  # Battery Parameters
+  # ==========================================================================
+
+  # Total battery capacity in kWh
+  battery_capacity_kwh: 14.3
+
+  # Charge rate in kW (use conservative average for planning)
+  # Actual may vary 3-6 kW, use 4.5 for reliable scheduling
+  charge_rate_kw: 4.5
+
+  # Discharge rate in kW
+  discharge_rate_kw: 4.5
+
+  # Minimum state of charge (emergency reserve)
+  min_soc: 10
+
+  # Maximum state of charge (full charge allowed)
+  max_soc: 100
+
+  # Round-trip efficiency (charge + discharge losses)
+  # 85% is typical for lithium batteries
+  efficiency: 0.85
+
+  # Base house consumption in Watts
+  # This is the minimum load when nothing else is running
+  base_consumption_w: 500
+
+  # Household load power sensor (W) used for statistical load profiling
+  # Prefer a sensor representing net house load (consumption minus PV)
+  # Leave empty to disable probabilistic load profiling
+  load_power_sensor: "sensor.growatt_power_to_load"
+
+  # Schedule resolution in minutes (60 = hourly plan)
+  slot_minutes: 60
+
+  # Recalculate schedule every N minutes (independent of slot_minutes)
+  adaptive_recalc_minutes: 30
+
+  # Load observation interval (minutes)
+  load_observation_minutes: 30
+
+  # Optional time-of-day load overrides (use when load is known to be higher)
+  # Values can be in W or kW (e.g., 900 or 0.9)
+  load_override_windows:
+    - start: "06:00"
+      end: "08:30"
+      load_w: 800
+    - start: "17:30"
+      end: "22:00"
+      load_w: 800
+
+
+  # Quantile for load forecast (0.5 = median, 0.8 = conservative)
+  load_quantile: 0.75
+
+  # DP SOC resolution in percent (smaller = more precise, slower)
+  soc_step_percent: 1.0
+
+  # Load profile persistence
+  # File path preferred (unlimited size). Leave empty to disable file persistence.
+  load_profile_file: "/config/load_profile.json"
+  # Optional HA input_text mirror (keep empty to avoid 255-char limit)
+  load_profile_entity: ""
+  load_profile_max_samples: 60
+  load_profile_min_samples: 6
+
+  # Status sensors (optional)
+  load_profile_last_observation_entity: sensor.load_profile_last_observation
+  load_profile_observation_count_entity: sensor.load_profile_observation_count
+
+  # If load sensor reports 0W under its minimum threshold, use last non-zero
+  # reading and never go below this floor value.
+  load_zero_floor_w: 450
+
+  # ==========================================================================
+  # Pricing Parameters
+  # ==========================================================================
+
+  # Fixed grid fees per kWh (distribution, taxes, etc.)
+  # These fees apply regardless of spot price
+  grid_fee_eur_kwh: 0.00
+
+  # Export rate multiplier (what percentage of spot you get for export)
+  # 0.8 = 80% of spot price for exported energy
+  export_rate_multiplier: 0.95
+
+  # ==========================================================================
+  # Optimization Thresholds
+  # ==========================================================================
+
+  # PV power threshold for solar override (Watts)
+  # When PV exceeds this, pause grid charging to use solar
+  pv_threshold_w: 500
+
+  # SOC deviation threshold for schedule recalculation (%)
+  # If actual SOC differs from expected by more than this, recalculate
+  soc_deviation_threshold: 5
+
+  # ==========================================================================
+  # Home Assistant Control Entities
+  # ==========================================================================
+
+  # Input boolean to enable/disable the optimizer
+  enabled_entity: input_boolean.battery_optimizer_enabled
+
+  # Input boolean for manual override mode
+  override_entity: input_boolean.battery_optimizer_override
+
+  # Input select for manual mode selection
+  manual_mode_entity: input_select.battery_manual_mode

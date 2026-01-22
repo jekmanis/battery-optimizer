@@ -1,0 +1,415 @@
+# =============================================================================
+# Battery Optimizer - Home Assistant Package
+# =============================================================================
+# This package provides the control entities and UI helpers for the
+# AppDaemon battery optimizer. Include this in your configuration.yaml:
+#
+#   homeassistant:
+#     packages:
+#       battery_optimizer: !include packages/battery_optimizer.yaml
+#
+# =============================================================================
+
+# =============================================================================
+# Input Booleans - Enable/Disable Controls
+# =============================================================================
+input_boolean:
+  battery_optimizer_enabled:
+    name: "Battery Optimizer Active"
+    icon: mdi:battery-charging-wireless
+    initial: true
+
+  battery_optimizer_override:
+    name: "Manual Override Mode"
+    icon: mdi:hand-back-right
+    initial: false
+
+# =============================================================================
+# Input Select - Manual Mode Selection
+# =============================================================================
+input_select:
+  battery_manual_mode:
+    name: "Manual Battery Mode"
+    icon: mdi:battery-sync
+    options:
+      - Auto
+      - Charge
+      - Hold
+      - Discharge
+    initial: Auto
+
+# =============================================================================
+# Input Numbers - Configurable Thresholds
+# =============================================================================
+input_number:
+  battery_min_soc:
+    name: "Minimum SOC Reserve"
+    icon: mdi:battery-10
+    min: 5
+    max: 50
+    step: 5
+    unit_of_measurement: "%"
+    initial: 10
+    mode: slider
+
+  battery_max_soc:
+    name: "Maximum SOC Target"
+    icon: mdi:battery
+    min: 50
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    initial: 100
+    mode: slider
+
+  battery_charge_price_threshold:
+    name: "Max Charge Price"
+    icon: mdi:currency-eur
+    min: 0
+    max: 0.50
+    step: 0.01
+    unit_of_measurement: "EUR/kWh"
+    initial: 0.15
+    mode: box
+
+  battery_discharge_price_threshold:
+    name: "Min Discharge Price"
+    icon: mdi:currency-eur
+    min: 0
+    max: 1.00
+    step: 0.01
+    unit_of_measurement: "EUR/kWh"
+    initial: 0.20
+    mode: box
+
+  battery_pv_threshold:
+    name: "PV Override Threshold"
+    icon: mdi:solar-power
+    min: 100
+    max: 2000
+    step: 100
+    unit_of_measurement: "W"
+    initial: 500
+    mode: slider
+
+  battery_avg_cost:
+    name: "Battery Average Cost"
+    icon: mdi:currency-eur
+    min: 0
+    max: 1.00
+    step: 0.0001
+    unit_of_measurement: "EUR/kWh"
+    initial: 0.10
+    mode: box
+
+# =============================================================================
+# Input Text - Learning Data Persistence
+# =============================================================================
+input_text:
+  battery_learning_data:
+    name: "Battery Learning Data"
+    icon: mdi:brain
+    max: 10000  # JSON data can be large
+    initial: ""
+
+# =============================================================================
+# Template Sensors - Schedule Display
+# =============================================================================
+template:
+  - sensor:
+      - name: "Battery Optimizer Status"
+        unique_id: battery_optimizer_status
+        icon: >-
+          {% set mode = state_attr('sensor.battery_optimizer', 'current_mode') %}
+          {% if mode == 'CHARGE' %}
+            mdi:battery-charging
+          {% elif mode == 'DISCHARGE' %}
+            mdi:battery-arrow-down
+          {% else %}
+            mdi:battery-clock
+          {% endif %}
+        state: >-
+          {% set mode = state_attr('sensor.battery_optimizer', 'current_mode') %}
+          {% if mode == 'CHARGE' %}
+            Charging
+          {% elif mode == 'DISCHARGE' %}
+            Discharging
+          {% else %}
+            Holding
+          {% endif %}
+        attributes:
+          current_mode: "{{ state_attr('sensor.battery_optimizer', 'current_mode') }}"
+          next_charge: "{{ state_attr('sensor.battery_optimizer', 'next_charge') }}"
+          next_discharge: "{{ state_attr('sensor.battery_optimizer', 'next_discharge') }}"
+          last_optimization: "{{ state_attr('sensor.battery_optimizer', 'last_optimization') }}"
+          battery_avg_cost: "{{ state_attr('sensor.battery_optimizer', 'battery_avg_cost') }}"
+          discharge_threshold: "{{ state_attr('sensor.battery_optimizer', 'discharge_threshold') }}"
+
+      - name: "Battery Next Charge Time"
+        unique_id: battery_next_charge_time
+        icon: mdi:battery-charging-high
+        device_class: timestamp
+        state: >-
+          {% set next = state_attr('sensor.battery_optimizer', 'next_charge') %}
+          {% if next %}
+            {{ next }}
+          {% else %}
+            unknown
+          {% endif %}
+
+      - name: "Battery Next Discharge Time"
+        unique_id: battery_next_discharge_time
+        icon: mdi:battery-arrow-down-outline
+        device_class: timestamp
+        state: >-
+          {% set next = state_attr('sensor.battery_optimizer', 'next_discharge') %}
+          {% if next %}
+            {{ next }}
+          {% else %}
+            unknown
+          {% endif %}
+
+      - name: "Battery Schedule Hours"
+        unique_id: battery_schedule_hours
+        icon: mdi:timetable
+        state: >-
+          {% set schedule = state_attr('sensor.battery_optimizer', 'schedule') %}
+          {% if schedule %}
+            {% set charge = schedule | selectattr('mode', 'eq', 'CHARGE') | list | count %}
+            {% set discharge = schedule | selectattr('mode', 'eq', 'DISCHARGE') | list | count %}
+            {{ charge }}h charge / {{ discharge }}h discharge
+          {% else %}
+            No schedule
+          {% endif %}
+        attributes:
+          charge_hours: >-
+            {% set schedule = state_attr('sensor.battery_optimizer', 'schedule') %}
+            {% if schedule %}
+              {{ schedule | selectattr('mode', 'eq', 'CHARGE') | list | count }}
+            {% else %}
+              0
+            {% endif %}
+          discharge_hours: >-
+            {% set schedule = state_attr('sensor.battery_optimizer', 'schedule') %}
+            {% if schedule %}
+              {{ schedule | selectattr('mode', 'eq', 'DISCHARGE') | list | count }}
+            {% else %}
+              0
+            {% endif %}
+          hold_hours: >-
+            {% set schedule = state_attr('sensor.battery_optimizer', 'schedule') %}
+            {% if schedule %}
+              {{ schedule | selectattr('mode', 'eq', 'HOLD') | list | count }}
+            {% else %}
+              0
+            {% endif %}
+
+      # Learning Stats Sensors
+      - name: "Battery Learning Confidence"
+        unique_id: battery_learning_confidence
+        icon: mdi:brain
+        unit_of_measurement: "%"
+        state: >-
+          {% set conf = state_attr('sensor.battery_learning_stats', 'confidence_pct') %}
+          {{ conf | default(0) | round(0) }}
+
+      - name: "Battery Learned Charge Rate"
+        unique_id: battery_learned_charge_rate
+        icon: mdi:lightning-bolt
+        unit_of_measurement: "kW"
+        state: >-
+          {% set rate = state_attr('sensor.battery_learning_stats', 'learned_charge_rate_kw') %}
+          {{ rate | default(0) | round(2) }}
+
+      - name: "Battery Overall Efficiency"
+        unique_id: battery_overall_efficiency
+        icon: mdi:percent
+        unit_of_measurement: "%"
+        state: >-
+          {% set eff = state_attr('sensor.battery_learning_stats', 'overall_efficiency') %}
+          {{ (eff | default(0) * 100) | round(1) }}
+
+      - name: "Battery Total Profit"
+        unique_id: battery_total_profit
+        icon: mdi:currency-eur
+        unit_of_measurement: "EUR"
+        state: >-
+          {% set profit = state_attr('sensor.battery_learning_stats', 'total_profit_eur') %}
+          {{ profit | default(0) | round(2) }}
+
+      - name: "Battery Total Energy Charged"
+        unique_id: battery_total_energy_charged
+        icon: mdi:battery-charging-high
+        unit_of_measurement: "kWh"
+        state: >-
+          {% set energy = state_attr('sensor.battery_learning_stats', 'total_energy_charged_kwh') %}
+          {{ energy | default(0) | round(1) }}
+
+      - name: "Battery Total Energy Discharged"
+        unique_id: battery_total_energy_discharged
+        icon: mdi:battery-arrow-down
+        unit_of_measurement: "kWh"
+        state: >-
+          {% set energy = state_attr('sensor.battery_learning_stats', 'total_energy_discharged_kwh') %}
+          {{ energy | default(0) | round(1) }}
+
+# =============================================================================
+# Automations - Optional Notifications
+# =============================================================================
+automation:
+  - id: battery_optimizer_mode_change_notification
+    alias: "Battery Optimizer - Mode Change Notification"
+    description: "Notify when battery mode changes"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: sensor.battery_optimizer
+        attribute: current_mode
+    condition:
+      - condition: state
+        entity_id: input_boolean.battery_optimizer_enabled
+        state: "on"
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "Battery Mode Changed"
+          message: >-
+            Battery mode changed to {{ state_attr('sensor.battery_optimizer', 'current_mode') }}
+          notification_id: battery_mode_change
+
+  - id: battery_optimizer_daily_summary
+    alias: "Battery Optimizer - Daily Summary"
+    description: "Send daily summary of optimization schedule"
+    mode: single
+    trigger:
+      - platform: time
+        at: "13:30:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.battery_optimizer_enabled
+        state: "on"
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "Battery Schedule Updated"
+          message: >-
+            {% set schedule = state_attr('sensor.battery_optimizer', 'schedule') %}
+            {% if schedule %}
+              {% set charge = schedule | selectattr('mode', 'eq', 'CHARGE') | list | count %}
+              {% set discharge = schedule | selectattr('mode', 'eq', 'DISCHARGE') | list | count %}
+              New schedule: {{ charge }}h charge, {{ discharge }}h discharge.
+              Next charge: {{ state_attr('sensor.battery_optimizer', 'next_charge') | default('None') }}
+              Next discharge: {{ state_attr('sensor.battery_optimizer', 'next_discharge') | default('None') }}
+            {% else %}
+              No schedule available.
+            {% endif %}
+          notification_id: battery_daily_summary
+
+  - id: battery_optimizer_safety_alert
+    alias: "Battery Optimizer - Safety Alert"
+    description: "Alert when safety limits are reached"
+    # NOTE: Update entity_id below if using a different SOC sensor (must match soc_sensor in apps.yaml)
+    mode: single
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.growatt_battery_soc  # <-- Update if soc_sensor differs
+        below: 12
+        for:
+          minutes: 5
+      - platform: numeric_state
+        entity_id: sensor.growatt_battery_soc  # <-- Update if soc_sensor differs
+        above: 98
+        for:
+          minutes: 5
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "Battery Safety Alert"
+          # NOTE: Update sensor name below if using a different SOC sensor
+          message: >-
+            Battery SOC is at {{ states('sensor.growatt_battery_soc') }}%.
+            {% if states('sensor.growatt_battery_soc') | float < 15 %}
+              Low battery warning!
+            {% else %}
+              Battery nearly full.
+            {% endif %}
+          notification_id: battery_safety_alert
+
+# =============================================================================
+# Scripts - Manual Control
+# =============================================================================
+script:
+  battery_force_charge:
+    alias: "Battery - Force Charge"
+    description: "Manually force battery to charge mode"
+    icon: mdi:battery-charging
+    sequence:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.battery_optimizer_override
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.battery_manual_mode
+        data:
+          option: Charge
+
+  battery_force_discharge:
+    alias: "Battery - Force Discharge"
+    description: "Manually force battery to discharge mode"
+    icon: mdi:battery-arrow-down
+    sequence:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.battery_optimizer_override
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.battery_manual_mode
+        data:
+          option: Discharge
+
+  battery_force_hold:
+    alias: "Battery - Force Hold"
+    description: "Manually force battery to hold mode"
+    icon: mdi:battery-clock
+    sequence:
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.battery_optimizer_override
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.battery_manual_mode
+        data:
+          option: Hold
+
+  battery_resume_auto:
+    alias: "Battery - Resume Auto"
+    description: "Return battery control to automatic optimization"
+    icon: mdi:battery-sync
+    sequence:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.battery_optimizer_override
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.battery_manual_mode
+        data:
+          option: Auto
+
+# =============================================================================
+# Modbus Hub - WIT Inverter TOU Schedule Control
+# =============================================================================
+# NOTE: The modbus hub "wit_inverter" should be defined in configuration.yaml
+# (not here) to avoid duplicate entries. Example configuration:
+#
+#   modbus:
+#     - name: wit_inverter
+#       type: tcp
+#       host: 192.168.33.8  # Your WIT inverter IP
+#       port: 502
+#       sensors:
+#         - name: "WIT Modbus Dummy"
+#           address: 30000
+#           slave: 1
+#
+# Then set modbus_hub: "wit_inverter" in apps.yaml to enable TOU sync.
+# =============================================================================

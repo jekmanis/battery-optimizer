@@ -514,8 +514,10 @@ class BatteryOptimizer(hass.Hass):
         optimize_hour = self.tomorrow_prices_hour
         self.run_daily(self.full_optimize, datetime.time(optimize_hour, 15))
 
-        # Also run optimization at startup
-        self.run_in(self.full_optimize, 5)
+        # Also run optimization at startup (with delay for HA services to be ready)
+        startup_delay = int(self.args.get("startup_delay_seconds", 30))
+        self.log(f"Scheduling startup optimization in {startup_delay}s")
+        self.run_in(self.full_optimize, startup_delay)
 
         # Adaptive re-evaluation (can be more frequent than schedule slots)
         self.run_every(
@@ -810,6 +812,23 @@ class BatteryOptimizer(hass.Hass):
         self.log(f"Service method returned {len(prices)} total prices")
         return prices
 
+    def _get_prices_for_date(self, date_obj, tz) -> List[PricePoint]:
+        """Fetch and normalize prices for a specific date via Nord Pool service."""
+        if not self.nordpool_config_entry:
+            return []
+
+        try:
+            data = self._call_nordpool_service(date_obj.isoformat())
+            if not data:
+                return []
+            parsed = self._parse_service_response(data, tz)
+            if not parsed:
+                return []
+            return self._normalize_prices(parsed)
+        except Exception as e:
+            self.log(f"Error fetching prices for {date_obj.isoformat()}: {e}", level="DEBUG")
+            return []
+
     def _call_nordpool_service(self, date_str: str) -> Optional[Dict]:
         """
         Call the nordpool.get_prices_for_date service.
@@ -1100,8 +1119,8 @@ class BatteryOptimizer(hass.Hass):
         analysis["break_even_spread"] = analysis["min"] / self.efficiency - analysis["min"]
         analysis["worthwhile_arbitrage"] = analysis["spread"] > analysis["break_even_spread"]
 
-        self.log(f"Price analysis: min={analysis['min']:.3f}, max={analysis['max']:.3f}, "
-                 f"spread={analysis['spread']:.3f}, arbitrage_worthwhile={analysis['worthwhile_arbitrage']}")
+        self.log(f"Price analysis: min={analysis['min']:.4f}, max={analysis['max']:.4f}, "
+                 f"spread={analysis['spread']:.4f}, arbitrage_worthwhile={analysis['worthwhile_arbitrage']}")
 
         return analysis
 
@@ -1193,6 +1212,65 @@ class BatteryOptimizer(hass.Hass):
         future_prices = [p for p in prices if is_future_price(p)]
         if not future_prices:
             return {}
+
+        # Ensure current slot is included (Nord Pool may exclude current hour as "past")
+        def prices_contains_slot(prices_list, slot):
+            slot_naive = slot.replace(tzinfo=None) if slot.tzinfo else slot
+            for p in prices_list:
+                p_naive = p.hour.replace(tzinfo=None) if p.hour.tzinfo else p.hour
+                if p_naive == slot_naive:
+                    return True
+            return False
+
+        if not prices_contains_slot(future_prices, current_slot):
+            # Current slot missing - try yesterday's Nord Pool data (timezone shift around midnight)
+            tz = self._get_local_timezone()
+            yesterday = current_slot.date() - datetime.timedelta(days=1)
+            yesterday_prices = self._get_prices_for_date(yesterday, tz)
+
+            def find_slot_price(prices_list, slot):
+                slot_naive = slot.replace(tzinfo=None) if slot.tzinfo else slot
+                for p in prices_list:
+                    p_naive = p.hour.replace(tzinfo=None) if p.hour.tzinfo else p.hour
+                    if p_naive == slot_naive:
+                        return p
+                return None
+
+            slot_price_point = find_slot_price(yesterday_prices, current_slot)
+            if slot_price_point is not None:
+                synth_price = slot_price_point.price
+                self.log(
+                    f"Added missing current slot {current_slot} using yesterday's price "
+                    f"{synth_price:.4f} EUR/kWh from {slot_price_point.hour}"
+                )
+            else:
+                # If still missing, synthesize using most recent past price if available
+                current_slot_naive = current_slot.replace(tzinfo=None) if current_slot.tzinfo else current_slot
+                prev_price_point = None
+                for p in prices:
+                    p_hour = p.hour
+                    p_naive = p_hour.replace(tzinfo=None) if p_hour.tzinfo else p_hour
+                    if p_naive <= current_slot_naive:
+                        if prev_price_point is None:
+                            prev_price_point = p
+                        else:
+                            prev_naive = prev_price_point.hour.replace(tzinfo=None) if prev_price_point.hour.tzinfo else prev_price_point.hour
+                            if p_naive > prev_naive:
+                                prev_price_point = p
+
+                if prev_price_point is not None:
+                    synth_price = prev_price_point.price
+                    self.log(
+                        f"Added missing current slot {current_slot} using previous price "
+                        f"{synth_price:.4f} EUR/kWh from {prev_price_point.hour}"
+                    )
+                else:
+                    # Fallback: use first available future price
+                    synth_price = min(future_prices, key=lambda p: p.hour).price
+                    self.log(f"Added missing current slot {current_slot} using next price {synth_price:.4f} EUR/kWh")
+
+            current_slot_price = PricePoint(hour=current_slot, price=synth_price)
+            future_prices.append(current_slot_price)
 
         schedule = {}
         hours_sorted_by_time = sorted(future_prices, key=lambda p: p.hour)
@@ -1355,11 +1433,11 @@ class BatteryOptimizer(hass.Hass):
             hour = price_point.hour
             price = price_point.price
             if action == BatteryMode.CHARGE:
-                reason = f"Charge @ {price:.3f} EUR/kWh"
+                reason = f"Charge @ {price:.4f} EUR/kWh"
             elif action == BatteryMode.DISCHARGE:
-                reason = f"Discharge @ {price:.3f} EUR/kWh (load~{lk:.2f}kW)"
+                reason = f"Discharge @ {price:.4f} EUR/kWh (load~{lk:.2f}kW)"
             else:
-                reason = f"Hold @ {price:.3f} EUR/kWh"
+                reason = f"Hold @ {price:.4f} EUR/kWh"
             schedule[hour] = ScheduleEntry(hour=hour, mode=action, reason=reason)
 
         charge_count = len([s for s in schedule.values() if s.mode == BatteryMode.CHARGE])
@@ -1724,10 +1802,17 @@ class BatteryOptimizer(hass.Hass):
             # Update battery cost based on actual SOC change from previous hour
             self._update_battery_cost_from_soc_change()
 
+            # When TOU sync is enabled, avoid hourly set_mode which clears TOU periods (30411=0)
+            if self.tou_sync_enabled and self.device_id:
+                self.log("TOU sync enabled; skipping hourly set_mode to preserve inverter TOU schedule")
+                return
             self.set_mode(entry.mode)
         else:
             self.log(f"No schedule entry for {current_slot}, defaulting to HOLD")
             self._update_battery_cost_from_soc_change()
+            if self.tou_sync_enabled and self.device_id:
+                self.log("TOU sync enabled; skipping hourly set_mode to preserve inverter TOU schedule")
+                return
             self.set_mode(BatteryMode.HOLD)
 
     def safety_check(self, kwargs=None):
@@ -2060,9 +2145,14 @@ class BatteryOptimizer(hass.Hass):
         - 30476: Default mode (0=load first/HOLD)
         - 30412-30471: Period data (3 registers per period: start, end, power)
 
+        CRITICAL: Write period data FIRST, then num_periods LAST.
+        This is the correct order required by Growatt firmware (wit-vpp-control.js pattern).
+
         Returns:
             True if sync succeeded, False otherwise
         """
+        import time
+
         if not self.device_id:
             self.log("No device_id configured, cannot sync TOU schedule", level="WARNING")
             return False
@@ -2070,20 +2160,20 @@ class BatteryOptimizer(hass.Hass):
         try:
             # Convert schedule to TOU periods
             periods = self.schedule_to_tou_periods()
+            num_periods = len(periods)
 
-            self.log(f"Syncing {len(periods)} TOU periods to inverter")
+            self.log(f"Syncing {num_periods} TOU periods to inverter")
 
-            # Enable VPP control (register 30100 = 1)
-            self._write_modbus_register(30100, 1)
+            # Step 1: Enable VPP control (register 30100 = 1)
+            if not self._write_register_with_retry(30100, 1):
+                self.log("Failed to enable VPP control", level="ERROR")
+                return False
 
-            # Set default mode to "load first" / HOLD (register 30476 = 0)
-            self._write_modbus_register(30476, 0)
+            # Step 2: Set default mode to "load first" / HOLD (register 30476 = 0)
+            self._write_register_with_retry(30476, 0)
+            time.sleep(0.3)
 
-            # Set number of periods BEFORE writing period data
-            # (Growatt firmware requires this order for reliable writes)
-            self._write_modbus_register(30411, len(periods))
-
-            # Write each period's registers (must be in chronological order)
+            # Step 3: Write ALL period data FIRST (before setting num_periods)
             for i, period in enumerate(periods):
                 base_addr = 30412 + (i * 3)
 
@@ -2092,13 +2182,37 @@ class BatteryOptimizer(hass.Hass):
                 power_unsigned = period.power if period.power >= 0 else 65536 + period.power
 
                 # Write period data (function 0x10 - write multiple registers)
-                # Note: num_periods (30411) must be set BEFORE writing period data
-                self._write_modbus_registers(base_addr, [period.start, period.end, power_unsigned])
+                self.call_service("growatt_modbus/write_registers",
+                    device_id=self.device_id,
+                    register=base_addr,
+                    values=[period.start, period.end, power_unsigned])
 
                 self.log(f"TOU Period {i+1}: {period.start//60:02d}:{period.start%60:02d} - "
                          f"{period.end//60:02d}:{period.end%60:02d}, power={period.power}%")
+                time.sleep(0.3)
 
-            self.log(f"TOU sync complete: {len(periods)} periods written")
+            # Step 4: Set num_periods LAST (activates the schedule)
+            time.sleep(0.5)
+            if not self._write_register_with_retry(30411, num_periods):
+                self.log("Failed to set num_periods", level="ERROR")
+                return False
+
+            # Step 5: Verify the write succeeded (optional - may not work on all setups)
+            time.sleep(0.5)
+            try:
+                verified = self._read_modbus_registers(30411, 1)
+                if verified and len(verified) > 0 and verified[0] == num_periods:
+                    self.log(f"TOU sync complete: {num_periods} periods written and verified")
+                elif verified is not None:
+                    self.log(f"TOU sync verification FAILED: expected {num_periods}, got {verified}", level="ERROR")
+                    return False
+                else:
+                    # Verification not available, assume success based on no write errors
+                    self.log(f"TOU sync complete: {num_periods} periods written (verification unavailable)")
+            except Exception as e:
+                # Verification failed but writes may have succeeded
+                self.log(f"TOU sync complete: {num_periods} periods written (verification error: {e})")
+
             return True
 
         except Exception as e:
@@ -2128,6 +2242,95 @@ class BatteryOptimizer(hass.Hass):
             register=address,
             values=values
         )
+
+    def _read_modbus_registers(self, address: int, count: int = 1) -> Optional[List[int]]:
+        """Read holding registers via growatt_modbus service.
+
+        Note: This uses HA service response feature. If the service doesn't
+        return data (older HA versions), verification will be skipped.
+        """
+        if not self.device_id:
+            return None
+        # Prefer REST API for response-returning services (avoids return_result schema errors)
+        rest_values = self._read_modbus_registers_rest(address, count)
+        if rest_values is not None:
+            return rest_values
+
+        # Fallback to AppDaemon call_service without return_result
+        try:
+            result = self.call_service(
+                "growatt_modbus/get_register_data",
+                device_id=self.device_id,
+                register_type="holding",
+                start_address=address,
+                count=count
+            )
+            if result and isinstance(result, dict) and result.get("success"):
+                return result.get("values")
+            return None
+        except Exception as e:
+            self.log(f"Failed to read registers {address}-{address+count-1}: {e}", level="WARNING")
+            return None
+
+    def _read_modbus_registers_rest(self, address: int, count: int) -> Optional[List[int]]:
+        """Read holding registers via HA REST API with return_response."""
+        if not REQUESTS_AVAILABLE:
+            return None
+
+        ha_url = self.args.get("ha_url", "").rstrip("/")
+        token = self.args.get("ha_token", "")
+        if not ha_url or not token:
+            return None
+
+        try:
+            url = f"{ha_url}/api/services/growatt_modbus/get_register_data?return_response"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "device_id": self.device_id,
+                "register_type": "holding",
+                "start_address": address,
+                "count": count
+            }
+
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
+            if response.status_code != 200:
+                self.log(f"REST API read returned status {response.status_code}: {response.text[:200]}", level="DEBUG")
+                return None
+
+            data = response.json()
+            if isinstance(data, dict):
+                if "service_response" in data:
+                    data = data["service_response"]
+                elif "response" in data:
+                    data = data["response"]
+
+            if isinstance(data, dict) and data.get("success"):
+                return data.get("values")
+
+            self.log(f"REST API read did not return success for {address}-{address+count-1}", level="DEBUG")
+            return None
+
+        except requests.exceptions.RequestException as e:
+            self.log(f"REST API read failed for {address}-{address+count-1}: {e}", level="DEBUG")
+            return None
+
+    def _write_register_with_retry(self, address: int, value: int, max_retries: int = 3) -> bool:
+        """Write single register with retry logic."""
+        import time
+        for attempt in range(max_retries):
+            try:
+                self.call_service("growatt_modbus/write_register",
+                    device_id=self.device_id, register=address, value=value)
+                time.sleep(0.3)  # Allow inverter to process
+                return True
+            except Exception as e:
+                self.log(f"Register {address} write attempt {attempt+1} failed: {e}", level="WARNING")
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)
+        return False
 
     # =========================================================================
     # Manual Override Handling

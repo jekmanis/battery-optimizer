@@ -47,7 +47,7 @@ battery_optimizer:
 
   # Growatt WIT device ID for Modbus control
   # Find this in Home Assistant Developer Tools > States > growatt entities
-  device_id: ""  # <-- Set your device_id here
+  device_id: "05005d2cc8b5b7acce146af1698e9fb3"  # <-- Set your device_id here
 
   # ==========================================================================
   # TOU Schedule Sync (Optional)

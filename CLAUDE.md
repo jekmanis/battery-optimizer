@@ -9,7 +9,7 @@ Battery Optimizer for Growatt WIT Inverter - a Home Assistant AppDaemon applicat
 ## Architecture
 
 ### File Structure
-- `appdaemon/apps/battery_optimizer.py` - Main optimization engine (~1,200 lines)
+- `appdaemon/apps/battery_optimizer.py` - Main optimization engine (~2,870 lines)
 - `appdaemon/apps/apps.yaml` - AppDaemon configuration with all parameters
 - `homeassistant/packages/battery_optimizer.yaml` - HA entities, automations, sensors
 
@@ -17,50 +17,82 @@ Battery Optimizer for Growatt WIT Inverter - a Home Assistant AppDaemon applicat
 
 | Lines | Section | Purpose |
 |-------|---------|---------|
-| 158-530 | Price Fetching | Nord Pool API/sensor data retrieval |
-| 535-700 | Optimization Algorithm | SOC-aware scheduling with timeline simulation |
-| 720-920 | Schedule Execution | Timing, adaptive optimization, recalculation |
-| 940-980 | Device Control | Growatt Modbus register writes |
-| 985-1025 | Manual Override | User intervention handling |
-| 1030-1150 | Battery Cost Tracking | Weighted average cost with persistence |
-| 1155-1220 | Helper Methods | SOC reading, dynamic config from HA entities |
+| 32-340 | Learning Engine | Self-learning charge rate and load profile tracking |
+| 356-425 | Load Profile | Historical load data for discharge predictions |
+| 426-455 | Data Models | BatteryMode, PricePoint, ScheduleEntry, TouPeriod |
+| 458-655 | Initialization | AppDaemon setup, config loading, scheduled tasks |
+| 659-980 | Price Fetching | Nord Pool API/sensor data retrieval with caching |
+| 1079-1160 | Price Analysis | Statistics and charge/discharge hour calculations |
+| 1162-1370 | Optimization Algorithm | Dynamic programming SOC-aware scheduling |
+| 1415-1675 | Schedule Execution | Full/adaptive optimization, recalculation |
+| 1676-1755 | Mode Execution | Hourly mode application, safety checks |
+| 1758-1920 | Device Control | Growatt Modbus register writes (VPP protocol) |
+| 1921-2130 | TOU Sync | Schedule sync to inverter TOU registers |
+| 2136-2180 | Manual Override | User intervention handling |
+| 2182-2465 | Battery Cost Tracking | Weighted average cost with persistence |
+| 2465-2690 | Helper Methods | SOC reading, timezone handling, slot alignment |
+| 2694-2870 | Properties & Logging | Dynamic config, schedule sensor, logging |
 
 ### Data Models
 - `BatteryMode` enum: HOLD (0), CHARGE (1), DISCHARGE (2)
 - `PricePoint` dataclass: Hour + price
 - `ScheduleEntry` dataclass: Hour + mode + reason
+- `TouPeriod` dataclass: Start/end minutes + power percentage
+- `LoadProfileStats` dataclass: Min/max/sum/count for load observations
+- `LearningStats` dataclass: Charge rate learning data per SOC range
 
 ## Core Algorithm
 
 ### Scheduling Logic (`find_optimal_schedule`)
-1. Select N cheapest hours for CHARGE (N = hours needed to reach max_soc)
-2. Calculate discharge threshold: `blended_cost / efficiency + grid_fee`
-3. Find candidate DISCHARGE hours above threshold
-4. **SOC Timeline Simulation**: Walk through hours chronologically, only allow discharge when `simulated_soc - drain >= min_soc`
-5. Remaining hours are HOLD
+Uses **dynamic programming** with SOC state tracking:
+1. Discretize SOC into energy levels (0.1 kWh steps)
+2. For each time slot, evaluate HOLD/CHARGE/DISCHARGE transitions
+3. Track best value for each (charge_count, energy_level) state
+4. Backtrack to extract optimal action sequence
 
-This prevents scheduling discharge before charge has raised SOC sufficiently.
+**Value calculations:**
+- CHARGE cost: `(price + grid_fee) * energy / efficiency`
+- DISCHARGE value: `(price + grid_fee) * energy` (avoided import cost)
+- Discharge is modeled as self-consumption: `min(predicted_load, discharge_rate)`
+
+### TOU Sync to Inverter
+Syncs schedule to inverter's TOU registers for autonomous operation:
+- Consolidates contiguous same-mode slots into periods
+- Includes today AND tomorrow's schedule (time-of-day based)
+- Today's entries take precedence for conflicting time slots
+- Maximum 20 periods supported by inverter
+
+### Growatt Modbus Quirks (VPP Protocol)
+**Critical**: Register write order matters!
+- Must set `num_periods` (30411) BEFORE writing period data
+- Multi-register writes (function 0x10) work when order is correct
+- TOU periods use minutes since midnight (0-1439)
+- Power: positive = charge, negative = discharge, +1% = true HOLD
+
+**Key Registers:**
+- 30100: VPP Control Authority (1=enable)
+- 30407: Remote Power Control Enable
+- 30409: Remote Power Percent (-100 to +100)
+- 30410: AC Charging Enable (1=PV first)
+- 30411: Number of TOU periods (0-20)
+- 30412+: TOU period data (3 registers each: start, end, power)
 
 ### Battery Cost Tracking
-- **Weighted average**: `(old_energy × old_cost + new_energy × charge_price) / total_energy`
+- **Weighted average**: `(old_energy * old_cost + new_energy * charge_price) / total_energy`
 - **SOC-based tracking**: Measures actual SOC changes, not theoretical charging
 - **Persistence**: Stored in `input_number.battery_avg_cost` (survives restarts)
-- **Blended threshold**: Combines existing battery cost with planned charge cost
-
-### Discharge Rate Assumption
-Uses `base_consumption` (default 500W) for discharge calculations, not max inverter rate. At 500W average house load, a 14.3 kWh battery lasts ~25 hours, not 3 hours.
 
 ### Dynamic Configuration
 These values read from HA entities at runtime (adjustable without restart):
-- `input_number.battery_min_soc` → min_soc
-- `input_number.battery_max_soc` → max_soc
-- `input_number.battery_pv_threshold` → pv_threshold
-- `input_number.battery_avg_cost` → battery cost persistence
+- `input_number.battery_min_soc` -> min_soc
+- `input_number.battery_max_soc` -> max_soc
+- `input_number.battery_pv_threshold` -> pv_threshold
+- `input_number.battery_avg_cost` -> battery cost persistence
 
 ### Scheduled Tasks
 - **13:15 daily**: Full optimization (after Nord Pool prices publish)
 - **Startup**: Initial optimization
-- **Every 30 min**: Adaptive re-evaluation + battery cost tracking
+- **Every 30 min**: Adaptive re-evaluation + schedule change logging
 - **Every 5 min**: Safety checks
 - **Hourly**: Mode execution + battery cost update
 
@@ -93,4 +125,4 @@ Manual verification via Home Assistant UI and AppDaemon logs. Set `device_id: ""
 - AppDaemon 4
 - Home Assistant
 - Nord Pool integration (built-in or HACS)
-- Growatt Modbus integration
+- Growatt Modbus integration (for inverter control)

@@ -110,7 +110,15 @@ These values read from HA entities at runtime (adjustable without restart):
 
 ## Development
 
-This is a Python AppDaemon project - no build/test/lint commands exist.
+This is a Python AppDaemon project. Use `uv` for running Python scripts and syntax checks:
+
+```bash
+# Check syntax
+uv run python -m py_compile appdaemon/apps/battery_optimizer.py
+
+# Run a script
+uv run python script.py
+```
 
 ### Deployment
 ```bash

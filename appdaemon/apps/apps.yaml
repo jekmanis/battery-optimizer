@@ -102,17 +102,6 @@ battery_optimizer:
   # Load observation interval (minutes)
   load_observation_minutes: 30
 
-  # Optional time-of-day load overrides (use when load is known to be higher)
-  # Values can be in W or kW (e.g., 900 or 0.9)
-  load_override_windows:
-    - start: "06:00"
-      end: "08:30"
-      load_w: 800
-    - start: "17:30"
-      end: "22:00"
-      load_w: 800
-
-
   # Quantile for load forecast (0.5 = median, 0.8 = conservative)
   load_quantile: 0.75
 
@@ -160,6 +149,11 @@ battery_optimizer:
   # SOC deviation threshold for schedule recalculation (%)
   # If actual SOC differs from expected by more than this, recalculate
   soc_deviation_threshold: 5
+
+  # Decision transparency logging (0=minimal, 1=summary, 2=verbose)
+  # Level 1: Log charge calculation breakdown and recalculation triggers
+  # Level 2: Also log candidate charge slots, arbitrage analysis
+  decision_log_level: 1
 
   # ==========================================================================
   # Home Assistant Control Entities

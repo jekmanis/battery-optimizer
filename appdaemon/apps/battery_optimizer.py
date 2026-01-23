@@ -48,13 +48,18 @@ class LearningStats:
     # Timestamps
     first_observation: Optional[str] = None
     last_observation: Optional[str] = None
+    # Temperature-aware charge rates: {"25-50": {"5-10": [3.1, 3.2], "10-15": [4.2, 4.5]}}
+    charge_rates_by_soc_temp: Dict[str, Dict[str, List[float]]] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict) -> 'LearningStats':
-        return cls(**data)
+        # Handle backward compatibility for older versions without charge_rates_by_soc_temp
+        known_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered_data = {k: v for k, v in data.items() if k in known_fields}
+        return cls(**filtered_data)
 
 
 class BatteryLearningEngine:
@@ -76,6 +81,7 @@ class BatteryLearningEngine:
         min_soc: float = 10.0,
         max_soc: float = 100.0,
         log_func=None,
+        temp_ranges: Optional[List[int]] = None,
     ):
         self.battery_capacity = battery_capacity_kwh
         self.nominal_charge_rate = nominal_charge_rate_kw
@@ -84,6 +90,9 @@ class BatteryLearningEngine:
         self.max_soc = max_soc
         self.log = log_func or print
 
+        # Temperature range boundaries for bucketing (default: <5, 5-10, 10-15, 15-20, >20)
+        self.temp_ranges = temp_ranges if temp_ranges is not None else [5, 10, 15, 20]
+
         # Learning data
         self.stats = LearningStats()
 
@@ -91,7 +100,6 @@ class BatteryLearningEngine:
         self.ema_alpha = 0.1
 
         # Learned parameters (start with nominals)
-        self.learned_charge_rate = nominal_charge_rate_kw
         self.learned_efficiency = nominal_efficiency
 
         # SOC-dependent charge rate multipliers
@@ -106,10 +114,6 @@ class BatteryLearningEngine:
             "90-100": 1.0,  # Will be learned
         }
 
-        # Confidence tracking
-        self.observation_count = 0
-        self.confidence_level = 0.0
-
     def _get_soc_range(self, soc: float) -> str:
         """Get the SOC range bucket for a given SOC."""
         if soc < 25:
@@ -123,13 +127,37 @@ class BatteryLearningEngine:
         else:
             return "90-100"
 
+    def _get_temp_range(self, temp: float) -> str:
+        """Get the temperature range bucket for a given temperature (Celsius).
+
+        Uses configured temp_ranges boundaries. For default [5, 10, 15, 20]:
+        - "<5" for temps below 5°C
+        - "5-10" for temps 5-10°C
+        - "10-15" for temps 10-15°C
+        - "15-20" for temps 15-20°C
+        - ">20" for temps above 20°C
+        """
+        if not self.temp_ranges:
+            return "all"
+
+        for i, boundary in enumerate(self.temp_ranges):
+            if temp < boundary:
+                if i == 0:
+                    return f"<{boundary}"
+                else:
+                    return f"{self.temp_ranges[i-1]}-{boundary}"
+
+        # Above the highest boundary
+        return f">{self.temp_ranges[-1]}"
+
     def record_charging(
         self,
         soc_start: float,
         soc_end: float,
         duration_minutes: float,
         energy_from_grid_kwh: Optional[float] = None,
-        charge_price: float = 0.0
+        charge_price: float = 0.0,
+        battery_temp: Optional[float] = None
     ):
         """
         Record a charging observation and update learned parameters.
@@ -140,6 +168,7 @@ class BatteryLearningEngine:
             duration_minutes: How long charging took
             energy_from_grid_kwh: Energy drawn from grid (if available from meter)
             charge_price: Price paid per kWh
+            battery_temp: Battery temperature in Celsius (if available)
         """
         if duration_minutes <= 0 or soc_end <= soc_start:
             return
@@ -160,7 +189,7 @@ class BatteryLearningEngine:
                 )
                 self.stats.efficiency_history.append(observed_efficiency)
 
-        # Update SOC-range specific charge rates
+        # Update SOC-range specific charge rates (legacy, SOC-only)
         soc_range = self._get_soc_range((soc_start + soc_end) / 2)
         if soc_range not in self.stats.charge_rates_by_soc:
             self.stats.charge_rates_by_soc[soc_range] = []
@@ -171,19 +200,23 @@ class BatteryLearningEngine:
             self.stats.charge_rates_by_soc[soc_range] = \
                 self.stats.charge_rates_by_soc[soc_range][-50:]
 
-        # Update overall learned charge rate with EMA
-        self.learned_charge_rate = (
-            self.ema_alpha * charge_rate +
-            (1 - self.ema_alpha) * self.learned_charge_rate
-        )
+        # Update temperature-aware charge rates (2D: SOC + temp)
+        if battery_temp is not None:
+            temp_range = self._get_temp_range(battery_temp)
+            if soc_range not in self.stats.charge_rates_by_soc_temp:
+                self.stats.charge_rates_by_soc_temp[soc_range] = {}
+            if temp_range not in self.stats.charge_rates_by_soc_temp[soc_range]:
+                self.stats.charge_rates_by_soc_temp[soc_range][temp_range] = []
+            self.stats.charge_rates_by_soc_temp[soc_range][temp_range].append(charge_rate)
+
+            # Keep last 50 observations per SOC+temp combination
+            if len(self.stats.charge_rates_by_soc_temp[soc_range][temp_range]) > 50:
+                self.stats.charge_rates_by_soc_temp[soc_range][temp_range] = \
+                    self.stats.charge_rates_by_soc_temp[soc_range][temp_range][-50:]
 
         # Update totals
         self.stats.total_energy_charged_kwh += energy_added
         self.stats.total_charge_cost_eur += energy_added * charge_price
-
-        # Update confidence
-        self.observation_count += 1
-        self.confidence_level = min(1.0, self.observation_count / 30)
 
         # Update timestamps
         now = datetime.datetime.now().isoformat()
@@ -191,9 +224,12 @@ class BatteryLearningEngine:
             self.stats.first_observation = now
         self.stats.last_observation = now
 
+        temp_str = f", temp={battery_temp:.1f}°C" if battery_temp is not None else ""
+        # Get observation count for this bucket
+        obs_count = len(self.stats.charge_rates_by_soc.get(soc_range, []))
         self.log(f"Learning: Recorded charge {soc_start:.1f}%->{soc_end:.1f}% "
-                 f"in {duration_minutes:.0f}min, rate={charge_rate:.2f}kW, "
-                 f"confidence={self.confidence_level*100:.0f}%")
+                 f"in {duration_minutes:.0f}min, rate={charge_rate:.2f}kW{temp_str}, "
+                 f"bucket={soc_range} ({obs_count} obs)")
 
     def record_discharging(
         self,
@@ -214,30 +250,108 @@ class BatteryLearningEngine:
         self.stats.total_energy_discharged_kwh += energy_delivered_kwh
         self.stats.total_discharge_revenue_eur += energy_delivered_kwh * price_eur_kwh
 
-    def get_charge_rate_for_soc(self, soc: float) -> float:
+    def get_charge_rate_for_soc(self, soc: float, battery_temp: Optional[float] = None) -> float:
         """
-        Get predicted charge rate for a given SOC level.
-        Uses learned data if available, otherwise model-based estimate.
+        Get predicted charge rate for a given SOC level and optional temperature.
+        Uses learned data with fallback chain:
+        1. Exact SOC+temp match (>=3 observations) -> median of last 10
+        2. SOC match, aggregate all temps
+        3. SOC-only legacy data
+        4. Nominal rate
+
+        Args:
+            soc: Current state of charge (%)
+            battery_temp: Current battery temperature in Celsius (optional)
+
+        Returns:
+            Predicted charge rate in kW
         """
         soc_range = self._get_soc_range(soc)
 
-        # Use learned data if we have enough observations
+        # Fallback 1: Try temperature-aware lookup if temp is available
+        if battery_temp is not None:
+            temp_range = self._get_temp_range(battery_temp)
+
+            # Check for exact SOC+temp match
+            if soc_range in self.stats.charge_rates_by_soc_temp:
+                temp_data = self.stats.charge_rates_by_soc_temp[soc_range]
+                if temp_range in temp_data and len(temp_data[temp_range]) >= 3:
+                    return statistics.median(temp_data[temp_range][-10:])
+
+                # Fallback 2: Aggregate all temps for this SOC range
+                all_rates = []
+                for rates in temp_data.values():
+                    all_rates.extend(rates[-10:])  # Last 10 from each temp bucket
+                if len(all_rates) >= 3:
+                    return statistics.median(all_rates)
+
+        # Fallback 3: Use SOC-only legacy data
         if soc_range in self.stats.charge_rates_by_soc:
             observations = self.stats.charge_rates_by_soc[soc_range]
             if len(observations) >= 3:
                 return statistics.median(observations[-10:])
 
-        # Fall back to model-based estimate
+        # Fallback 4: Use configured nominal charge rate
         multiplier = self.soc_charge_multipliers.get(soc_range, 1.0)
-        return self.learned_charge_rate * multiplier
+        return self.nominal_charge_rate * multiplier
+
+    def get_confidence_for_soc(self, soc: float, battery_temp: Optional[float] = None) -> float:
+        """
+        Get prediction confidence for a given SOC level and optional temperature.
+
+        Confidence reflects both data source quality and observation count:
+        - SOC+temp exact match: 0.7 base + up to 0.3 based on count (max at 10 obs)
+        - SOC+temp aggregated: 0.5 base + up to 0.2 based on count (max at 15 obs)
+        - SOC-only data: 0.3 base + up to 0.2 based on count (max at 10 obs)
+        - Nominal fallback: 0.0
+
+        Returns:
+            Confidence level 0.0 to 1.0
+        """
+        soc_range = self._get_soc_range(soc)
+
+        # Check temperature-aware data first
+        if battery_temp is not None:
+            temp_range = self._get_temp_range(battery_temp)
+
+            if soc_range in self.stats.charge_rates_by_soc_temp:
+                temp_data = self.stats.charge_rates_by_soc_temp[soc_range]
+
+                # Exact SOC+temp match
+                if temp_range in temp_data and len(temp_data[temp_range]) >= 3:
+                    count = len(temp_data[temp_range])
+                    return 0.7 + min(0.3, (count - 3) / 7 * 0.3)
+
+                # Aggregated temps for this SOC range
+                all_rates = []
+                for rates in temp_data.values():
+                    all_rates.extend(rates)
+                if len(all_rates) >= 3:
+                    return 0.5 + min(0.2, (len(all_rates) - 3) / 12 * 0.2)
+
+        # SOC-only data
+        if soc_range in self.stats.charge_rates_by_soc:
+            observations = self.stats.charge_rates_by_soc[soc_range]
+            if len(observations) >= 3:
+                count = len(observations)
+                return 0.3 + min(0.2, (count - 3) / 7 * 0.2)
+
+        # Nominal fallback - no confidence
+        return 0.0
 
     def predict_charge_time(
         self,
         current_soc: float,
-        target_soc: float
+        target_soc: float,
+        battery_temp: Optional[float] = None
     ) -> Tuple[float, float, float]:
         """
         Predict time to charge from current to target SOC.
+
+        Args:
+            current_soc: Current state of charge (%)
+            target_soc: Target state of charge (%)
+            battery_temp: Current battery temperature in Celsius (optional)
 
         Returns: (expected_hours, min_hours, max_hours)
         """
@@ -245,20 +359,25 @@ class BatteryLearningEngine:
             return 0.0, 0.0, 0.0
 
         total_time = 0.0
+        total_confidence = 0.0
+        step_count = 0
         soc = current_soc
         step = 5.0
 
         while soc < target_soc:
             next_soc = min(soc + step, target_soc)
             energy_needed = (next_soc - soc) / 100 * self.battery_capacity
-            charge_rate = self.get_charge_rate_for_soc(soc)
+            charge_rate = self.get_charge_rate_for_soc(soc, battery_temp)
             grid_energy = energy_needed / self.learned_efficiency
             time_hours = grid_energy / max(0.1, charge_rate)
             total_time += time_hours
+            total_confidence += self.get_confidence_for_soc(soc, battery_temp)
+            step_count += 1
             soc = next_soc
 
-        # Confidence interval
-        uncertainty = 0.3 * (1 - self.confidence_level)
+        # Confidence interval based on average per-bucket confidence
+        avg_confidence = total_confidence / max(1, step_count)
+        uncertainty = 0.3 * (1 - avg_confidence)
         return total_time, total_time * (1 - uncertainty), total_time * (1 + uncertainty)
 
     def get_learning_summary(self) -> Dict:
@@ -276,29 +395,53 @@ class BatteryLearningEngine:
             self.stats.total_charge_cost_eur
         )
 
+        # Build temperature-aware rates summary with per-bucket confidence
+        temp_aware_rates = {}
+        for soc_range, temp_data in self.stats.charge_rates_by_soc_temp.items():
+            temp_aware_rates[soc_range] = {}
+            for temp_range, rates in temp_data.items():
+                if rates:
+                    count = len(rates)
+                    # Confidence: 0.7 base + up to 0.3 based on count (max at 10 obs)
+                    confidence = 0.7 + min(0.3, (count - 3) / 7 * 0.3) if count >= 3 else 0.0
+                    temp_aware_rates[soc_range][temp_range] = {
+                        "median_kw": round(statistics.median(rates[-10:]), 2),
+                        "observations": count,
+                        "confidence": round(confidence, 2)
+                    }
+
+        # Build SOC-only rates with confidence
+        soc_charge_rates = {}
+        for soc_range, rates in self.stats.charge_rates_by_soc.items():
+            if rates:
+                count = len(rates)
+                # Confidence: 0.3 base + up to 0.2 based on count (max at 10 obs)
+                confidence = 0.3 + min(0.2, (count - 3) / 7 * 0.2) if count >= 3 else 0.0
+                soc_charge_rates[soc_range] = {
+                    "median_kw": round(statistics.median(rates[-10:]), 2),
+                    "observations": count,
+                    "confidence": round(confidence, 2)
+                }
+
+        # Calculate total observations across all buckets
+        total_observations = sum(len(v) for v in self.stats.charge_rates_by_soc.values())
+
         return {
-            "learned_charge_rate_kw": round(self.learned_charge_rate, 2),
             "learned_efficiency": round(self.learned_efficiency, 3),
-            "confidence_pct": round(self.confidence_level * 100, 0),
             "total_energy_charged_kwh": round(self.stats.total_energy_charged_kwh, 1),
             "total_energy_discharged_kwh": round(self.stats.total_energy_discharged_kwh, 1),
             "overall_efficiency": round(overall_efficiency, 3),
             "total_profit_eur": round(total_profit, 2),
-            "observation_count": self.observation_count,
-            "soc_charge_rates": {
-                k: round(statistics.median(v[-10:]), 2) if v else None
-                for k, v in self.stats.charge_rates_by_soc.items()
-            },
+            "total_observations": total_observations,
+            "soc_charge_rates": soc_charge_rates,
+            "temp_aware_rates": temp_aware_rates,
         }
 
     def save_to_json(self) -> str:
         """Serialize learning state for persistence."""
         data = {
-            "version": 2,
-            "learned_charge_rate": self.learned_charge_rate,
+            "version": 5,  # v5 removes global confidence (use per-bucket confidence instead)
             "learned_efficiency": self.learned_efficiency,
-            "observation_count": self.observation_count,
-            "confidence_level": self.confidence_level,
             "stats": self.stats.to_dict(),
         }
         return json.dumps(data)
@@ -308,10 +451,8 @@ class BatteryLearningEngine:
         try:
             data = json.loads(json_str)
             if data.get("version", 0) >= 1:
-                self.learned_charge_rate = data.get("learned_charge_rate", self.nominal_charge_rate)
+                # Note: learned_charge_rate removed in v4, global confidence removed in v5
                 self.learned_efficiency = data.get("learned_efficiency", self.nominal_efficiency)
-                self.observation_count = data.get("observation_count", 0)
-                self.confidence_level = data.get("confidence_level", 0.0)
                 if "stats" in data:
                     self.stats = LearningStats.from_dict(data["stats"])
                 return True
@@ -569,6 +710,7 @@ class BatteryOptimizer(hass.Hass):
         # Other sensor entities
         self.soc_sensor = self.args.get("soc_sensor", "sensor.growatt_battery_soc")
         self.pv_power_sensor = self.args.get("pv_power_sensor", "sensor.growatt_pv_power")
+        self.battery_temp_sensor = self.args.get("battery_temp_sensor", "")
 
         # Nord Pool publishes tomorrow's prices at 13:00 CET
         # Default to 14 for EET (Latvia, Lithuania, Estonia) which is 13:00 CET
@@ -1365,8 +1507,32 @@ class BatteryOptimizer(hass.Hass):
                 current_slot_index = i
                 break
 
-        base_charge_energy_kwh = self.charge_rate * self.efficiency * self.slot_hours
-        base_charge_cost_kwh = self.charge_rate * self.slot_hours
+        # Get temperature-aware charge rate if temperature sensor is available
+        # This improves scheduling accuracy for batteries that charge slower when cold
+        current_temp = self._get_battery_temp()
+        learned_charge_rate = self.learning_engine.get_charge_rate_for_soc(
+            current_soc_for_calc, current_temp
+        )
+
+        # Pre-compute charge rates for each slot considering temperature warm-up
+        # Model: battery warms ~2°C per hour of consecutive charging, capped at 25°C
+        charge_rates_per_slot = []
+        estimated_temp = current_temp
+        estimated_soc = current_soc_for_calc
+        for i, p in enumerate(hours_sorted_by_time):
+            slot_rate = self.learning_engine.get_charge_rate_for_soc(estimated_soc, estimated_temp)
+            charge_rates_per_slot.append(slot_rate)
+            # Rough estimate: if charging, SOC increases and temp increases
+            # We use the base rate for estimation since we don't know actual charging yet
+            estimated_soc = min(self.max_soc, estimated_soc + (slot_rate * self.efficiency * self.slot_hours / self.battery_capacity * 100))
+            if estimated_temp is not None:
+                # Model temperature warm-up during charging (conservative: assume charging)
+                estimated_temp = min(25.0, estimated_temp + 2.0 * self.slot_hours)
+
+        # Use learned rate for base calculation (falls back to nominal if no data)
+        base_charge_rate = learned_charge_rate
+        base_charge_energy_kwh = base_charge_rate * self.efficiency * self.slot_hours
+        base_charge_cost_kwh = base_charge_rate * self.slot_hours
         load_kw = [self._predict_load_kw(p.hour) for p in hours_sorted_by_time]
         discharge_energy_kwh = [
             min(lk, self.discharge_rate) * self.slot_hours * slot_fractions[i]
@@ -1393,8 +1559,10 @@ class BatteryOptimizer(hass.Hass):
             discharge_value = buy_price  # Avoided import cost; charging already accounts energy cost
             fraction = slot_fractions[t]
             discharge_kwh = discharge_energy_kwh[t]
-            charge_energy_kwh = base_charge_energy_kwh * fraction
-            charge_cost_kwh = base_charge_cost_kwh * fraction
+            # Use per-slot charge rate (temperature-aware if available)
+            slot_charge_rate = charge_rates_per_slot[t]
+            charge_energy_kwh = slot_charge_rate * self.efficiency * self.slot_hours * fraction
+            charge_cost_kwh = slot_charge_rate * self.slot_hours * fraction
             # Treat current partial slot as a full slot for charge-counting decisions
             if current_slot_index is not None and t == current_slot_index and fraction < 0.999:
                 charge_count_increment = 1
@@ -2802,9 +2970,7 @@ class BatteryOptimizer(hass.Hass):
                     data = fh.read()
                 if data and self.learning_engine.load_from_json(data):
                     summary = self.learning_engine.get_learning_summary()
-                    self.log(f"Loaded learning data from file: {summary['observation_count']} observations, "
-                             f"confidence={summary['confidence_pct']}%, "
-                             f"learned_rate={summary['learned_charge_rate_kw']}kW")
+                    self.log(f"Loaded learning data from file: {summary['total_observations']} observations")
                     return
             except FileNotFoundError:
                 pass
@@ -2818,9 +2984,7 @@ class BatteryOptimizer(hass.Hass):
                 if state and state not in ("unknown", "unavailable", ""):
                     if self.learning_engine.load_from_json(state):
                         summary = self.learning_engine.get_learning_summary()
-                        self.log(f"Loaded learning data: {summary['observation_count']} observations, "
-                                 f"confidence={summary['confidence_pct']}%, "
-                                 f"learned_rate={summary['learned_charge_rate_kw']}kW")
+                        self.log(f"Loaded learning data: {summary['total_observations']} observations")
                         return
             except Exception as e:
                 self.log(f"Could not load learning data: {e}", level="WARNING")
@@ -2946,19 +3110,18 @@ class BatteryOptimizer(hass.Hass):
             summary = self.learning_engine.get_learning_summary()
             self.set_state(
                 "sensor.battery_learning_stats",
-                state=f"{summary['confidence_pct']:.0f}",
+                state=str(summary["total_observations"]),
                 attributes={
                     "friendly_name": "Battery Learning Stats",
-                    "unit_of_measurement": "% confidence",
-                    "learned_charge_rate_kw": summary["learned_charge_rate_kw"],
+                    "unit_of_measurement": "observations",
                     "learned_efficiency": summary["learned_efficiency"],
-                    "confidence_pct": summary["confidence_pct"],
                     "total_energy_charged_kwh": summary["total_energy_charged_kwh"],
                     "total_energy_discharged_kwh": summary["total_energy_discharged_kwh"],
                     "overall_efficiency": summary["overall_efficiency"],
                     "total_profit_eur": summary["total_profit_eur"],
-                    "observation_count": summary["observation_count"],
+                    "total_observations": summary["total_observations"],
                     "soc_charge_rates": summary["soc_charge_rates"],
+                    "temp_aware_rates": summary.get("temp_aware_rates", {}),
                     "icon": "mdi:brain",
                 }
             )
@@ -3022,12 +3185,14 @@ class BatteryOptimizer(hass.Hass):
 
             self._save_battery_cost()
 
-            # Feed learning engine with charging observation
+            # Feed learning engine with charging observation (include battery temp if available)
+            battery_temp = self._get_battery_temp()
             self.learning_engine.record_charging(
                 soc_start=self._last_soc,
                 soc_end=current_soc,
                 duration_minutes=duration_minutes,
-                charge_price=charge_price
+                charge_price=charge_price,
+                battery_temp=battery_temp
             )
             self._save_learning_data()
             self._update_learning_sensor()
@@ -3101,6 +3266,24 @@ class BatteryOptimizer(hass.Hass):
         except (ValueError, TypeError):
             pass
         return 0.0
+
+    def _get_battery_temp(self) -> Optional[float]:
+        """Get current battery temperature in Celsius.
+
+        Returns None if:
+        - No temp sensor configured
+        - Sensor is unavailable/unknown
+        - Sensor value cannot be parsed
+        """
+        if not self.battery_temp_sensor:
+            return None
+        try:
+            state = self.get_state(self.battery_temp_sensor)
+            if state and state not in ("unknown", "unavailable"):
+                return float(state)
+        except (ValueError, TypeError):
+            pass
+        return None
 
     def _get_load_power(self) -> Optional[float]:
         """Get current household load in Watts (from configured sensor)."""
@@ -3329,6 +3512,17 @@ class BatteryOptimizer(hass.Hass):
                 if entry.mode == BatteryMode.DISCHARGE and next_discharge is None:
                     next_discharge = hour.isoformat()
 
+            # Get temperature-aware rate information
+            current_temp = self._get_battery_temp()
+            current_soc = self._get_current_soc() or 50.0
+            current_predicted_rate = self.learning_engine.get_charge_rate_for_soc(
+                current_soc, current_temp
+            )
+
+            # Get temperature-aware rates summary from learning engine
+            learning_summary = self.learning_engine.get_learning_summary()
+            temp_aware_rates = learning_summary.get("temp_aware_rates", {})
+
             # Set sensor state
             self.set_state("sensor.battery_optimizer",
                 state=self.current_mode.name,
@@ -3347,6 +3541,10 @@ class BatteryOptimizer(hass.Hass):
                     "last_soc_deviation": round(self._last_soc_deviation, 1) if self._last_soc_deviation is not None else None,
                     "min_charge_slots_required": self._last_min_charge_slots,
                     "charge_slots": self._last_charge_slots,
+                    # Temperature-aware charge rate attributes
+                    "current_battery_temp": round(current_temp, 1) if current_temp is not None else None,
+                    "current_predicted_rate": round(current_predicted_rate, 2),
+                    "temp_aware_rates": temp_aware_rates,
                     "friendly_name": "Battery Optimizer"
                 }
             )

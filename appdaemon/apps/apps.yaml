@@ -41,6 +41,12 @@ battery_optimizer:
   # Growatt PV power production sensor (for solar-aware adjustments)
   pv_power_sensor: sensor.growatt_pv_power
 
+  # Growatt battery temperature sensor (for temperature-aware charge rate prediction)
+  # When configured, the optimizer learns and predicts charge rates based on temperature
+  # This improves scheduling accuracy for batteries that charge slower when cold
+  # Leave empty to disable temperature-aware learning
+  battery_temp_sensor: "sensor.growatt_battery_temperature"
+
   # ==========================================================================
   # Device Control
   # ==========================================================================

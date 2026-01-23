@@ -185,3 +185,4 @@ If you see errors like "Failed to write to registers starting at 304XX" or "Ille
 | `grid_fee_eur_kwh` | 0.05 | Fixed grid fees per kWh |
 | `battery_wear_cost_eur_kwh` | 0.00 | Per-kWh wear cost added to discharge cost |
 | `pv_threshold_w` | 500 | PV power to trigger solar override |
+| `battery_temp_sensor` | `` | Battery temperature sensor for temp-aware charge rate learning (optional) |

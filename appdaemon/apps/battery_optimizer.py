@@ -1294,6 +1294,7 @@ class BatteryOptimizer(hass.Hass):
         minutes_into_slot = max(0.0, (now - current_slot).total_seconds() / 60.0)
         first_fraction = min(1.0, max(0.0, (self.slot_minutes - minutes_into_slot) / max(1, self.slot_minutes)))
         slot_fractions = [1.0] * n_slots
+        current_slot_index = None
         for i, p in enumerate(hours_sorted_by_time):
             p_hour = p.hour
             compare_current = current_slot
@@ -1303,6 +1304,7 @@ class BatteryOptimizer(hass.Hass):
                 compare_current = compare_current.replace(tzinfo=None)
             if p_hour == compare_current:
                 slot_fractions[i] = first_fraction
+                current_slot_index = i
                 break
 
         base_charge_energy_kwh = self.charge_rate * self.efficiency * self.slot_hours
@@ -1335,7 +1337,11 @@ class BatteryOptimizer(hass.Hass):
             discharge_kwh = discharge_energy_kwh[t]
             charge_energy_kwh = base_charge_energy_kwh * fraction
             charge_cost_kwh = base_charge_cost_kwh * fraction
-            charge_count_increment = 0 if fraction < 0.999 else 1
+            # Treat current partial slot as a full slot for charge-counting decisions
+            if current_slot_index is not None and t == current_slot_index and fraction < 0.999:
+                charge_count_increment = 1
+            else:
+                charge_count_increment = 0 if fraction < 0.999 else 1
             next_dp = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
             next_prev_idx = [[None] * n_states for _ in range(max_charge_slots + 1)]
             next_prev_c = [[None] * n_states for _ in range(max_charge_slots + 1)]
@@ -2141,12 +2147,19 @@ class BatteryOptimizer(hass.Hass):
 
         TOU Register Reference:
         - 30100: VPP Control Authority (1=enable)
+        - 30407: Remote Power Control (0=disable, so TOU takes precedence!)
+        - 30410: AC Charging Enable (1=enable, CRITICAL for charge periods!)
         - 30411: Number of active periods (0-20)
         - 30476: Default mode (0=load first/HOLD)
         - 30412-30471: Period data (3 registers per period: start, end, power)
 
-        CRITICAL: Write period data FIRST, then num_periods LAST.
-        This is the correct order required by Growatt firmware (wit-vpp-control.js pattern).
+        CRITICAL WRITE SEQUENCE (discovered through testing):
+        1. Clear num_periods to 0
+        2. Zero out all period registers (stale data causes overlap validation failures!)
+        3. Write periods SEQUENTIALLY: write period N data, then set num_periods=N
+        4. If any write fails, clear num_periods to deactivate partial schedule
+
+        Key insight: Zeroed registers [0,0,0] are treated as "empty" by firmware.
 
         Returns:
             True if sync succeeded, False otherwise
@@ -2169,35 +2182,79 @@ class BatteryOptimizer(hass.Hass):
                 self.log("Failed to enable VPP control", level="ERROR")
                 return False
 
-            # Step 2: Set default mode to "load first" / HOLD (register 30476 = 0)
+            # Step 2: Enable AC charging (register 30410 = 1) - CRITICAL for charge periods!
+            self._write_register_with_retry(30410, 1)
+            time.sleep(0.3)
+
+            # Step 3: Disable remote control (register 30407 = 0) so TOU takes precedence
+            # Without this, remote control overrides TOU schedule!
+            self._write_register_with_retry(30407, 0)
+            time.sleep(0.3)
+
+            # Step 4: Set default mode to "load first" / HOLD (register 30476 = 0)
             self._write_register_with_retry(30476, 0)
             time.sleep(0.3)
 
-            # Step 3: Write ALL period data FIRST (before setting num_periods)
+            # Step 5: Clear existing schedule and zero out period registers
+            # CRITICAL: Stale non-zero data in period registers causes overlap validation failures!
+            # Zeroed registers [0,0,0] are treated as "empty" and allow fresh writes.
+            self.log("Clearing TOU schedule and zeroing period registers...")
+            self._write_register_with_retry(30411, 0, verify=False)
+            time.sleep(0.3)
+
+            # Zero out all period registers we'll use (prevents stale data overlap issues)
+            # Use multi-register writes for efficiency
+            for i in range(num_periods):
+                base_addr = 30412 + (i * 3)
+                # Zero all 3 registers atomically (best effort, don't fail on errors)
+                try:
+                    self.call_service("growatt_modbus/write_registers",
+                        device_id=self.device_id, register=base_addr, values=[0, 0, 0])
+                except Exception:
+                    pass  # Best effort - continue even if zeroing fails
+                time.sleep(0.2)
+            time.sleep(0.3)
+
+            # Step 6: Write periods SEQUENTIALLY, incrementing num_periods after each
+            # This is the key sequence that works with Growatt firmware:
+            # 1. Write period N data (using atomic multi-register write)
+            # 2. Set num_periods=N
+            # 3. Repeat for next period
+            write_failures = 0
             for i, period in enumerate(periods):
                 base_addr = 30412 + (i * 3)
 
                 # Convert negative power to unsigned 16-bit
-                # -100 becomes 65436, -50 becomes 65486
                 power_unsigned = period.power if period.power >= 0 else 65536 + period.power
 
-                # Write period data (function 0x10 - write multiple registers)
-                self.call_service("growatt_modbus/write_registers",
-                    device_id=self.device_id,
-                    register=base_addr,
-                    values=[period.start, period.end, power_unsigned])
+                # Write all 3 registers atomically using multi-register write (function 0x10)
+                # This is more reliable than individual writes
+                success = self._write_registers_with_retry(
+                    base_addr, [period.start, period.end, power_unsigned]
+                )
 
-                self.log(f"TOU Period {i+1}: {period.start//60:02d}:{period.start%60:02d} - "
-                         f"{period.end//60:02d}:{period.end%60:02d}, power={period.power}%")
+                if success:
+                    # Increment num_periods to activate this period
+                    if not self._write_register_with_retry(30411, i + 1):
+                        self.log(f"Failed to set num_periods to {i+1}", level="WARNING")
+                        success = False
+                    else:
+                        self.log(f"TOU Period {i+1}: {period.start//60:02d}:{period.start%60:02d} - "
+                                 f"{period.end//60:02d}:{period.end%60:02d}, power={period.power}%")
+
+                if not success:
+                    write_failures += 1
+                    self.log(f"TOU Period {i+1} write FAILED", level="ERROR")
+
                 time.sleep(0.3)
 
-            # Step 4: Set num_periods LAST (activates the schedule)
-            time.sleep(0.5)
-            if not self._write_register_with_retry(30411, num_periods):
-                self.log("Failed to set num_periods", level="ERROR")
+            # If any period writes failed, clear num_periods to deactivate partial schedule
+            if write_failures > 0:
+                self.log(f"TOU sync failed: {write_failures} period(s) failed to write, clearing schedule", level="ERROR")
+                self._write_register_with_retry(30411, 0, verify=False)
                 return False
 
-            # Step 5: Verify the write succeeded (optional - may not work on all setups)
+            # Step 7: Verify num_periods is correct
             time.sleep(0.5)
             try:
                 verified = self._read_modbus_registers(30411, 1)
@@ -2317,19 +2374,85 @@ class BatteryOptimizer(hass.Hass):
             self.log(f"REST API read failed for {address}-{address+count-1}: {e}", level="DEBUG")
             return None
 
-    def _write_register_with_retry(self, address: int, value: int, max_retries: int = 3) -> bool:
-        """Write single register with retry logic."""
+    def _write_register_with_retry(self, address: int, value: int, max_retries: int = 3, verify: bool = True) -> bool:
+        """Write single register with retry logic and optional verification.
+
+        Args:
+            address: Modbus register address
+            value: Value to write (unsigned 16-bit)
+            max_retries: Number of write attempts
+            verify: If True, read back and verify the written value
+
+        Returns:
+            True if write (and verification if enabled) succeeded
+        """
         import time
         for attempt in range(max_retries):
             try:
                 self.call_service("growatt_modbus/write_register",
                     device_id=self.device_id, register=address, value=value)
-                time.sleep(0.3)  # Allow inverter to process
-                return True
+                time.sleep(0.5)  # Allow inverter to process
+
+                # Verify the write by reading back
+                if verify:
+                    readback = self._read_modbus_registers(address, 1)
+                    if readback and len(readback) > 0:
+                        if readback[0] == value:
+                            return True
+                        else:
+                            self.log(f"Register {address} verify failed: wrote {value}, read {readback[0]}", level="WARNING")
+                    else:
+                        # Verification read failed, but write may have succeeded
+                        self.log(f"Register {address} verify read failed (attempt {attempt+1})", level="WARNING")
+                else:
+                    return True  # No verification requested
+
             except Exception as e:
                 self.log(f"Register {address} write attempt {attempt+1} failed: {e}", level="WARNING")
-                if attempt < max_retries - 1:
-                    time.sleep(0.5)
+
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
+
+        return False
+
+    def _write_registers_with_retry(self, address: int, values: List[int], max_retries: int = 3) -> bool:
+        """Write multiple registers atomically with retry logic and verification.
+
+        Uses Modbus function 0x10 (write multiple registers) for atomic writes.
+        This is more reliable than individual register writes.
+
+        Args:
+            address: Starting Modbus register address
+            values: List of values to write (unsigned 16-bit each)
+            max_retries: Number of write attempts
+
+        Returns:
+            True if write and verification succeeded
+        """
+        import time
+        for attempt in range(max_retries):
+            try:
+                self.call_service("growatt_modbus/write_registers",
+                    device_id=self.device_id, register=address, values=values)
+                time.sleep(0.5)  # Allow inverter to process
+
+                # Verify the write by reading back
+                readback = self._read_modbus_registers(address, len(values))
+                if readback and len(readback) == len(values):
+                    if readback == values:
+                        return True
+                    else:
+                        self.log(f"Registers {address}-{address+len(values)-1} verify failed: "
+                                 f"wrote {values}, read {readback}", level="WARNING")
+                else:
+                    self.log(f"Registers {address} verify read failed (attempt {attempt+1})", level="WARNING")
+
+            except Exception as e:
+                self.log(f"Registers {address} write attempt {attempt+1} failed: {e}", level="WARNING")
+
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
+
         return False
 
     # =========================================================================
@@ -2432,10 +2555,8 @@ class BatteryOptimizer(hass.Hass):
 
     def _init_learning_engine(self):
         """Initialize learning engine from persistent storage"""
-        self.learning_data_entity = self.args.get(
-            "learning_data_entity",
-            "input_text.battery_learning_data"
-        )
+        self.learning_data_file = self.args.get("learning_data_file", "")
+        self.learning_data_entity = self.args.get("learning_data_entity", "")
 
         # Track timing for learning observations
         self._charge_start_soc: Optional[float] = None
@@ -2443,18 +2564,35 @@ class BatteryOptimizer(hass.Hass):
         self._discharge_start_soc: Optional[float] = None
         self._discharge_start_time: Optional[datetime.datetime] = None
 
-        # Try to load learning data from HA
-        try:
-            state = self.get_state(self.learning_data_entity)
-            if state and state not in ("unknown", "unavailable", ""):
-                if self.learning_engine.load_from_json(state):
+        # Prefer file-based persistence if configured
+        if self.learning_data_file:
+            try:
+                with open(self.learning_data_file, "r", encoding="utf-8") as fh:
+                    data = fh.read()
+                if data and self.learning_engine.load_from_json(data):
                     summary = self.learning_engine.get_learning_summary()
-                    self.log(f"Loaded learning data: {summary['observation_count']} observations, "
+                    self.log(f"Loaded learning data from file: {summary['observation_count']} observations, "
                              f"confidence={summary['confidence_pct']}%, "
                              f"learned_rate={summary['learned_charge_rate_kw']}kW")
                     return
-        except Exception as e:
-            self.log(f"Could not load learning data: {e}", level="WARNING")
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                self.log(f"Could not load learning data file: {e}", level="WARNING")
+
+        # Try to load learning data from HA
+        if self.learning_data_entity:
+            try:
+                state = self.get_state(self.learning_data_entity)
+                if state and state not in ("unknown", "unavailable", ""):
+                    if self.learning_engine.load_from_json(state):
+                        summary = self.learning_engine.get_learning_summary()
+                        self.log(f"Loaded learning data: {summary['observation_count']} observations, "
+                                 f"confidence={summary['confidence_pct']}%, "
+                                 f"learned_rate={summary['learned_charge_rate_kw']}kW")
+                        return
+            except Exception as e:
+                self.log(f"Could not load learning data: {e}", level="WARNING")
 
         self.log("Starting with fresh learning data")
 
@@ -2552,10 +2690,22 @@ class BatteryOptimizer(hass.Hass):
         """Persist learning data to Home Assistant entity"""
         try:
             json_data = self.learning_engine.save_to_json()
-            self.call_service("input_text/set_value",
-                entity_id=self.learning_data_entity,
-                value=json_data
-            )
+            if self.learning_data_file:
+                try:
+                    with open(self.learning_data_file, "w", encoding="utf-8") as fh:
+                        fh.write(json_data)
+                except Exception as e:
+                    self.log(f"Could not save learning data file: {e}", level="DEBUG")
+
+            # Optional HA entity persistence (limited to 255 chars)
+            if self.learning_data_entity:
+                if len(json_data) <= 255:
+                    self.call_service("input_text/set_value",
+                        entity_id=self.learning_data_entity,
+                        value=json_data
+                    )
+                else:
+                    self.log("Learning data exceeds 255 chars; skipping input_text persistence", level="DEBUG")
         except Exception as e:
             self.log(f"Could not save learning data: {e}", level="DEBUG")
 
@@ -2609,7 +2759,13 @@ class BatteryOptimizer(hass.Hass):
         # Calculate time since last observation
         now = self.datetime()
         if self._last_hour:
-            duration_minutes = (now - self._last_hour).total_seconds() / 60
+            # Ensure consistent timezone handling to avoid naive/aware mismatch
+            last_hour = self._last_hour
+            if now.tzinfo is not None and last_hour.tzinfo is None:
+                last_hour = last_hour.replace(tzinfo=now.tzinfo)
+            elif now.tzinfo is None and last_hour.tzinfo is not None:
+                now = now.replace(tzinfo=last_hour.tzinfo)
+            duration_minutes = (now - last_hour).total_seconds() / 60
         else:
             duration_minutes = 60  # Default to 1 hour
 

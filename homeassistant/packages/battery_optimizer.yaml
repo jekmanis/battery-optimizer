@@ -103,16 +103,6 @@ input_number:
     mode: box
 
 # =============================================================================
-# Input Text - Learning Data Persistence
-# =============================================================================
-input_text:
-  battery_learning_data:
-    name: "Battery Learning Data"
-    icon: mdi:brain
-    max: 10000  # JSON data can be large
-    initial: ""
-
-# =============================================================================
 # Template Sensors - Schedule Display
 # =============================================================================
 template:

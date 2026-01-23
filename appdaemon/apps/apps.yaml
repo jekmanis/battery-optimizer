@@ -122,6 +122,8 @@ battery_optimizer:
   # Load profile persistence
   # File path preferred (unlimited size). Leave empty to disable file persistence.
   load_profile_file: "/config/load_profile.json"
+  # Learning data persistence (JSON file on disk)
+  learning_data_file: "/config/battery_learning_data.json"
   # Optional HA input_text mirror (keep empty to avoid 255-char limit)
   load_profile_entity: ""
   load_profile_max_samples: 60

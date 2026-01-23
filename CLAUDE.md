@@ -63,18 +63,30 @@ Syncs schedule to inverter's TOU registers for autonomous operation:
 - Maximum 20 periods supported by inverter
 
 ### Growatt Modbus Quirks (VPP Protocol)
-**Critical**: Register write order matters!
-- Must set `num_periods` (30411) BEFORE writing period data
-- Multi-register writes (function 0x10) work when order is correct
-- TOU periods use minutes since midnight (0-1439)
-- Power: positive = charge, negative = discharge, +1% = true HOLD
+**Critical**: Register write order for TOU sync:
+1. Set `30100=1` (VPP control authority)
+2. Set `30410=1` (AC charging enable - required for charge periods!)
+3. Set `30407=0` (Disable remote control - so TOU takes precedence!)
+4. Set `30411=0` (Clear existing schedule)
+5. Zero out all period registers (30412+ for periods to write) - **stale data causes overlap validation failures!**
+6. Write periods SEQUENTIALLY:
+   - Write period 1 data (30412-30414), set `30411=1`
+   - Write period 2 data (30415-30417), set `30411=2`
+   - ... repeat for each period
+7. Verify final num_periods
+
+**Key insights**:
+- If `30407=1` (remote control enabled), it overrides TOU schedule!
+- Period 1 MUST start at 00:00 (register 30412 must be 0)
+- Zeroed registers [0,0,0] are treated as "empty" and allow writes
+- Non-zero stale data causes firmware overlap validation to reject writes
 
 **Key Registers:**
 - 30100: VPP Control Authority (1=enable)
-- 30407: Remote Power Control Enable
-- 30409: Remote Power Percent (-100 to +100)
-- 30410: AC Charging Enable (1=PV first)
-- 30411: Number of TOU periods (0-20)
+- 30407: Remote Power Control (0=disable for TOU, 1=enable for manual control)
+- 30409: Remote Power Percent (-100 to +100) - only used when 30407=1
+- 30410: AC Charging Enable (1=PV first) - REQUIRED for charge periods
+- 30411: Number of TOU periods (0-20) - must be set BEFORE writing period data
 - 30412+: TOU period data (3 registers each: start, end, power)
 
 ### Battery Cost Tracking

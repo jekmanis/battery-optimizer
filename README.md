@@ -157,6 +157,20 @@ Check these sensors are available in Developer Tools > States:
 
 Leave `device_id` empty to run in "dry run" mode - the optimizer will log decisions without sending commands to the inverter.
 
+### TOU Period Write Failures
+
+If you see errors like "Failed to write to registers starting at 304XX" or "Illegal data value":
+
+**Root Cause:** The Growatt firmware validates TOU period writes against ALL 20 period registers, not just the active ones. Stale data from previous schedules can cause "overlap validation" failures.
+
+**Solution:** The optimizer now clears ALL 20 period registers before writing a new schedule. This fix ensures clean writes even when the number of periods changes between schedule updates.
+
+**If problems persist:**
+1. Check AppDaemon logs for specific error messages
+2. The optimizer uses exponential backoff retries (0.7s, 1.05s, 1.58s delays)
+3. Verify the Growatt Modbus integration isn't showing connection errors
+4. Concurrent Modbus reads (from the HA coordinator) can occasionally cause bus contention - the retries should handle this
+
 ## Configuration Reference
 
 | Parameter | Default | Description |
@@ -166,7 +180,8 @@ Leave `device_id` empty to run in "dry run" mode - the optimizer will log decisi
 | `discharge_rate_kw` | 4.5 | Discharge power for calculations |
 | `min_soc` | 10 | Minimum SOC reserve (%) |
 | `max_soc` | 100 | Maximum SOC target (%) |
-| `efficiency` | 0.85 | Round-trip efficiency |
+| `efficiency` | 0.95 | Round-trip efficiency |
 | `base_consumption_w` | 500 | Base house consumption |
 | `grid_fee_eur_kwh` | 0.05 | Fixed grid fees per kWh |
+| `battery_wear_cost_eur_kwh` | 0.00 | Per-kWh wear cost added to discharge cost |
 | `pv_threshold_w` | 500 | PV power to trigger solar override |

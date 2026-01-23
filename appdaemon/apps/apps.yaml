@@ -81,8 +81,7 @@ battery_optimizer:
   max_soc: 100
 
   # Round-trip efficiency (charge + discharge losses)
-  # 85% is typical for lithium batteries
-  efficiency: 0.85
+  efficiency: 0.95
 
   # Base house consumption in Watts
   # This is the minimum load when nothing else is running
@@ -133,6 +132,9 @@ battery_optimizer:
   # Fixed grid fees per kWh (distribution, taxes, etc.)
   # These fees apply regardless of spot price
   grid_fee_eur_kwh: 0.00
+
+  # Optional battery wear cost per kWh (discourages cycling at marginal prices)
+  battery_wear_cost_eur_kwh: 0.00
 
   # Export rate multiplier (what percentage of spot you get for export)
   # 0.8 = 80% of spot price for exported energy

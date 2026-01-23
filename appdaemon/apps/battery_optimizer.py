@@ -640,6 +640,7 @@ class BatteryOptimizer(hass.Hass):
 
         # Pricing
         self.grid_fee = float(self.args.get("grid_fee_eur_kwh", 0.05))
+        self.battery_wear_cost = float(self.args.get("battery_wear_cost_eur_kwh", 0.0))
         self.export_rate_multiplier = float(self.args.get("export_rate_multiplier", 1.0))
         self.log(f"Loaded grid_fee: {self.grid_fee} EUR/kWh")
 
@@ -1326,6 +1327,15 @@ class BatteryOptimizer(hass.Hass):
         min_charge_slots = max(0, int(charge_hours_needed))
         if min_charge_slots > n_slots:
             min_charge_slots = n_slots
+        # Precompute which slots are "favorable" for charging (raw price basis)
+        charge_price_threshold = self.battery_avg_cost * 1.05
+        favorable_flags = [p.price <= charge_price_threshold for p in hours_sorted_by_time]
+        favorable_remaining = [0] * n_slots
+        remaining = 0
+        for i in range(n_slots - 1, -1, -1):
+            if favorable_flags[i]:
+                remaining += 1
+            favorable_remaining[i] = remaining
 
         # Energy bounds in kWh
         current_soc_for_calc = current_soc if current_soc is not None else 50.0
@@ -1380,7 +1390,7 @@ class BatteryOptimizer(hass.Hass):
             # For self-consumption (load-backed discharge), value is avoided import cost
             # Only use export_rate_multiplier if actually exporting to grid
             # Since discharge is modeled as min(load, discharge_rate), it's self-consumption
-            discharge_value = buy_price  # Avoided import cost
+            discharge_value = buy_price  # Avoided import cost; charging already accounts energy cost
             fraction = slot_fractions[t]
             discharge_kwh = discharge_energy_kwh[t]
             charge_energy_kwh = base_charge_energy_kwh * fraction
@@ -1409,11 +1419,11 @@ class BatteryOptimizer(hass.Hass):
 
                     # CHARGE
                     # Only allow charging if:
-                    # 1. We still need to meet min_charge_slots (survival requirement), OR
-                    # 2. Raw price is favorable vs battery avg cost (economically sensible)
-                    need_more_charge_slots = c < min_charge_slots
-                    price_is_favorable = price <= self.battery_avg_cost * 1.05  # 5% tolerance (raw price basis)
-                    allow_charge = need_more_charge_slots or price_is_favorable
+                    # 1. Raw price is favorable vs battery avg cost (economically sensible), OR
+                    # 2. There aren't enough favorable slots left to meet min_charge_slots
+                    price_is_favorable = favorable_flags[t]
+                    must_use_unfavorable = (c + favorable_remaining[t]) < min_charge_slots
+                    allow_charge = price_is_favorable or must_use_unfavorable
 
                     if allow_charge and charge_energy_kwh > 0 and c + charge_count_increment <= max_charge_slots:
                         new_energy = energy_levels[idx] + charge_energy_kwh
@@ -1564,12 +1574,14 @@ class BatteryOptimizer(hass.Hass):
 
             # Input state
             charge_price_threshold = self.battery_avg_cost * 1.05  # Raw price threshold used in DP
+            discharge_threshold = self._get_discharge_threshold()
             self.log(f"Input State:")
             self.log(f"  Current SOC: {current_soc:.1f}%")
             self.log(f"  Min SOC target: {self.min_soc:.1f}%")
             self.log(f"  Min charge slots required: {min_charge_slots} (to avoid hitting min SOC)")
             self.log(f"  Battery avg cost: {self.battery_avg_cost:.4f} EUR/kWh")
             self.log(f"  Charge price threshold: {charge_price_threshold:.4f} EUR/kWh (raw price, excl. grid fee)")
+            self.log(f"  Discharge cost threshold: {discharge_threshold:.4f} EUR/kWh (avg/eff + grid fee + wear)")
 
         # Verbose logging (level 2): show candidates and analysis
         if self.decision_log_level >= 2:
@@ -2394,16 +2406,18 @@ class BatteryOptimizer(hass.Hass):
             self._write_register_with_retry(30476, 0)
             time.sleep(0.3)
 
-            # Step 5: Clear existing schedule and zero out period registers
-            # CRITICAL: Stale non-zero data in period registers causes overlap validation failures!
+            # Step 5: Clear existing schedule and zero out ALL period registers
+            # CRITICAL: Stale non-zero data in ANY period register causes overlap validation failures!
+            # The firmware validates writes against ALL registers, not just active ones.
             # Zeroed registers [0,0,0] are treated as "empty" and allow fresh writes.
             self.log("Clearing TOU schedule and zeroing period registers...")
             self._write_register_with_retry(30411, 0, verify=False)
-            time.sleep(0.3)
+            time.sleep(0.5)
 
-            # Zero out all period registers we'll use (prevents stale data overlap issues)
-            # Use multi-register writes for efficiency
-            for i in range(num_periods):
+            # Zero out ALL 20 period registers (not just the ones we'll use!)
+            # This is crucial - leftover data from a previous schedule causes "Illegal data value" errors
+            MAX_TOU_PERIODS = 20
+            for i in range(MAX_TOU_PERIODS):
                 base_addr = 30412 + (i * 3)
                 # Zero all 3 registers atomically (best effort, don't fail on errors)
                 try:
@@ -2411,8 +2425,8 @@ class BatteryOptimizer(hass.Hass):
                         device_id=self.device_id, register=base_addr, values=[0, 0, 0])
                 except Exception:
                     pass  # Best effort - continue even if zeroing fails
-                time.sleep(0.2)
-            time.sleep(0.3)
+                time.sleep(0.1)
+            time.sleep(0.5)
 
             # Step 6: Write periods SEQUENTIALLY, incrementing num_periods after each
             # This is the key sequence that works with Growatt firmware:
@@ -2445,7 +2459,7 @@ class BatteryOptimizer(hass.Hass):
                     write_failures += 1
                     self.log(f"TOU Period {i+1} write FAILED", level="ERROR")
 
-                time.sleep(0.3)
+                time.sleep(0.5)  # Allow inverter time to process before next period
 
             # If any period writes failed, clear num_periods to deactivate partial schedule
             if write_failures > 0:
@@ -2620,6 +2634,11 @@ class BatteryOptimizer(hass.Hass):
         Uses Modbus function 0x10 (write multiple registers) for atomic writes.
         This is more reliable than individual register writes.
 
+        Retry strategy uses exponential backoff to handle:
+        - Bus contention (concurrent reads from HA coordinator)
+        - Firmware validation processing time
+        - Transient communication errors
+
         Args:
             address: Starting Modbus register address
             values: List of values to write (unsigned 16-bit each)
@@ -2629,11 +2648,16 @@ class BatteryOptimizer(hass.Hass):
             True if write and verification succeeded
         """
         import time
+        base_delay = 0.7  # Initial delay after write
+
         for attempt in range(max_retries):
             try:
                 self.call_service("growatt_modbus/write_registers",
                     device_id=self.device_id, register=address, values=values)
-                time.sleep(0.5)  # Allow inverter to process
+
+                # Exponential backoff for processing time
+                delay = base_delay * (1.5 ** attempt)
+                time.sleep(delay)
 
                 # Verify the write by reading back
                 readback = self._read_modbus_registers(address, len(values))
@@ -2647,10 +2671,18 @@ class BatteryOptimizer(hass.Hass):
                     self.log(f"Registers {address} verify read failed (attempt {attempt+1})", level="WARNING")
 
             except Exception as e:
-                self.log(f"Registers {address} write attempt {attempt+1} failed: {e}", level="WARNING")
+                # Log the actual exception for debugging
+                error_str = str(e)
+                if "Illegal data value" in error_str or "exception 3" in error_str.lower():
+                    self.log(f"Registers {address} write rejected by firmware (Modbus exception 3: Illegal data value). "
+                             f"Values: {values}. This may indicate overlap with existing period data.", level="WARNING")
+                else:
+                    self.log(f"Registers {address} write attempt {attempt+1} failed: {e}", level="WARNING")
 
             if attempt < max_retries - 1:
-                time.sleep(0.5)
+                # Exponential backoff between retries
+                retry_delay = 1.0 * (2 ** attempt)  # 1s, 2s, 4s
+                time.sleep(retry_delay)
 
         return False
 
@@ -3022,9 +3054,9 @@ class BatteryOptimizer(hass.Hass):
 
     def _get_discharge_threshold(self) -> float:
         """Calculate discharge threshold based on actual battery cost"""
-        # Threshold = what we paid / efficiency + grid fees
+        # Threshold = (what we paid + grid fees) / efficiency + wear cost
         # Only discharge if we can "sell" above this price
-        threshold = self.battery_avg_cost / self.efficiency + self.grid_fee
+        threshold = ((self.battery_avg_cost + self.grid_fee) / self.efficiency) + self.battery_wear_cost
         return threshold
 
     def _get_price_for_hour(self, hour: datetime.datetime) -> Optional[float]:

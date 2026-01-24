@@ -232,3 +232,16 @@ If you see errors like "Failed to write to registers starting at 304XX" or "Ille
 | `soc_tracking_minutes` | 1 | Poll interval for SOC tracking used by learning and battery cost updates |
 
 Charge-rate learning uses the elapsed time between significant SOC changes (>=1% steps), not the poll interval.
+
+## Scheduling Algorithm Highlights
+
+The optimizer uses dynamic programming to find the optimal charge/hold/discharge schedule. Key features:
+
+- **SOC-aware optimization**: Tracks battery state through time to ensure feasible schedules
+- **Partial charge support**: Can "top off" the battery when a full charge slot would exceed `max_soc`, utilizing cheap prices fully
+- **Load profile learning**: Builds statistical model of household consumption by time-of-day
+- **Temperature-aware charge rates**: Learns actual charge rates by SOC and temperature for accurate scheduling
+- **Two-pass optimization**: Re-runs with projected battery costs when charging significantly changes the cost basis
+- **Survival-first charging**: Guarantees minimum charge slots to avoid hitting `min_soc`
+
+See [docs/scheduling-algorithm.md](docs/scheduling-algorithm.md) for full algorithm documentation.

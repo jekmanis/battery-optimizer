@@ -11,6 +11,49 @@
 # =============================================================================
 
 # =============================================================================
+# Group - Battery Optimizer Entities
+# =============================================================================
+# Creates a group containing all Battery Optimizer entities for easy access
+# =============================================================================
+group:
+  battery_optimizer:
+    name: "Battery Optimizer"
+    icon: mdi:battery-charging-wireless
+    entities:
+      # Controls
+      - input_boolean.battery_optimizer_enabled
+      - input_boolean.battery_optimizer_override
+      - input_select.battery_manual_mode
+      # Thresholds
+      - input_number.battery_min_soc
+      - input_number.battery_max_soc
+      - input_number.battery_charge_price_threshold
+      - input_number.battery_discharge_price_threshold
+      - input_number.battery_pv_threshold
+      - input_number.battery_avg_cost
+      # Status Sensors
+      - sensor.battery_optimizer
+      - sensor.battery_learning_stats
+      - sensor.battery_next_charge_time
+      - sensor.battery_next_discharge_time
+      - sensor.battery_schedule_hours
+      # Learning Stats
+      - sensor.battery_learning_confidence
+      - sensor.battery_learned_charge_rate
+      - sensor.battery_total_profit
+      - sensor.battery_total_energy_charged
+      - sensor.battery_total_energy_discharged
+      # Scripts
+      - script.battery_force_charge
+      - script.battery_force_discharge
+      - script.battery_force_hold
+      - script.battery_resume_auto
+      # Automations
+      - automation.battery_optimizer_mode_change_notification
+      - automation.battery_optimizer_daily_summary
+      - automation.battery_optimizer_safety_alert
+
+# =============================================================================
 # Input Booleans - Enable/Disable Controls
 # =============================================================================
 input_boolean:
@@ -106,34 +149,6 @@ input_number:
 # =============================================================================
 template:
   - sensor:
-      - name: "Battery Optimizer Status"
-        unique_id: battery_optimizer_status
-        icon: >-
-          {% set mode = state_attr('sensor.battery_optimizer', 'current_mode') %}
-          {% if mode == 'CHARGE' %}
-            mdi:battery-charging
-          {% elif mode == 'DISCHARGE' %}
-            mdi:battery-arrow-down
-          {% else %}
-            mdi:battery-clock
-          {% endif %}
-        state: >-
-          {% set mode = state_attr('sensor.battery_optimizer', 'current_mode') %}
-          {% if mode == 'CHARGE' %}
-            Charging
-          {% elif mode == 'DISCHARGE' %}
-            Discharging
-          {% else %}
-            Holding
-          {% endif %}
-        attributes:
-          current_mode: "{{ state_attr('sensor.battery_optimizer', 'current_mode') }}"
-          next_charge: "{{ state_attr('sensor.battery_optimizer', 'next_charge') }}"
-          next_discharge: "{{ state_attr('sensor.battery_optimizer', 'next_discharge') }}"
-          last_optimization: "{{ state_attr('sensor.battery_optimizer', 'last_optimization') }}"
-          battery_avg_cost: "{{ state_attr('sensor.battery_optimizer', 'battery_avg_cost') }}"
-          discharge_threshold: "{{ state_attr('sensor.battery_optimizer', 'discharge_threshold') }}"
-
       - name: "Battery Next Charge Time"
         unique_id: battery_next_charge_time
         icon: mdi:battery-charging-high
@@ -209,14 +224,6 @@ template:
         state: >-
           {% set rate = state_attr('sensor.battery_learning_stats', 'learned_charge_rate_kw') %}
           {{ rate | default(0) | round(2) }}
-
-      - name: "Battery Overall Efficiency"
-        unique_id: battery_overall_efficiency
-        icon: mdi:percent
-        unit_of_measurement: "%"
-        state: >-
-          {% set eff = state_attr('sensor.battery_learning_stats', 'overall_efficiency') %}
-          {{ (eff | default(0) * 100) | round(1) }}
 
       - name: "Battery Total Profit"
         unique_id: battery_total_profit

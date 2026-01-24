@@ -124,6 +124,49 @@ The schedule is exposed via `sensor.battery_optimizer` with attributes:
 - `next_charge` - Next scheduled charge time
 - `next_discharge` - Next scheduled discharge time
 
+## Rolling TOU Schedule Sync
+
+The optimizer syncs its schedule to the inverter's Time-of-Use (TOU) registers, allowing the inverter to operate autonomously even if Home Assistant goes offline.
+
+### The Problem
+
+TOU registers only support time-of-day values (00:00-23:59), not specific dates. After midnight, "afternoon hours" in the TOU would still reflect yesterday's schedule until the next sync.
+
+### The Solution: Rolling Boundary
+
+Every 30 minutes, the optimizer updates the TOU schedule using a **rolling boundary** — the start time of the currently active TOU period:
+
+- **Hours before the boundary** (already passed today) → use **tomorrow's** schedule
+- **Hours from the boundary onward** (still to come) → use **today's** schedule
+
+**Example:** If the current TOU period is DISCHARGE 14:00-18:59, and it's now 16:00 Tuesday:
+```
+00:00-13:59 → Wednesday's schedule (these hours next execute tomorrow)
+14:00-23:59 → Tuesday's schedule (these hours execute today)
+```
+
+The boundary stays at 14:00 until the period ends at 19:00, then jumps to the next period's start time. This avoids unnecessary writes mid-period.
+
+**Progression through the day:**
+```
+Period 00:00-05:59: boundary=00:00 → all hours use today's schedule
+Period 06:00-13:59: boundary=06:00 → 00:00-05:59=tomorrow, 06:00-23:59=today
+Period 14:00-18:59: boundary=14:00 → 00:00-13:59=tomorrow, 14:00-23:59=today
+Period 19:00-23:59: boundary=19:00 → 00:00-18:59=tomorrow, 19:00-23:59=today
+```
+
+### Offline Resilience
+
+If Home Assistant goes offline at 18:00, the inverter already has:
+- Valid schedule for 18:00-23:59 (today's remaining hours)
+- Valid schedule for 00:00-17:59 (tomorrow's early hours)
+
+The inverter can operate correctly through midnight and into the next morning without any intervention.
+
+### Efficient Updates
+
+The optimizer only writes to the inverter when actual behavior would change. It compares the proposed schedule with the current TOU minute-by-minute and skips writes if they're identical, avoiding unnecessary 20-second write cycles.
+
 ## File Structure
 
 ```
@@ -186,3 +229,6 @@ If you see errors like "Failed to write to registers starting at 304XX" or "Ille
 | `battery_wear_cost_eur_kwh` | 0.00 | Per-kWh wear cost added to discharge cost |
 | `pv_threshold_w` | 500 | PV power to trigger solar override |
 | `battery_temp_sensor` | `` | Battery temperature sensor for temp-aware charge rate learning (optional) |
+| `soc_tracking_minutes` | 1 | Poll interval for SOC tracking used by learning and battery cost updates |
+
+Charge-rate learning uses the elapsed time between significant SOC changes (>=1% steps), not the poll interval.

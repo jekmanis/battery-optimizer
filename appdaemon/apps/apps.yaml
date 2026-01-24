@@ -107,6 +107,9 @@ battery_optimizer:
   # Load observation interval (minutes)
   load_observation_minutes: 30
 
+  # SOC tracking interval for learning/battery cost updates (minutes)
+  soc_tracking_minutes: 1
+
   # Quantile for load forecast (0.5 = median, 0.8 = conservative)
   load_quantile: 0.75
 

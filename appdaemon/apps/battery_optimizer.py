@@ -224,7 +224,7 @@ class BatteryLearningEngine:
             self.stats.first_observation = now
         self.stats.last_observation = now
 
-        temp_str = f", temp={battery_temp:.1f}°C" if battery_temp is not None else ""
+        temp_str = f", temp={battery_temp:.1f}C" if battery_temp is not None else ""
         # Get observation count for this bucket
         obs_count = len(self.stats.charge_rates_by_soc.get(soc_range, []))
         self.log(f"Learning: Recorded charge {soc_start:.1f}%->{soc_end:.1f}% "
@@ -687,6 +687,13 @@ class BatteryOptimizer(hass.Hass):
             self.load_observation_minutes * 60
         )
 
+        # SOC tracking for learning and battery cost updates
+        self.run_every(
+            self._update_battery_cost_from_soc_change,
+            self._next_interval_time(self.soc_tracking_minutes),
+            self.soc_tracking_minutes * 60
+        )
+
         # Listen for manual override changes
         if self.args.get("override_entity"):
             self.listen_state(self.on_override_change, self.args["override_entity"])
@@ -752,6 +759,12 @@ class BatteryOptimizer(hass.Hass):
         if self.load_observation_minutes <= 0 or 1440 % self.load_observation_minutes != 0:
             self.log(f"Invalid load_observation_minutes={self.load_observation_minutes}, falling back to 30", level="WARNING")
             self.load_observation_minutes = 30
+
+        # SOC tracking interval for learning/cost updates (minutes)
+        self.soc_tracking_minutes = int(self.args.get("soc_tracking_minutes", 1))
+        if self.soc_tracking_minutes <= 0:
+            self.log(f"Invalid soc_tracking_minutes={self.soc_tracking_minutes}, falling back to 1", level="WARNING")
+            self.soc_tracking_minutes = 1
 
         # DP resolution for SOC (percent step)
         self.soc_step_percent = float(self.args.get("soc_step_percent", 1.0))
@@ -1913,9 +1926,6 @@ class BatteryOptimizer(hass.Hass):
         Adaptive re-evaluation on a configurable interval.
         Adjusts schedule based on actual SOC and PV production.
         """
-        # Always update battery cost tracking based on SOC changes
-        self._update_battery_cost_from_soc_change()
-
         if not self._is_enabled() or self._is_override_active():
             return
 
@@ -2034,6 +2044,10 @@ class BatteryOptimizer(hass.Hass):
                 self.log(f"Schedule updated ({', '.join(changes)}), SOC: {current_soc}%")
                 self._log_schedule(self.schedule, self.expected_soc_schedule)
 
+        # Check if TOU needs rolling update (every adaptive cycle)
+        if self.tou_sync_enabled and self.device_id:
+            self._check_and_sync_rolling_tou()
+
         # Re-evaluate current mode based on updated schedule
         self.execute_scheduled_mode(None)
 
@@ -2134,7 +2148,9 @@ class BatteryOptimizer(hass.Hass):
             self.sync_schedule_to_inverter()
 
         self._update_schedule_sensor()
-        # Note: _log_schedule is called by adaptive_optimize after detecting changes
+
+        # Log the recalculated schedule
+        self._log_schedule(self.schedule, self.expected_soc_schedule)
 
     def execute_scheduled_mode(self, kwargs, force: bool = False):
         """
@@ -2184,9 +2200,6 @@ class BatteryOptimizer(hass.Hass):
         if entry:
             self.log(f"Executing scheduled mode for {current_slot}: {entry.mode.name} ({entry.reason})")
 
-            # Update battery cost based on actual SOC change from previous hour
-            self._update_battery_cost_from_soc_change()
-
             # When TOU sync is enabled, avoid hourly set_mode which clears TOU periods (30411=0)
             if self.tou_sync_enabled and self.device_id:
                 self.log("TOU sync enabled; skipping hourly set_mode to preserve inverter TOU schedule")
@@ -2194,7 +2207,6 @@ class BatteryOptimizer(hass.Hass):
             self.set_mode(entry.mode)
         else:
             self.log(f"No schedule entry for {current_slot}, defaulting to HOLD")
-            self._update_battery_cost_from_soc_change()
             if self.tou_sync_enabled and self.device_id:
                 self.log("TOU sync enabled; skipping hourly set_mode to preserve inverter TOU schedule")
                 return
@@ -2388,7 +2400,7 @@ class BatteryOptimizer(hass.Hass):
     # TOU Schedule Sync
     # =========================================================================
 
-    def schedule_to_tou_periods(self) -> List[TouPeriod]:
+    def schedule_to_tou_periods(self, boundary_minute: int = None) -> List[TouPeriod]:
         """
         Convert the current schedule to TOU periods for inverter programming.
 
@@ -2403,8 +2415,13 @@ class BatteryOptimizer(hass.Hass):
 
         NOTE: TOU periods are limited to a single day (0-1439 minutes). The schedule
         may span today and tomorrow, so we include entries from both days mapped to
-        time-of-day. If the same time-of-day appears on both days (e.g., 22:00 today
-        and 22:00 tomorrow), we prefer today's entry since it executes first.
+        time-of-day.
+
+        Args:
+            boundary_minute: Minutes since midnight (0-1439) for rolling day boundary.
+                            Hours before this use tomorrow's schedule, hours from this
+                            onward use today's schedule. If None, uses default behavior
+                            (prefer today's entry for conflicts).
 
         Returns:
             List of TouPeriod objects (max 20 periods)
@@ -2443,13 +2460,29 @@ class BatteryOptimizer(hass.Hass):
 
             minutes = local_hour.hour * 60 + local_hour.minute
 
-            # If conflict, prefer the earlier date (today over tomorrow)
-            if minutes in time_of_day_map:
-                existing_date = time_of_day_map[minutes][1]
-                if entry_date < existing_date:
+            # Decide which day's entry to use for this time-of-day
+            if boundary_minute is not None:
+                # Rolling window: before boundary = tomorrow, at/after boundary = today
+                # This allows gradual transition of tomorrow's schedule into "past" hours
+                prefer_tomorrow = minutes < boundary_minute
+
+                if minutes in time_of_day_map:
+                    existing_date = time_of_day_map[minutes][1]
+                    # Override existing entry if we prefer the other day
+                    if prefer_tomorrow and entry_date == tomorrow:
+                        time_of_day_map[minutes] = (entry, entry_date)
+                    elif not prefer_tomorrow and entry_date == today:
+                        time_of_day_map[minutes] = (entry, entry_date)
+                else:
                     time_of_day_map[minutes] = (entry, entry_date)
             else:
-                time_of_day_map[minutes] = (entry, entry_date)
+                # Default behavior: prefer today's entry for conflicts
+                if minutes in time_of_day_map:
+                    existing_date = time_of_day_map[minutes][1]
+                    if entry_date < existing_date:
+                        time_of_day_map[minutes] = (entry, entry_date)
+                else:
+                    time_of_day_map[minutes] = (entry, entry_date)
 
         if not time_of_day_map:
             self.log("No schedule entries for today/tomorrow, skipping TOU sync")
@@ -2517,12 +2550,159 @@ class BatteryOptimizer(hass.Hass):
 
         return periods
 
-    def sync_schedule_to_inverter(self) -> bool:
+    def _read_current_tou_periods(self) -> Optional[List[TouPeriod]]:
+        """
+        Read current TOU periods from inverter registers.
+
+        Returns:
+            List of TouPeriod objects, or None if read fails
+        """
+        if not self.device_id:
+            return None
+
+        try:
+            # Read number of active periods
+            num_periods_data = self._read_modbus_registers(30411, 1)
+            if not num_periods_data:
+                return None
+
+            num_periods = num_periods_data[0]
+            if num_periods == 0:
+                return []
+
+            # Read period data (3 registers per period: start, end, power)
+            period_regs = self._read_modbus_registers(30412, num_periods * 3)
+            if not period_regs or len(period_regs) < num_periods * 3:
+                return None
+
+            periods = []
+            for i in range(num_periods):
+                base = i * 3
+                start = period_regs[base]
+                end = period_regs[base + 1]
+                power_raw = period_regs[base + 2]
+                # Convert unsigned to signed (power can be -100 to +100)
+                power = power_raw if power_raw <= 32767 else power_raw - 65536
+                periods.append(TouPeriod(start=start, end=end, power=power))
+
+            return periods
+
+        except Exception as e:
+            self.log(f"Failed to read current TOU periods: {e}", level="DEBUG")
+            return None
+
+    def _check_and_sync_rolling_tou(self):
+        """
+        Check if TOU schedule needs rolling update and sync if needed.
+
+        Uses a rolling boundary based on the current TOU period's start time.
+        Hours before the boundary use tomorrow's schedule, hours from the
+        boundary onward use today's schedule. This ensures smooth day transitions.
+
+        Compares the proposed schedule with inverter's current TOU and only
+        syncs if they differ.
+        """
+        if not self.schedule:
+            return
+
+        # Read current TOU from inverter
+        existing_periods = self._read_current_tou_periods()
+        if existing_periods is None:
+            self.log("Cannot read current TOU for rolling check", level="DEBUG")
+            return
+
+        # Find current time and determine boundary from active period
+        now = self.datetime()
+        local_tz = self._get_local_timezone()
+        if now.tzinfo is not None and local_tz:
+            now = now.astimezone(local_tz)
+        current_minute = now.hour * 60 + now.minute
+
+        # Find the start of the currently active TOU period (our rolling boundary)
+        boundary_minute = 0
+        for period in existing_periods:
+            if period.start <= current_minute <= period.end:
+                boundary_minute = period.start
+                break
+
+        # Generate new TOU with rolling boundary
+        new_periods = self.schedule_to_tou_periods(boundary_minute=boundary_minute)
+
+        if not new_periods:
+            return
+
+        # Compare with existing - only sync if behavior would change
+        # Use bidirectional "fits inside" check for behavioral equivalence
+        # (same minute-by-minute power values, regardless of period boundaries)
+        if (self._new_schedule_fits_in_existing(new_periods, existing_periods) and
+            self._new_schedule_fits_in_existing(existing_periods, new_periods)):
+            return  # No behavioral change needed
+
+        self.log(f"Rolling TOU update: boundary={boundary_minute//60:02d}:{boundary_minute%60:02d}, "
+                 f"updating {len(new_periods)} periods")
+        self.sync_schedule_to_inverter(boundary_minute=boundary_minute, skip_fit_check=True)
+
+    def _new_schedule_fits_in_existing(self, new_periods: List[TouPeriod],
+                                        existing_periods: List[TouPeriod]) -> bool:
+        """
+        Check if new TOU schedule fits inside existing schedule.
+
+        "Fits inside" means the new schedule doesn't require any behavior change
+        from the inverter's perspective. For example:
+        - Existing: 00:00-23:59 discharge
+        - New: 12:00-23:59 discharge
+        -> Fits inside, because the existing schedule already covers the new one
+
+        This is useful to avoid unnecessary writes which take ~20 seconds.
+
+        Returns:
+            True if new schedule fits inside existing (no write needed)
+        """
+        if not existing_periods:
+            # No existing schedule, must write
+            return False
+
+        if not new_periods:
+            # New schedule is empty - differs from any existing schedule
+            return False
+
+        # Build time-of-day maps for both schedules (minute -> power)
+        def build_minute_map(periods: List[TouPeriod]) -> Dict[int, int]:
+            minute_map = {}
+            for period in periods:
+                for minute in range(period.start, period.end + 1):
+                    if minute <= 1439:  # Valid minutes in a day
+                        minute_map[minute] = period.power
+            return minute_map
+
+        existing_map = build_minute_map(existing_periods)
+        new_map = build_minute_map(new_periods)
+
+        # Check: for every minute in the new schedule, the existing schedule
+        # must have the same mode (power value)
+        for minute, new_power in new_map.items():
+            existing_power = existing_map.get(minute)
+            if existing_power is None or existing_power != new_power:
+                # Existing schedule doesn't cover this minute, or has different mode
+                return False
+
+        # New schedule fits inside existing - no write needed
+        return True
+
+    def sync_schedule_to_inverter(self, boundary_minute: int = None,
+                                    skip_fit_check: bool = False) -> bool:
         """
         Sync the current schedule to the inverter's TOU registers.
 
         Uses the Growatt Modbus integration to write TOU period registers.
         This allows the inverter to operate autonomously even if HA goes offline.
+
+        Args:
+            boundary_minute: Optional rolling boundary for day transition. If specified,
+                            hours before this use tomorrow's schedule, hours from this
+                            onward use today's. Passed through to schedule_to_tou_periods().
+            skip_fit_check: If True, skip the "fits inside existing" optimization check.
+                           Used by rolling sync which already did a proper comparison.
 
         TOU Register Reference:
         - 30100: VPP Control Authority (1=enable)
@@ -2551,8 +2731,17 @@ class BatteryOptimizer(hass.Hass):
 
         try:
             # Convert schedule to TOU periods
-            periods = self.schedule_to_tou_periods()
+            periods = self.schedule_to_tou_periods(boundary_minute=boundary_minute)
             num_periods = len(periods)
+
+            # Check if new schedule fits inside existing inverter schedule
+            # If so, skip the write to avoid unnecessary 20-second delay
+            # Skip this check when called from rolling sync (which already did proper comparison)
+            if not skip_fit_check:
+                existing_periods = self._read_current_tou_periods()
+                if existing_periods is not None and self._new_schedule_fits_in_existing(periods, existing_periods):
+                    self.log(f"TOU schedule unchanged or fits inside existing ({num_periods} periods) - skipping write")
+                    return True
 
             self.log(f"Syncing {num_periods} TOU periods to inverter")
 
@@ -2585,15 +2774,15 @@ class BatteryOptimizer(hass.Hass):
             # Zero out ALL 20 period registers (not just the ones we'll use!)
             # This is crucial - leftover data from a previous schedule causes "Illegal data value" errors
             MAX_TOU_PERIODS = 20
-            for i in range(MAX_TOU_PERIODS):
-                base_addr = 30412 + (i * 3)
-                # Zero all 3 registers atomically (best effort, don't fail on errors)
-                try:
-                    self.call_service("growatt_modbus/write_registers",
-                        device_id=self.device_id, register=base_addr, values=[0, 0, 0])
-                except Exception:
-                    pass  # Best effort - continue even if zeroing fails
-                time.sleep(0.1)
+            clear_values = [0] * (MAX_TOU_PERIODS * 3)
+            try:
+                cleared = self._write_registers_with_retry(30412, clear_values, max_retries=2)
+                if cleared:
+                    self.log(f"Cleared {MAX_TOU_PERIODS} TOU period registers", level="DEBUG")
+                else:
+                    self.log("Bulk zeroing of TOU period registers failed (continuing)", level="WARNING")
+            except Exception as e:
+                self.log(f"Bulk zeroing of TOU period registers failed: {e}", level="WARNING")
             time.sleep(0.5)
 
             # Step 6: Write periods SEQUENTIALLY, incrementing num_periods after each
@@ -2912,7 +3101,12 @@ class BatteryOptimizer(hass.Hass):
         # Track SOC for measuring actual charge/discharge
         self._last_soc: Optional[float] = self._get_current_soc()
         self._last_mode: BatteryMode = BatteryMode.HOLD
-        self._last_hour: Optional[datetime.datetime] = self.datetime().replace(minute=0, second=0, microsecond=0)
+        # Track SOC sample timing and pricing slot separately
+        self._last_soc_time: Optional[datetime.datetime] = self.datetime()
+        # Track last significant SOC change (>=1%) for learning durations
+        self._last_sig_soc: Optional[float] = self._last_soc
+        self._last_sig_soc_time: Optional[datetime.datetime] = self._last_soc_time
+        self._last_price_slot: Optional[datetime.datetime] = self._align_to_slot(self.datetime())
 
         # Try to load from persistent storage
         try:
@@ -3128,16 +3322,22 @@ class BatteryOptimizer(hass.Hass):
         except Exception as e:
             self.log(f"Could not update learning sensor: {e}", level="DEBUG")
 
-    def _update_battery_cost_from_soc_change(self):
+    def _update_battery_cost_from_soc_change(self, kwargs=None):
         """
         Update battery cost based on actual SOC change since last check.
         Called periodically to track real charging/discharging.
         """
         current_soc = self._get_current_soc()
-        current_hour = self._align_to_slot(self.datetime())
+        now = self.datetime()
+        current_slot = self._align_to_slot(now)
 
         if current_soc is None or self._last_soc is None:
             self._last_soc = current_soc
+            self._last_soc_time = now
+            if current_soc is not None:
+                self._last_sig_soc = current_soc
+                self._last_sig_soc_time = now
+            self._last_price_slot = current_slot
             return
 
         soc_change = current_soc - self._last_soc
@@ -3145,27 +3345,27 @@ class BatteryOptimizer(hass.Hass):
         # Only process significant changes (> 1%)
         if abs(soc_change) < 1.0:
             self._last_soc = current_soc
-            self._last_hour = current_hour  # Always update hour to prevent stale pricing
+            self._last_soc_time = now
+            self._last_price_slot = current_slot  # Always update slot to prevent stale pricing
             return
 
         energy_change_kwh = abs(soc_change) / 100 * self.battery_capacity
 
         # Calculate time since last observation
-        now = self.datetime()
-        if self._last_hour:
+        if self._last_sig_soc_time:
             # Ensure consistent timezone handling to avoid naive/aware mismatch
-            last_hour = self._last_hour
-            if now.tzinfo is not None and last_hour.tzinfo is None:
-                last_hour = last_hour.replace(tzinfo=now.tzinfo)
-            elif now.tzinfo is None and last_hour.tzinfo is not None:
-                now = now.replace(tzinfo=last_hour.tzinfo)
-            duration_minutes = (now - last_hour).total_seconds() / 60
+            last_time = self._last_sig_soc_time
+            if now.tzinfo is not None and last_time.tzinfo is None:
+                last_time = last_time.replace(tzinfo=now.tzinfo)
+            elif now.tzinfo is None and last_time.tzinfo is not None:
+                now = now.replace(tzinfo=last_time.tzinfo)
+            duration_minutes = (now - last_time).total_seconds() / 60
         else:
-            duration_minutes = 60  # Default to 1 hour
+            duration_minutes = float(getattr(self, "soc_tracking_minutes", 1))  # Fallback to configured interval
 
         if soc_change > 0:
             # Battery charged - get price for the charging period
-            charge_price = self._get_price_for_hour(self._last_hour) if self._last_hour else None
+            charge_price = self._get_price_for_hour(self._last_price_slot) if self._last_price_slot else None
             if charge_price is None:
                 charge_price = self.battery_avg_cost  # Fallback to current avg
 
@@ -3199,7 +3399,7 @@ class BatteryOptimizer(hass.Hass):
 
         elif soc_change < 0:
             # Battery discharged - cost per kWh stays same, just less energy
-            discharge_price = self._get_price_for_hour(self._last_hour) if self._last_hour else 0.0
+            discharge_price = self._get_price_for_hour(self._last_price_slot) if self._last_price_slot else 0.0
 
             self.log(f"Battery discharged: {soc_change:.1f}% (-{energy_change_kwh:.2f} kWh), "
                      f"avg cost unchanged: {self.battery_avg_cost:.4f} EUR/kWh")
@@ -3215,7 +3415,10 @@ class BatteryOptimizer(hass.Hass):
             self._update_learning_sensor()
 
         self._last_soc = current_soc
-        self._last_hour = current_hour
+        self._last_soc_time = now
+        self._last_sig_soc = current_soc
+        self._last_sig_soc_time = now
+        self._last_price_slot = current_slot
 
     def _get_discharge_threshold(self) -> float:
         """Calculate discharge threshold based on actual battery cost"""

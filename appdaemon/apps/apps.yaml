@@ -159,7 +159,7 @@ battery_optimizer:
 
   # SOC deviation threshold for schedule recalculation (%)
   # If actual SOC differs from expected by more than this, recalculate
-  soc_deviation_threshold: 5
+  soc_deviation_threshold: 4
 
   # Decision transparency logging (0=minimal, 1=summary, 2=verbose)
   # Level 1: Log charge calculation breakdown and recalculation triggers

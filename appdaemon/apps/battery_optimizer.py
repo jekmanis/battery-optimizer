@@ -1700,12 +1700,7 @@ class BatteryOptimizer(hass.Hass):
         for price_point, action, lk in zip(hours_sorted_by_time, actions, load_kw):
             hour = price_point.hour
             price = price_point.price
-            if action == BatteryMode.CHARGE:
-                reason = f"Charge @ {price:.4f} EUR/kWh"
-            elif action == BatteryMode.DISCHARGE:
-                reason = f"Discharge @ {price:.4f} EUR/kWh (load~{lk:.2f}kW)"
-            else:
-                reason = f"Hold @ {price:.4f} EUR/kWh"
+            reason = f"{price:.4f} EUR/kWh load~{lk:.2f}kW"
             schedule[hour] = ScheduleEntry(hour=hour, mode=action, reason=reason)
 
         # === Two-pass enhancement: re-run if projected costs differ significantly ===
@@ -1875,12 +1870,7 @@ class BatteryOptimizer(hass.Hass):
                 for price_point, action, lk in zip(hours_sorted_by_time, actions, load_kw):
                     hour = price_point.hour
                     price = price_point.price
-                    if action == BatteryMode.CHARGE:
-                        reason = f"Charge @ {price:.4f} EUR/kWh"
-                    elif action == BatteryMode.DISCHARGE:
-                        reason = f"Discharge @ {price:.4f} EUR/kWh (load~{lk:.2f}kW)"
-                    else:
-                        reason = f"Hold @ {price:.4f} EUR/kWh"
+                    reason = f"{price:.4f} EUR/kWh load~{lk:.2f}kW"
                     schedule[hour] = ScheduleEntry(hour=hour, mode=action, reason=reason)
 
                 # Update projected costs for the final schedule
@@ -4069,9 +4059,21 @@ class BatteryOptimizer(hass.Hass):
                         end_soc = max(self.min_soc, start_soc - (energy_removed / self.battery_capacity) * 100)
                     else:  # HOLD
                         end_soc = start_soc
-                    soc_str = f" -> {end_soc:5.1f}%"
+                    soc_str = f" ->{end_soc:5.1f}%"
 
-            self.log(f"  {time_str}  {mode_str}  {entry.reason}{soc_str}")
+            # For discharge, show battery avg cost as primary, grid price in parentheses
+            reason_display = entry.reason
+            if entry.mode == BatteryMode.DISCHARGE and self._last_projected_costs:
+                proj_cost = self._last_projected_costs.get(hour)
+                if proj_cost is not None:
+                    # Parse grid price from reason: "X.XXXX EUR/kWh load~Y.YYkW"
+                    parts = entry.reason.split(" EUR/kWh")
+                    if len(parts) == 2:
+                        grid_price = parts[0]
+                        rest = parts[1]
+                        reason_display = f"{proj_cost:.4f} EUR/kWh (grid {grid_price}){rest}"
+
+            self.log(f"  {time_str}  {mode_str}  {reason_display}{soc_str}")
 
         self.log("=" * 60)
 

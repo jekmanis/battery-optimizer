@@ -153,12 +153,14 @@ flowchart TB
 
 If the optimization starts part-way into the current slot, a **fraction** of the slot is used:
 - Energy added/removed is scaled by the fraction remaining in the slot.
-- **Charge slot counting**: the current partial slot still counts as 1 charge slot toward `min_charge_slots`. Other partial slots (if any) do not increment the count.
+- **Charge slot counting**: the current partial slot does **not** count as a full charge slot toward `min_charge_slots`. Only full slots (fraction >= 0.999) increment the charge count.
+- **Partial-slot decision**: the algorithm enumerates HOLD/CHARGE/DISCHARGE for the current partial slot, then runs DP on the remaining full slots. If any candidate can still satisfy `min_charge_slots`, it is preferred over higher-value candidates that cannot.
 
 #### DP Table Structure
 
 ```
 dp[c][e] = best value achievable with c charge slots and energy level e
+dp_tie[c][e] = secondary score used only to break near-ties (prefers cheaper/later charge slots)
 prev_idx[t][c][e] = energy index at time t-1 that led to (c, e) at time t
 prev_c[t][c][e] = charge count at time t-1 that led to (c, e) at time t
 prev_action[t][c][e] = action (HOLD/CHARGE/DISCHARGE) taken to reach (c, e)
@@ -178,6 +180,7 @@ next_dp[c][e] = max(next_dp[c][e], dp[c][e])
 ##### 2. CHARGE
 ```
 if allow_charge:
+    inc = 0 if slot_fraction < 0.999 else 1
     new_energy = e + charge_energy
     actual_charge = charge_energy
     actual_cost = charge_cost_kwh
@@ -196,6 +199,9 @@ if allow_charge:
         cost = buy_price * actual_cost
         next_dp[c+inc][e'] = max(next_dp[c+inc][e'], dp[c][e] - cost)
 ```
+
+**Tie-breaking (charge placement):**
+If objective values are effectively equal (within a small epsilon), the DP uses a secondary score (`dp_tie`) to prefer cheaper and later charge slots.
 
 **Partial Charge Support:**
 
@@ -277,6 +283,7 @@ for each time slot t:
                 # Try CHARGE (if allowed)
                 # favorable_remaining[t] = number of favorable slots from t..end
                 if (price <= battery_avg_cost * 1.05) OR (c + favorable_remaining[t] < min_charge_slots):
+                    inc = 0 if slot_fraction < 0.999 else 1
                     new_energy = e + charge_energy
                     actual_charge = charge_energy
                     actual_cost = charge_cost
@@ -293,6 +300,7 @@ for each time slot t:
 
                     if actual_charge > 0:
                         update next_dp[c+inc][new_e] with cost = buy_price * actual_cost
+                        # If equal within epsilon, prefer cheaper/later charge slots
 
                 # Try DISCHARGE
                 discharge_value = (price + grid_fee)
@@ -447,19 +455,12 @@ flowchart TB
 | `15-20°C` | Near-nominal |
 | `>20°C` | Full rate (~6kW typical) |
 
-### Temperature Warm-up Modeling
+### Temperature Rate Forecast in Scheduling
 
-During scheduling, the optimizer models battery warm-up for multi-hour charging:
-- **Warm-up rate**: +2°C per hour of consecutive charging
-- **Cap**: Temperature estimate is capped at 25°C
-- Per-slot charge rates are computed based on estimated SOC and temperature for that slot
-
-```
-For slot t:
-  estimated_soc[t] = estimated_soc[t-1] + charge_energy[t-1] (if charging)
-  estimated_temp[t] = min(25°C, estimated_temp[t-1] + 2°C × slot_hours)
-  charge_rate[t] = learning_engine.get_charge_rate_for_soc(estimated_soc[t], estimated_temp[t])
-```
+Scheduling uses a neutral forecast for charge rates:
+- Per-slot charge rates are computed using the current SOC and current temperature.
+- The same rate is applied across the planning horizon.
+- No warm-up or cooling is modeled in the scheduler.
 
 ### Fallback Behavior
 
@@ -644,13 +645,15 @@ Time     Price      Mode       Reason
 1. **Self-consumption model**: Discharge is modeled as avoiding grid import, not exporting.
 2. **Survival-first charging**: Minimum charge slots prevent hitting `min_soc`.
 3. **Economic charging with survival fallback**: Prefer favorable prices; only allow unfavorable charging when there are too few favorable slots left to meet `min_charge_slots`.
-4. **Partial charge support**: When near `max_soc`, allows partial "top off" charging to fully utilize cheap price windows instead of blocking the entire slot.
-5. **Two-pass optimization**: Re-runs DP with projected battery costs when scheduled charging would significantly change the cost basis, enabling better discharge decisions.
-6. **Economic discharge**: Discharge value is reduced by battery cost `((avg + grid_fee)/eff + wear)`, creating HOLD when price is marginal.
-7. **Conservative load forecasting**: 75th percentile default guards against peaks.
-8. **Adaptive recalculation**: Real-world SOC deviations trigger schedule updates.
-9. **Timezone awareness**: Handles DST and mixed timezone data correctly.
-10. **Temperature-aware learning**: Learns actual charge rates by SOC and temperature, improving scheduling accuracy for batteries with temperature-dependent performance (e.g., slower charging when cold).
+4. **Partial-slot handling**: Partial current slots do not increment the charge count; candidates that still satisfy `min_charge_slots` are preferred.
+5. **Tie-breaking for charge placement**: When values are effectively equal, the DP prefers cheaper and later charge slots.
+6. **Partial charge support**: When near `max_soc`, allows partial "top off" charging to fully utilize cheap price windows instead of blocking the entire slot.
+7. **Two-pass optimization**: Re-runs DP with projected battery costs when scheduled charging would significantly change the cost basis, enabling better discharge decisions.
+8. **Economic discharge**: Discharge value is reduced by battery cost `((avg + grid_fee)/eff + wear)`, creating HOLD when price is marginal.
+9. **Conservative load forecasting**: 75th percentile default guards against peaks.
+10. **Adaptive recalculation**: Real-world SOC deviations trigger schedule updates.
+11. **Timezone awareness**: Handles DST and mixed timezone data correctly.
+12. **Temperature-aware learning**: Learns actual charge rates by SOC and temperature, improving scheduling accuracy for batteries with temperature-dependent performance (e.g., slower charging when cold).
 
 ## Algorithm Flow Summary
 

@@ -670,10 +670,8 @@ class BatteryOptimizer(hass.Hass):
         optimize_hour = self.tomorrow_prices_hour
         self.run_daily(self.full_optimize, datetime.time(optimize_hour, 15))
 
-        # Also run optimization at startup (with delay for HA services to be ready)
-        startup_delay = int(self.args.get("startup_delay_seconds", 30))
-        self.log(f"Scheduling startup optimization in {startup_delay}s")
-        self.run_in(self.full_optimize, startup_delay)
+        # Startup optimization is triggered from _init_battery_cost() after battery cost is loaded
+        # (either immediately if HA available, or after homeassistant_start event)
 
         # Adaptive re-evaluation (can be more frequent than schedule slots)
         self.run_every(
@@ -2218,7 +2216,10 @@ class BatteryOptimizer(hass.Hass):
         # Check for solar override
         if pv_power > self.pv_threshold and self.current_mode == BatteryMode.CHARGE:
             self.log(f"Solar override: PV={pv_power}W, switching from charge to hold")
-            self.set_mode(BatteryMode.HOLD)
+            if self.tou_sync_enabled and self.device_id:
+                self._insert_hold_and_resync("solar_override")
+            else:
+                self.set_mode(BatteryMode.HOLD)
             return
 
         # Get current slot for schedule change logging
@@ -2431,6 +2432,55 @@ class BatteryOptimizer(hass.Hass):
                 return
             self.set_mode(BatteryMode.HOLD)
 
+    def _insert_hold_and_resync(self, reason: str = "safety"):
+        """
+        Insert HOLD for the current slot and resync TOU schedule.
+
+        This preserves the rest of the schedule while only modifying the current
+        hour to HOLD. Much better than set_mode(HOLD) which destroys the entire
+        TOU schedule and creates a 2-hour HOLD period that can conflict.
+
+        Args:
+            reason: Reason for the HOLD (used in log messages and schedule entry)
+        """
+        now = self.datetime()
+        local_tz = self._get_local_timezone()
+        if now.tzinfo is not None and local_tz is not None:
+            now = now.astimezone(local_tz)
+        current_slot = self._align_to_slot(now)
+
+        # Check if both schedule AND current mode are already HOLD
+        # Only skip if truly nothing needs to change (both aligned to HOLD)
+        if current_slot in self.schedule:
+            old_entry = self.schedule[current_slot]
+            if old_entry.mode == BatteryMode.HOLD and self.current_mode == BatteryMode.HOLD:
+                return  # Both schedule and inverter already HOLD, nothing to do
+            if old_entry.mode != BatteryMode.HOLD:
+                # Schedule needs updating
+                self.schedule[current_slot] = ScheduleEntry(
+                    hour=current_slot,
+                    mode=BatteryMode.HOLD,
+                    reason=f"{reason}_hold (was {old_entry.mode.name})"
+                )
+                self.log(f"Inserted HOLD at {current_slot} (was {old_entry.mode.name})")
+            else:
+                # Schedule is HOLD but current_mode isn't - log the enforcement
+                self.log(f"Enforcing HOLD at {current_slot} (schedule was HOLD but mode was {self.current_mode.name})")
+        else:
+            self.schedule[current_slot] = ScheduleEntry(
+                hour=current_slot,
+                mode=BatteryMode.HOLD,
+                reason=f"{reason}_hold"
+            )
+            self.log(f"Inserted HOLD at {current_slot}")
+
+        self._handle_mode_transition(BatteryMode.HOLD)
+        self._update_schedule_sensor()
+
+        # Resync TOU with updated schedule (uses existing async wrapper)
+        if self.tou_sync_enabled and self.device_id:
+            self._schedule_tou_sync(skip_fit_check=True, reason=f"{reason}_hold_resync")
+
     def _check_soc_boundaries(self, current_soc: float) -> bool:
         """
         Check SOC boundaries and enforce safety limits.
@@ -2448,13 +2498,19 @@ class BatteryOptimizer(hass.Hass):
         # Stop discharge if SOC too low
         if current_soc <= self.min_soc and self.current_mode == BatteryMode.DISCHARGE:
             self.log(f"Safety: Stopping discharge, SOC at minimum ({current_soc}%)")
-            self.set_mode(BatteryMode.HOLD)
+            if self.tou_sync_enabled and self.device_id:
+                self._insert_hold_and_resync("safety_min_soc")
+            else:
+                self.set_mode(BatteryMode.HOLD)
             return True
 
         # Stop charge if SOC full
         if current_soc >= self.max_soc and self.current_mode == BatteryMode.CHARGE:
             self.log(f"Safety: Stopping charge, SOC at maximum ({current_soc}%)")
-            self.set_mode(BatteryMode.HOLD)
+            if self.tou_sync_enabled and self.device_id:
+                self._insert_hold_and_resync("safety_max_soc")
+            else:
+                self.set_mode(BatteryMode.HOLD)
             return True
 
         return False
@@ -2668,7 +2724,26 @@ class BatteryOptimizer(hass.Hass):
                 start_min = max(0, current_minutes - 5)
                 end_min = min(1439, current_minutes + 120)
 
-                # Set num_periods BEFORE writing period data (required by Growatt firmware)
+                # CRITICAL: Clear ALL TOU period registers BEFORE writing new period!
+                # Stale non-zero data in ANY period register causes overlap validation failures!
+                # The firmware validates writes against ALL registers, not just active ones.
+                self.call_service("growatt_modbus/write_register",
+                    device_id=self.device_id,
+                    register=VPP_TOU_NUM_PERIODS,
+                    value=0
+                )
+                # Zero out all 20 period registers (60 registers total: 20 periods x 3 registers)
+                MAX_TOU_PERIODS = 20
+                try:
+                    self.call_service("growatt_modbus/write_registers",
+                        device_id=self.device_id,
+                        register=VPP_TOU_PERIOD1_BASE,
+                        values=[0] * (MAX_TOU_PERIODS * 3)
+                    )
+                except Exception as e:
+                    self.log(f"Bulk zeroing of TOU registers failed: {e}", level="WARNING")
+
+                # Now write the HOLD period
                 self.call_service("growatt_modbus/write_register",
                     device_id=self.device_id,
                     register=VPP_TOU_NUM_PERIODS,
@@ -3549,27 +3624,14 @@ class BatteryOptimizer(hass.Hass):
             if state and state not in ("unknown", "unavailable"):
                 self.battery_avg_cost = float(state)
                 self.log(f"Loaded battery avg cost from HA: {self.battery_avg_cost:.4f} EUR/kWh")
+                self._schedule_startup_optimization()
                 return
         except (ValueError, TypeError) as e:
             self.log(f"Could not load battery cost from {self.battery_cost_entity}: {e}", level="WARNING")
 
-        # Fallback: estimate from recent prices
-        current_soc = self._get_current_soc()
-        if current_soc is None or current_soc <= self.min_soc:
-            self.battery_avg_cost = 0.0
-            self._save_battery_cost()
-            return
-
-        prices = self.get_prices()
-        if prices:
-            avg_price = sum(p.price for p in prices) / len(prices)
-            self.battery_avg_cost = avg_price
-            self.log(f"Initialized battery avg cost to {self.battery_avg_cost:.4f} EUR/kWh (estimated from recent prices)")
-        else:
-            self.battery_avg_cost = 0.10  # Default fallback
-            self.log(f"Initialized battery avg cost to {self.battery_avg_cost:.4f} EUR/kWh (default)")
-
-        self._save_battery_cost()
+        # HA not ready yet - wait for homeassistant_start event to load cost and start optimizer
+        self.log("HA entities not available yet, waiting for homeassistant_start event")
+        self.listen_event(self._on_ha_start, "homeassistant_start")
 
     def _save_battery_cost(self):
         """Persist battery cost to Home Assistant entity"""
@@ -3580,6 +3642,27 @@ class BatteryOptimizer(hass.Hass):
             )
         except Exception as e:
             self.log(f"Could not save battery cost to {self.battery_cost_entity}: {e}", level="DEBUG")
+
+    def _schedule_startup_optimization(self):
+        """Schedule the startup optimization"""
+        self.log("Scheduling startup optimization")
+        self.run_in(self.full_optimize, 1)
+
+    def _on_ha_start(self, event_name, data, kwargs):
+        """Load battery cost after HA start and trigger startup optimization"""
+        try:
+            state = self.get_state(self.battery_cost_entity)
+            if state and state not in ("unknown", "unavailable"):
+                self.battery_avg_cost = float(state)
+                self.log(f"Loaded battery avg cost from HA: {self.battery_avg_cost:.4f} EUR/kWh")
+            else:
+                self.battery_avg_cost = 0.10  # Default fallback
+                self.log(f"Battery cost entity unavailable, using default: {self.battery_avg_cost:.4f} EUR/kWh", level="WARNING")
+        except (ValueError, TypeError) as e:
+            self.battery_avg_cost = 0.10
+            self.log(f"Could not load battery cost ({e}), using default: {self.battery_avg_cost:.4f} EUR/kWh", level="WARNING")
+
+        self._schedule_startup_optimization()
 
     def _init_learning_engine(self):
         """Initialize learning engine from persistent storage"""

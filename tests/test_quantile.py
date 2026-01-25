@@ -6,7 +6,7 @@ import math
 
 import pytest
 
-from battery_optimizer import _quantile
+from battery_optimizer_lib import _quantile
 
 
 class TestQuantile:

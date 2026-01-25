@@ -9,29 +9,47 @@ Battery Optimizer for Growatt WIT Inverter - a Home Assistant AppDaemon applicat
 ## Architecture
 
 ### File Structure
-- `appdaemon/apps/battery_optimizer.py` - Main optimization engine (~2,870 lines)
-- `appdaemon/apps/apps.yaml` - AppDaemon configuration with all parameters
-- `homeassistant/packages/battery_optimizer.yaml` - HA entities, automations, sensors
+```
+appdaemon/apps/
+├── battery_optimizer.py           # Main AppDaemon app (~4300 lines)
+├── battery_optimizer_lib/         # Python package for helper modules
+│   ├── __init__.py                # Re-exports for convenience
+│   ├── models.py                  # Data classes and enums (~90 lines)
+│   ├── learning_engine.py         # BatteryLearningEngine (~290 lines)
+│   ├── load_profile.py            # LoadProfile (~90 lines)
+│   ├── price_service.py           # NordPoolPriceService (~420 lines)
+│   └── tou_sync.py                # TouSyncManager (~520 lines)
+├── apps.yaml                      # AppDaemon configuration
+homeassistant/packages/
+└── battery_optimizer.yaml         # HA entities, automations, sensors
+```
+
+### Package Modules (battery_optimizer_lib/)
+
+| Module | Classes/Functions | Purpose |
+|--------|-------------------|---------|
+| `models.py` | BatteryMode, PricePoint, ScheduleEntry, TouPeriod, LearningStats, LoadProfileStats | Pure data structures and enums |
+| `learning_engine.py` | BatteryLearningEngine | Self-learning charge rate and efficiency tracking |
+| `load_profile.py` | LoadProfile, _quantile | Statistical load forecasting by time-of-day |
+| `price_service.py` | NordPoolPriceService | Nord Pool price fetching via HA integration |
+| `tou_sync.py` | TouSyncManager | TOU schedule sync and device control via Modbus |
 
 ### Key Code Sections in battery_optimizer.py
 
-| Lines | Section | Purpose |
-|-------|---------|---------|
-| 32-340 | Learning Engine | Self-learning charge rate and load profile tracking |
-| 356-425 | Load Profile | Historical load data for discharge predictions |
-| 426-455 | Data Models | BatteryMode, PricePoint, ScheduleEntry, TouPeriod |
-| 458-655 | Initialization | AppDaemon setup, config loading, scheduled tasks |
-| 659-980 | Price Fetching | Nord Pool API/sensor data retrieval with caching |
-| 1079-1160 | Price Analysis | Statistics and charge/discharge hour calculations |
-| 1162-1370 | Optimization Algorithm | Dynamic programming SOC-aware scheduling |
-| 1415-1675 | Schedule Execution | Full/adaptive optimization, recalculation |
-| 1676-1755 | Mode Execution | Hourly mode application, safety checks |
-| 1758-1920 | Device Control | Growatt Modbus register writes (VPP protocol) |
-| 1921-2130 | TOU Sync | Schedule sync to inverter TOU registers |
-| 2136-2180 | Manual Override | User intervention handling |
-| 2182-2465 | Battery Cost Tracking | Weighted average cost with persistence |
-| 2465-2690 | Helper Methods | SOC reading, timezone handling, slot alignment |
-| 2694-2870 | Properties & Logging | Dynamic config, schedule sensor, logging |
+| Section | Purpose |
+|---------|---------|
+| Initialization | AppDaemon setup, config loading, scheduled tasks |
+| Price Fetching | Nord Pool API/sensor data retrieval with caching |
+| Price Analysis | Statistics and charge/discharge hour calculations |
+| Optimization Algorithm | Dynamic programming SOC-aware scheduling |
+| Schedule Execution | Full/adaptive optimization, recalculation |
+| Mode Execution | Hourly mode application, safety checks |
+| Device Control | Growatt Modbus register writes (VPP protocol) |
+| TOU Sync | Schedule sync to inverter TOU registers |
+| Manual Override | User intervention handling |
+| Battery Cost Tracking | Weighted average cost with persistence |
+| Helper Methods | SOC reading, timezone handling, slot alignment |
+| Properties & Logging | Dynamic config, schedule sensor, logging |
 
 ### Data Models
 - `BatteryMode` enum: HOLD (0), CHARGE (1), DISCHARGE (2)

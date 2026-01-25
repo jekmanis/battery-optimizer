@@ -1,0 +1,93 @@
+"""
+Data models for the Battery Optimizer.
+
+Contains pure data structures with minimal dependencies - enums and dataclasses
+used throughout the battery optimizer system.
+"""
+
+import datetime
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from typing import Dict, List, Optional
+
+
+class BatteryMode(Enum):
+    """Battery operating modes."""
+    HOLD = 0
+    CHARGE = 1
+    DISCHARGE = 2
+
+
+@dataclass
+class PricePoint:
+    """Represents a single time-slot price data point."""
+    hour: datetime.datetime
+    price: float
+
+    def __lt__(self, other):
+        return self.price < other.price
+
+
+@dataclass
+class ScheduleEntry:
+    """Represents a scheduled battery mode for a specific time slot."""
+    hour: datetime.datetime
+    mode: BatteryMode
+    reason: str
+
+
+@dataclass
+class TouPeriod:
+    """Represents a TOU period for inverter scheduling."""
+    start: int      # Minutes since midnight
+    end: int        # Minutes since midnight
+    power: int      # -100 to +100 (positive=charge, negative=discharge)
+
+
+@dataclass
+class LearningStats:
+    """Aggregated learning statistics for battery performance."""
+    # Charging rates by SOC range (kW observed at different SOC levels)
+    charge_rates_by_soc: Dict[str, List[float]] = field(default_factory=dict)
+    # Discharge rates by SOC range
+    discharge_rates_by_soc: Dict[str, List[float]] = field(default_factory=dict)
+    # Round-trip efficiency observations
+    efficiency_history: List[float] = field(default_factory=list)
+    # Prediction accuracy (predicted vs actual charge time)
+    prediction_errors: List[float] = field(default_factory=list)
+    # Totals
+    total_energy_charged_kwh: float = 0.0
+    total_energy_discharged_kwh: float = 0.0
+    total_charge_cost_eur: float = 0.0
+    total_discharge_revenue_eur: float = 0.0
+    total_cycles: int = 0
+    # Timestamps
+    first_observation: Optional[str] = None
+    last_observation: Optional[str] = None
+    # Temperature-aware charge rates: {"25-50": {"5-10": [3.1, 3.2], "10-15": [4.2, 4.5]}}
+    charge_rates_by_soc_temp: Dict[str, Dict[str, List[float]]] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'LearningStats':
+        # Handle backward compatibility for older versions without charge_rates_by_soc_temp
+        known_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered_data = {k: v for k, v in data.items() if k in known_fields}
+        return cls(**filtered_data)
+
+
+@dataclass
+class LoadProfileStats:
+    """Aggregated load observations per time slot."""
+    samples_by_slot: Dict[str, List[float]] = field(default_factory=dict)  # slot -> W samples
+    observation_count: int = 0
+    last_observation: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'LoadProfileStats':
+        return cls(**data)

@@ -31,7 +31,7 @@ sys.modules["appdaemon.plugins.hass.hassapi"] = mock_hass_module
 
 
 # Now we can import the module components
-from battery_optimizer import (
+from battery_optimizer_lib import (
     BatteryLearningEngine,
     BatteryMode,
     LearningStats,

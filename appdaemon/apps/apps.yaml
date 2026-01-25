@@ -107,9 +107,6 @@ battery_optimizer:
   # Load observation interval (minutes)
   load_observation_minutes: 30
 
-  # SOC tracking interval for learning/battery cost updates (minutes)
-  soc_tracking_minutes: 1
-
   # Quantile for load forecast (0.5 = median, 0.8 = conservative)
   load_quantile: 0.75
 
@@ -161,7 +158,7 @@ battery_optimizer:
   # If actual SOC differs from expected by more than this, recalculate
   soc_deviation_threshold: 4
 
-  # Decision transparency logging (0=minimal, 1=summary, 2=verbose)
+  # Decision transparency logging (0=minimal, 1=summary, 2=verbose, 3=max decision details)
   # Level 1: Log charge calculation breakdown and recalculation triggers
   # Level 2: Also log candidate charge slots, arbitrage analysis
   decision_log_level: 1

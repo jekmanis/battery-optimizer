@@ -624,6 +624,10 @@ class BatteryOptimizer(hass.Hass):
         self.last_optimization: Optional[datetime.datetime] = None
         self.expected_soc_schedule: Dict[datetime.datetime, float] = {}
         self._last_nonzero_load_w: Optional[float] = None
+        self._previous_schedule_from_sensor: Optional[Dict[datetime.datetime, BatteryMode]] = None
+        self._tou_sync_in_progress: bool = False
+        self._tou_sync_pending: bool = False
+        self._tou_sync_pending_kwargs: Optional[Dict[str, object]] = None
 
         # Battery cost tracking (weighted average cost of energy in battery)
         self.battery_avg_cost: float = 0.0  # EUR/kWh
@@ -657,6 +661,9 @@ class BatteryOptimizer(hass.Hass):
             log_func=self.log,
         )
         self._init_load_profile()
+
+        # Restore previous schedule from sensor (for continuity on restart)
+        self._restore_previous_schedule_from_sensor()
 
         # Full re-optimization after Nord Pool publishes tomorrow's prices
         # Uses configured hour (default 14 for EET = 13 CET) plus 15 minutes buffer
@@ -2166,6 +2173,9 @@ class BatteryOptimizer(hass.Hass):
         # Generate schedule
         self.schedule = self.find_optimal_schedule(future_prices, charge_hours_needed, current_soc)
 
+        # On restart, preserve CHARGE intent for current slot if it was charging before
+        self._preserve_charge_on_restart(current_slot)
+
         # Calculate expected SOC trajectory
         self.expected_soc_schedule = self.calculate_expected_soc_schedule(self.schedule, current_soc)
 
@@ -2176,7 +2186,7 @@ class BatteryOptimizer(hass.Hass):
 
         # Sync schedule to inverter TOU registers (if configured)
         if self.tou_sync_enabled and self.device_id:
-            self.sync_schedule_to_inverter()
+            self._schedule_tou_sync(reason="full_optimize")
 
         # Apply current hour's mode
         self.execute_scheduled_mode(None)
@@ -2307,7 +2317,23 @@ class BatteryOptimizer(hass.Hass):
                 if changed_modes:
                     changes.append(f"{len(changed_modes)} mode changes")
                 self.log(f"Schedule updated ({', '.join(changes)}), SOC: {current_soc}%")
-                self._log_schedule(self.schedule, self.expected_soc_schedule)
+                # Log only current and future schedule entries (not past hours)
+                def is_current_or_future(h):
+                    compare_h = self._normalize_to_local(h, local_tz)
+                    compare_now = self._normalize_to_local(current_slot, local_tz)
+                    if compare_h is None or compare_now is None:
+                        return False
+                    if compare_h.tzinfo is not None and compare_now.tzinfo is None:
+                        compare_h = compare_h.replace(tzinfo=None)
+                    elif compare_h.tzinfo is None and compare_now.tzinfo is not None:
+                        compare_now = compare_now.replace(tzinfo=None)
+                    return compare_h >= compare_now
+
+                future_schedule = {
+                    h: e for h, e in self.schedule.items()
+                    if is_current_or_future(h)
+                }
+                self._log_schedule(future_schedule, self.expected_soc_schedule)
 
         # Check if TOU needs rolling update (every adaptive cycle)
         if self.tou_sync_enabled and self.device_id:
@@ -2410,12 +2436,9 @@ class BatteryOptimizer(hass.Hass):
 
         # Sync updated schedule to inverter TOU registers (if configured)
         if self.tou_sync_enabled and self.device_id:
-            self.sync_schedule_to_inverter()
+            self._schedule_tou_sync(reason="recalculate")
 
         self._update_schedule_sensor()
-
-        # Log the recalculated schedule
-        self._log_schedule(self.schedule, self.expected_soc_schedule)
 
     def execute_scheduled_mode(self, kwargs, force: bool = False):
         """
@@ -2722,9 +2745,17 @@ class BatteryOptimizer(hass.Hass):
         current_period_mode = None
         current_period_start = None
 
-        today = self.date()
-        tomorrow = today + dt.timedelta(days=1)
         local_tz = self._get_local_timezone()
+        now = self.datetime()
+        if not isinstance(now, datetime.datetime):
+            now = datetime.datetime.now()
+        if local_tz is not None:
+            if now.tzinfo is not None:
+                now = now.astimezone(local_tz)
+            else:
+                now = now.replace(tzinfo=local_tz)
+        today = now.date()
+        tomorrow = today + dt.timedelta(days=1)
 
         def get_local_dt(hour_dt):
             """Convert to local timezone if needed."""
@@ -2878,6 +2909,42 @@ class BatteryOptimizer(hass.Hass):
             self.log(f"Failed to read current TOU periods: {e}", level="DEBUG")
             return None
 
+    def _schedule_tou_sync(self, boundary_minute: int = None, skip_fit_check: bool = False,
+                           allow_queue: bool = True, reason: str = ""):
+        """Schedule a TOU sync, avoiding overlapping register writes."""
+        if self._tou_sync_in_progress:
+            if allow_queue:
+                self._tou_sync_pending = True
+                self._tou_sync_pending_kwargs = {
+                    "boundary_minute": boundary_minute,
+                    "skip_fit_check": skip_fit_check,
+                    "reason": reason,
+                }
+                if reason:
+                    self.log(f"TOU sync already in progress; queued ({reason})", level="DEBUG")
+            else:
+                if reason:
+                    self.log(f"TOU sync already in progress; skipping ({reason})", level="DEBUG")
+            return
+
+        self._tou_sync_in_progress = True
+        self._tou_sync_pending = False
+        self._tou_sync_pending_kwargs = None
+        if reason:
+            self.log(f"Scheduling TOU sync ({reason})", level="DEBUG")
+        self.create_task(self._run_tou_sync(boundary_minute=boundary_minute, skip_fit_check=skip_fit_check))
+
+    async def _run_tou_sync(self, boundary_minute: int = None, skip_fit_check: bool = False):
+        try:
+            await self.sync_schedule_to_inverter(boundary_minute=boundary_minute, skip_fit_check=skip_fit_check)
+        finally:
+            self._tou_sync_in_progress = False
+            if self._tou_sync_pending:
+                pending_kwargs = self._tou_sync_pending_kwargs or {}
+                self._tou_sync_pending = False
+                self._tou_sync_pending_kwargs = None
+                self._schedule_tou_sync(**pending_kwargs)
+
     def _check_and_sync_rolling_tou(self):
         """
         Check if TOU schedule needs rolling update and sync if needed.
@@ -2890,6 +2957,9 @@ class BatteryOptimizer(hass.Hass):
         syncs if they differ.
         """
         if not self.schedule:
+            return
+        if self._tou_sync_in_progress:
+            self.log("TOU sync already in progress; skipping rolling check", level="DEBUG")
             return
 
         # Read current TOU from inverter
@@ -2927,7 +2997,8 @@ class BatteryOptimizer(hass.Hass):
 
         self.log(f"Rolling TOU update: boundary={boundary_minute//60:02d}:{boundary_minute%60:02d}, "
                  f"updating {len(new_periods)} periods")
-        self.sync_schedule_to_inverter(boundary_minute=boundary_minute, skip_fit_check=True)
+        self._schedule_tou_sync(boundary_minute=boundary_minute, skip_fit_check=True,
+                                allow_queue=False, reason="rolling_update")
 
     def _new_schedule_fits_in_existing(self, new_periods: List[TouPeriod],
                                         existing_periods: List[TouPeriod]) -> bool:
@@ -2976,7 +3047,7 @@ class BatteryOptimizer(hass.Hass):
         # New schedule fits inside existing - no write needed
         return True
 
-    def sync_schedule_to_inverter(self, boundary_minute: int = None,
+    async def sync_schedule_to_inverter(self, boundary_minute: int = None,
                                     skip_fit_check: bool = False) -> bool:
         """
         Sync the current schedule to the inverter's TOU registers.
@@ -3010,8 +3081,6 @@ class BatteryOptimizer(hass.Hass):
         Returns:
             True if sync succeeded, False otherwise
         """
-        import time
-
         if not self.device_id:
             self.log("No device_id configured, cannot sync TOU schedule", level="WARNING")
             return False
@@ -3033,44 +3102,44 @@ class BatteryOptimizer(hass.Hass):
             self.log(f"Syncing {num_periods} TOU periods to inverter")
 
             # Step 1: Enable VPP control (register 30100 = 1)
-            if not self._write_register_with_retry(30100, 1):
+            if not await self._write_register_with_retry(30100, 1):
                 self.log("Failed to enable VPP control", level="ERROR")
                 return False
 
             # Step 2: Enable AC charging (register 30410 = 1) - CRITICAL for charge periods!
-            self._write_register_with_retry(30410, 1)
-            time.sleep(0.3)
+            await self._write_register_with_retry(30410, 1)
+            await self.sleep(0.3)
 
             # Step 3: Disable remote control (register 30407 = 0) so TOU takes precedence
             # Without this, remote control overrides TOU schedule!
-            self._write_register_with_retry(30407, 0)
-            time.sleep(0.3)
+            await self._write_register_with_retry(30407, 0)
+            await self.sleep(0.3)
 
             # Step 4: Set default mode to "load first" / HOLD (register 30476 = 0)
-            self._write_register_with_retry(30476, 0)
-            time.sleep(0.3)
+            await self._write_register_with_retry(30476, 0)
+            await self.sleep(0.3)
 
             # Step 5: Clear existing schedule and zero out ALL period registers
             # CRITICAL: Stale non-zero data in ANY period register causes overlap validation failures!
             # The firmware validates writes against ALL registers, not just active ones.
             # Zeroed registers [0,0,0] are treated as "empty" and allow fresh writes.
             self.log("Clearing TOU schedule and zeroing period registers...")
-            self._write_register_with_retry(30411, 0, verify=False)
-            time.sleep(0.5)
+            await self._write_register_with_retry(30411, 0, verify=False)
+            await self.sleep(0.5)
 
             # Zero out ALL 20 period registers (not just the ones we'll use!)
             # This is crucial - leftover data from a previous schedule causes "Illegal data value" errors
             MAX_TOU_PERIODS = 20
             clear_values = [0] * (MAX_TOU_PERIODS * 3)
             try:
-                cleared = self._write_registers_with_retry(30412, clear_values, max_retries=2)
+                cleared = await self._write_registers_with_retry(30412, clear_values, max_retries=2)
                 if cleared:
                     self.log(f"Cleared {MAX_TOU_PERIODS} TOU period registers", level="DEBUG")
                 else:
                     self.log("Bulk zeroing of TOU period registers failed (continuing)", level="WARNING")
             except Exception as e:
                 self.log(f"Bulk zeroing of TOU period registers failed: {e}", level="WARNING")
-            time.sleep(0.5)
+            await self.sleep(0.5)
 
             # Step 6: Write periods SEQUENTIALLY, incrementing num_periods after each
             # This is the key sequence that works with Growatt firmware:
@@ -3086,13 +3155,13 @@ class BatteryOptimizer(hass.Hass):
 
                 # Write all 3 registers atomically using multi-register write (function 0x10)
                 # This is more reliable than individual writes
-                success = self._write_registers_with_retry(
+                success = await self._write_registers_with_retry(
                     base_addr, [period.start, period.end, power_unsigned]
                 )
 
                 if success:
                     # Increment num_periods to activate this period
-                    if not self._write_register_with_retry(30411, i + 1):
+                    if not await self._write_register_with_retry(30411, i + 1):
                         self.log(f"Failed to set num_periods to {i+1}", level="WARNING")
                         success = False
                     else:
@@ -3103,16 +3172,16 @@ class BatteryOptimizer(hass.Hass):
                     write_failures += 1
                     self.log(f"TOU Period {i+1} write FAILED", level="ERROR")
 
-                time.sleep(0.5)  # Allow inverter time to process before next period
+                await self.sleep(0.5)  # Allow inverter time to process before next period
 
             # If any period writes failed, clear num_periods to deactivate partial schedule
             if write_failures > 0:
                 self.log(f"TOU sync failed: {write_failures} period(s) failed to write, clearing schedule", level="ERROR")
-                self._write_register_with_retry(30411, 0, verify=False)
+                await self._write_register_with_retry(30411, 0, verify=False)
                 return False
 
             # Step 7: Verify num_periods is correct
-            time.sleep(0.5)
+            await self.sleep(0.5)
             try:
                 verified = self._read_modbus_registers(30411, 1)
                 if verified and len(verified) > 0 and verified[0] == num_periods:
@@ -3231,7 +3300,7 @@ class BatteryOptimizer(hass.Hass):
             self.log(f"REST API read failed for {address}-{address+count-1}: {e}", level="DEBUG")
             return None
 
-    def _write_register_with_retry(self, address: int, value: int, max_retries: int = 3, verify: bool = True) -> bool:
+    async def _write_register_with_retry(self, address: int, value: int, max_retries: int = 3, verify: bool = True) -> bool:
         """Write single register with retry logic and optional verification.
 
         Args:
@@ -3243,12 +3312,11 @@ class BatteryOptimizer(hass.Hass):
         Returns:
             True if write (and verification if enabled) succeeded
         """
-        import time
         for attempt in range(max_retries):
             try:
                 self.call_service("growatt_modbus/write_register",
                     device_id=self.device_id, register=address, value=value)
-                time.sleep(0.5)  # Allow inverter to process
+                await self.sleep(0.5)  # Allow inverter to process
 
                 # Verify the write by reading back
                 if verify:
@@ -3268,11 +3336,11 @@ class BatteryOptimizer(hass.Hass):
                 self.log(f"Register {address} write attempt {attempt+1} failed: {e}", level="WARNING")
 
             if attempt < max_retries - 1:
-                time.sleep(0.5)
+                await self.sleep(0.5)
 
         return False
 
-    def _write_registers_with_retry(self, address: int, values: List[int], max_retries: int = 3) -> bool:
+    async def _write_registers_with_retry(self, address: int, values: List[int], max_retries: int = 3) -> bool:
         """Write multiple registers atomically with retry logic and verification.
 
         Uses Modbus function 0x10 (write multiple registers) for atomic writes.
@@ -3291,7 +3359,6 @@ class BatteryOptimizer(hass.Hass):
         Returns:
             True if write and verification succeeded
         """
-        import time
         base_delay = 0.7  # Initial delay after write
 
         for attempt in range(max_retries):
@@ -3301,7 +3368,7 @@ class BatteryOptimizer(hass.Hass):
 
                 # Exponential backoff for processing time
                 delay = base_delay * (1.5 ** attempt)
-                time.sleep(delay)
+                await self.sleep(delay)
 
                 # Verify the write by reading back
                 readback = self._read_modbus_registers(address, len(values))
@@ -3326,7 +3393,7 @@ class BatteryOptimizer(hass.Hass):
             if attempt < max_retries - 1:
                 # Exponential backoff between retries
                 retry_delay = 1.0 * (2 ** attempt)  # 1s, 2s, 4s
-                time.sleep(retry_delay)
+                await self.sleep(retry_delay)
 
         return False
 
@@ -3501,6 +3568,108 @@ class BatteryOptimizer(hass.Hass):
                 self.log(f"Could not load load profile data: {e}", level="WARNING")
 
         self.log("Starting with fresh load profile")
+
+    def _restore_previous_schedule_from_sensor(self):
+        """
+        Restore the previous schedule from sensor.battery_optimizer on startup.
+        This enables continuity when restarting mid-hour during a charging slot.
+        """
+        try:
+            attrs = self.get_state("sensor.battery_optimizer", attribute="all")
+            if not attrs or "attributes" not in attrs:
+                self.log("No previous schedule found in sensor")
+                return
+
+            schedule_data = attrs.get("attributes", {}).get("schedule", [])
+            if not schedule_data:
+                self.log("No schedule data in sensor attributes")
+                return
+
+            restored = {}
+            for entry in schedule_data:
+                try:
+                    hour_str = entry.get("time")
+                    mode_str = entry.get("mode")
+                    if hour_str and mode_str:
+                        hour = datetime.datetime.fromisoformat(hour_str)
+                        mode = BatteryMode[mode_str]
+                        restored[hour] = mode
+                except (ValueError, KeyError) as e:
+                    self.log(f"Could not parse schedule entry {entry}: {e}", level="DEBUG")
+                    continue
+
+            if restored:
+                self._previous_schedule_from_sensor = restored
+                self.log(f"Restored previous schedule from sensor: {len(restored)} entries")
+            else:
+                self.log("No valid entries found in previous schedule")
+
+        except Exception as e:
+            self.log(f"Could not restore previous schedule: {e}", level="WARNING")
+
+    def _preserve_charge_on_restart(self, current_slot: datetime.datetime):
+        """
+        If restarting mid-hour during what was a charging slot, preserve the CHARGE mode.
+
+        The DP algorithm sees only remaining time in the current slot and may decide HOLD
+        is optimal when only minutes remain. But if this was meant to be a charging hour,
+        we should continue charging to maintain the original intent.
+        """
+        if self._previous_schedule_from_sensor is None:
+            return  # Not a restart with previous schedule
+
+        # Find the previous mode for the current slot (handle timezone variations)
+        previous_mode = None
+        slot_naive = current_slot.replace(tzinfo=None) if current_slot.tzinfo else current_slot
+
+        for prev_hour, prev_mode in self._previous_schedule_from_sensor.items():
+            prev_naive = prev_hour.replace(tzinfo=None) if prev_hour.tzinfo else prev_hour
+            if prev_naive == slot_naive:
+                previous_mode = prev_mode
+                break
+            # Also match by date and hour if exact match fails
+            if (prev_naive.date() == slot_naive.date() and
+                prev_naive.hour == slot_naive.hour and
+                prev_naive.minute == slot_naive.minute):
+                previous_mode = prev_mode
+                break
+
+        if previous_mode != BatteryMode.CHARGE:
+            return  # Previous slot wasn't charging, nothing to preserve
+
+        # Find current slot in new schedule
+        current_entry = None
+        current_key = None
+        for sched_hour, entry in self.schedule.items():
+            sched_naive = sched_hour.replace(tzinfo=None) if sched_hour.tzinfo else sched_hour
+            if sched_naive == slot_naive:
+                current_entry = entry
+                current_key = sched_hour
+                break
+            if (sched_naive.date() == slot_naive.date() and
+                sched_naive.hour == slot_naive.hour and
+                sched_naive.minute == slot_naive.minute):
+                current_entry = entry
+                current_key = sched_hour
+                break
+
+        if current_entry is None:
+            return  # Current slot not in schedule
+
+        if current_entry.mode == BatteryMode.HOLD:
+            # Override to CHARGE to maintain continuity
+            self.log(
+                f"Preserving CHARGE mode for current slot {current_slot.strftime('%H:%M')} "
+                f"(was charging before restart, algorithm chose HOLD due to partial slot)"
+            )
+            self.schedule[current_key] = ScheduleEntry(
+                hour=current_entry.hour,
+                mode=BatteryMode.CHARGE,
+                reason="continuing_charge_from_restart"
+            )
+
+        # Clear the previous schedule after first use (only needed for startup)
+        self._previous_schedule_from_sensor = None
 
     def _save_load_profile(self):
         """Persist load profile to Home Assistant entity"""
@@ -3972,7 +4141,22 @@ class BatteryOptimizer(hass.Hass):
         Tries AppDaemon's timezone first, falls back to system local timezone.
         """
         # Try AppDaemon's timezone first
-        tz = self.datetime().tzinfo
+        now = self.datetime()
+        if not isinstance(now, datetime.datetime):
+            try:
+                if hasattr(now, "done") and now.done():
+                    result = now.result()
+                    if isinstance(result, datetime.datetime):
+                        now = result
+            except Exception:
+                pass
+        if not isinstance(now, datetime.datetime):
+            try:
+                now = datetime.datetime.now().astimezone()
+            except Exception:
+                now = datetime.datetime.now()
+
+        tz = now.tzinfo
         if tz is not None:
             return tz
 
@@ -3982,6 +4166,14 @@ class BatteryOptimizer(hass.Hass):
             return datetime.datetime.now().astimezone().tzinfo
         except Exception:
             return None
+
+    def _normalize_to_local(self, dt: datetime.datetime, local_tz) -> datetime.datetime:
+        """Normalize a datetime to local timezone for comparison."""
+        if dt is None:
+            return dt
+        if local_tz is not None and dt.tzinfo is not None:
+            return dt.astimezone(local_tz)
+        return dt
 
     @property
     def min_soc(self) -> float:

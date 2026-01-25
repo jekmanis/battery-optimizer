@@ -110,11 +110,16 @@ These values read from HA entities at runtime (adjustable without restart):
 
 ## Development
 
-This is a Python AppDaemon project. Use `uv` for running Python scripts and syntax checks:
+This is a Python AppDaemon project. Use `uv` for running Python scripts and syntax checks.
+
+**Shell note**: Even though the platform is Windows, the shell is bash. Don't use Windows-specific syntax like `cd /d`. The working directory is already set, so run commands directly without `cd`.
 
 ```bash
 # Check syntax
 uv run python -m py_compile appdaemon/apps/battery_optimizer.py
+
+# Run tests
+uv run pytest tests/ -v
 
 # Run a script
 uv run python script.py

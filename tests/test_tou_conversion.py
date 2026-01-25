@@ -21,10 +21,14 @@ class MockTouOptimizer:
     def __init__(self):
         self.schedule: Dict[datetime.datetime, ScheduleEntry] = {}
         self._current_date = datetime.date(2024, 1, 15)
+        self._current_datetime = datetime.datetime(2024, 1, 15, 12, 0, 0)
         self.slot_minutes = 60  # Default hourly slots
 
     def date(self):
         return self._current_date
+
+    def datetime(self):
+        return self._current_datetime
 
     def log(self, message: str, level: str = "INFO"):
         pass

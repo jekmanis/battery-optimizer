@@ -682,9 +682,6 @@ class BatteryOptimizer(hass.Hass):
             self.adaptive_recalc_minutes * 60
         )
 
-        # Safety check every 5 minutes
-        self.run_every(self.safety_check, self.datetime(), 5 * 60)
-
         # Schedule execution every slot (hourly if slot_minutes=60)
         self.run_every(self.execute_scheduled_mode, self._next_slot_time(), self.slot_minutes * 60)
 
@@ -695,18 +692,22 @@ class BatteryOptimizer(hass.Hass):
             self.load_observation_minutes * 60
         )
 
-        # SOC tracking for learning and battery cost updates
-        self.run_every(
-            self._update_battery_cost_from_soc_change,
-            self._next_interval_time(self.soc_tracking_minutes),
-            self.soc_tracking_minutes * 60
-        )
-
         # Listen for manual override changes
         if self.args.get("override_entity"):
             self.listen_state(self.on_override_change, self.args["override_entity"])
         if self.args.get("manual_mode_entity"):
             self.listen_state(self.on_manual_mode_change, self.args["manual_mode_entity"])
+
+        # Listen to SOC changes for instant response (replaces polling-based checks)
+        self.listen_state(self._on_soc_change, self.soc_sensor)
+
+        # Run initial SOC check on startup (listener only fires on changes)
+        startup_soc = self._get_current_soc()
+        if startup_soc is not None:
+            self._check_soc_boundaries(startup_soc)
+            # Initialize tracking state if not already set
+            if self._last_soc is None:
+                self._process_soc_change_event(startup_soc)
 
         # Create sensor for exposing schedule
         self._update_schedule_sensor()
@@ -2199,7 +2200,8 @@ class BatteryOptimizer(hass.Hass):
     def adaptive_optimize(self, kwargs=None):
         """
         Adaptive re-evaluation on a configurable interval.
-        Adjusts schedule based on actual SOC and PV production.
+        Handles PV override, schedule change logging, and TOU sync.
+        SOC deviation detection is now event-driven via _on_soc_change.
         """
         if not self._is_enabled() or self._is_override_active():
             return
@@ -2219,7 +2221,7 @@ class BatteryOptimizer(hass.Hass):
             self.set_mode(BatteryMode.HOLD)
             return
 
-        # Check SOC deviation from expected
+        # Get current slot for schedule change logging
         now = self.datetime()
         local_tz = self._get_local_timezone()
         if now.tzinfo is not None and local_tz is not None:
@@ -2227,80 +2229,6 @@ class BatteryOptimizer(hass.Hass):
         elif local_tz is not None:
             now = now.replace(tzinfo=local_tz)
         current_slot = self._align_to_slot(now)
-
-        expected_soc = self.expected_soc_schedule.get(current_slot)
-
-        # If not found, try matching by hour value with different timezone representations
-        if expected_soc is None and self.expected_soc_schedule:
-            for schedule_hour, soc_value in self.expected_soc_schedule.items():
-                compare_schedule = schedule_hour
-                if schedule_hour.tzinfo is not None and local_tz is not None:
-                    compare_schedule = schedule_hour.astimezone(local_tz)
-                compare_current = current_slot
-                if current_slot.tzinfo is not None and local_tz is not None:
-                    compare_current = current_slot.astimezone(local_tz)
-                if (compare_schedule.date() == compare_current.date() and
-                    compare_schedule.hour == compare_current.hour and
-                    compare_schedule.minute == compare_current.minute):
-                    expected_soc = soc_value
-                    break
-
-        if expected_soc is not None:
-            # Adjust expected SOC within the slot based on elapsed time
-            entry = self.schedule.get(current_slot)
-            if entry is None and self.schedule:
-                for schedule_hour, schedule_entry in self.schedule.items():
-                    compare_schedule = schedule_hour
-                    if schedule_hour.tzinfo is not None and local_tz is not None:
-                        compare_schedule = schedule_hour.astimezone(local_tz)
-                    compare_current = current_slot
-                    if current_slot.tzinfo is not None and local_tz is not None:
-                        compare_current = current_slot.astimezone(local_tz)
-                    if (compare_schedule.date() == compare_current.date() and
-                        compare_schedule.hour == compare_current.hour and
-                        compare_schedule.minute == compare_current.minute):
-                        entry = schedule_entry
-                        break
-
-            minutes_into_slot = max(0.0, (now - current_slot).total_seconds() / 60.0)
-            fraction = min(1.0, minutes_into_slot / max(1, self.slot_minutes))
-            expected_soc_now = expected_soc
-            if entry and fraction > 0:
-                if entry.mode == BatteryMode.CHARGE:
-                    energy_added = self.charge_rate * self.efficiency * self.slot_hours * fraction
-                    expected_soc_now = min(
-                        self.max_soc,
-                        expected_soc + (energy_added / self.battery_capacity) * 100
-                    )
-                elif entry.mode == BatteryMode.DISCHARGE:
-                    load_kw = self._predict_load_kw(current_slot)
-                    energy_removed = min(load_kw, self.discharge_rate) * self.slot_hours * fraction
-                    expected_soc_now = max(
-                        self.min_soc,
-                        expected_soc - (energy_removed / self.battery_capacity) * 100
-                    )
-
-            soc_delta = current_soc - expected_soc_now
-
-            if abs(soc_delta) > self.soc_deviation_threshold:
-                # Store trigger context for sensor exposure
-                self._last_recalc_trigger = "soc_deviation"
-                self._last_recalc_time = self.datetime()
-                self._last_soc_deviation = soc_delta
-
-                # Enhanced logging for decision transparency
-                if self.decision_log_level >= 1:
-                    self.log("=" * 70)
-                    self.log("RECALCULATION TRIGGERED: SOC Deviation")
-                    self.log("=" * 70)
-                    self.log(f"  Expected SOC: {expected_soc_now:.1f}%")
-                    self.log(f"  Actual SOC: {current_soc:.1f}%")
-                    self.log(f"  Deviation: {soc_delta:+.1f}% (threshold: {self.soc_deviation_threshold}%)")
-                    self.log("=" * 70)
-                else:
-                    self.log(f"SOC deviation detected: actual={current_soc}%, expected={expected_soc_now:.1f}%, delta={soc_delta}%")
-
-                self._recalculate_remaining_schedule(current_soc)
 
         # Check if schedule changed and log if so
         current_schedule_snapshot = {h: e.mode for h, e in self.schedule.items()} if self.schedule else {}
@@ -2503,26 +2431,144 @@ class BatteryOptimizer(hass.Hass):
                 return
             self.set_mode(BatteryMode.HOLD)
 
-    def safety_check(self, kwargs=None):
+    def _check_soc_boundaries(self, current_soc: float) -> bool:
         """
-        Safety check every 5 minutes.
-        Ensures SOC stays within bounds.
-        """
-        current_soc = self._get_current_soc()
-        if current_soc is None:
-            return
+        Check SOC boundaries and enforce safety limits.
 
+        Safety limits are enforced regardless of manual override status -
+        protecting the battery from over-discharge or over-charge is more
+        important than honoring a manual mode selection.
+
+        Args:
+            current_soc: Current battery state of charge (%)
+
+        Returns:
+            True if mode was changed due to boundary violation, False otherwise
+        """
         # Stop discharge if SOC too low
         if current_soc <= self.min_soc and self.current_mode == BatteryMode.DISCHARGE:
             self.log(f"Safety: Stopping discharge, SOC at minimum ({current_soc}%)")
             self.set_mode(BatteryMode.HOLD)
-            return
+            return True
 
         # Stop charge if SOC full
         if current_soc >= self.max_soc and self.current_mode == BatteryMode.CHARGE:
             self.log(f"Safety: Stopping charge, SOC at maximum ({current_soc}%)")
             self.set_mode(BatteryMode.HOLD)
+            return True
+
+        return False
+
+    def safety_check(self, kwargs=None):
+        """
+        Safety check - ensures SOC stays within bounds.
+        Now called via SOC state listener for instant response.
+        Kept for backward compatibility.
+        """
+        current_soc = self._get_current_soc()
+        if current_soc is None:
             return
+        self._check_soc_boundaries(current_soc)
+
+    def _check_soc_deviation(self, current_soc: float) -> bool:
+        """
+        Check if SOC deviates significantly from expected and trigger recalculation.
+
+        Args:
+            current_soc: Current battery state of charge (%)
+
+        Returns:
+            True if recalculation was triggered, False otherwise
+        """
+        if not self._is_enabled() or self._is_override_active():
+            return False
+
+        now = self.datetime()
+        local_tz = self._get_local_timezone()
+        if now.tzinfo is not None and local_tz is not None:
+            now = now.astimezone(local_tz)
+        elif local_tz is not None:
+            now = now.replace(tzinfo=local_tz)
+        current_slot = self._align_to_slot(now)
+
+        expected_soc = self.expected_soc_schedule.get(current_slot)
+
+        # If not found, try matching by hour value with different timezone representations
+        if expected_soc is None and self.expected_soc_schedule:
+            for schedule_hour, soc_value in self.expected_soc_schedule.items():
+                compare_schedule = schedule_hour
+                if schedule_hour.tzinfo is not None and local_tz is not None:
+                    compare_schedule = schedule_hour.astimezone(local_tz)
+                compare_current = current_slot
+                if current_slot.tzinfo is not None and local_tz is not None:
+                    compare_current = current_slot.astimezone(local_tz)
+                if (compare_schedule.date() == compare_current.date() and
+                    compare_schedule.hour == compare_current.hour and
+                    compare_schedule.minute == compare_current.minute):
+                    expected_soc = soc_value
+                    break
+
+        if expected_soc is None:
+            return False
+
+        # Adjust expected SOC within the slot based on elapsed time
+        entry = self.schedule.get(current_slot)
+        if entry is None and self.schedule:
+            for schedule_hour, schedule_entry in self.schedule.items():
+                compare_schedule = schedule_hour
+                if schedule_hour.tzinfo is not None and local_tz is not None:
+                    compare_schedule = schedule_hour.astimezone(local_tz)
+                compare_current = current_slot
+                if current_slot.tzinfo is not None and local_tz is not None:
+                    compare_current = current_slot.astimezone(local_tz)
+                if (compare_schedule.date() == compare_current.date() and
+                    compare_schedule.hour == compare_current.hour and
+                    compare_schedule.minute == compare_current.minute):
+                    entry = schedule_entry
+                    break
+
+        minutes_into_slot = max(0.0, (now - current_slot).total_seconds() / 60.0)
+        fraction = min(1.0, minutes_into_slot / max(1, self.slot_minutes))
+        expected_soc_now = expected_soc
+        if entry and fraction > 0:
+            if entry.mode == BatteryMode.CHARGE:
+                energy_added = self.charge_rate * self.efficiency * self.slot_hours * fraction
+                expected_soc_now = min(
+                    self.max_soc,
+                    expected_soc + (energy_added / self.battery_capacity) * 100
+                )
+            elif entry.mode == BatteryMode.DISCHARGE:
+                load_kw = self._predict_load_kw(current_slot)
+                energy_removed = min(load_kw, self.discharge_rate) * self.slot_hours * fraction
+                expected_soc_now = max(
+                    self.min_soc,
+                    expected_soc - (energy_removed / self.battery_capacity) * 100
+                )
+
+        soc_delta = current_soc - expected_soc_now
+
+        if abs(soc_delta) > self.soc_deviation_threshold:
+            # Store trigger context for sensor exposure
+            self._last_recalc_trigger = "soc_deviation"
+            self._last_recalc_time = self.datetime()
+            self._last_soc_deviation = soc_delta
+
+            # Enhanced logging for decision transparency
+            if self.decision_log_level >= 1:
+                self.log("=" * 70)
+                self.log("RECALCULATION TRIGGERED: SOC Deviation")
+                self.log("=" * 70)
+                self.log(f"  Expected SOC: {expected_soc_now:.1f}%")
+                self.log(f"  Actual SOC: {current_soc:.1f}%")
+                self.log(f"  Deviation: {soc_delta:+.1f}% (threshold: {self.soc_deviation_threshold}%)")
+                self.log("=" * 70)
+            else:
+                self.log(f"SOC deviation detected: actual={current_soc}%, expected={expected_soc_now:.1f}%, delta={soc_delta}%")
+
+            self._recalculate_remaining_schedule(current_soc)
+            return True
+
+        return False
 
     # =========================================================================
     # VPP Control
@@ -3444,6 +3490,41 @@ class BatteryOptimizer(hass.Hass):
             self.execute_scheduled_mode(None)
 
     # =========================================================================
+    # SOC State Change Handler
+    # =========================================================================
+
+    def _on_soc_change(self, entity, attribute, old, new, kwargs):
+        """
+        Handle SOC state changes - instant response to battery level changes.
+
+        This event-driven handler replaces the previous polling-based approach for:
+        1. Safety checks (boundary enforcement)
+        2. Cost tracking and learning
+        3. SOC deviation detection for schedule recalculation
+
+        Called automatically when the SOC sensor value changes in Home Assistant.
+        """
+        # Skip invalid states
+        if new in ("unknown", "unavailable", None):
+            return
+        if old in ("unknown", "unavailable", None):
+            old = None
+
+        try:
+            current_soc = float(new)
+        except (ValueError, TypeError):
+            return
+
+        # 1. Safety check - immediate boundary enforcement
+        self._check_soc_boundaries(current_soc)
+
+        # 2. Cost tracking & learning (always process to keep state accurate)
+        self._process_soc_change_event(current_soc)
+
+        # 3. Deviation detection for adaptive optimization
+        self._check_soc_deviation(current_soc)
+
+    # =========================================================================
     # Battery Cost Tracking
     # =========================================================================
 
@@ -3778,21 +3859,22 @@ class BatteryOptimizer(hass.Hass):
         except Exception as e:
             self.log(f"Could not update learning sensor: {e}", level="DEBUG")
 
-    def _update_battery_cost_from_soc_change(self, kwargs=None):
+    def _process_soc_change_event(self, current_soc: float):
         """
-        Update battery cost based on actual SOC change since last check.
-        Called periodically to track real charging/discharging.
+        Process SOC change for battery cost tracking and learning.
+        Called by _on_soc_change when SOC state changes.
+
+        Args:
+            current_soc: Current battery state of charge (%)
         """
-        current_soc = self._get_current_soc()
         now = self.datetime()
         current_slot = self._align_to_slot(now)
 
-        if current_soc is None or self._last_soc is None:
+        if self._last_soc is None:
             self._last_soc = current_soc
             self._last_soc_time = now
-            if current_soc is not None:
-                self._last_sig_soc = current_soc
-                self._last_sig_soc_time = now
+            self._last_sig_soc = current_soc
+            self._last_sig_soc_time = now
             self._last_price_slot = current_slot
             return
 
@@ -3811,13 +3893,14 @@ class BatteryOptimizer(hass.Hass):
         if self._last_sig_soc_time:
             # Ensure consistent timezone handling to avoid naive/aware mismatch
             last_time = self._last_sig_soc_time
-            if now.tzinfo is not None and last_time.tzinfo is None:
-                last_time = last_time.replace(tzinfo=now.tzinfo)
-            elif now.tzinfo is None and last_time.tzinfo is not None:
-                now = now.replace(tzinfo=last_time.tzinfo)
-            duration_minutes = (now - last_time).total_seconds() / 60
+            compare_now = now
+            if compare_now.tzinfo is not None and last_time.tzinfo is None:
+                last_time = last_time.replace(tzinfo=compare_now.tzinfo)
+            elif compare_now.tzinfo is None and last_time.tzinfo is not None:
+                compare_now = compare_now.replace(tzinfo=last_time.tzinfo)
+            duration_minutes = (compare_now - last_time).total_seconds() / 60
         else:
-            duration_minutes = float(getattr(self, "soc_tracking_minutes", 1))  # Fallback to configured interval
+            duration_minutes = 1.0  # Fallback
 
         if soc_change > 0:
             # Battery charged - get price for the charging period
@@ -3874,6 +3957,16 @@ class BatteryOptimizer(hass.Hass):
         self._last_sig_soc = current_soc
         self._last_sig_soc_time = now
         self._last_price_slot = current_slot
+
+    def _update_battery_cost_from_soc_change(self, kwargs=None):
+        """
+        Update battery cost based on actual SOC change since last check.
+        Kept for backward compatibility - now delegates to _process_soc_change_event.
+        """
+        current_soc = self._get_current_soc()
+        if current_soc is None:
+            return
+        self._process_soc_change_event(current_soc)
 
     def _get_discharge_threshold(self) -> float:
         """Calculate discharge threshold based on actual battery cost"""

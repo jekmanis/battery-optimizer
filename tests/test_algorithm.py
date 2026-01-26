@@ -467,3 +467,192 @@ class TestScheduleConsistency:
         schedule = optimizer.find_optimal_schedule(long_prices, 4, current_soc=50)
 
         assert len(schedule) == 48
+
+
+class TestDischargeVsHoldDecision:
+    """Test cases specifically for DISCHARGE vs HOLD decisions."""
+
+    def test_discharge_preferred_when_cheaper_overnight_charging(self):
+        """
+        When overnight charging is cheap, DISCHARGE should be preferred over HOLD
+        because the extra charge cost is less than the saved load cost.
+
+        Scenario (from user bug report):
+        - At 23:00, price = 0.1257, discharge is allowed (above threshold)
+        - SOC is ~18%, enough for one hour of discharge
+        - Overnight charging is cheap (negative to ~5 cents)
+        - Battery will charge to 100% overnight regardless
+        - DISCHARGE at 23:00 should be chosen because:
+          * Saves load cost at 23:00: ~0.07 EUR
+          * Extra charge cost overnight: ~0.024 EUR
+          * Net benefit: ~0.05 EUR
+        """
+        # Create optimizer with verbose logging
+        optimizer = MockOptimizer(
+            battery_capacity=14.3,
+            charge_rate=4.5,
+            discharge_rate=4.5,
+            efficiency=0.90,
+            min_soc=10.0,
+            max_soc=100.0,
+            grid_fee=0.045,
+            battery_avg_cost=0.05,
+            base_consumption=500,  # 0.5 kW load
+        )
+        optimizer.decision_log_level = 3  # Enable deep tracing
+
+        # Override log to capture output
+        log_output = []
+        original_log = optimizer.log
+        def capture_log(message, level="INFO"):
+            log_output.append(message)
+            print(message)  # Also print for debugging
+        optimizer.log = capture_log
+
+        # Create prices: starting at 23:00 today, going through tomorrow
+        base_time = datetime.datetime(2024, 1, 15, 23, 0, 0)
+        prices = [
+            # Today 23:00 - moderate price, discharge should be allowed
+            PricePoint(hour=base_time, price=0.1257),
+            # Tomorrow 00:00-06:00 - cheap overnight (some negative)
+            PricePoint(hour=base_time + datetime.timedelta(hours=1), price=-0.02),
+            PricePoint(hour=base_time + datetime.timedelta(hours=2), price=-0.01),
+            PricePoint(hour=base_time + datetime.timedelta(hours=3), price=0.01),
+            PricePoint(hour=base_time + datetime.timedelta(hours=4), price=0.02),
+            PricePoint(hour=base_time + datetime.timedelta(hours=5), price=0.03),
+            PricePoint(hour=base_time + datetime.timedelta(hours=6), price=0.05),
+            # Tomorrow 07:00-12:00 - moderate morning
+            PricePoint(hour=base_time + datetime.timedelta(hours=7), price=0.10),
+            PricePoint(hour=base_time + datetime.timedelta(hours=8), price=0.12),
+            PricePoint(hour=base_time + datetime.timedelta(hours=9), price=0.10),
+            PricePoint(hour=base_time + datetime.timedelta(hours=10), price=0.08),
+            PricePoint(hour=base_time + datetime.timedelta(hours=11), price=0.07),
+            PricePoint(hour=base_time + datetime.timedelta(hours=12), price=0.08),
+            # Tomorrow 13:00-17:00 - expensive peak
+            PricePoint(hour=base_time + datetime.timedelta(hours=13), price=0.15),
+            PricePoint(hour=base_time + datetime.timedelta(hours=14), price=0.20),
+            PricePoint(hour=base_time + datetime.timedelta(hours=15), price=0.25),
+            PricePoint(hour=base_time + datetime.timedelta(hours=16), price=0.30),
+            PricePoint(hour=base_time + datetime.timedelta(hours=17), price=0.25),
+            PricePoint(hour=base_time + datetime.timedelta(hours=18), price=0.18),
+        ]
+
+        optimizer.set_datetime(base_time)
+
+        # Start at 18% SOC - enough for discharge but will need charging
+        schedule = optimizer.find_optimal_schedule(prices, 5, current_soc=18.2)
+
+        # Debug output
+        print("\n=== Schedule ===")
+        for hour, entry in sorted(schedule.items()):
+            print(f"{hour.strftime('%H:%M')}: {entry.mode.name} - {entry.reason}")
+
+        # The first slot (23:00) should be DISCHARGE, not HOLD
+        first_slot = base_time
+        assert first_slot in schedule, "First slot should be in schedule"
+        first_entry = schedule[first_slot]
+
+        # Print the log output for debugging
+        print("\n=== Log Output ===")
+        for line in log_output:
+            print(line)
+
+        # The key assertion: DISCHARGE should be preferred over HOLD at 23:00
+        # because overnight charging is cheap enough to make up for the discharged energy
+        assert first_entry.mode == BatteryMode.DISCHARGE, (
+            f"Expected DISCHARGE at 23:00, got {first_entry.mode.name}. "
+            f"Reason: {first_entry.reason}"
+        )
+
+    def test_discharge_with_high_battery_cost(self):
+        """
+        Test with higher battery_avg_cost to see if threshold calculations cause issues.
+
+        Higher battery cost means higher discharge threshold, which might
+        prevent discharge at 23:00 even though it would be economically beneficial.
+        """
+        # Create optimizer with higher battery cost
+        optimizer = MockOptimizer(
+            battery_capacity=14.3,
+            charge_rate=4.5,
+            discharge_rate=4.5,
+            efficiency=0.90,
+            min_soc=10.0,
+            max_soc=100.0,
+            grid_fee=0.045,
+            battery_avg_cost=0.10,  # Higher battery cost - this raises discharge threshold
+            base_consumption=500,
+        )
+        optimizer.decision_log_level = 3
+
+        log_output = []
+        def capture_log(message, level="INFO"):
+            log_output.append(message)
+            print(message)
+        optimizer.log = capture_log
+
+        # Create prices matching user's scenario:
+        # - 23:00 @ 0.1257 (moderate, above threshold)
+        # - Overnight charging is cheap
+        # - Next day has high peak around 17:00
+        base_time = datetime.datetime(2024, 1, 15, 23, 0, 0)
+        prices = [
+            # Today 23:00
+            PricePoint(hour=base_time, price=0.1257),
+            # Tomorrow 00:00-06:00 - cheap overnight
+            PricePoint(hour=base_time + datetime.timedelta(hours=1), price=-0.02),
+            PricePoint(hour=base_time + datetime.timedelta(hours=2), price=-0.01),
+            PricePoint(hour=base_time + datetime.timedelta(hours=3), price=0.01),
+            PricePoint(hour=base_time + datetime.timedelta(hours=4), price=0.02),
+            PricePoint(hour=base_time + datetime.timedelta(hours=5), price=0.03),
+            PricePoint(hour=base_time + datetime.timedelta(hours=6), price=0.05),
+            PricePoint(hour=base_time + datetime.timedelta(hours=7), price=0.08),
+            # Tomorrow 08:00-16:00 - moderate
+            PricePoint(hour=base_time + datetime.timedelta(hours=8), price=0.10),
+            PricePoint(hour=base_time + datetime.timedelta(hours=9), price=0.12),
+            PricePoint(hour=base_time + datetime.timedelta(hours=10), price=0.10),
+            PricePoint(hour=base_time + datetime.timedelta(hours=11), price=0.08),
+            PricePoint(hour=base_time + datetime.timedelta(hours=12), price=0.07),
+            PricePoint(hour=base_time + datetime.timedelta(hours=13), price=0.08),
+            PricePoint(hour=base_time + datetime.timedelta(hours=14), price=0.10),
+            PricePoint(hour=base_time + datetime.timedelta(hours=15), price=0.15),
+            PricePoint(hour=base_time + datetime.timedelta(hours=16), price=0.20),
+            # Tomorrow 17:00-18:00 - HIGH peak (this is what user's log showed)
+            PricePoint(hour=base_time + datetime.timedelta(hours=17), price=0.30),  # High!
+            PricePoint(hour=base_time + datetime.timedelta(hours=18), price=0.3157),  # User's 17:00 price
+            PricePoint(hour=base_time + datetime.timedelta(hours=19), price=0.25),
+            PricePoint(hour=base_time + datetime.timedelta(hours=20), price=0.18),
+        ]
+
+        optimizer.set_datetime(base_time)
+        schedule = optimizer.find_optimal_schedule(prices, 5, current_soc=18.2)
+
+        # Debug output
+        print("\n=== Schedule (high battery cost) ===")
+        for hour, entry in sorted(schedule.items()):
+            print(f"{hour.strftime('%H:%M')}: {entry.mode.name} - {entry.reason}")
+
+        first_slot = base_time
+        first_entry = schedule.get(first_slot)
+
+        # Calculate expected discharge threshold
+        discharge_threshold = (optimizer.battery_avg_cost / optimizer.efficiency) + optimizer.grid_fee
+        buy_price_23 = 0.1257 + optimizer.grid_fee
+        print(f"\nDischarge threshold: {discharge_threshold:.4f}")
+        print(f"Buy price at 23:00: {buy_price_23:.4f}")
+        print(f"Discharge allowed: {buy_price_23 >= discharge_threshold}")
+
+        # With battery_avg_cost=0.10, threshold = 0.10/0.90 + 0.045 = 0.156
+        # buy_price_23 = 0.1257 + 0.045 = 0.1707
+        # So 0.1707 >= 0.156 -> discharge IS allowed
+        # But let's see what the algorithm chooses
+
+        if first_entry:
+            print(f"\nFirst slot mode: {first_entry.mode.name}")
+            # Even with higher battery cost, DISCHARGE should be chosen if:
+            # 1. Discharge is allowed (buy_price >= threshold)
+            # 2. Overnight charging cost < load cost saved
+            assert first_entry.mode == BatteryMode.DISCHARGE, (
+                f"Expected DISCHARGE at 23:00 even with high battery cost. "
+                f"Got {first_entry.mode.name}. Reason: {first_entry.reason}"
+            )

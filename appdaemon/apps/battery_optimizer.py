@@ -1084,6 +1084,10 @@ class BatteryOptimizer(hass.Hass):
                     fraction > 0.5  # Full slots only
                 )
 
+                # Deep trace: track paths from discharge-allowed slots
+                # Tag states that came from a discharge so we can follow their evolution
+                deep_trace_this_slot = self.decision_log_level >= 3 and t < 5
+
                 for c in range(max_charge_slots + 1):
                     for idx, val in enumerate(dp[c]):
                         if val <= neg_inf / 2:
@@ -1215,6 +1219,25 @@ class BatteryOptimizer(hass.Hass):
                 if trace_this_slot and slot_trace:
                     dp_trace_slots.append((hours_list[t].hour, price, slot_trace))
 
+                # Deep trace: log state evolution for first few slots
+                if deep_trace_this_slot:
+                    self.log(f"[DeepTrace] After slot {t} ({hours_list[t].hour.strftime('%H:%M')} @ {price:.4f}):")
+                    # Show states with valid values, grouped by charge count
+                    for c in range(min(3, max_charge_slots + 1)):
+                        active_states = [
+                            (i, next_dp[c][i], next_prev_action[c][i])
+                            for i in range(n_states)
+                            if next_dp[c][i] > neg_inf / 2
+                        ]
+                        if active_states:
+                            # Show top 3 by value
+                            active_states.sort(key=lambda x: x[1], reverse=True)
+                            top_states = active_states[:3]
+                            self.log(f"  c={c}: " + ", ".join(
+                                f"idx={i} ({self.min_soc + i*step_kwh/self.battery_capacity*100:.1f}%) val={v:.4f} via {a.name if a else 'None'}"
+                                for i, v, a in top_states
+                            ))
+
                 dp = next_dp
                 dp_tie = next_dp_tie
                 prev_idx[t] = next_prev_idx
@@ -1257,6 +1280,12 @@ class BatteryOptimizer(hass.Hass):
             partial_flags: List[bool] = []
             idx = best_idx if best_idx is not None else start_idx_local
             c = best_c if best_c is not None else start_c
+
+            # Deep trace: log backtracking
+            if self.decision_log_level >= 3:
+                self.log(f"[DeepTrace] Backtracking from best final state: c={c}, idx={idx}, val={best_val:.4f}")
+
+            backtrack_trace = []
             for t in range(n_list_slots - 1, -1, -1):
                 action = prev_action[t][c][idx] or BatteryMode.HOLD
                 is_partial = prev_partial[t][c][idx] if action == BatteryMode.DISCHARGE else False
@@ -1264,6 +1293,12 @@ class BatteryOptimizer(hass.Hass):
                 partial_flags.append(is_partial)
                 prev_i = prev_idx[t][c][idx]
                 prev_c_val = prev_c[t][c][idx]
+
+                # Record backtrack info for first few slots
+                if t < 5 and self.decision_log_level >= 3:
+                    soc_at_t = self.min_soc + (idx * step_kwh / self.battery_capacity) * 100
+                    backtrack_trace.append(f"t={t} ({hours_list[t].hour.strftime('%H:%M')}): action={action.name}, c={c}->prev_c={prev_c_val}, idx={idx} ({soc_at_t:.1f}%)->prev_i={prev_i}")
+
                 if prev_i is None or prev_c_val is None:
                     idx = idx
                     c = c
@@ -1272,6 +1307,12 @@ class BatteryOptimizer(hass.Hass):
                     c = prev_c_val
             actions.reverse()
             partial_flags.reverse()
+
+            # Log backtrack trace in chronological order
+            if backtrack_trace and self.decision_log_level >= 3:
+                self.log("[DeepTrace] Backtrack path (first 5 slots):")
+                for line in reversed(backtrack_trace):
+                    self.log(f"  {line}")
 
             # Log DP trace for diagnostic slots
             if dp_trace_slots and self.decision_log_level >= 3:
@@ -1434,6 +1475,12 @@ class BatteryOptimizer(hass.Hass):
                 best_feasible_partial_flags_remaining: List[bool] = []
                 best_feasible_value = neg_inf
 
+                # Log greedy lookahead candidates
+                if self.decision_log_level >= 3:
+                    self.log(f"[GreedyLookahead] Partial slot {price_point.hour.strftime('%H:%M')} @ {price:.4f}, discharge_allowed={discharge_allowed}")
+                    self.log(f"  Candidates: {[(c[0].name, c[2]) for c in candidates]}")
+
+                greedy_results = []
                 for action, new_energy, immediate_val, start_c, start_idx_override, is_partial in candidates:
                     actions_remaining, partial_flags_remaining, future_val, meets_min = _run_dp(
                         hours_remaining,
@@ -1448,6 +1495,7 @@ class BatteryOptimizer(hass.Hass):
                         start_idx_override=start_idx_override,
                     )
                     total_val = immediate_val + future_val
+                    greedy_results.append((action.name, immediate_val, future_val, total_val, meets_min))
                     if total_val > best_value:
                         best_value = total_val
                         best_action = action
@@ -1460,6 +1508,33 @@ class BatteryOptimizer(hass.Hass):
                         best_feasible_is_partial = is_partial
                         best_feasible_actions_remaining = actions_remaining
                         best_feasible_partial_flags_remaining = partial_flags_remaining
+
+                # Log greedy lookahead results
+                if self.decision_log_level >= 3:
+                    for name, imm, fut, tot, meets in greedy_results:
+                        self.log(f"  {name}: immediate={imm:.4f}, future={fut:.4f}, total={tot:.4f}, meets_min={meets}")
+                    self.log(f"  -> Best feasible: {best_feasible_action.name if best_feasible_action else 'None'} (val={best_feasible_value:.4f})")
+
+                    # Explain HOLD vs DISCHARGE decision if both were candidates
+                    hold_result = next((r for r in greedy_results if r[0] == "HOLD"), None)
+                    discharge_result = next((r for r in greedy_results if r[0] == "DISCHARGE"), None)
+                    if hold_result and discharge_result:
+                        hold_imm, hold_fut, hold_tot = hold_result[1], hold_result[2], hold_result[3]
+                        disc_imm, disc_fut, disc_tot = discharge_result[1], discharge_result[2], discharge_result[3]
+                        saved_by_discharge = disc_imm - hold_imm  # Should be positive (HOLD pays, DISCHARGE doesn't)
+                        extra_charge_cost = disc_fut - hold_fut  # Should be negative (DISCHARGE path costs more to recharge)
+                        net_benefit = disc_tot - hold_tot  # Positive = DISCHARGE better, Negative = HOLD better
+
+                        if net_benefit > 0.001:
+                            self.log(f"  [DECISION] DISCHARGE wins: saves {saved_by_discharge:.4f} now, extra charge cost {-extra_charge_cost:.4f}, net benefit {net_benefit:.4f}")
+                        elif net_benefit < -0.001:
+                            self.log(f"  [DECISION] HOLD wins: would save {saved_by_discharge:.4f} by discharging, but recharging costs {-extra_charge_cost:.4f} extra (>{saved_by_discharge:.4f})")
+                            # Calculate effective round-trip cost
+                            if discharge_kwh > 0.01:
+                                effective_recharge_cost_per_kwh = -extra_charge_cost / (discharge_kwh / self.efficiency)
+                                self.log(f"             Overnight recharge cost: ~{effective_recharge_cost_per_kwh:.4f}/kWh vs discharge value {buy_price:.4f}/kWh")
+                        else:
+                            self.log(f"  [DECISION] Tie (within 0.001): HOLD preferred by default")
 
                 if best_feasible_action is not None:
                     actions = [best_feasible_action] + best_feasible_actions_remaining
@@ -1667,125 +1742,6 @@ class BatteryOptimizer(hass.Hass):
                     threshold = self._get_discharge_threshold_for_cost(cost)
                     self.log(f"  After {slot.strftime('%Y-%m-%d %H:%M')}: avg_cost={cost:.4f}, threshold={threshold:.4f}")
                     prev_cost = cost
-
-        # Diagnostic: Analyze suspicious HOLD slots (where discharge was allowed by price but HOLD chosen)
-        if self.decision_log_level >= 2:
-            discharge_threshold = self._get_discharge_threshold()
-            suspicious_holds = []
-
-            # Simulate SOC trajectory through the schedule
-            simulated_soc = current_soc
-            soc_at_slot = {}
-
-            for hour in sorted(schedule.keys()):
-                soc_at_slot[hour] = simulated_soc
-                entry = schedule[hour]
-                idx = next((i for i, p in enumerate(prices_sorted) if p.hour == hour), 0)
-                slot_load = load_kw[idx] if idx < len(load_kw) else 0.5
-
-                if entry.mode == BatteryMode.CHARGE:
-                    energy_added = self.charge_rate * self.efficiency * self.slot_hours
-                    soc_increase = (energy_added / self.battery_capacity) * 100
-                    simulated_soc = min(self.max_soc, simulated_soc + soc_increase)
-                elif entry.mode == BatteryMode.DISCHARGE:
-                    energy_removed = min(slot_load, self.discharge_rate) * self.slot_hours
-                    soc_decrease = (energy_removed / self.battery_capacity) * 100
-                    simulated_soc = max(self.min_soc, simulated_soc - soc_decrease)
-
-            # Find suspicious HOLD slots
-            for hour, entry in schedule.items():
-                if entry.mode != BatteryMode.HOLD:
-                    continue
-
-                price_point = next((p for p in prices_sorted if p.hour == hour), None)
-                if price_point is None:
-                    continue
-
-                price = price_point.price
-                buy_price = price + self.grid_fee
-
-                # Get the threshold for this slot (may be dynamic)
-                slot_threshold = self._get_discharge_threshold_for_cost(
-                    self._last_projected_costs.get(hour, self.battery_avg_cost)
-                ) if self._last_projected_costs else discharge_threshold
-
-                # Check if discharge would have been allowed by price
-                if buy_price >= slot_threshold - 1e-6:
-                    idx = next((i for i, p in enumerate(prices_sorted) if p.hour == hour), 0)
-                    slot_load = load_kw[idx] if idx < len(load_kw) else 0.5
-                    soc_before = soc_at_slot.get(hour, current_soc)
-                    discharge_kwh = min(slot_load, self.discharge_rate) * self.slot_hours
-                    soc_after_discharge = soc_before - (discharge_kwh / self.battery_capacity) * 100
-
-                    # Calculate potential value lost by holding instead of discharging
-                    potential_value = buy_price * discharge_kwh
-
-                    suspicious_holds.append({
-                        "hour": hour,
-                        "price": price,
-                        "buy_price": buy_price,
-                        "threshold": slot_threshold,
-                        "load_kw": slot_load,
-                        "soc_before": soc_before,
-                        "soc_after_discharge": soc_after_discharge,
-                        "would_hit_min": soc_after_discharge < self.min_soc,
-                        "potential_value": potential_value,
-                    })
-
-            if suspicious_holds:
-                # Find future DISCHARGE slots to check if HOLD is preserving energy for them
-                future_discharge_slots = [
-                    (h, e, next((p.price for p in prices_sorted if p.hour == h), 0))
-                    for h, e in schedule.items()
-                    if e.mode == BatteryMode.DISCHARGE
-                ]
-
-                self.log(f"\n[!] DIAGNOSTIC: Suspicious HOLD slots (discharge allowed by price but HOLD chosen):")
-                for sh in sorted(suspicious_holds, key=lambda x: x["hour"]):
-                    # Determine the reason for HOLD
-                    if sh["would_hit_min"]:
-                        status = "[X] SOC constraint"
-                    else:
-                        # Check if there are later DISCHARGE slots with higher prices
-                        later_higher = [
-                            (h, p) for h, e, p in future_discharge_slots
-                            if h > sh["hour"] and p > sh["price"]
-                        ]
-                        if later_higher:
-                            best_later = max(later_higher, key=lambda x: x[1])
-                            # This HOLD preserves energy for more valuable discharge
-                            status = f"[OK] preserving for {best_later[0].strftime('%H:%M')} @ {best_later[1]:.4f}"
-                        else:
-                            status = "[?] DP chose HOLD (unclear reason)"
-
-                    self.log(
-                        f"  {sh['hour'].strftime('%Y-%m-%d %H:%M')}: price={sh['price']:.4f} "
-                        f"(threshold={sh['threshold']:.4f}) | "
-                        f"SOC: {sh['soc_before']:.1f}%->{sh['soc_after_discharge']:.1f}% | "
-                        f"load={sh['load_kw']:.2f}kW | "
-                        f"lost_value={sh['potential_value']:.4f}EUR | {status}"
-                    )
-
-                # Also log the slots just before and after suspicious holds for context
-                self.log(f"\n  Context - adjacent slots:")
-                for sh in sorted(suspicious_holds, key=lambda x: x["hour"]):
-                    hour = sh["hour"]
-                    prev_hour = hour - datetime.timedelta(hours=1)
-                    next_hour = hour + datetime.timedelta(hours=1)
-
-                    for ctx_hour, label in [(prev_hour, "before"), (next_hour, "after")]:
-                        if ctx_hour in schedule:
-                            ctx_entry = schedule[ctx_hour]
-                            ctx_price_point = next((p for p in prices_sorted if p.hour == ctx_hour), None)
-                            ctx_price = ctx_price_point.price if ctx_price_point else 0
-                            ctx_idx = next((i for i, p in enumerate(prices_sorted) if p.hour == ctx_hour), 0)
-                            ctx_load = load_kw[ctx_idx] if ctx_idx < len(load_kw) else 0.5
-                            ctx_soc = soc_at_slot.get(ctx_hour, 0)
-                            self.log(
-                                f"    {label} {ctx_hour.strftime('%H:%M')}: {ctx_entry.mode.name} @ "
-                                f"{ctx_price:.4f} EUR/kWh, load={ctx_load:.2f}kW, SOC={ctx_soc:.1f}%"
-                            )
-
         if self.decision_log_level >= 1:
             self.log("=" * 70)
 

@@ -66,6 +66,8 @@ class LearningStats:
     last_observation: Optional[str] = None
     # Temperature-aware charge rates: {"25-50": {"5-10": [3.1, 3.2], "10-15": [4.2, 4.5]}}
     charge_rates_by_soc_temp: Dict[str, Dict[str, List[float]]] = field(default_factory=dict)
+    # Temperature warming rates during charging: {"10-15": [0.3, 0.4, 0.35]} (°C/minute by starting temp range)
+    temp_warming_rates: Dict[str, List[float]] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)

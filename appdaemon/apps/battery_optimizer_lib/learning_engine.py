@@ -108,7 +108,9 @@ class BatteryLearningEngine:
         duration_minutes: float,
         energy_from_grid_kwh: Optional[float] = None,
         charge_price: float = 0.0,
-        battery_temp: Optional[float] = None
+        battery_temp: Optional[float] = None,
+        battery_temp_start: Optional[float] = None,
+        battery_temp_end: Optional[float] = None
     ):
         """
         Record a charging observation and update learned parameters.
@@ -119,7 +121,9 @@ class BatteryLearningEngine:
             duration_minutes: How long charging took
             energy_from_grid_kwh: Energy drawn from grid (if available from meter)
             charge_price: Price paid per kWh
-            battery_temp: Battery temperature in Celsius (if available)
+            battery_temp: Battery temperature in Celsius (if available) - used for charge rate bucketing
+            battery_temp_start: Battery temperature at start of charging (for warming rate tracking)
+            battery_temp_end: Battery temperature at end of charging (for warming rate tracking)
         """
         if duration_minutes <= 0 or soc_end <= soc_start:
             return
@@ -164,6 +168,25 @@ class BatteryLearningEngine:
             if len(self.stats.charge_rates_by_soc_temp[soc_range][temp_range]) > 50:
                 self.stats.charge_rates_by_soc_temp[soc_range][temp_range] = \
                     self.stats.charge_rates_by_soc_temp[soc_range][temp_range][-50:]
+
+        # Track temperature warming rate during charging
+        # This helps predict when the inverter will switch to higher charge power
+        if (battery_temp_start is not None and battery_temp_end is not None and
+                duration_minutes >= 1.0):
+            temp_change = battery_temp_end - battery_temp_start
+            # Only record positive warming (battery heating up during charge)
+            if temp_change > 0:
+                warming_rate = temp_change / duration_minutes  # °C/minute
+                start_temp_range = self._get_temp_range(battery_temp_start)
+
+                if start_temp_range not in self.stats.temp_warming_rates:
+                    self.stats.temp_warming_rates[start_temp_range] = []
+                self.stats.temp_warming_rates[start_temp_range].append(warming_rate)
+
+                # Keep last 50 observations per starting temp range
+                if len(self.stats.temp_warming_rates[start_temp_range]) > 50:
+                    self.stats.temp_warming_rates[start_temp_range] = \
+                        self.stats.temp_warming_rates[start_temp_range][-50:]
 
         # Update totals
         self.stats.total_energy_charged_kwh += energy_added
@@ -290,6 +313,139 @@ class BatteryLearningEngine:
         # Nominal fallback - no confidence
         return 0.0
 
+    def get_warming_rate(self, starting_temp: float) -> Optional[float]:
+        """
+        Get predicted battery warming rate during charging for a given starting temperature.
+
+        Args:
+            starting_temp: Battery temperature at start of charging (°C)
+
+        Returns:
+            Warming rate in °C/minute, or None if insufficient data
+        """
+        temp_range = self._get_temp_range(starting_temp)
+
+        if temp_range in self.stats.temp_warming_rates:
+            rates = self.stats.temp_warming_rates[temp_range]
+            if len(rates) >= 3:
+                return statistics.median(rates[-10:])
+
+        # Try adjacent temperature ranges if exact match not found
+        for try_temp in [starting_temp - 5, starting_temp + 5]:
+            try_range = self._get_temp_range(try_temp)
+            if try_range in self.stats.temp_warming_rates:
+                rates = self.stats.temp_warming_rates[try_range]
+                if len(rates) >= 3:
+                    return statistics.median(rates[-10:])
+
+        return None
+
+    def predict_temp_after_duration(
+        self,
+        start_temp: float,
+        duration_minutes: float
+    ) -> float:
+        """
+        Predict battery temperature after charging for a given duration.
+
+        Args:
+            start_temp: Starting battery temperature (°C)
+            duration_minutes: Charging duration in minutes
+
+        Returns:
+            Predicted temperature after charging
+        """
+        warming_rate = self.get_warming_rate(start_temp)
+        if warming_rate is None:
+            # Default warming rate if no data (conservative estimate)
+            warming_rate = 0.1  # °C/minute
+
+        return start_temp + (warming_rate * duration_minutes)
+
+    def get_time_to_reach_temp(
+        self,
+        start_temp: float,
+        target_temp: float
+    ) -> Optional[float]:
+        """
+        Predict how long it will take to reach a target temperature during charging.
+
+        Args:
+            start_temp: Starting battery temperature (°C)
+            target_temp: Target temperature to reach (°C)
+
+        Returns:
+            Time in minutes to reach target temp, or None if won't warm up
+        """
+        if target_temp <= start_temp:
+            return 0.0
+
+        warming_rate = self.get_warming_rate(start_temp)
+        if warming_rate is None or warming_rate <= 0:
+            return None
+
+        return (target_temp - start_temp) / warming_rate
+
+    def predict_charge_energy_with_warming(
+        self,
+        current_soc: float,
+        start_temp: float,
+        duration_minutes: float,
+        temp_threshold: float = 16.0
+    ) -> Tuple[float, float]:
+        """
+        Predict charge energy accounting for temperature warming during charging.
+
+        The inverter may charge faster once the battery warms above a threshold.
+        This method calculates total energy by splitting the duration into
+        cold and warm periods.
+
+        Args:
+            current_soc: Current state of charge (%)
+            start_temp: Starting battery temperature (°C)
+            duration_minutes: Total charging duration (minutes)
+            temp_threshold: Temperature above which faster charging occurs (°C)
+
+        Returns:
+            Tuple of (total_energy_kwh, end_temperature)
+        """
+        total_energy = 0.0
+        remaining_minutes = duration_minutes
+        current_temp = start_temp
+
+        # If already warm, use warm charge rate for entire duration
+        if start_temp >= temp_threshold:
+            charge_rate = self.get_charge_rate_for_soc(current_soc, start_temp)
+            total_energy = charge_rate * (duration_minutes / 60)
+            # Predict end temperature
+            end_temp = self.predict_temp_after_duration(start_temp, duration_minutes)
+            return total_energy, end_temp
+
+        # Calculate time to reach threshold temperature
+        time_to_warm = self.get_time_to_reach_temp(start_temp, temp_threshold)
+
+        if time_to_warm is not None and time_to_warm < duration_minutes:
+            # Phase 1: Cold charging until reaching threshold
+            cold_rate = self.get_charge_rate_for_soc(current_soc, start_temp)
+            cold_energy = cold_rate * (time_to_warm / 60)
+            total_energy += cold_energy
+
+            # Phase 2: Warm charging for remaining time
+            warm_minutes = remaining_minutes - time_to_warm
+            warm_rate = self.get_charge_rate_for_soc(current_soc, temp_threshold)
+            warm_energy = warm_rate * (warm_minutes / 60)
+            total_energy += warm_energy
+
+            # End temperature continues warming
+            end_temp = self.predict_temp_after_duration(temp_threshold, warm_minutes)
+        else:
+            # Won't reach threshold during this duration - use cold rate throughout
+            cold_rate = self.get_charge_rate_for_soc(current_soc, start_temp)
+            total_energy = cold_rate * (duration_minutes / 60)
+            end_temp = self.predict_temp_after_duration(start_temp, duration_minutes)
+
+        return total_energy, end_temp
+
     def predict_charge_time(
         self,
         current_soc: float,
@@ -377,6 +533,16 @@ class BatteryLearningEngine:
         # Calculate total observations across all buckets
         total_observations = sum(len(v) for v in self.stats.charge_rates_by_soc.values())
 
+        # Build warming rates summary
+        warming_rates_summary = {}
+        for temp_range, rates in self.stats.temp_warming_rates.items():
+            if rates:
+                count = len(rates)
+                warming_rates_summary[temp_range] = {
+                    "median_c_per_min": round(statistics.median(rates[-10:]), 3),
+                    "observations": count
+                }
+
         return {
             "learned_efficiency": round(self.learned_efficiency, 3),
             "total_energy_charged_kwh": round(self.stats.total_energy_charged_kwh, 1),
@@ -386,6 +552,7 @@ class BatteryLearningEngine:
             "total_observations": total_observations,
             "soc_charge_rates": soc_charge_rates,
             "temp_aware_rates": temp_aware_rates,
+            "temp_warming_rates": warming_rates_summary,
         }
 
     def save_to_json(self) -> str:

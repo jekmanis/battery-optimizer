@@ -1022,10 +1022,10 @@ class BatteryOptimizer(hass.Hass):
             start_c: int,
             discharge_thresholds_list: Optional[List[float]] = None,
             start_idx_override: Optional[int] = None,
-        ) -> Tuple[List[BatteryMode], float, bool]:
+        ) -> Tuple[List[BatteryMode], List[bool], float, bool]:
             n_list_slots = len(hours_list)
             if n_list_slots == 0:
-                return [], 0.0, True
+                return [], [], 0.0, True
 
             dp = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
             dp_tie = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
@@ -1041,6 +1041,7 @@ class BatteryOptimizer(hass.Hass):
             prev_idx = [[[None] * n_states for _ in range(max_charge_slots + 1)] for _ in range(n_list_slots)]
             prev_c = [[[None] * n_states for _ in range(max_charge_slots + 1)] for _ in range(n_list_slots)]
             prev_action = [[[None] * n_states for _ in range(max_charge_slots + 1)] for _ in range(n_list_slots)]
+            prev_partial = [[[False] * n_states for _ in range(max_charge_slots + 1)] for _ in range(n_list_slots)]
 
             def _should_update(curr_val: float, curr_tie: float, cand_val: float, cand_tie: float) -> bool:
                 if cand_val > curr_val + tie_val_eps:
@@ -1074,6 +1075,7 @@ class BatteryOptimizer(hass.Hass):
                 next_prev_idx = [[None] * n_states for _ in range(max_charge_slots + 1)]
                 next_prev_c = [[None] * n_states for _ in range(max_charge_slots + 1)]
                 next_prev_action = [[None] * n_states for _ in range(max_charge_slots + 1)]
+                next_prev_partial = [[False] * n_states for _ in range(max_charge_slots + 1)]
 
                 # Trace info for this slot (for diagnostic logging)
                 slot_trace = []
@@ -1146,10 +1148,30 @@ class BatteryOptimizer(hass.Hass):
                         if discharge_allowed and discharge_kwh > 0:
                             discharge_attempted = True
                             new_energy = energy_levels[idx] - discharge_kwh
+                            is_partial = False
+                            actual_discharge_kwh = discharge_kwh
+
                             if new_energy >= min_energy - 1e-6:
+                                # Full discharge - battery can cover entire load
                                 next_idx = int(round((new_energy - min_energy) / step_kwh))
                                 next_idx = min(max(next_idx, 0), n_states - 1)
                                 next_val = val + (discharge_value * discharge_kwh)
+                            elif energy_levels[idx] > min_energy + discharge_kwh * 0.5:
+                                # Partial discharge - discharge until min_soc, grid covers remainder
+                                # Only allow if we have at least half the load's worth of energy
+                                is_partial = True
+                                actual_discharge_kwh = energy_levels[idx] - min_energy
+                                grid_import = discharge_kwh - actual_discharge_kwh
+                                # Value = savings from battery discharge - cost of remaining grid import
+                                next_val = val + (discharge_value * actual_discharge_kwh) - (buy_price * grid_import)
+                                next_idx = 0  # End up at min_energy
+                                new_energy = min_energy
+                            else:
+                                discharge_blocked_reason = f"would_hit_min_soc ({new_energy:.2f} < {min_energy:.2f})"
+                                next_val = None
+                                next_idx = None
+
+                            if next_val is not None:
                                 discharge_next_idx = next_idx
                                 discharge_next_val = next_val
                                 if _should_update(next_dp[c][next_idx], next_dp_tie[c][next_idx], next_val, curr_tie):
@@ -1158,14 +1180,13 @@ class BatteryOptimizer(hass.Hass):
                                     next_prev_idx[c][next_idx] = idx
                                     next_prev_c[c][next_idx] = c
                                     next_prev_action[c][next_idx] = BatteryMode.DISCHARGE
+                                    next_prev_partial[c][next_idx] = is_partial
                                     discharge_updated = True
                                 else:
                                     # Discharge transition was blocked - another path was better
                                     discharge_blocked_reason = (
                                         f"existing_val={next_dp[c][next_idx]:.4f} >= discharge_val={next_val:.4f}"
                                     )
-                            else:
-                                discharge_blocked_reason = f"would_hit_min_soc ({new_energy:.2f} < {min_energy:.2f})"
 
                         # Collect trace for this state if interesting
                         # Log all charge counts for high-SOC states (to debug post-charge HOLD issues)
@@ -1198,6 +1219,7 @@ class BatteryOptimizer(hass.Hass):
                 prev_idx[t] = next_prev_idx
                 prev_c[t] = next_prev_c
                 prev_action[t] = next_prev_action
+                prev_partial[t] = next_prev_partial
 
             best_val = neg_inf
             best_tie = neg_inf
@@ -1231,11 +1253,14 @@ class BatteryOptimizer(hass.Hass):
                 )
 
             actions: List[BatteryMode] = []
+            partial_flags: List[bool] = []
             idx = best_idx if best_idx is not None else start_idx_local
             c = best_c if best_c is not None else start_c
             for t in range(n_list_slots - 1, -1, -1):
                 action = prev_action[t][c][idx] or BatteryMode.HOLD
+                is_partial = prev_partial[t][c][idx] if action == BatteryMode.DISCHARGE else False
                 actions.append(action)
+                partial_flags.append(is_partial)
                 prev_i = prev_idx[t][c][idx]
                 prev_c_val = prev_c[t][c][idx]
                 if prev_i is None or prev_c_val is None:
@@ -1245,6 +1270,7 @@ class BatteryOptimizer(hass.Hass):
                     idx = prev_i
                     c = prev_c_val
             actions.reverse()
+            partial_flags.reverse()
 
             # Log DP trace for diagnostic slots
             if dp_trace_slots and self.decision_log_level >= 3:
@@ -1279,7 +1305,7 @@ class BatteryOptimizer(hass.Hass):
                             )
                 self.log("=" * 70)
 
-            return actions, best_val, meets_min
+            return actions, partial_flags, best_val, meets_min
 
         def _build_schedule(discharge_thresholds: Optional[List[float]] = None) -> Dict[datetime.datetime, ScheduleEntry]:
             schedule_local: Dict[datetime.datetime, ScheduleEntry] = {}
@@ -1321,11 +1347,12 @@ class BatteryOptimizer(hass.Hass):
                     else None
                 )
 
+                # Candidates: (action, new_energy, immediate_val, start_c, start_idx_override, is_partial)
                 candidates = []
 
                 # HOLD
                 candidates.append(
-                    (BatteryMode.HOLD, start_energy, 0.0, 0, None)
+                    (BatteryMode.HOLD, start_energy, 0.0, 0, None, False)
                 )
 
                 # CHARGE
@@ -1355,6 +1382,7 @@ class BatteryOptimizer(hass.Hass):
                                 -buy_price * actual_charge_cost,
                                 partial_charge_increment,
                                 start_idx_override,
+                                False,
                             )
                         )
 
@@ -1362,6 +1390,7 @@ class BatteryOptimizer(hass.Hass):
                 if discharge_allowed and discharge_kwh > 0:
                     new_energy = start_energy - discharge_kwh
                     if new_energy >= min_energy - 1e-6:
+                        # Full discharge
                         idx_float = (new_energy - min_energy) / step_kwh
                         start_idx_override = int(math.ceil(idx_float - 1e-9))
                         candidates.append(
@@ -1371,18 +1400,38 @@ class BatteryOptimizer(hass.Hass):
                                 buy_price * discharge_kwh,
                                 0,
                                 start_idx_override,
+                                False,
+                            )
+                        )
+                    elif start_energy > min_energy + discharge_kwh * 0.5:
+                        # Partial discharge - discharge until min_soc
+                        actual_discharge_kwh = start_energy - min_energy
+                        grid_import = discharge_kwh - actual_discharge_kwh
+                        partial_value = buy_price * actual_discharge_kwh - buy_price * grid_import
+                        candidates.append(
+                            (
+                                BatteryMode.DISCHARGE,
+                                min_energy,
+                                partial_value,
+                                0,
+                                0,  # End at min_energy = index 0
+                                True,
                             )
                         )
 
                 best_action = BatteryMode.HOLD
+                best_is_partial = False
                 best_actions_remaining: List[BatteryMode] = []
+                best_partial_flags_remaining: List[bool] = []
                 best_value = neg_inf
                 best_feasible_action: Optional[BatteryMode] = None
+                best_feasible_is_partial = False
                 best_feasible_actions_remaining: List[BatteryMode] = []
+                best_feasible_partial_flags_remaining: List[bool] = []
                 best_feasible_value = neg_inf
 
-                for action, new_energy, immediate_val, start_c, start_idx_override in candidates:
-                    actions_remaining, future_val, meets_min = _run_dp(
+                for action, new_energy, immediate_val, start_c, start_idx_override, is_partial in candidates:
+                    actions_remaining, partial_flags_remaining, future_val, meets_min = _run_dp(
                         hours_remaining,
                         load_remaining,
                         charge_rates_remaining,
@@ -1398,18 +1447,24 @@ class BatteryOptimizer(hass.Hass):
                     if total_val > best_value:
                         best_value = total_val
                         best_action = action
+                        best_is_partial = is_partial
                         best_actions_remaining = actions_remaining
+                        best_partial_flags_remaining = partial_flags_remaining
                     if meets_min and total_val > best_feasible_value:
                         best_feasible_value = total_val
                         best_feasible_action = action
+                        best_feasible_is_partial = is_partial
                         best_feasible_actions_remaining = actions_remaining
+                        best_feasible_partial_flags_remaining = partial_flags_remaining
 
                 if best_feasible_action is not None:
                     actions = [best_feasible_action] + best_feasible_actions_remaining
+                    partial_flags = [best_feasible_is_partial] + best_feasible_partial_flags_remaining
                 else:
                     actions = [best_action] + best_actions_remaining
+                    partial_flags = [best_is_partial] + best_partial_flags_remaining
             else:
-                actions, _, _ = _run_dp(
+                actions, partial_flags, _, _ = _run_dp(
                     hours_sorted_by_time,
                     load_kw,
                     charge_rates_per_slot,
@@ -1421,10 +1476,12 @@ class BatteryOptimizer(hass.Hass):
                     discharge_thresholds_list=discharge_thresholds,
                 )
 
-            for price_point, action, lk in zip(hours_sorted_by_time, actions, load_kw):
+            for price_point, action, lk, is_partial in zip(hours_sorted_by_time, actions, load_kw, partial_flags):
                 hour = price_point.hour
                 price = price_point.price
                 reason = f"{price:.4f} EUR/kWh load~{lk:.2f}kW"
+                if is_partial:
+                    reason += " (until depleted)"
                 schedule_local[hour] = ScheduleEntry(hour=hour, mode=action, reason=reason)
             return schedule_local
 
@@ -2164,9 +2221,9 @@ class BatteryOptimizer(hass.Hass):
         """
         # Stop discharge if SOC too low
         if current_soc <= self.min_soc and self.current_mode == BatteryMode.DISCHARGE:
-            self.log(f"Safety: Stopping discharge, SOC at minimum ({current_soc}%)")
+            self.log(f"Safety: HOLD (battery depleted at {current_soc}%)")
             if self.tou_sync_enabled and self.device_id:
-                self._insert_hold_and_resync("safety_min_soc")
+                self._insert_hold_and_resync("battery_depleted")
             else:
                 self.set_mode(BatteryMode.HOLD)
             return True

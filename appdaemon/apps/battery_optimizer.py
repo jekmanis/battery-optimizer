@@ -1133,7 +1133,8 @@ class BatteryOptimizer(hass.Hass):
                             if actual_charge_energy > 0:
                                 next_idx = int(round((new_energy - min_energy) / step_kwh))
                                 next_idx = min(max(next_idx, 0), n_states - 1)
-                                next_val = val - (buy_price * actual_charge_cost)
+                                # Charge cost + load cost (must import both from grid)
+                                next_val = val - (buy_price * actual_charge_cost) - (buy_price * discharge_kwh)
                                 charge_tie_bias = (-price * tie_price_weight) + (t * tie_time_weight)
                                 next_tie = curr_tie + charge_tie_bias
                                 c_next = c + charge_count_increment
@@ -1350,9 +1351,10 @@ class BatteryOptimizer(hass.Hass):
                 # Candidates: (action, new_energy, immediate_val, start_c, start_idx_override, is_partial)
                 candidates = []
 
-                # HOLD
+                # HOLD - must pay grid price for load (same as main DP)
+                hold_cost = buy_price * discharge_kwh
                 candidates.append(
-                    (BatteryMode.HOLD, start_energy, 0.0, 0, None, False)
+                    (BatteryMode.HOLD, start_energy, -hold_cost, 0, None, False)
                 )
 
                 # CHARGE
@@ -1375,11 +1377,13 @@ class BatteryOptimizer(hass.Hass):
                     if actual_charge_energy > 0:
                         idx_float = (new_energy - min_energy) / step_kwh
                         start_idx_override = int(math.floor(idx_float + 1e-9))
+                        # Charge cost + load cost (must import both from grid)
+                        charge_immediate_cost = -buy_price * actual_charge_cost - buy_price * discharge_kwh
                         candidates.append(
                             (
                                 BatteryMode.CHARGE,
                                 new_energy,
-                                -buy_price * actual_charge_cost,
+                                charge_immediate_cost,
                                 partial_charge_increment,
                                 start_idx_override,
                                 False,

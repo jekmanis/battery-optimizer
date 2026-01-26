@@ -141,8 +141,8 @@ flowchart TB
     end
 
     subgraph Transitions["Possible Transitions"]
-        HOLD["HOLD: (c, e) -> (c, e)<br/>value += 0"]
-        CHARGE["CHARGE: (c, e) -> (c+inc, e + charge_kwh)<br/>value -= buy_price * grid_kwh"]
+        HOLD["HOLD: (c, e) -> (c, e)<br/>value -= buy_price * discharge_kwh"]
+        CHARGE["CHARGE: (c, e) -> (c+inc, e + charge_kwh)<br/>value -= buy_price * (charge_cost_kwh + discharge_kwh)"]
         DISCHARGE["DISCHARGE: (c, e) -> (c, e - discharge_kwh)<br/>value += discharge_value * discharge_kwh"]
     end
 
@@ -172,10 +172,11 @@ For each time slot `t`, the algorithm evaluates three possible actions:
 
 ##### 1. HOLD
 ```
-next_dp[c][e] = max(next_dp[c][e], dp[c][e])
+hold_cost = buy_price * discharge_kwh
+next_dp[c][e] = max(next_dp[c][e], dp[c][e] - hold_cost)
 ```
 - No energy change
-- No value change
+- Value decreases by the grid import needed to cover predicted load
 
 ##### 2. CHARGE
 ```
@@ -196,7 +197,7 @@ if allow_charge:
             actual_charge = 0  # Too small
 
     if actual_charge > 0:
-        cost = buy_price * actual_cost
+        cost = buy_price * (actual_cost + discharge_kwh)
         next_dp[c+inc][e'] = max(next_dp[c+inc][e'], dp[c][e] - cost)
 ```
 
@@ -256,18 +257,21 @@ discharge_kwh = min(predicted_load_kw, discharge_rate) * slot_hours * slot_fract
 
 | Mode | Value Formula | Description |
 |------|---------------|-------------|
-| CHARGE | `-(price + grid_fee) * grid_kwh` | Cost to buy grid energy for charging |
+| CHARGE | `-(price + grid_fee) * (charge_cost_kwh + discharge_kwh)` | Cost to cover load + charge from grid |
 | DISCHARGE | `+(price + grid_fee) * discharge_kwh` | Avoided import cost from self-consumption |
-| HOLD | `0` | No cost or value |
+| HOLD | `-(price + grid_fee) * discharge_kwh` | Cost to cover load from grid (battery idle) |
 
 Where:
 ```
 charge_energy_kwh = charge_rate * efficiency * slot_hours * slot_fraction
 charge_cost_kwh = charge_rate * slot_hours * slot_fraction  # grid energy
+discharge_kwh = min(predicted_load_kw, discharge_rate) * slot_hours * slot_fraction
+buy_price = price + grid_fee
 ```
 
 Notes:
 - `export_rate_multiplier` is currently **not used** because discharge is modeled as self-consumption only.
+- Battery average cost is **not** subtracted from the DISCHARGE value; it only gates discharge eligibility via the per-slot discharge threshold.
 
 #### Algorithm Pseudocode
 
@@ -278,7 +282,7 @@ for each time slot t:
         for each energy_level e:
             if dp[c][e] is valid:
                 # Try HOLD
-                update next_dp[c][e] if better
+                update next_dp[c][e] with cost = buy_price * discharge_kwh
 
                 # Try CHARGE (if allowed)
                 # favorable_remaining[t] = number of favorable slots from t..end
@@ -299,7 +303,7 @@ for each time slot t:
                             actual_charge = 0
 
                     if actual_charge > 0:
-                        update next_dp[c+inc][new_e] with cost = buy_price * actual_cost
+                        update next_dp[c+inc][new_e] with cost = buy_price * (actual_cost + discharge_kwh)
                         # If equal within epsilon, prefer cheaper/later charge slots
 
                 # Try DISCHARGE

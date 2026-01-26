@@ -1056,7 +1056,6 @@ class BatteryOptimizer(hass.Hass):
             for t in range(n_list_slots):
                 price = hours_list[t].price
                 buy_price = price + self.grid_fee
-                discharge_value = buy_price
                 slot_discharge_threshold = (
                     discharge_thresholds_list[t]
                     if discharge_thresholds_list is not None
@@ -1154,17 +1153,18 @@ class BatteryOptimizer(hass.Hass):
 
                             if new_energy >= min_energy - 1e-6:
                                 # Full discharge - battery can cover entire load
+                                # Value = avoided grid import (no cost, vs HOLD which pays buy_price * load)
                                 next_idx = int(round((new_energy - min_energy) / step_kwh))
                                 next_idx = min(max(next_idx, 0), n_states - 1)
-                                next_val = val + (discharge_value * discharge_kwh)
+                                next_val = val  # No grid cost - battery covers load
                             elif energy_levels[idx] > min_energy + discharge_kwh * 0.5:
                                 # Partial discharge - discharge until min_soc, grid covers remainder
                                 # Only allow if we have at least half the load's worth of energy
                                 is_partial = True
                                 actual_discharge_kwh = energy_levels[idx] - min_energy
                                 grid_import = discharge_kwh - actual_discharge_kwh
-                                # Value = savings from battery discharge - cost of remaining grid import
-                                next_val = val + (discharge_value * actual_discharge_kwh) - (buy_price * grid_import)
+                                # Value = avoided import for battery portion, pay grid for remainder
+                                next_val = val - (buy_price * grid_import)
                                 next_idx = 0  # End up at min_energy
                                 new_energy = min_energy
                             else:
@@ -1394,14 +1394,14 @@ class BatteryOptimizer(hass.Hass):
                 if discharge_allowed and discharge_kwh > 0:
                     new_energy = start_energy - discharge_kwh
                     if new_energy >= min_energy - 1e-6:
-                        # Full discharge
+                        # Full discharge - no grid cost (battery covers load)
                         idx_float = (new_energy - min_energy) / step_kwh
                         start_idx_override = int(math.ceil(idx_float - 1e-9))
                         candidates.append(
                             (
                                 BatteryMode.DISCHARGE,
                                 new_energy,
-                                buy_price * discharge_kwh,
+                                0,  # No cost - battery covers load
                                 0,
                                 start_idx_override,
                                 False,
@@ -1411,7 +1411,7 @@ class BatteryOptimizer(hass.Hass):
                         # Partial discharge - discharge until min_soc
                         actual_discharge_kwh = start_energy - min_energy
                         grid_import = discharge_kwh - actual_discharge_kwh
-                        partial_value = buy_price * actual_discharge_kwh - buy_price * grid_import
+                        partial_value = -buy_price * grid_import  # Pay only for grid portion
                         candidates.append(
                             (
                                 BatteryMode.DISCHARGE,

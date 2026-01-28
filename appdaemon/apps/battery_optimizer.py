@@ -1948,9 +1948,14 @@ class BatteryOptimizer(hass.Hass):
         if self.tou_sync_enabled and self.device_id:
             self._check_and_sync_rolling_tou()
 
-    def _recalculate_remaining_schedule(self, current_soc: float):
+    def _recalculate_remaining_schedule(self, current_soc: float, extra_charge_slots: int = 0):
         """
         Recalculate schedule for remaining hours based on current SOC.
+
+        Args:
+            current_soc: Current battery state of charge (%)
+            extra_charge_slots: Additional charge slots to add beyond minimum required
+                               (used for catch-up charging when behind schedule)
         """
         now = self.datetime()
         local_tz = self._get_local_timezone()
@@ -1988,6 +1993,12 @@ class BatteryOptimizer(hass.Hass):
 
         # Recalculate minimum charge slots needed to survive the remaining horizon
         charge_hours_needed = self.calculate_min_charge_slots_for_horizon(current_soc, future_prices)
+
+        # Add extra slots for catch-up charging (when behind schedule and need to reach max_soc)
+        if extra_charge_slots > 0:
+            self.log(f"Boosting min_charge_slots by {extra_charge_slots} to catch up to target SOC "
+                     f"(base={charge_hours_needed}, total={charge_hours_needed + extra_charge_slots})")
+            charge_hours_needed += extra_charge_slots
 
         # Generate new schedule for remaining time
         new_schedule = self.find_optimal_schedule(future_prices, charge_hours_needed, current_soc)
@@ -2199,6 +2210,76 @@ class BatteryOptimizer(hass.Hass):
 
         return False
 
+    def _get_cheapest_upcoming_prices(self, remaining_hours: List[datetime.datetime], count: int) -> List[float]:
+        """
+        Get the N cheapest prices from remaining hours that are currently HOLD.
+
+        Used when charging is behind schedule to identify cheap HOLD slots that
+        could be converted to CHARGE for catch-up charging.
+
+        Args:
+            remaining_hours: List of future hour timestamps to consider
+            count: Number of cheapest prices to return
+
+        Returns:
+            List of up to 'count' cheapest prices from HOLD slots, sorted ascending
+        """
+        if count <= 0:
+            return []
+
+        prices = self.get_prices()
+        price_map = {p.hour: p.price for p in prices}
+
+        # Get prices for remaining hours that are HOLD in current schedule
+        hold_prices = []
+        local_tz = self._get_local_timezone()
+
+        for hour in remaining_hours:
+            entry = self.schedule.get(hour)
+
+            # Also try timezone-aware matching if direct lookup fails
+            if entry is None and self.schedule:
+                for schedule_hour, schedule_entry in self.schedule.items():
+                    compare_schedule = schedule_hour
+                    compare_hour = hour
+                    if local_tz is not None:
+                        if schedule_hour.tzinfo is not None:
+                            compare_schedule = schedule_hour.astimezone(local_tz)
+                        if hour.tzinfo is not None:
+                            compare_hour = hour.astimezone(local_tz)
+                    if (compare_schedule.date() == compare_hour.date() and
+                        compare_schedule.hour == compare_hour.hour and
+                        compare_schedule.minute == compare_hour.minute):
+                        entry = schedule_entry
+                        break
+
+            if entry and entry.mode == BatteryMode.HOLD:
+                # Find the price for this hour
+                price = price_map.get(hour)
+
+                # Also try timezone-aware matching for price lookup
+                if price is None:
+                    for price_hour, price_val in price_map.items():
+                        compare_price = price_hour
+                        compare_hour = hour
+                        if local_tz is not None:
+                            if price_hour.tzinfo is not None:
+                                compare_price = price_hour.astimezone(local_tz)
+                            if hour.tzinfo is not None:
+                                compare_hour = hour.astimezone(local_tz)
+                        if (compare_price.date() == compare_hour.date() and
+                            compare_price.hour == compare_hour.hour and
+                            compare_price.minute == compare_hour.minute):
+                            price = price_val
+                            break
+
+                if price is not None:
+                    hold_prices.append(price)
+
+        # Return the cheapest N
+        hold_prices.sort()
+        return hold_prices[:count]
+
     def safety_check(self, kwargs=None):
         """
         Safety check - ensures SOC stays within bounds.
@@ -2315,12 +2396,29 @@ class BatteryOptimizer(hass.Hass):
                 # (typically around 16°C for many inverters)
                 temp_threshold = 16.0
 
+                # Helper for timezone-safe datetime comparison
+                def compare_hours(h1, h2):
+                    """Compare two datetimes, handling mixed timezone-aware/naive."""
+                    cmp_h1, cmp_h2 = h1, h2
+                    if local_tz is not None:
+                        if h1.tzinfo is not None:
+                            cmp_h1 = h1.astimezone(local_tz)
+                        if h2.tzinfo is not None:
+                            cmp_h2 = h2.astimezone(local_tz)
+                    # Handle mixed aware/naive by stripping tzinfo
+                    if cmp_h1.tzinfo is not None and cmp_h2.tzinfo is None:
+                        cmp_h1 = cmp_h1.replace(tzinfo=None)
+                    elif cmp_h1.tzinfo is None and cmp_h2.tzinfo is not None:
+                        cmp_h2 = cmp_h2.replace(tzinfo=None)
+                    return cmp_h1, cmp_h2
+
                 for future_hour in sorted(self.schedule.keys()):
-                    if future_hour >= current_slot:
+                    cmp_future, cmp_current = compare_hours(future_hour, current_slot)
+                    if cmp_future >= cmp_current:
                         future_entry = self.schedule.get(future_hour)
                         if future_entry and future_entry.mode == BatteryMode.CHARGE:
                             # For current slot, only count remaining time
-                            if future_hour == current_slot:
+                            if cmp_future == cmp_current:
                                 remaining_minutes = (1.0 - fraction) * self.slot_minutes
                             else:
                                 remaining_minutes = self.slot_minutes
@@ -2376,6 +2474,73 @@ class BatteryOptimizer(hass.Hass):
             self._last_recalc_time = self.datetime()
             self._last_soc_deviation = soc_delta
 
+            # Calculate extra charge slots when behind schedule during CHARGE mode
+            extra_charge_slots = 0
+            if entry and entry.mode == BatteryMode.CHARGE and soc_delta < 0:
+                # We're behind schedule and won't reach max_soc with current schedule
+                # Calculate extra charge slots needed
+                soc_deficit = self.max_soc - projected_final_soc
+                energy_deficit_kwh = (soc_deficit / 100) * self.battery_capacity
+
+                # Use learned or configured charge rate for calculation
+                effective_charge_rate = self.charge_rate
+                if self.learning_engine:
+                    learned_rate = self.learning_engine.get_charge_rate_for_soc(current_soc, current_temp)
+                    if learned_rate is not None and learned_rate > 0:
+                        effective_charge_rate = learned_rate
+
+                energy_per_slot = effective_charge_rate * self.efficiency * self.slot_hours
+                extra_slots_needed = math.ceil(energy_deficit_kwh / energy_per_slot) if energy_per_slot > 0 else 0
+
+                if extra_slots_needed > 0:
+                    # Get remaining hours for price lookup (with timezone-safe comparison)
+                    def is_future_hour(h):
+                        """Compare hours handling mixed timezone-aware/naive datetimes."""
+                        compare_h = h
+                        compare_slot = current_slot
+                        if local_tz is not None:
+                            if h.tzinfo is not None:
+                                compare_h = h.astimezone(local_tz)
+                            if current_slot.tzinfo is not None:
+                                compare_slot = current_slot.astimezone(local_tz)
+                        # Handle mixed timezone-aware/naive by comparing as naive
+                        if compare_h.tzinfo is not None and compare_slot.tzinfo is None:
+                            compare_h = compare_h.replace(tzinfo=None)
+                        elif compare_h.tzinfo is None and compare_slot.tzinfo is not None:
+                            compare_slot = compare_slot.replace(tzinfo=None)
+                        return compare_h > compare_slot
+
+                    remaining_hours = [h for h in sorted(self.schedule.keys()) if is_future_hour(h)]
+
+                    # Only add extra slots if economically beneficial
+                    upcoming_prices = self._get_cheapest_upcoming_prices(remaining_hours, extra_slots_needed)
+                    if upcoming_prices:
+                        avg_extra_charge_price = sum(upcoming_prices) / len(upcoming_prices)
+                        discharge_threshold = self._get_discharge_threshold()
+
+                        # Economic check: charging cost < what we'd pay from grid during discharge
+                        # Charge price includes grid fee, threshold is already grid-aware
+                        charge_cost = avg_extra_charge_price + self.grid_fee
+                        if charge_cost < discharge_threshold:
+                            self.log(
+                                f"Charging behind schedule: projected {projected_final_soc:.1f}% vs target {self.max_soc}%, "
+                                f"adding {extra_slots_needed} slot(s) at avg {avg_extra_charge_price:.4f} EUR/kWh "
+                                f"(charge cost {charge_cost:.4f} < discharge threshold {discharge_threshold:.4f})"
+                            )
+                            extra_charge_slots = extra_slots_needed
+                        else:
+                            self.log(
+                                f"Charging behind schedule but extra charging not economical: "
+                                f"projected {projected_final_soc:.1f}% vs target {self.max_soc}%, "
+                                f"avg price {avg_extra_charge_price:.4f} + fee {self.grid_fee:.4f} = {charge_cost:.4f} "
+                                f">= threshold {discharge_threshold:.4f}"
+                            )
+                    else:
+                        self.log(
+                            f"Charging behind schedule: projected {projected_final_soc:.1f}% vs target {self.max_soc}%, "
+                            f"but no HOLD slots available for extra charging"
+                        )
+
             # Enhanced logging for decision transparency
             if self.decision_log_level >= 1:
                 self.log("=" * 70)
@@ -2384,11 +2549,13 @@ class BatteryOptimizer(hass.Hass):
                 self.log(f"  Expected SOC: {expected_soc_now:.1f}%")
                 self.log(f"  Actual SOC: {current_soc:.1f}%")
                 self.log(f"  Deviation: {soc_delta:+.1f}% (threshold: {self.soc_deviation_threshold}%)")
+                if extra_charge_slots > 0:
+                    self.log(f"  Extra charge slots requested: {extra_charge_slots}")
                 self.log("=" * 70)
             else:
                 self.log(f"SOC deviation detected: actual={current_soc}%, expected={expected_soc_now:.1f}%, delta={soc_delta}%")
 
-            self._recalculate_remaining_schedule(current_soc)
+            self._recalculate_remaining_schedule(current_soc, extra_charge_slots=extra_charge_slots)
             return True
 
         return False
@@ -4281,7 +4448,13 @@ class BatteryOptimizer(hass.Hass):
                 if start_soc is not None:
                     # Calculate end-of-slot SOC based on the action
                     if entry.mode == BatteryMode.CHARGE:
-                        energy_added = self.charge_rate * self.efficiency * self.slot_hours
+                        # Use learned charge rate if available (matches calculate_expected_soc_schedule)
+                        effective_charge_rate = self.charge_rate
+                        if self.learning_engine:
+                            learned_rate = self.learning_engine.get_charge_rate_for_soc(start_soc)
+                            if learned_rate is not None and learned_rate > 0:
+                                effective_charge_rate = learned_rate
+                        energy_added = effective_charge_rate * self.efficiency * self.slot_hours
                         end_soc = min(self.max_soc, start_soc + (energy_added / self.battery_capacity) * 100)
                     elif entry.mode == BatteryMode.DISCHARGE:
                         load_kw = self._predict_load_kw(hour)

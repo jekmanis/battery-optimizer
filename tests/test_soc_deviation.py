@@ -8,7 +8,7 @@ These tests verify that:
 """
 
 import datetime
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from unittest.mock import MagicMock
 
 import pytest
@@ -77,13 +77,31 @@ class MockSocDeviationOptimizer:
         """Return mock battery temperature (None by default, can be set in tests)."""
         return getattr(self, '_battery_temp', None)
 
-    def _recalculate_remaining_schedule(self, current_soc: float):
+    def _recalculate_remaining_schedule(self, current_soc: float, extra_charge_slots: int = 0):
         """Track recalculation calls."""
         self._recalculate_calls.append(current_soc)
 
+    def get_prices(self):
+        """Return mock prices (can be overridden in tests)."""
+        return getattr(self, '_prices', [])
 
-# Bind the actual method from BatteryOptimizer
+    def _get_discharge_threshold(self) -> float:
+        """Return mock discharge threshold (can be overridden in tests)."""
+        return getattr(self, '_discharge_threshold', 0.20)
+
+    @property
+    def grid_fee(self):
+        """Return mock grid fee (can be overridden in tests)."""
+        return getattr(self, '_grid_fee', 0.05)
+
+    @grid_fee.setter
+    def grid_fee(self, value):
+        self._grid_fee = value
+
+
+# Bind the actual methods from BatteryOptimizer
 MockSocDeviationOptimizer._check_soc_deviation = BatteryOptimizer._check_soc_deviation
+MockSocDeviationOptimizer._get_cheapest_upcoming_prices = BatteryOptimizer._get_cheapest_upcoming_prices
 
 
 class TestSocDeviationDuringCharge:
@@ -749,3 +767,664 @@ class TestExpectedSocCalculationWithLearnedRate:
         # After charge hour should be around 79% not 88%
         assert expected_soc[slot_06] < 85.0  # Using learned rate, not theoretical
         assert expected_soc[slot_06] > 70.0  # But still some charging
+
+
+class TestLogScheduleUsesLearnedRate:
+    """
+    Test that _log_schedule uses learned charge rate for SOC display.
+
+    This tests the fix for the bug where _log_schedule used only the configured
+    charge rate while calculate_expected_soc_schedule used the learned rate,
+    causing inconsistent SOC values in the schedule display.
+
+    Example of the bug:
+        2026-01-28 04:00  CHARGE     0.1091 EUR/kWh load~0.52kW -> 87.9%
+        2026-01-28 05:00  HOLD       0.1300 EUR/kWh load~0.52kW ->100.0%  <- BUG!
+
+    The HOLD slot showed 100% (from expected_soc calculated with high learned rate)
+    while the CHARGE slot showed 87.9% (calculated with low configured rate).
+    """
+
+    def test_log_schedule_uses_learned_charge_rate(self):
+        """
+        Verify _log_schedule uses learned charge rate, matching calculate_expected_soc_schedule.
+
+        With a high learned rate (~6.8 kW) vs configured rate (4.5 kW):
+        - Learned rate: 6.8 * 0.95 / 14.3 * 100 = ~45% SOC gain per hour
+        - Configured rate: 4.5 * 0.95 / 14.3 * 100 = ~30% SOC gain per hour
+
+        If _log_schedule uses learned rate, the displayed end SOC for CHARGE
+        should match the expected_soc value used for the following HOLD slot.
+        """
+        class MockLogScheduleOptimizer:
+            def __init__(self):
+                self.charge_rate = 4.5  # Configured (lower)
+                self.discharge_rate = 4.5
+                self.efficiency = 0.95
+                self.slot_hours = 1.0
+                self.battery_capacity = 14.3
+                self.max_soc = 100.0
+                self.min_soc = 10.0
+                self.learning_engine = BatteryLearningEngine(battery_capacity_kwh=14.3)
+                self._last_projected_costs = None
+                self._log_messages = []
+
+            def _predict_load_kw(self, hour):
+                return 0.5
+
+            def _get_local_timezone(self):
+                return None
+
+            def log(self, message: str, level: str = "INFO"):
+                self._log_messages.append(message)
+
+        # Bind methods from BatteryOptimizer
+        MockLogScheduleOptimizer.calculate_expected_soc_schedule = BatteryOptimizer.calculate_expected_soc_schedule
+        MockLogScheduleOptimizer._log_schedule = BatteryOptimizer._log_schedule
+        MockLogScheduleOptimizer._get_expected_soc_for_hour = BatteryOptimizer._get_expected_soc_for_hour
+
+        optimizer = MockLogScheduleOptimizer()
+
+        # Record charging at high rate ~6.8 kW (need at least 3 observations)
+        # 1% SOC = 0.143 kWh, in 1.26 min -> 0.143 / (1.26/60) = 6.8 kW
+        for _ in range(5):
+            optimizer.learning_engine.record_charging(
+                soc_start=50.0,
+                soc_end=51.0,
+                duration_minutes=1.26  # 1% in 1.26 min = ~6.8 kW
+            )
+
+        slot_04 = datetime.datetime(2024, 1, 15, 4, 0, 0)
+        slot_05 = datetime.datetime(2024, 1, 15, 5, 0, 0)
+
+        schedule = {
+            slot_04: ScheduleEntry(hour=slot_04, mode=BatteryMode.CHARGE, reason="0.1091 EUR/kWh load~0.52kW"),
+            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.HOLD, reason="0.1300 EUR/kWh load~0.52kW"),
+        }
+
+        # Calculate expected SOC (uses learned rate)
+        expected_soc = optimizer.calculate_expected_soc_schedule(schedule, starting_soc=55.0)
+
+        # Log the schedule (should also use learned rate now)
+        optimizer._log_schedule(schedule, expected_soc)
+
+        # Parse logged SOC values
+        logged_soc_values = {}
+        for msg in optimizer._log_messages:
+            # Look for lines like "  2024-01-15 04:00  CHARGE     0.1091 EUR/kWh load~0.52kW ->XX.X%"
+            if "->" in msg and "%" in msg:
+                parts = msg.strip().split()
+                if len(parts) >= 3:
+                    time_str = parts[1]  # "04:00" or "05:00"
+                    # Extract SOC from end of line
+                    soc_part = msg.split("->")[-1].strip()
+                    soc_value = float(soc_part.replace("%", ""))
+                    logged_soc_values[time_str] = soc_value
+
+        # Verify both slots were logged
+        assert "04:00" in logged_soc_values, f"Missing 04:00 in logged values: {optimizer._log_messages}"
+        assert "05:00" in logged_soc_values, f"Missing 05:00 in logged values: {optimizer._log_messages}"
+
+        charge_end_soc = logged_soc_values["04:00"]
+        hold_start_soc = logged_soc_values["05:00"]
+
+        # Key assertion: The end SOC of CHARGE should equal the start SOC of HOLD
+        # Both should be capped at max_soc (100%) with high charge rate
+        # With learned rate ~6.8 kW: 55% + ~45% = 100% (capped)
+        # With configured rate 4.5 kW: 55% + ~30% = 85%
+        # The bug would show 85% for CHARGE but 100% for HOLD
+        assert charge_end_soc == hold_start_soc, (
+            f"Inconsistent SOC display: CHARGE end={charge_end_soc}%, "
+            f"HOLD displayed={hold_start_soc}%. "
+            f"Both should use learned rate and show the same value."
+        )
+
+        # Additional check: With high learned rate, should hit max_soc
+        assert charge_end_soc >= 95.0, (
+            f"Expected near max_soc with high learned rate, got {charge_end_soc}%. "
+            "This suggests _log_schedule is not using the learned rate."
+        )
+
+    def test_log_schedule_without_learning_engine_uses_configured_rate(self):
+        """
+        Verify _log_schedule falls back to configured rate when no learning engine.
+        """
+        class MockNoLearningOptimizer:
+            def __init__(self):
+                self.charge_rate = 4.5
+                self.discharge_rate = 4.5
+                self.efficiency = 0.95
+                self.slot_hours = 1.0
+                self.battery_capacity = 14.3
+                self.max_soc = 100.0
+                self.min_soc = 10.0
+                self.learning_engine = None  # No learning engine
+                self._last_projected_costs = None
+                self._log_messages = []
+
+            def _predict_load_kw(self, hour):
+                return 0.5
+
+            def _get_local_timezone(self):
+                return None
+
+            def log(self, message: str, level: str = "INFO"):
+                self._log_messages.append(message)
+
+        MockNoLearningOptimizer.calculate_expected_soc_schedule = BatteryOptimizer.calculate_expected_soc_schedule
+        MockNoLearningOptimizer._log_schedule = BatteryOptimizer._log_schedule
+        MockNoLearningOptimizer._get_expected_soc_for_hour = BatteryOptimizer._get_expected_soc_for_hour
+
+        optimizer = MockNoLearningOptimizer()
+
+        slot_04 = datetime.datetime(2024, 1, 15, 4, 0, 0)
+        slot_05 = datetime.datetime(2024, 1, 15, 5, 0, 0)
+
+        schedule = {
+            slot_04: ScheduleEntry(hour=slot_04, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
+            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.HOLD, reason="0.13 EUR/kWh"),
+        }
+
+        expected_soc = optimizer.calculate_expected_soc_schedule(schedule, starting_soc=55.0)
+        optimizer._log_schedule(schedule, expected_soc)
+
+        # Parse logged SOC values
+        logged_soc_values = {}
+        for msg in optimizer._log_messages:
+            if "->" in msg and "%" in msg:
+                parts = msg.strip().split()
+                if len(parts) >= 3:
+                    time_str = parts[1]
+                    soc_part = msg.split("->")[-1].strip()
+                    soc_value = float(soc_part.replace("%", ""))
+                    logged_soc_values[time_str] = soc_value
+
+        charge_end_soc = logged_soc_values["04:00"]
+        hold_start_soc = logged_soc_values["05:00"]
+
+        # Should still be consistent (both use configured rate)
+        assert charge_end_soc == hold_start_soc
+
+        # With configured rate 4.5 kW: 55% + (4.5 * 0.95 / 14.3 * 100) = 55% + 29.9% = 84.9%
+        assert 80.0 < charge_end_soc < 90.0, (
+            f"Expected ~85% with configured rate, got {charge_end_soc}%"
+        )
+
+
+class TestExtraChargeSlotsWhenBehindSchedule:
+    """
+    Test the feature that adds extra charge slots when charging is behind schedule.
+
+    When charging is slower than expected (learned rate was optimistic), the battery
+    may not reach max_soc by the end of scheduled CHARGE slots. The system should:
+    1. Detect the shortfall (projected_final_soc < max_soc - 5)
+    2. Calculate extra slots needed
+    3. Only add extra slots if economically beneficial (charge cost < discharge threshold)
+    4. Pass extra_charge_slots to _recalculate_remaining_schedule
+    """
+
+    @pytest.fixture
+    def optimizer(self):
+        """Create a mock optimizer for testing extra charge slots feature."""
+        opt = MockSocDeviationOptimizer()
+        # Add additional tracking for extra_charge_slots
+        opt._recalculate_extra_slots = []
+
+        # Override _recalculate_remaining_schedule to capture extra_charge_slots
+        original_recalculate = opt._recalculate_remaining_schedule
+        def tracking_recalculate(current_soc, extra_charge_slots=0):
+            opt._recalculate_extra_slots.append(extra_charge_slots)
+            opt._recalculate_calls.append(current_soc)
+        opt._recalculate_remaining_schedule = tracking_recalculate
+
+        return opt
+
+    def test_extra_slots_calculated_when_behind_schedule(self, optimizer):
+        """
+        Scenario: At 05:30, charging at slow rate, won't reach max_soc.
+        Should calculate extra slots and pass to recalculation.
+
+        Setup:
+        - Current SOC: 55%
+        - Expected at 05:30: ~64% (14% gain expected in 30 min)
+        - Deviation: -9% (exceeds 4% threshold)
+        - Remaining CHARGE hours: 0.5h in slot_05, 1.0h in slot_06 (but at slow rate)
+        - With slow rate ~2.86 kW: projected final = 83.5% < 95%
+
+        Expected: Extra slots calculated, cheap HOLD slot at 07:00 identified
+        """
+        slot_05 = datetime.datetime(2024, 1, 15, 5, 0, 0)
+        slot_06 = datetime.datetime(2024, 1, 15, 6, 0, 0)
+        slot_07 = datetime.datetime(2024, 1, 15, 7, 0, 0)  # HOLD slot, potential for extra charge
+
+        optimizer.schedule = {
+            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
+            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
+            slot_07: ScheduleEntry(hour=slot_07, mode=BatteryMode.HOLD, reason="0.12 EUR/kWh"),
+        }
+        optimizer.expected_soc_schedule = {
+            slot_05: 50.0,
+            slot_06: 78.4,
+            slot_07: 100.0,
+        }
+        optimizer._current_datetime = datetime.datetime(2024, 1, 15, 5, 30, 0)
+
+        # Set up slow learned rate (~2.86 kW)
+        optimizer.learning_engine = BatteryLearningEngine(battery_capacity_kwh=14.3)
+        for _ in range(5):
+            optimizer.learning_engine.record_charging(
+                soc_start=60.0, soc_end=61.0, duration_minutes=3.0
+            )
+
+        # Mock get_prices to return prices for the slots
+        optimizer._prices = [
+            type('PricePoint', (), {'hour': slot_05, 'price': 0.10})(),
+            type('PricePoint', (), {'hour': slot_06, 'price': 0.10})(),
+            type('PricePoint', (), {'hour': slot_07, 'price': 0.12})(),
+        ]
+        optimizer.get_prices = lambda: optimizer._prices
+
+        # Mock _get_discharge_threshold to return a high value (so charging is economical)
+        optimizer._get_discharge_threshold = lambda: 0.20  # Higher than charge price + grid fee
+        optimizer.grid_fee = 0.05
+
+        current_soc = 55.0
+
+        result = optimizer._check_soc_deviation(current_soc)
+
+        # Should trigger recalculation
+        assert result is True
+        assert len(optimizer._recalculate_calls) == 1
+
+        # Should have passed extra_charge_slots > 0
+        assert len(optimizer._recalculate_extra_slots) == 1
+        assert optimizer._recalculate_extra_slots[0] > 0
+
+        # Should log about adding extra slots
+        assert any("adding" in msg.lower() and "slot" in msg.lower() for msg in optimizer._log_messages)
+
+    def test_no_extra_slots_when_charging_economically_unfavorable(self, optimizer):
+        """
+        Scenario: Behind schedule but extra charging is not economical.
+        Charge price + grid fee >= discharge threshold.
+
+        Should NOT add extra slots.
+        """
+        slot_05 = datetime.datetime(2024, 1, 15, 5, 0, 0)
+        slot_06 = datetime.datetime(2024, 1, 15, 6, 0, 0)
+        slot_07 = datetime.datetime(2024, 1, 15, 7, 0, 0)  # HOLD slot, expensive
+
+        optimizer.schedule = {
+            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
+            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
+            slot_07: ScheduleEntry(hour=slot_07, mode=BatteryMode.HOLD, reason="0.25 EUR/kWh"),  # Expensive
+        }
+        optimizer.expected_soc_schedule = {
+            slot_05: 50.0,
+            slot_06: 78.4,
+            slot_07: 100.0,
+        }
+        optimizer._current_datetime = datetime.datetime(2024, 1, 15, 5, 30, 0)
+
+        # Set up slow learned rate
+        optimizer.learning_engine = BatteryLearningEngine(battery_capacity_kwh=14.3)
+        for _ in range(5):
+            optimizer.learning_engine.record_charging(
+                soc_start=60.0, soc_end=61.0, duration_minutes=3.0
+            )
+
+        # Mock prices with expensive HOLD slot
+        optimizer._prices = [
+            type('PricePoint', (), {'hour': slot_05, 'price': 0.10})(),
+            type('PricePoint', (), {'hour': slot_06, 'price': 0.10})(),
+            type('PricePoint', (), {'hour': slot_07, 'price': 0.25})(),  # Expensive
+        ]
+        optimizer.get_prices = lambda: optimizer._prices
+
+        # Low discharge threshold - charging is not economical
+        optimizer._get_discharge_threshold = lambda: 0.20  # Lower than 0.25 + 0.05 grid fee
+        optimizer.grid_fee = 0.05
+
+        current_soc = 55.0
+
+        result = optimizer._check_soc_deviation(current_soc)
+
+        # Should still trigger recalculation
+        assert result is True
+        assert len(optimizer._recalculate_calls) == 1
+
+        # Should NOT have passed extra_charge_slots (or passed 0)
+        assert len(optimizer._recalculate_extra_slots) == 1
+        assert optimizer._recalculate_extra_slots[0] == 0
+
+        # Should log about not economical
+        assert any("not economical" in msg.lower() for msg in optimizer._log_messages)
+
+    def test_no_extra_slots_when_no_hold_slots_available(self, optimizer):
+        """
+        Scenario: Behind schedule but remaining slots are DISCHARGE (no HOLD to convert).
+        Need extra charging but no HOLD slots available.
+
+        Should trigger recalculation but NOT add extra slots.
+
+        Setup:
+        - Only 1 CHARGE slot remaining (slot_05, already 30 min in)
+        - Next slot is DISCHARGE (expensive) - no HOLD slots to convert
+        - With slow rate 2.86 kW and 0.5h remaining: 2.86 * 0.95 * 0.5 = 1.36 kWh = 9.5% SOC
+        - From 55%, projected final = 64.5% << 95%
+        """
+        slot_05 = datetime.datetime(2024, 1, 15, 5, 0, 0)
+        slot_06 = datetime.datetime(2024, 1, 15, 6, 0, 0)  # DISCHARGE, not HOLD
+
+        optimizer.schedule = {
+            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
+            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.DISCHARGE, reason="0.30 EUR/kWh"),  # DISCHARGE
+        }
+        optimizer.expected_soc_schedule = {
+            slot_05: 50.0,
+            slot_06: 78.4,  # Expected from original schedule
+        }
+        optimizer._current_datetime = datetime.datetime(2024, 1, 15, 5, 30, 0)
+
+        # Set up slow learned rate (~2.86 kW)
+        optimizer.learning_engine = BatteryLearningEngine(battery_capacity_kwh=14.3)
+        for _ in range(5):
+            optimizer.learning_engine.record_charging(
+                soc_start=60.0, soc_end=61.0, duration_minutes=3.0
+            )
+
+        # Mock prices - slot_06 is expensive (DISCHARGE), no HOLD slots
+        optimizer._prices = [
+            type('PricePoint', (), {'hour': slot_05, 'price': 0.10})(),
+            type('PricePoint', (), {'hour': slot_06, 'price': 0.30})(),
+        ]
+        optimizer.get_prices = lambda: optimizer._prices
+
+        optimizer._get_discharge_threshold = lambda: 0.20
+        optimizer.grid_fee = 0.05
+
+        current_soc = 55.0
+
+        result = optimizer._check_soc_deviation(current_soc)
+
+        # Should trigger recalculation (behind schedule, won't reach max_soc)
+        assert result is True
+        assert len(optimizer._recalculate_calls) == 1
+
+        # Should NOT have passed extra_charge_slots (no HOLD slots available)
+        assert len(optimizer._recalculate_extra_slots) == 1
+        assert optimizer._recalculate_extra_slots[0] == 0
+
+        # Should log about no HOLD slots
+        assert any("no hold slots" in msg.lower() for msg in optimizer._log_messages)
+
+    def test_extra_slots_only_during_charge_mode_behind_schedule(self, optimizer):
+        """
+        Scenario: Deviation during HOLD or DISCHARGE mode should NOT calculate extra slots.
+        Extra slots logic only applies to CHARGE mode when behind schedule.
+        """
+        slot_10 = datetime.datetime(2024, 1, 15, 10, 0, 0)
+        slot_11 = datetime.datetime(2024, 1, 15, 11, 0, 0)
+
+        # HOLD mode with deviation
+        optimizer.schedule = {
+            slot_10: ScheduleEntry(hour=slot_10, mode=BatteryMode.HOLD, reason="0.15 EUR/kWh"),
+            slot_11: ScheduleEntry(hour=slot_11, mode=BatteryMode.HOLD, reason="0.15 EUR/kWh"),
+        }
+        optimizer.expected_soc_schedule = {
+            slot_10: 70.0,
+            slot_11: 70.0,
+        }
+        optimizer._current_datetime = datetime.datetime(2024, 1, 15, 10, 30, 0)
+
+        # During HOLD, expected_soc_now = 70.0
+        # Actual: 60% (10% deviation, exceeds threshold)
+        current_soc = 60.0
+
+        # Mock prices
+        optimizer._prices = [
+            type('PricePoint', (), {'hour': slot_10, 'price': 0.15})(),
+            type('PricePoint', (), {'hour': slot_11, 'price': 0.15})(),
+        ]
+        optimizer.get_prices = lambda: optimizer._prices
+        optimizer._get_discharge_threshold = lambda: 0.20
+        optimizer.grid_fee = 0.05
+
+        result = optimizer._check_soc_deviation(current_soc)
+
+        # Should trigger recalculation
+        assert result is True
+        assert len(optimizer._recalculate_calls) == 1
+
+        # Should NOT have calculated extra slots (not in CHARGE mode)
+        assert len(optimizer._recalculate_extra_slots) == 1
+        assert optimizer._recalculate_extra_slots[0] == 0
+
+    def test_handles_mixed_timezone_aware_naive_datetimes(self, optimizer):
+        """
+        Scenario: Schedule keys are timezone-aware but current_slot is naive (or vice versa).
+        Should not raise TypeError when comparing datetimes.
+
+        This tests the fix for the bug where direct comparison `h > current_slot`
+        would crash with "can't compare offset-naive and offset-aware datetimes".
+        """
+        # Use a fixed offset timezone (UTC+2) to avoid needing tzdata package
+        tz = datetime.timezone(datetime.timedelta(hours=2))
+
+        # Create timezone-aware schedule keys
+        slot_05_aware = datetime.datetime(2024, 1, 15, 5, 0, 0, tzinfo=tz)
+        slot_06_aware = datetime.datetime(2024, 1, 15, 6, 0, 0, tzinfo=tz)
+        slot_07_aware = datetime.datetime(2024, 1, 15, 7, 0, 0, tzinfo=tz)
+
+        optimizer.schedule = {
+            slot_05_aware: ScheduleEntry(hour=slot_05_aware, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
+            slot_06_aware: ScheduleEntry(hour=slot_06_aware, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
+            slot_07_aware: ScheduleEntry(hour=slot_07_aware, mode=BatteryMode.HOLD, reason="0.12 EUR/kWh"),
+        }
+
+        # Use naive datetime for expected_soc_schedule (mixed scenario)
+        slot_05_naive = datetime.datetime(2024, 1, 15, 5, 0, 0)
+        slot_06_naive = datetime.datetime(2024, 1, 15, 6, 0, 0)
+        slot_07_naive = datetime.datetime(2024, 1, 15, 7, 0, 0)
+
+        optimizer.expected_soc_schedule = {
+            slot_05_naive: 50.0,
+            slot_06_naive: 78.4,
+            slot_07_naive: 100.0,
+        }
+
+        # Current time is naive (simulates _align_to_slot returning naive when no local_tz)
+        optimizer._current_datetime = datetime.datetime(2024, 1, 15, 5, 30, 0)
+
+        # Set up slow learned rate
+        optimizer.learning_engine = BatteryLearningEngine(battery_capacity_kwh=14.3)
+        for _ in range(5):
+            optimizer.learning_engine.record_charging(
+                soc_start=60.0, soc_end=61.0, duration_minutes=3.0
+            )
+
+        # Mock prices with aware timestamps
+        optimizer._prices = [
+            type('PricePoint', (), {'hour': slot_05_aware, 'price': 0.10})(),
+            type('PricePoint', (), {'hour': slot_06_aware, 'price': 0.10})(),
+            type('PricePoint', (), {'hour': slot_07_aware, 'price': 0.12})(),
+        ]
+        optimizer.get_prices = lambda: optimizer._prices
+
+        optimizer._get_discharge_threshold = lambda: 0.20
+        optimizer.grid_fee = 0.05
+
+        current_soc = 55.0
+
+        # Should NOT raise TypeError - this is the main assertion
+        # The function should handle mixed timezone-aware/naive comparison gracefully
+        try:
+            result = optimizer._check_soc_deviation(current_soc)
+        except TypeError as e:
+            if "can't compare" in str(e) and "naive" in str(e):
+                pytest.fail(f"TypeError raised due to timezone mismatch: {e}")
+            raise
+
+        # The result doesn't matter as much as not crashing, but it should work
+        # (may return True or False depending on how the comparison resolves)
+        assert result in (True, False)
+
+
+class TestGetCheapestUpcomingPrices:
+    """Test the _get_cheapest_upcoming_prices helper method."""
+
+    @pytest.fixture
+    def optimizer(self):
+        return MockSocDeviationOptimizer()
+
+    def test_returns_cheapest_hold_prices(self, optimizer):
+        """Should return the N cheapest prices from HOLD slots only."""
+        slot_05 = datetime.datetime(2024, 1, 15, 5, 0, 0)
+        slot_06 = datetime.datetime(2024, 1, 15, 6, 0, 0)
+        slot_07 = datetime.datetime(2024, 1, 15, 7, 0, 0)
+        slot_08 = datetime.datetime(2024, 1, 15, 8, 0, 0)
+
+        optimizer.schedule = {
+            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.HOLD, reason="0.15"),  # HOLD
+            slot_07: ScheduleEntry(hour=slot_07, mode=BatteryMode.DISCHARGE, reason="expensive"),
+            slot_08: ScheduleEntry(hour=slot_08, mode=BatteryMode.HOLD, reason="0.12"),  # HOLD, cheaper
+        }
+
+        optimizer._prices = [
+            type('PricePoint', (), {'hour': slot_05, 'price': 0.10})(),
+            type('PricePoint', (), {'hour': slot_06, 'price': 0.15})(),
+            type('PricePoint', (), {'hour': slot_07, 'price': 0.25})(),
+            type('PricePoint', (), {'hour': slot_08, 'price': 0.12})(),
+        ]
+        optimizer.get_prices = lambda: optimizer._prices
+
+        # Bind the method
+        optimizer._get_cheapest_upcoming_prices = BatteryOptimizer._get_cheapest_upcoming_prices.__get__(optimizer)
+
+        remaining_hours = [slot_06, slot_07, slot_08]
+        result = optimizer._get_cheapest_upcoming_prices(remaining_hours, 2)
+
+        # Should return the 2 cheapest HOLD slot prices (slot_08=0.12, slot_06=0.15)
+        assert len(result) == 2
+        assert result == [0.12, 0.15]
+
+    def test_returns_empty_when_no_hold_slots(self, optimizer):
+        """Should return empty list when no HOLD slots exist."""
+        slot_05 = datetime.datetime(2024, 1, 15, 5, 0, 0)
+        slot_06 = datetime.datetime(2024, 1, 15, 6, 0, 0)
+
+        optimizer.schedule = {
+            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.DISCHARGE, reason="expensive"),
+        }
+
+        optimizer._prices = [
+            type('PricePoint', (), {'hour': slot_05, 'price': 0.10})(),
+            type('PricePoint', (), {'hour': slot_06, 'price': 0.25})(),
+        ]
+        optimizer.get_prices = lambda: optimizer._prices
+
+        optimizer._get_cheapest_upcoming_prices = BatteryOptimizer._get_cheapest_upcoming_prices.__get__(optimizer)
+
+        remaining_hours = [slot_05, slot_06]
+        result = optimizer._get_cheapest_upcoming_prices(remaining_hours, 2)
+
+        assert result == []
+
+    def test_returns_fewer_when_not_enough_hold_slots(self, optimizer):
+        """Should return only available HOLD slot prices if fewer than requested."""
+        slot_05 = datetime.datetime(2024, 1, 15, 5, 0, 0)
+        slot_06 = datetime.datetime(2024, 1, 15, 6, 0, 0)
+
+        optimizer.schedule = {
+            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.HOLD, reason="moderate"),  # Only 1 HOLD
+        }
+
+        optimizer._prices = [
+            type('PricePoint', (), {'hour': slot_05, 'price': 0.10})(),
+            type('PricePoint', (), {'hour': slot_06, 'price': 0.15})(),
+        ]
+        optimizer.get_prices = lambda: optimizer._prices
+
+        optimizer._get_cheapest_upcoming_prices = BatteryOptimizer._get_cheapest_upcoming_prices.__get__(optimizer)
+
+        remaining_hours = [slot_05, slot_06]
+        result = optimizer._get_cheapest_upcoming_prices(remaining_hours, 3)  # Request 3
+
+        # Should return only 1 (the only HOLD slot)
+        assert len(result) == 1
+        assert result == [0.15]
+
+
+class TestRecalculateRemainingScheduleWithExtraSlots:
+    """Test that _recalculate_remaining_schedule properly uses extra_charge_slots."""
+
+    def test_extra_slots_boost_min_charge_slots(self):
+        """
+        Verify that extra_charge_slots parameter boosts the min_charge_slots
+        used in the optimization.
+        """
+        # This test verifies the logging behavior to confirm the parameter is used
+        class MockRecalculateOptimizer:
+            def __init__(self):
+                self.slot_minutes = 60
+                self.slot_hours = 1.0
+                self._log_messages = []
+                self._min_charge_slots_used = None
+
+            def log(self, message: str, level: str = "INFO"):
+                self._log_messages.append(message)
+
+            def datetime(self):
+                return datetime.datetime(2024, 1, 15, 5, 30, 0)
+
+            def _get_local_timezone(self):
+                return None
+
+            def _align_to_slot(self, dt):
+                return dt.replace(minute=0, second=0, microsecond=0)
+
+            def get_prices(self):
+                return [
+                    type('PricePoint', (), {'hour': datetime.datetime(2024, 1, 15, 6, 0, 0), 'price': 0.10})(),
+                    type('PricePoint', (), {'hour': datetime.datetime(2024, 1, 15, 7, 0, 0), 'price': 0.15})(),
+                ]
+
+            def calculate_min_charge_slots_for_horizon(self, soc, prices):
+                return 1  # Base requirement
+
+            def find_optimal_schedule(self, prices, min_charge_slots, soc):
+                self._min_charge_slots_used = min_charge_slots
+                return {}
+
+            def calculate_expected_soc_schedule(self, schedule, starting_soc):
+                return {}
+
+            def _log_schedule(self, schedule, expected_soc):
+                pass
+
+            def _schedule_tou_sync(self, reason):
+                pass
+
+            def _update_schedule_sensor(self):
+                pass
+
+        MockRecalculateOptimizer._recalculate_remaining_schedule = BatteryOptimizer._recalculate_remaining_schedule
+
+        opt = MockRecalculateOptimizer()
+        opt.schedule = {}
+        opt.expected_soc_schedule = {}
+        opt.tou_sync_enabled = False
+        opt.device_id = ""
+        opt.decision_log_level = 1
+
+        # Call with extra_charge_slots=2
+        opt._recalculate_remaining_schedule(55.0, extra_charge_slots=2)
+
+        # Verify logging indicates the boost
+        assert any("boosting min_charge_slots by 2" in msg.lower() for msg in opt._log_messages)
+
+        # Verify the min_charge_slots used in optimization was boosted
+        assert opt._min_charge_slots_used == 3  # 1 base + 2 extra

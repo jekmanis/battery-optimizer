@@ -74,6 +74,34 @@ def learning_engine_with_data(learning_engine):
 
 
 @pytest.fixture
+def learning_engine_with_warming_data(learning_engine):
+    """Learning engine with temperature warming rate data for cold->warm transitions.
+
+    Simulates a battery that charges slowly when cold (~3kW at 10-15°C) and
+    faster when warm (~6kW at >16°C), with warming rate data.
+    """
+    # Record cold charge rates (10-15°C -> ~3kW)
+    # These represent slow charging when battery is cold
+    for _ in range(5):
+        learning_engine.record_charging(
+            soc_start=30, soc_end=50, duration_minutes=60,
+            battery_temp=12.0,
+            battery_temp_start=10.0, battery_temp_end=14.0
+        )
+
+    # Record warm charge rates (>16°C -> ~6kW)
+    # These represent faster charging when battery is warm
+    for _ in range(5):
+        learning_engine.record_charging(
+            soc_start=50, soc_end=80, duration_minutes=60,
+            battery_temp=18.0,
+            battery_temp_start=16.0, battery_temp_end=20.0
+        )
+
+    return learning_engine
+
+
+@pytest.fixture
 def load_profile():
     """Create a fresh LoadProfile for testing."""
     return LoadProfile(

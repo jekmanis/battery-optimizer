@@ -755,7 +755,7 @@ class TestExpectedSocCalculationWithLearnedRate:
             slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.HOLD, reason="moderate"),
         }
 
-        expected_soc = optimizer.calculate_expected_soc_schedule(schedule, starting_soc=60.0)
+        expected_soc, _ = optimizer.calculate_expected_soc_schedule(schedule, starting_soc=60.0)
 
         # With learned rate ~2.86 kW, SOC gain per hour = 2.86 * 0.95 / 14.3 * 100 = ~19%
         # Starting at 60%, after charge hour: ~79%
@@ -843,10 +843,10 @@ class TestLogScheduleUsesLearnedRate:
         }
 
         # Calculate expected SOC (uses learned rate)
-        expected_soc = optimizer.calculate_expected_soc_schedule(schedule, starting_soc=55.0)
+        expected_soc, _ = optimizer.calculate_expected_soc_schedule(schedule, starting_soc=55.0)
 
         # Log the schedule (should also use learned rate now)
-        optimizer._log_schedule(schedule, expected_soc)
+        optimizer._log_schedule(schedule, expected_soc, None)
 
         # Parse logged SOC values
         logged_soc_values = {}
@@ -925,8 +925,8 @@ class TestLogScheduleUsesLearnedRate:
             slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.HOLD, reason="0.13 EUR/kWh"),
         }
 
-        expected_soc = optimizer.calculate_expected_soc_schedule(schedule, starting_soc=55.0)
-        optimizer._log_schedule(schedule, expected_soc)
+        expected_soc, _ = optimizer.calculate_expected_soc_schedule(schedule, starting_soc=55.0)
+        optimizer._log_schedule(schedule, expected_soc, None)
 
         # Parse logged SOC values
         logged_soc_values = {}
@@ -1399,10 +1399,13 @@ class TestRecalculateRemainingScheduleWithExtraSlots:
                 self._min_charge_slots_used = min_charge_slots
                 return {}
 
-            def calculate_expected_soc_schedule(self, schedule, starting_soc):
-                return {}
+            def _get_battery_temp(self):
+                return None
 
-            def _log_schedule(self, schedule, expected_soc):
+            def calculate_expected_soc_schedule(self, schedule, starting_soc, starting_temp=None):
+                return {}, {}
+
+            def _log_schedule(self, schedule, expected_soc, expected_temp=None):
                 pass
 
             def _schedule_tou_sync(self, reason):
@@ -1416,6 +1419,7 @@ class TestRecalculateRemainingScheduleWithExtraSlots:
         opt = MockRecalculateOptimizer()
         opt.schedule = {}
         opt.expected_soc_schedule = {}
+        opt.expected_temp_schedule = {}
         opt.tou_sync_enabled = False
         opt.device_id = ""
         opt.decision_log_level = 1

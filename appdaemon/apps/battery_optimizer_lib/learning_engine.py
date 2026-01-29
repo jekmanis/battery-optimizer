@@ -224,6 +224,142 @@ class BatteryLearningEngine:
         self.stats.total_energy_discharged_kwh += energy_delivered_kwh
         self.stats.total_discharge_revenue_eur += energy_delivered_kwh * price_eur_kwh
 
+    def record_temperature_observation(self, temp: float):
+        """
+        Record a battery temperature observation for ambient temperature estimation.
+
+        Keeps a rolling window of recent observations to estimate ambient temperature
+        (minimum temperature the battery reaches when idle).
+
+        Args:
+            temp: Current battery temperature (°C)
+        """
+        if temp is None:
+            return
+
+        self.stats.recent_min_temps.append(temp)
+
+        # Keep last ~48 observations (assuming hourly recording, ~2 days of data)
+        max_observations = 48
+        if len(self.stats.recent_min_temps) > max_observations:
+            self.stats.recent_min_temps = self.stats.recent_min_temps[-max_observations:]
+
+    def get_estimated_ambient_temp(self, default: float = 10.0) -> float:
+        """
+        Get estimated ambient temperature based on recent minimum observations.
+
+        Uses the minimum of recent battery temperature observations as a proxy
+        for ambient temperature (coldest the battery gets when idle).
+
+        Args:
+            default: Default ambient if no observations available (°C)
+
+        Returns:
+            Estimated ambient temperature (°C)
+        """
+        if not self.stats.recent_min_temps:
+            return default
+
+        # Use minimum of recent observations as ambient estimate
+        # Add small buffer (1°C) since battery may not fully reach ambient
+        min_temp = min(self.stats.recent_min_temps)
+        return min_temp
+
+    def record_cooling(
+        self,
+        temp_start: float,
+        temp_end: float,
+        duration_minutes: float,
+        ambient_temp: Optional[float] = None
+    ):
+        """
+        Record a cooling observation during idle (HOLD/DISCHARGE) periods.
+
+        Calculates the exponential decay rate and stores it by starting temperature range.
+
+        Args:
+            temp_start: Temperature at start of idle period (°C)
+            temp_end: Temperature at end of idle period (°C)
+            duration_minutes: Duration of idle period (minutes)
+            ambient_temp: Ambient temperature estimate (°C), uses estimated if not provided
+        """
+        # Use estimated ambient if not provided
+        if ambient_temp is None:
+            ambient_temp = self.get_estimated_ambient_temp(default=10.0)
+
+        # Only record if we have meaningful cooling (temp dropped toward ambient)
+        if duration_minutes < 1.0:
+            return
+        if temp_start <= ambient_temp:
+            return  # Already at or below ambient, no cooling to measure
+        if temp_end >= temp_start:
+            return  # Temperature didn't drop (maybe it even rose)
+        if temp_end < ambient_temp:
+            return  # Dropped below ambient - invalid data
+
+        # Calculate the decay rate from the exponential decay formula:
+        # T(t) = ambient + (start - ambient) * e^(-rate * t)
+        # Solving for rate: rate = -ln((end - ambient) / (start - ambient)) / t
+        import math
+        temp_diff_start = temp_start - ambient_temp
+        temp_diff_end = temp_end - ambient_temp
+
+        if temp_diff_end <= 0 or temp_diff_start <= 0:
+            return  # Avoid math errors
+
+        ratio = temp_diff_end / temp_diff_start
+        if ratio <= 0 or ratio >= 1:
+            return  # Invalid ratio
+
+        cooling_rate = -math.log(ratio) / duration_minutes
+
+        # Sanity check: rate should be positive and reasonable (0.001 to 0.1 per minute)
+        if cooling_rate <= 0.001 or cooling_rate > 0.1:
+            return
+
+        # Store by starting temperature range
+        start_temp_range = self._get_temp_range(temp_start)
+
+        if start_temp_range not in self.stats.temp_cooling_rates:
+            self.stats.temp_cooling_rates[start_temp_range] = []
+        self.stats.temp_cooling_rates[start_temp_range].append(cooling_rate)
+
+        # Keep last 50 observations per starting temp range
+        if len(self.stats.temp_cooling_rates[start_temp_range]) > 50:
+            self.stats.temp_cooling_rates[start_temp_range] = \
+                self.stats.temp_cooling_rates[start_temp_range][-50:]
+
+        self.log(f"Learning: Recorded cooling {temp_start:.1f}C->{temp_end:.1f}C "
+                 f"in {duration_minutes:.0f}min, rate={cooling_rate:.4f}/min, "
+                 f"bucket={start_temp_range}")
+
+    def get_cooling_rate(self, starting_temp: float) -> Optional[float]:
+        """
+        Get predicted cooling rate for a given starting temperature.
+
+        Args:
+            starting_temp: Battery temperature at start of idle period (°C)
+
+        Returns:
+            Cooling rate (decay per minute), or None if insufficient data
+        """
+        temp_range = self._get_temp_range(starting_temp)
+
+        if temp_range in self.stats.temp_cooling_rates:
+            rates = self.stats.temp_cooling_rates[temp_range]
+            if len(rates) >= 3:
+                return statistics.median(rates[-10:])
+
+        # Try adjacent temperature ranges if exact match not found
+        for try_temp in [starting_temp - 5, starting_temp + 5]:
+            try_range = self._get_temp_range(try_temp)
+            if try_range in self.stats.temp_cooling_rates:
+                rates = self.stats.temp_cooling_rates[try_range]
+                if len(rates) >= 3:
+                    return statistics.median(rates[-10:])
+
+        return None
+
     def get_charge_rate_for_soc(self, soc: float, battery_temp: Optional[float] = None) -> float:
         """
         Get predicted charge rate for a given SOC level and optional temperature.
@@ -361,6 +497,49 @@ class BatteryLearningEngine:
             warming_rate = 0.1  # °C/minute
 
         return start_temp + (warming_rate * duration_minutes)
+
+    def predict_temp_after_idle(
+        self,
+        start_temp: float,
+        duration_minutes: float,
+        ambient_temp: Optional[float] = None,
+        default_cooling_rate: float = 0.012
+    ) -> float:
+        """
+        Predict battery temperature after idle (not charging) for a given duration.
+
+        Uses exponential decay toward ambient temperature. First tries to use
+        learned cooling rate for the starting temperature, falls back to default.
+
+        Args:
+            start_temp: Starting battery temperature (°C)
+            duration_minutes: Idle duration in minutes
+            ambient_temp: Ambient temperature to decay toward (°C), uses estimated if not provided
+            default_cooling_rate: Fallback rate if no learned data available
+                         0.012 means battery loses ~50% of excess temp per hour
+                         (e.g., 21°C → ~18°C after 1 hour with 15°C ambient)
+
+        Returns:
+            Predicted temperature after idle period
+        """
+        # Use estimated ambient if not provided
+        if ambient_temp is None:
+            ambient_temp = self.get_estimated_ambient_temp(default=10.0)
+
+        if start_temp <= ambient_temp:
+            # Already at or below ambient, won't cool further
+            return start_temp
+
+        # Try to use learned cooling rate, fall back to default
+        learned_rate = self.get_cooling_rate(start_temp)
+        cooling_rate = learned_rate if learned_rate is not None else default_cooling_rate
+
+        # Exponential decay: temp approaches ambient
+        # T(t) = ambient + (start - ambient) * e^(-rate * t)
+        import math
+        temp_diff = start_temp - ambient_temp
+        decay_factor = math.exp(-cooling_rate * duration_minutes)
+        return ambient_temp + (temp_diff * decay_factor)
 
     def get_time_to_reach_temp(
         self,
@@ -543,6 +722,19 @@ class BatteryLearningEngine:
                     "observations": count
                 }
 
+        # Build cooling rates summary
+        cooling_rates_summary = {}
+        for temp_range, rates in self.stats.temp_cooling_rates.items():
+            if rates:
+                count = len(rates)
+                cooling_rates_summary[temp_range] = {
+                    "median_rate_per_min": round(statistics.median(rates[-10:]), 4),
+                    "observations": count
+                }
+
+        # Estimated ambient temperature
+        estimated_ambient = self.get_estimated_ambient_temp(default=10.0)
+
         return {
             "learned_efficiency": round(self.learned_efficiency, 3),
             "total_energy_charged_kwh": round(self.stats.total_energy_charged_kwh, 1),
@@ -553,6 +745,8 @@ class BatteryLearningEngine:
             "soc_charge_rates": soc_charge_rates,
             "temp_aware_rates": temp_aware_rates,
             "temp_warming_rates": warming_rates_summary,
+            "temp_cooling_rates": cooling_rates_summary,
+            "estimated_ambient_temp": round(estimated_ambient, 1),
         }
 
     def save_to_json(self) -> str:

@@ -338,3 +338,194 @@ class TestBatteryLearningEngine:
         assert success
         assert learning_engine.learned_efficiency == 0.88
         assert learning_engine.stats.total_energy_charged_kwh == 100.0
+
+
+class TestCoolingRateLearning:
+    """Test cases for cooling rate learning."""
+
+    def test_record_cooling_basic(self, learning_engine):
+        """Recording cooling should store data in temp_cooling_rates."""
+        learning_engine.record_cooling(
+            temp_start=21.0,
+            temp_end=18.0,
+            duration_minutes=60,
+            ambient_temp=15.0
+        )
+
+        assert ">20" in learning_engine.stats.temp_cooling_rates
+        assert len(learning_engine.stats.temp_cooling_rates[">20"]) == 1
+
+    def test_record_cooling_calculates_rate(self, learning_engine):
+        """Cooling rate should be calculated correctly from exponential decay."""
+        # 21°C -> 18°C in 60 min with ambient 15°C
+        # rate = -ln((18-15)/(21-15)) / 60 = -ln(0.5) / 60 ≈ 0.0116
+        learning_engine.record_cooling(
+            temp_start=21.0,
+            temp_end=18.0,
+            duration_minutes=60,
+            ambient_temp=15.0
+        )
+
+        rate = learning_engine.stats.temp_cooling_rates[">20"][0]
+        assert 0.010 < rate < 0.013  # Should be around 0.0116
+
+    def test_record_cooling_ignored_when_no_drop(self, learning_engine):
+        """No cooling recorded if temperature didn't drop."""
+        learning_engine.record_cooling(
+            temp_start=21.0,
+            temp_end=22.0,  # Temp increased
+            duration_minutes=60
+        )
+
+        assert len(learning_engine.stats.temp_cooling_rates) == 0
+
+    def test_record_cooling_ignored_below_ambient(self, learning_engine):
+        """No cooling recorded if start temp at or below ambient."""
+        learning_engine.record_cooling(
+            temp_start=14.0,  # Below ambient
+            temp_end=13.0,
+            duration_minutes=60,
+            ambient_temp=15.0
+        )
+
+        assert len(learning_engine.stats.temp_cooling_rates) == 0
+
+    def test_record_cooling_ignored_short_duration(self, learning_engine):
+        """No cooling recorded for very short durations."""
+        learning_engine.record_cooling(
+            temp_start=21.0,
+            temp_end=20.0,
+            duration_minutes=0.5  # Too short
+        )
+
+        assert len(learning_engine.stats.temp_cooling_rates) == 0
+
+    def test_get_cooling_rate_returns_none_without_data(self, learning_engine):
+        """Should return None when no cooling data available."""
+        rate = learning_engine.get_cooling_rate(21.0)
+        assert rate is None
+
+    def test_get_cooling_rate_returns_median(self, learning_engine):
+        """Should return median of last observations."""
+        # Record multiple cooling observations
+        for end_temp in [18.0, 17.5, 18.5, 17.8, 18.2]:
+            learning_engine.record_cooling(
+                temp_start=21.0,
+                temp_end=end_temp,
+                duration_minutes=60,
+                ambient_temp=15.0
+            )
+
+        rate = learning_engine.get_cooling_rate(21.0)
+        assert rate is not None
+        assert 0.008 < rate < 0.016  # Should be in reasonable range
+
+    def test_predict_temp_after_idle_uses_learned_rate(self, learning_engine):
+        """Prediction should use learned rate when available."""
+        # Record enough cooling observations
+        for _ in range(5):
+            learning_engine.record_cooling(
+                temp_start=21.0,
+                temp_end=18.0,
+                duration_minutes=60,
+                ambient_temp=15.0
+            )
+
+        # Predict with learned rate
+        predicted = learning_engine.predict_temp_after_idle(21.0, 60, ambient_temp=15.0)
+
+        # Should be around 18°C (matching the learned data)
+        assert 17.5 < predicted < 18.5
+
+    def test_predict_temp_after_idle_uses_default_when_no_data(self, learning_engine):
+        """Prediction should use default rate when no learned data."""
+        predicted = learning_engine.predict_temp_after_idle(
+            21.0, 60, ambient_temp=15.0, default_cooling_rate=0.012
+        )
+
+        # With default rate 0.012, should cool to ~17.9°C
+        assert 17.5 < predicted < 18.5
+
+    def test_cooling_rates_in_learning_summary(self, learning_engine):
+        """Learning summary should include cooling rates."""
+        # First record ambient observations so cooling recording doesn't fail
+        for temp in [15.0, 14.0, 15.5]:
+            learning_engine.record_temperature_observation(temp)
+
+        for _ in range(5):
+            learning_engine.record_cooling(
+                temp_start=21.0,
+                temp_end=18.0,
+                duration_minutes=60
+            )
+
+        summary = learning_engine.get_learning_summary()
+
+        assert "temp_cooling_rates" in summary
+        assert ">20" in summary["temp_cooling_rates"]
+        assert "median_rate_per_min" in summary["temp_cooling_rates"][">20"]
+        assert "observations" in summary["temp_cooling_rates"][">20"]
+
+
+class TestAmbientTemperatureEstimation:
+    """Test cases for ambient temperature estimation."""
+
+    def test_record_temperature_observation(self, learning_engine):
+        """Should record temperature observations."""
+        learning_engine.record_temperature_observation(12.0)
+        learning_engine.record_temperature_observation(15.0)
+
+        assert len(learning_engine.stats.recent_min_temps) == 2
+        assert 12.0 in learning_engine.stats.recent_min_temps
+        assert 15.0 in learning_engine.stats.recent_min_temps
+
+    def test_record_temperature_observation_limits_history(self, learning_engine):
+        """Should limit history to ~48 observations."""
+        for i in range(60):
+            learning_engine.record_temperature_observation(10.0 + i * 0.1)
+
+        assert len(learning_engine.stats.recent_min_temps) == 48
+
+    def test_get_estimated_ambient_returns_minimum(self, learning_engine):
+        """Should return minimum of recent observations as ambient."""
+        learning_engine.record_temperature_observation(15.0)
+        learning_engine.record_temperature_observation(12.0)
+        learning_engine.record_temperature_observation(18.0)
+        learning_engine.record_temperature_observation(10.0)
+        learning_engine.record_temperature_observation(14.0)
+
+        ambient = learning_engine.get_estimated_ambient_temp()
+
+        assert ambient == 10.0
+
+    def test_get_estimated_ambient_returns_default_when_empty(self, learning_engine):
+        """Should return default when no observations."""
+        ambient = learning_engine.get_estimated_ambient_temp(default=10.0)
+        assert ambient == 10.0
+
+        ambient = learning_engine.get_estimated_ambient_temp(default=15.0)
+        assert ambient == 15.0
+
+    def test_estimated_ambient_in_learning_summary(self, learning_engine):
+        """Learning summary should include estimated ambient temperature."""
+        learning_engine.record_temperature_observation(12.0)
+        learning_engine.record_temperature_observation(10.0)
+
+        summary = learning_engine.get_learning_summary()
+
+        assert "estimated_ambient_temp" in summary
+        assert summary["estimated_ambient_temp"] == 10.0
+
+    def test_cooling_uses_estimated_ambient(self, learning_engine):
+        """Cooling predictions should use estimated ambient, not hardcoded default."""
+        # Set ambient to 8°C via observations
+        for temp in [10.0, 8.0, 9.0]:
+            learning_engine.record_temperature_observation(temp)
+
+        # Predict cooling from 20°C - should cool toward 8°C
+        predicted = learning_engine.predict_temp_after_idle(20.0, 60)
+
+        # With ambient 8°C and default rate, should cool significantly
+        # but still be well above 8°C after 1 hour
+        assert predicted < 20.0
+        assert predicted > 8.0

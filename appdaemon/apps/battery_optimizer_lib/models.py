@@ -68,6 +68,10 @@ class LearningStats:
     charge_rates_by_soc_temp: Dict[str, Dict[str, List[float]]] = field(default_factory=dict)
     # Temperature warming rates during charging: {"10-15": [0.3, 0.4, 0.35]} (°C/minute by starting temp range)
     temp_warming_rates: Dict[str, List[float]] = field(default_factory=dict)
+    # Temperature cooling rates during idle: {">20": [0.015, 0.012]} (decay rate per minute by starting temp range)
+    temp_cooling_rates: Dict[str, List[float]] = field(default_factory=dict)
+    # Recent minimum battery temperatures for ambient estimation (last ~48h of observations)
+    recent_min_temps: List[float] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)

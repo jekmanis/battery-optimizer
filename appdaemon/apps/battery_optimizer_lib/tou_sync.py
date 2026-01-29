@@ -493,21 +493,8 @@ class TouSyncManager:
                 await self._write_register_with_retry(VPP_TOU_NUM_PERIODS, 0, verify=False)
                 return False
 
-            # Step 7: Verify
-            await self.sleep(0.5)
-            try:
-                verified = self._read_modbus_registers(VPP_TOU_NUM_PERIODS, 1)
-                if verified and len(verified) > 0 and verified[0] == num_periods:
-                    self.log(f"TOU sync complete: {num_periods} periods written and verified")
-                elif verified is not None:
-                    self.log(f"TOU sync verification FAILED: expected {num_periods}, got {verified}",
-                            level="ERROR")
-                    return False
-                else:
-                    self.log(f"TOU sync complete: {num_periods} periods written (verification unavailable)")
-            except Exception as e:
-                self.log(f"TOU sync complete: {num_periods} periods written (verification error: {e})")
-
+            # All writes succeeded and were individually verified
+            self.log(f"TOU sync complete: {num_periods} periods written and verified")
             return True
 
         except Exception as e:

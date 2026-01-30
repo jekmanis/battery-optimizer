@@ -1089,7 +1089,7 @@ class BatteryOptimizer(hass.Hass):
                 slot_charge_rate = charge_rates_list[t]
                 charge_energy_kwh = slot_charge_rate * self.efficiency * self.slot_hours * fraction
                 charge_cost_kwh = slot_charge_rate * self.slot_hours * fraction
-                charge_count_increment = 0 if fraction < 0.999 else 1
+                charge_count_increment = 1  # Always count - energy is tracked separately
 
                 next_dp = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
                 next_dp_tie = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
@@ -1427,7 +1427,7 @@ class BatteryOptimizer(hass.Hass):
                 price_is_favorable = favorable_flags[partial_index]
                 must_use_unfavorable = (0 + favorable_remaining[partial_index]) < min_charge_slots
                 allow_charge = price_is_favorable or must_use_unfavorable
-                partial_charge_increment = 0 if fraction < 0.999 else 1
+                partial_charge_increment = 1  # Always count - energy is tracked separately
                 if allow_charge and charge_energy_kwh > 0 and partial_charge_increment <= max_charge_slots:
                     new_energy = start_energy + charge_energy_kwh
                     actual_charge_energy = charge_energy_kwh

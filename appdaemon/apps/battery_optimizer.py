@@ -828,7 +828,6 @@ class BatteryOptimizer(hass.Hass):
                                 "discharge_to_soc": next_soc_discharge,
                                 "discharge_to_idx": discharge_next_idx,
                                 "discharge_val": discharge_next_val,
-                                "discharge_gain": (discharge_next_val - val) if discharge_next_val else 0,
                             })
 
                 # Store trace for this slot
@@ -960,9 +959,12 @@ class BatteryOptimizer(hass.Hass):
                                 status = "-> HOLD set (no discharge attempted)"
 
                             c_info = f"c={trace['charge_count']}, " if trace.get('charge_count', 0) > 0 else ""
+                            delta = (trace['discharge_val'] - trace['hold_val']) if trace['discharge_val'] is not None else None
+                            delta_str = f"+{delta:.4f}" if delta is not None and delta >= 0 else (f"{delta:.4f}" if delta is not None else "N/A")
+                            discharge_val_str = f"{trace['discharge_val']:.4f}" if trace['discharge_val'] is not None else "N/A"
                             self.log(
-                                f"  SOC {trace['from_soc']:.1f}% ({c_info}idx={trace['from_idx']}, val={trace['from_val']:.4f}): "
-                                f"discharge_gain={trace['discharge_gain']:.4f} to SOC {trace['discharge_to_soc']:.1f}% | {status}"
+                                f"  SOC {trace['from_soc']:.1f}% ({c_info}idx={trace['from_idx']}): "
+                                f"hold={trace['hold_val']:.4f} vs discharge={discharge_val_str} (delta={delta_str}) -> {status}"
                             )
                 self.log("=" * 70)
 

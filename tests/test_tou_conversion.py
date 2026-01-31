@@ -11,6 +11,7 @@ from typing import Dict, List
 import pytest
 
 from battery_optimizer import BatteryMode, ScheduleEntry, TouPeriod
+from battery_optimizer_lib import TouSyncManager
 
 
 class MockTouOptimizer:
@@ -23,6 +24,21 @@ class MockTouOptimizer:
         self._current_date = datetime.date(2024, 1, 15)
         self._current_datetime = datetime.datetime(2024, 1, 15, 12, 0, 0)
         self.slot_minutes = 60  # Default hourly slots
+
+        # Create TouSyncManager for delegation
+        self._tou_sync_manager = TouSyncManager(
+            device_id="",
+            slot_minutes=self.slot_minutes,
+            ha_url="",
+            ha_token="",
+            call_service_func=lambda *args, **kwargs: None,
+            get_datetime_func=self.datetime,
+            get_timezone_func=self._get_local_timezone,
+            sleep_func=lambda x: None,
+            create_task_func=lambda x: None,
+            log_func=self.log,
+            get_schedule_func=lambda: self.schedule,
+        )
 
     def date(self):
         return self._current_date

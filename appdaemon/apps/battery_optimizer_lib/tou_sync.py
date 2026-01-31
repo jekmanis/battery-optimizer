@@ -52,6 +52,7 @@ class TouSyncManager:
         sleep_func: Callable,
         create_task_func: Callable,
         log_func: Callable,
+        get_schedule_func: Callable[[], Dict[datetime.datetime, ScheduleEntry]] = None,
     ):
         """
         Initialize the TOU sync manager.
@@ -67,6 +68,7 @@ class TouSyncManager:
             sleep_func: Async sleep function
             create_task_func: Async task creation function
             log_func: Callback for logging
+            get_schedule_func: Callback to get latest schedule (ensures fresh data at execution time)
         """
         self.device_id = device_id
         self.slot_minutes = slot_minutes
@@ -79,6 +81,7 @@ class TouSyncManager:
         self.sleep = sleep_func
         self.create_task = create_task_func
         self.log = log_func
+        self.get_schedule = get_schedule_func or (lambda: {})
 
         # Sync state
         self._tou_sync_in_progress = False
@@ -268,18 +271,21 @@ class TouSyncManager:
 
     def schedule_tou_sync(
         self,
-        schedule: Dict[datetime.datetime, ScheduleEntry],
         boundary_minute: int = None,
         skip_fit_check: bool = False,
         allow_queue: bool = True,
         reason: str = ""
     ):
-        """Schedule a TOU sync, avoiding overlapping register writes."""
+        """Schedule a TOU sync, avoiding overlapping register writes.
+
+        Note: Schedule is fetched fresh via get_schedule() at execution time,
+        ensuring the latest schedule is always used even if queued.
+        """
         if self._tou_sync_in_progress:
             if allow_queue:
                 self._tou_sync_pending = True
+                # Don't store schedule - it will be fetched fresh at execution time
                 self._tou_sync_pending_kwargs = {
-                    "schedule": schedule,
                     "boundary_minute": boundary_minute,
                     "skip_fit_check": skip_fit_check,
                     "reason": reason,
@@ -295,21 +301,21 @@ class TouSyncManager:
         self._tou_sync_pending = False
         self._tou_sync_pending_kwargs = None
         if reason:
-            self.log(f"Scheduling TOU sync ({reason})", level="DEBUG")
+            self.log(f"Scheduling TOU sync ({reason})", level="INFO")
         self.create_task(self._run_tou_sync(
-            schedule=schedule,
             boundary_minute=boundary_minute,
             skip_fit_check=skip_fit_check
         ))
 
     async def _run_tou_sync(
         self,
-        schedule: Dict[datetime.datetime, ScheduleEntry],
         boundary_minute: int = None,
         skip_fit_check: bool = False
     ):
-        """Run TOU sync with cleanup."""
+        """Run TOU sync with cleanup. Fetches fresh schedule at execution time."""
         try:
+            # Get fresh schedule at execution time, not when sync was scheduled
+            schedule = self.get_schedule()
             await self.sync_schedule_to_inverter(
                 schedule=schedule,
                 boundary_minute=boundary_minute,
@@ -323,10 +329,13 @@ class TouSyncManager:
                 self._tou_sync_pending_kwargs = None
                 self.schedule_tou_sync(**pending_kwargs)
 
-    def check_and_sync_rolling_tou(self, schedule: Dict[datetime.datetime, ScheduleEntry]):
+    def check_and_sync_rolling_tou(self):
         """
         Check if TOU schedule needs rolling update and sync if needed.
+
+        Fetches fresh schedule via get_schedule() to ensure latest data.
         """
+        schedule = self.get_schedule()
         if not schedule:
             return
         if self._tou_sync_in_progress:
@@ -363,7 +372,6 @@ class TouSyncManager:
         self.log(f"Rolling TOU update: boundary={boundary_minute//60:02d}:{boundary_minute%60:02d}, "
                  f"updating {len(new_periods)} periods")
         self.schedule_tou_sync(
-            schedule=schedule,
             boundary_minute=boundary_minute,
             skip_fit_check=True,
             allow_queue=False,

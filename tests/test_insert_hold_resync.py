@@ -17,6 +17,7 @@ apps_dir = Path(__file__).parent.parent / "appdaemon" / "apps"
 sys.path.insert(0, str(apps_dir))
 
 from battery_optimizer import BatteryMode, ScheduleEntry, TouPeriod, BatteryOptimizer
+from battery_optimizer_lib import TouSyncManager
 
 
 class MockInsertHoldOptimizer:
@@ -35,6 +36,21 @@ class MockInsertHoldOptimizer:
         self._schedule_tou_sync_calls = []
         self._handle_mode_transition_calls = []
         self._update_schedule_sensor_calls = 0
+
+        # Create TouSyncManager for delegation
+        self._tou_sync_manager = TouSyncManager(
+            device_id=self.device_id,
+            slot_minutes=self.slot_minutes,
+            ha_url="",
+            ha_token="",
+            call_service_func=lambda *args, **kwargs: None,
+            get_datetime_func=self.datetime,
+            get_timezone_func=self._get_local_timezone,
+            sleep_func=lambda x: None,
+            create_task_func=lambda x: None,
+            log_func=self.log,
+            get_schedule_func=lambda: self.schedule,
+        )
 
     def datetime(self):
         return self._current_datetime

@@ -66,8 +66,6 @@ class BatteryOptimizer(hass.Hass):
         # Internal state
         self.current_mode: BatteryMode = BatteryMode.HOLD
         self.schedule: Dict[datetime.datetime, ScheduleEntry] = {}
-        self.cached_prices: List[PricePoint] = []
-        self.cached_prices_date: Optional[datetime.date] = None  # Date when prices were cached
         self.last_optimization: Optional[datetime.datetime] = None
         self.expected_soc_schedule: Dict[datetime.datetime, float] = {}
         self.expected_temp_schedule: Dict[datetime.datetime, float] = {}
@@ -122,6 +120,23 @@ class BatteryOptimizer(hass.Hass):
             create_task_func=self.create_task,
             log_func=self.log,
             get_schedule_func=lambda: self.schedule,  # Fresh schedule at execution time
+        )
+
+        # Nord Pool price service for fetching electricity prices
+        self._price_service = NordPoolPriceService(
+            nordpool_config_entry=self.nordpool_config_entry,
+            nordpool_area=self.nordpool_area,
+            nordpool_sensor=self.nordpool_sensor,
+            ha_url=self.args.get("ha_url", ""),
+            ha_token=self.args.get("ha_token", ""),
+            tomorrow_prices_hour=self.tomorrow_prices_hour,
+            slot_minutes=self.slot_minutes,
+            get_state_func=self.get_state,
+            call_service_func=self.call_service,
+            get_datetime_func=self.datetime,
+            get_date_func=self.date,
+            get_timezone_func=self._get_local_timezone,
+            log_func=self.log,
         )
 
         # Restore previous schedule from sensor (for continuity on restart)
@@ -281,445 +296,12 @@ class BatteryOptimizer(hass.Hass):
                  f"efficiency={self.efficiency}, slot={self.slot_minutes}min")
 
     # =========================================================================
-    # Price Fetching and Analysis
+    # Price Fetching (delegates to NordPoolPriceService)
     # =========================================================================
 
     def get_prices(self) -> List[PricePoint]:
-        """
-        Fetch prices from Nord Pool.
-        Returns combined today + tomorrow prices when available.
-        Supports both built-in HA Nord Pool integration (via service call) and HACS custom component (via attributes).
-        """
-        self.log(f"get_prices called. Config: nordpool_config_entry='{self.nordpool_config_entry}', area='{self.nordpool_area}', ha_url='{self.args.get('ha_url', 'NOT SET')}'")
-
-        prices = []
-        today = self.date()
-        tomorrow = today + datetime.timedelta(days=1)
-        tz = self._get_local_timezone()
-
-        # Try built-in HA Nord Pool integration first (uses service call)
-        if self.nordpool_config_entry:
-            prices = self._get_prices_via_service(today, tomorrow, tz)
-            if prices:
-                prices = self._normalize_prices(prices)
-                self.cached_prices = prices
-                self.cached_prices_date = today
-                self.log(f"Fetched {len(prices)} price points via service call")
-                return prices
-
-        # Fall back to HACS custom component (uses sensor attributes)
-        prices = self._get_prices_via_sensor(today, tomorrow, tz)
-        if prices:
-            prices = self._normalize_prices(prices)
-            self.cached_prices = prices
-            self.cached_prices_date = today
-            self.log(f"Fetched {len(prices)} price points via sensor attributes")
-            return prices
-
-        # Validate cached prices are not stale before using
-        if self.cached_prices and self.cached_prices_date:
-            # Cache is valid if it was fetched today or yesterday (may contain tomorrow's prices)
-            cache_age_days = (today - self.cached_prices_date).days
-            if cache_age_days <= 1:
-                # Additional check: ensure we have prices for today
-                has_today_prices = any(p.hour.date() == today for p in self.cached_prices)
-                if has_today_prices:
-                    self.log(f"Using cached prices (cached {cache_age_days} day(s) ago)", level="WARNING")
-                    return self.cached_prices
-                else:
-                    self.log(f"Cached prices don't contain today's prices, clearing stale cache", level="WARNING")
-                    self.cached_prices = []
-                    self.cached_prices_date = None
-            else:
-                self.log(f"Cached prices are {cache_age_days} days old, clearing stale cache", level="WARNING")
-                self.cached_prices = []
-                self.cached_prices_date = None
-
-        self.log("No price data available from any source", level="WARNING")
-        return []
-
-    def _normalize_prices(self, prices: List[PricePoint]) -> List[PricePoint]:
-        """
-        Normalize price points to the configured slot size.
-        Aggregates higher-resolution data or expands lower-resolution data.
-        """
-        if not prices:
-            return []
-
-        sorted_prices = sorted(prices, key=lambda p: p.hour)
-        deltas = []
-        for i in range(1, len(sorted_prices)):
-            delta_min = (sorted_prices[i].hour - sorted_prices[i - 1].hour).total_seconds() / 60
-            if delta_min > 0:
-                deltas.append(delta_min)
-        min_delta = min(deltas) if deltas else self.slot_minutes
-
-        # Already at desired resolution
-        if abs(min_delta - self.slot_minutes) < 0.1:
-            return sorted_prices
-
-        # Aggregate finer data into slot buckets
-        if min_delta < self.slot_minutes:
-            buckets: Dict[datetime.datetime, List[float]] = {}
-            for p in sorted_prices:
-                bucket = self._align_to_slot(p.hour)
-                buckets.setdefault(bucket, []).append(p.price)
-            normalized = [
-                PricePoint(hour=dt, price=sum(vals) / len(vals))
-                for dt, vals in buckets.items()
-            ]
-            return sorted(normalized, key=lambda p: p.hour)
-
-        # Expand coarser data into multiple slots
-        factor = int(round(min_delta / self.slot_minutes))
-        if factor <= 1 or abs(min_delta - factor * self.slot_minutes) > 0.1:
-            # Fallback to bucketing if resolution is irregular
-            buckets: Dict[datetime.datetime, List[float]] = {}
-            for p in sorted_prices:
-                bucket = self._align_to_slot(p.hour)
-                buckets.setdefault(bucket, []).append(p.price)
-            normalized = [
-                PricePoint(hour=dt, price=sum(vals) / len(vals))
-                for dt, vals in buckets.items()
-            ]
-            return sorted(normalized, key=lambda p: p.hour)
-
-        expanded: List[PricePoint] = []
-        for p in sorted_prices:
-            for i in range(factor):
-                expanded.append(PricePoint(
-                    hour=p.hour + datetime.timedelta(minutes=i * self.slot_minutes),
-                    price=p.price
-                ))
-        return sorted(expanded, key=lambda p: p.hour)
-
-    def _get_prices_via_service(self, today, tomorrow, tz) -> List[PricePoint]:
-        """
-        Fetch prices using the built-in HA Nord Pool integration service.
-        Uses nordpool.get_prices_for_date action.
-        """
-        prices = []
-
-        if not self.nordpool_config_entry:
-            self.log("nordpool_config_entry not configured, skipping service call", level="DEBUG")
-            return prices
-
-        self.log(f"Fetching prices via service for config_entry={self.nordpool_config_entry}, area={self.nordpool_area}")
-
-        try:
-            # Fetch today's prices
-            self.log(f"Fetching today's prices ({today.isoformat()})...")
-            today_data = self._call_nordpool_service(today.isoformat())
-            self.log(f"Today data received: {today_data is not None}, type={type(today_data)}")
-            if today_data:
-                today_prices = self._parse_service_response(today_data, tz)
-                self.log(f"Parsed {len(today_prices)} prices for today")
-                prices.extend(today_prices)
-
-            # Fetch tomorrow's prices (available after ~13:00 CET)
-            # Use configured hour adjusted for local timezone (default 14 for EET = 13 CET)
-            current_hour = self.datetime().hour
-            self.log(f"Current hour: {current_hour}, will fetch tomorrow: {current_hour >= self.tomorrow_prices_hour}")
-            if current_hour >= self.tomorrow_prices_hour:
-                try:
-                    self.log(f"Fetching tomorrow's prices ({tomorrow.isoformat()})...")
-                    tomorrow_data = self._call_nordpool_service(tomorrow.isoformat())
-                    if tomorrow_data:
-                        tomorrow_prices = self._parse_service_response(tomorrow_data, tz)
-                        self.log(f"Parsed {len(tomorrow_prices)} prices for tomorrow")
-                        prices.extend(tomorrow_prices)
-                except Exception as e:
-                    self.log(f"Tomorrow's prices not yet available: {e}", level="DEBUG")
-
-        except Exception as e:
-            self.log(f"Error fetching prices via service: {e}", level="WARNING")
-            self.log(traceback.format_exc(), level="WARNING")
-
-        self.log(f"Service method returned {len(prices)} total prices")
-        return prices
-
-    def _get_prices_for_date(self, date_obj, tz) -> List[PricePoint]:
-        """Fetch and normalize prices for a specific date via Nord Pool service."""
-        if not self.nordpool_config_entry:
-            return []
-
-        try:
-            data = self._call_nordpool_service(date_obj.isoformat())
-            if not data:
-                return []
-            parsed = self._parse_service_response(data, tz)
-            if not parsed:
-                return []
-            return self._normalize_prices(parsed)
-        except Exception as e:
-            self.log(f"Error fetching prices for {date_obj.isoformat()}: {e}", level="DEBUG")
-            return []
-
-    def _call_nordpool_service(self, date_str: str) -> Optional[Dict]:
-        """
-        Call the nordpool.get_prices_for_date service.
-        Tries AppDaemon call_service first, falls back to REST API.
-        """
-        # Try REST API approach (more reliable for response actions)
-        result = self._call_nordpool_rest_api(date_str)
-        if result:
-            return result
-
-        # Fallback to AppDaemon call_service (may not return response data)
-        try:
-            result = self.call_service(
-                "nordpool/get_prices_for_date",
-                config_entry=self.nordpool_config_entry,
-                date=date_str,
-                areas=self.nordpool_area,  # Single string, not a list
-                return_result=True
-            )
-            self.log(f"Nord Pool service response for {date_str}: {type(result)}")
-            return result
-        except Exception as e:
-            self.log(f"Service call failed for {date_str}: {e}", level="WARNING")
-            return None
-
-    def _call_nordpool_rest_api(self, date_str: str) -> Optional[Dict]:
-        """
-        Call Nord Pool service via Home Assistant REST API.
-        This is more reliable for response-returning actions.
-        """
-        if not REQUESTS_AVAILABLE:
-            self.log("requests module not available for REST API", level="WARNING")
-            return None
-
-        try:
-            # Get HA URL and token from apps.yaml
-            ha_url = self.args.get("ha_url", "").rstrip("/")
-            token = self.args.get("ha_token", "")
-
-            self.log(f"REST API config: ha_url={ha_url[:30] if ha_url else 'MISSING'}..., token={'SET' if token else 'MISSING'}")
-
-            if not ha_url or not token:
-                self.log("ha_url and ha_token not configured in apps.yaml - needed for Nord Pool service calls", level="WARNING")
-                return None
-
-            # Add return_response for HA 2023.7+ response-returning actions
-            url = f"{ha_url}/api/services/nordpool/get_prices_for_date?return_response"
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "config_entry": self.nordpool_config_entry,
-                "date": date_str,
-                "areas": self.nordpool_area  # Single string, not a list
-            }
-
-            self.log(f"Calling Nord Pool API: POST {url}")
-            self.log(f"Payload: {json.dumps(payload)}")
-            response = requests.post(url, json=payload, headers=headers, timeout=30)
-
-            self.log(f"REST API response status: {response.status_code}")
-            if response.status_code == 200:
-                data = response.json()
-                self.log(f"REST API response for {date_str}: type={type(data)}, keys={list(data.keys()) if isinstance(data, dict) else 'N/A'}")
-
-                # Response is wrapped in service_response for HA 2023.7+ actions
-                if isinstance(data, dict):
-                    # Extract from service_response wrapper
-                    if "service_response" in data:
-                        self.log("Found service_response wrapper")
-                        return data["service_response"]
-                    # Check for response wrapper (older format)
-                    if "response" in data:
-                        return data["response"]
-                    # Check for area data directly
-                    if self.nordpool_area in data or self.nordpool_area.lower() in data:
-                        return data
-
-                    self.log(f"Response keys: {list(data.keys())[:10]}", level="DEBUG")
-                    return data
-                elif isinstance(data, list) and data:
-                    self.log(f"Response is list with {len(data)} items", level="DEBUG")
-                    return {self.nordpool_area: data}
-                return data
-            else:
-                self.log(f"REST API returned status {response.status_code}: {response.text[:200]}", level="WARNING")
-                return None
-
-        except requests.exceptions.RequestException as e:
-            self.log(f"REST API request failed: {e}", level="WARNING")
-            return None
-        except Exception as e:
-            self.log(f"REST API call failed: {e}", level="WARNING")
-            self.log(traceback.format_exc(), level="DEBUG")
-            return None
-
-    def _parse_service_response(self, data: Dict, tz) -> List[PricePoint]:
-        """
-        Parse the response from nordpool.get_prices_for_date service.
-        Response format: {area: [{start, end, price}, ...]}
-        Prices are in EUR/MWh, need to convert to EUR/kWh.
-        """
-        prices = []
-
-        if not data:
-            self.log("No data to parse", level="DEBUG")
-            return prices
-
-        self.log(f"Parsing response data type: {type(data)}, keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
-
-        # Handle different response formats
-        area_prices = []
-
-        if isinstance(data, dict):
-            # Try direct area lookup
-            area_prices = data.get(self.nordpool_area, [])
-            if not area_prices:
-                area_prices = data.get(self.nordpool_area.lower(), [])
-
-            # Try nested in 'prices' key
-            if not area_prices and "prices" in data:
-                area_prices = data["prices"]
-
-            # Try the first key if it contains a list
-            if not area_prices:
-                for key, value in data.items():
-                    if isinstance(value, list) and value:
-                        self.log(f"Found price list under key '{key}' with {len(value)} entries")
-                        area_prices = value
-                        break
-
-        elif isinstance(data, list):
-            area_prices = data
-
-        self.log(f"Parsing {len(area_prices)} price entries for area {self.nordpool_area}")
-
-        for entry in area_prices:
-            if not isinstance(entry, dict):
-                continue
-
-            start_str = entry.get("start", "")
-            price_mwh = entry.get("price")
-
-            if price_mwh is None:
-                continue
-
-            # Parse start time (UTC format: 2026-01-21T00:00:00+00:00)
-            try:
-                if isinstance(start_str, str):
-                    # Handle various datetime formats
-                    start_str = start_str.replace("Z", "+00:00")
-                    start_dt = datetime.datetime.fromisoformat(start_str)
-                else:
-                    continue
-
-                # Convert to local timezone
-                if tz and start_dt.tzinfo:
-                    start_dt = start_dt.astimezone(tz)
-                elif tz:
-                    start_dt = start_dt.replace(tzinfo=tz)
-
-                # Convert EUR/MWh to EUR/kWh
-                price_kwh = float(price_mwh) / 1000.0
-                prices.append(PricePoint(hour=start_dt, price=price_kwh))
-
-            except (ValueError, TypeError) as e:
-                self.log(f"Error parsing price entry {entry}: {e}", level="DEBUG")
-                continue
-
-        return prices
-
-    def _get_prices_via_sensor(self, today, tomorrow, tz) -> List[PricePoint]:
-        """
-        Fetch prices from HACS custom component sensor attributes.
-        """
-        try:
-            state = self.get_state(self.nordpool_sensor, attribute="all")
-            if not state:
-                return []
-
-            prices = []
-            attrs = state.get("attributes", {})
-
-            # HACS custom component uses raw_today/raw_tomorrow or today/tomorrow
-            today_prices = attrs.get("raw_today") or attrs.get("today") or []
-            tomorrow_prices = attrs.get("raw_tomorrow") or attrs.get("tomorrow") or []
-
-            # Process today's prices
-            if today_prices:
-                if isinstance(today_prices, list) and today_prices:
-                    if isinstance(today_prices[0], dict):
-                        # raw format: list of {start, end, value}
-                        for entry in today_prices:
-                            price = entry.get("value")
-                            start = entry.get("start")
-                            if price is not None and start:
-                                try:
-                                    if isinstance(start, str):
-                                        dt = datetime.datetime.fromisoformat(start.replace("Z", "+00:00"))
-                                    else:
-                                        dt = start
-                                    if tz and dt.tzinfo:
-                                        dt = dt.astimezone(tz)
-                                    elif tz:
-                                        dt = dt.replace(tzinfo=tz)
-                                    prices.append(PricePoint(hour=dt, price=float(price)))
-                                except (ValueError, TypeError):
-                                    pass
-                    else:
-                        # Simple list of prices (infer step size)
-                        step_minutes = 60
-                        if len(today_prices) > 0 and 1440 % len(today_prices) == 0:
-                            step_minutes = int(1440 / len(today_prices))
-                        for idx, price in enumerate(today_prices):
-                            if price is not None:
-                                minutes = idx * step_minutes
-                                dt = datetime.datetime.combine(
-                                    today,
-                                    datetime.time(minutes // 60, minutes % 60)
-                                )
-                                if tz:
-                                    dt = dt.replace(tzinfo=tz)
-                                prices.append(PricePoint(hour=dt, price=float(price)))
-
-            # Process tomorrow's prices
-            if tomorrow_prices:
-                if isinstance(tomorrow_prices, list) and tomorrow_prices:
-                    if isinstance(tomorrow_prices[0], dict):
-                        for entry in tomorrow_prices:
-                            price = entry.get("value")
-                            start = entry.get("start")
-                            if price is not None and start:
-                                try:
-                                    if isinstance(start, str):
-                                        dt = datetime.datetime.fromisoformat(start.replace("Z", "+00:00"))
-                                    else:
-                                        dt = start
-                                    if tz and dt.tzinfo:
-                                        dt = dt.astimezone(tz)
-                                    elif tz:
-                                        dt = dt.replace(tzinfo=tz)
-                                    prices.append(PricePoint(hour=dt, price=float(price)))
-                                except (ValueError, TypeError):
-                                    pass
-                    else:
-                        step_minutes = 60
-                        if len(tomorrow_prices) > 0 and 1440 % len(tomorrow_prices) == 0:
-                            step_minutes = int(1440 / len(tomorrow_prices))
-                        for idx, price in enumerate(tomorrow_prices):
-                            if price is not None:
-                                minutes = idx * step_minutes
-                                dt = datetime.datetime.combine(
-                                    tomorrow,
-                                    datetime.time(minutes // 60, minutes % 60)
-                                )
-                                if tz:
-                                    dt = dt.replace(tzinfo=tz)
-                                prices.append(PricePoint(hour=dt, price=float(price)))
-
-            return prices
-
-        except Exception as e:
-            self.log(f"Error fetching prices via sensor: {e}", level="WARNING")
-            return []
+        """Fetch prices from Nord Pool. Delegates to NordPoolPriceService."""
+        return self._price_service.get_prices()
 
     # =========================================================================
     # Optimization Algorithm
@@ -893,7 +475,7 @@ class BatteryOptimizer(hass.Hass):
             # Current slot missing - try yesterday's Nord Pool data (timezone shift around midnight)
             tz = self._get_local_timezone()
             yesterday = current_slot.date() - datetime.timedelta(days=1)
-            yesterday_prices = self._get_prices_for_date(yesterday, tz)
+            yesterday_prices = self._price_service.get_prices_for_date(yesterday, tz)
 
             def find_slot_price(prices_list, slot):
                 slot_naive = slot.replace(tzinfo=None) if slot.tzinfo else slot
@@ -2794,179 +2376,26 @@ class BatteryOptimizer(hass.Hass):
 
     def set_mode(self, mode: BatteryMode, power_percent: int = 100):
         """
-        Set the battery mode via VPP protocol registers (30xxx).
+        Set the battery mode via VPP protocol registers.
 
-        WIT inverters use VPP protocol - legacy registers 201/202 do NOT work!
-
-        VPP Register Reference:
-        - 30100: VPP Control Authority (must be 1 to enable control)
-        - 30407: Remote Power Control Enable (0=off, 1=on)
-        - 30409: Remote Power Percent (-100 to +100, positive=charge, negative=discharge)
-        - 30410: AC Charging Enable (1=PV first, required for grid charging)
-        - 30411: Number of TOU periods
-        - 30412-30414: TOU Period 1 (start, end, power)
+        Delegates to TouSyncManager for the actual register writes.
+        Updates mode tracking on success or in dry-run mode.
 
         Mode Mapping:
-        - CHARGE: 30407=1, 30409=+power_percent (enables AC charging)
-        - DISCHARGE: 30407=1, 30409=-power_percent
-        - HOLD: TOU with +1% charge - firmware quirk creates TRUE standby state!
-                CRITICAL: Simply setting 30407=0 returns to self-consumption where
-                battery WILL discharge to supply house load - this is NOT true HOLD!
-                CRITICAL: +1% = HOLD, but -1% = FULL DISCHARGE (asymmetric behavior!)
+        - CHARGE: Remote control with positive power
+        - DISCHARGE: Remote control with negative power
+        - HOLD: TOU with +1% charge (firmware quirk for true standby)
+
+        Dry-run mode: When device_id is empty, no register writes are performed
+        but internal state is still updated for testing/simulation purposes.
         """
-        if not self.device_id:
-            # Dry-run mode: update state without register writes
+        # Delegate to TouSyncManager for register writes
+        success = self._tou_sync_manager.set_mode(mode, power_percent)
+
+        # Update mode tracking on success, or always in dry-run mode (no device_id)
+        # for state consistency during testing/simulation
+        if success or not self.device_id:
             self._handle_mode_transition(mode)
-            self.log(f"No device_id configured, would set mode to {mode.name}", level="WARNING")
-            return
-
-        try:
-            # VPP Register addresses
-            VPP_CONTROL_AUTHORITY = 30100
-            VPP_REMOTE_POWER_ENABLE = 30407
-            VPP_REMOTE_POWER_PERCENT = 30409
-            VPP_AC_CHARGE_ENABLE = 30410
-            VPP_TOU_NUM_PERIODS = 30411
-            VPP_TOU_PERIOD1_BASE = 30412
-
-            # Step 1: Enable VPP control authority (persists across power cycles)
-            self.call_service("growatt_modbus/write_register",
-                device_id=self.device_id,
-                register=VPP_CONTROL_AUTHORITY,
-                value=1
-            )
-
-            if mode == BatteryMode.HOLD:
-                # HOLD: Use TOU +1% charge workaround for TRUE standby
-                # This is a firmware quirk - +1% charge via TOU creates actual idle state
-                # Simply disabling remote control (30407=0) returns to self-consumption
-                # where battery WILL discharge to supply house load!
-                # CRITICAL: +1% = HOLD, but -1% = FULL DISCHARGE (asymmetric!)
-                self.log("Setting HOLD mode via TOU +1% workaround (true standby)")
-
-                # Enable AC charging (required for TOU charge to work)
-                try:
-                    self.call_service("growatt_modbus/write_register",
-                        device_id=self.device_id,
-                        register=VPP_AC_CHARGE_ENABLE,
-                        value=1
-                    )
-                except Exception as e:
-                    self.log(f"AC charge enable (30410) failed: {e}", level="WARNING")
-
-                # Get current time for TOU period (use HA timezone, not system time)
-                now = self.datetime()
-                local_tz = self._get_local_timezone()
-                if now.tzinfo is not None and local_tz is not None:
-                    now = now.astimezone(local_tz)
-                current_minutes = now.hour * 60 + now.minute
-
-                # Create TOU period: (now - 5min) to (now + 2 hours) at +1% charge
-                start_min = max(0, current_minutes - 5)
-                end_min = min(1439, current_minutes + 120)
-
-                # CRITICAL: Clear ALL TOU period registers BEFORE writing new period!
-                # Stale non-zero data in ANY period register causes overlap validation failures!
-                # The firmware validates writes against ALL registers, not just active ones.
-                self.call_service("growatt_modbus/write_register",
-                    device_id=self.device_id,
-                    register=VPP_TOU_NUM_PERIODS,
-                    value=0
-                )
-                # Zero out all 20 period registers (60 registers total: 20 periods x 3 registers)
-                MAX_TOU_PERIODS = 20
-                try:
-                    self.call_service("growatt_modbus/write_registers",
-                        device_id=self.device_id,
-                        register=VPP_TOU_PERIOD1_BASE,
-                        values=[0] * (MAX_TOU_PERIODS * 3)
-                    )
-                except Exception as e:
-                    self.log(f"Bulk zeroing of TOU registers failed: {e}", level="WARNING")
-
-                # Now write the HOLD period
-                self.call_service("growatt_modbus/write_register",
-                    device_id=self.device_id,
-                    register=VPP_TOU_NUM_PERIODS,
-                    value=1
-                )
-
-                # Write TOU period using function 0x10 (write multiple registers)
-                self.call_service("growatt_modbus/write_registers",
-                    device_id=self.device_id,
-                    register=VPP_TOU_PERIOD1_BASE,
-                    values=[start_min, end_min, 1]  # +1% = HOLD (NOT -1% which = full discharge!)
-                )
-
-                self.log(f"Set battery mode to HOLD via TOU {start_min//60:02d}:{start_min%60:02d}-{end_min//60:02d}:{end_min%60:02d} @ +1%")
-
-            elif mode == BatteryMode.CHARGE:
-                # CHARGE: Enable AC charging, enable remote control, set positive power
-
-                # Clear any HOLD TOU periods first
-                self.call_service("growatt_modbus/write_register",
-                    device_id=self.device_id,
-                    register=VPP_TOU_NUM_PERIODS,
-                    value=0
-                )
-
-                # Enable AC charging (PV priority - some firmware rejects AC priority=2)
-                try:
-                    self.call_service("growatt_modbus/write_register",
-                        device_id=self.device_id,
-                        register=VPP_AC_CHARGE_ENABLE,
-                        value=1  # 1=PV priority (safer than 2=AC priority)
-                    )
-                except Exception as e:
-                    self.log(f"AC charge enable (30410) failed: {e} - may not work on all firmware", level="WARNING")
-
-                # Enable remote power control
-                self.call_service("growatt_modbus/write_register",
-                    device_id=self.device_id,
-                    register=VPP_REMOTE_POWER_ENABLE,
-                    value=1
-                )
-
-                # Set charge power (positive value)
-                self.call_service("growatt_modbus/write_register",
-                    device_id=self.device_id,
-                    register=VPP_REMOTE_POWER_PERCENT,
-                    value=power_percent
-                )
-                self.log(f"Set battery mode to CHARGE at {power_percent}%")
-
-            elif mode == BatteryMode.DISCHARGE:
-                # DISCHARGE: Enable remote control, set negative power
-
-                # Clear any HOLD TOU periods first
-                self.call_service("growatt_modbus/write_register",
-                    device_id=self.device_id,
-                    register=VPP_TOU_NUM_PERIODS,
-                    value=0
-                )
-
-                # Enable remote power control
-                self.call_service("growatt_modbus/write_register",
-                    device_id=self.device_id,
-                    register=VPP_REMOTE_POWER_ENABLE,
-                    value=1
-                )
-
-                # Set discharge power (negative value, convert to unsigned 16-bit)
-                # -100 becomes 65436 (65536 - 100)
-                power_value = 65536 - power_percent
-                self.call_service("growatt_modbus/write_register",
-                    device_id=self.device_id,
-                    register=VPP_REMOTE_POWER_PERCENT,
-                    value=power_value
-                )
-                self.log(f"Set battery mode to DISCHARGE at {power_percent}%")
-
-            # All register writes succeeded - now update mode tracking
-            self._handle_mode_transition(mode)
-
-        except Exception as e:
-            self.log(f"Error setting battery mode: {e}", level="ERROR")
 
     # =========================================================================
     # TOU Schedule Sync (delegates to TouSyncManager)
@@ -3612,9 +3041,9 @@ class BatteryOptimizer(hass.Hass):
         return projected_costs, current_cost
 
     def _get_price_for_hour(self, hour: datetime.datetime) -> Optional[float]:
-        """Get the electricity price for a specific slot"""
+        """Get the electricity price for a specific slot from price service cache."""
         local_tz = self._get_local_timezone()
-        for price_point in self.cached_prices:
+        for price_point in self._price_service.cached_prices:
             # Convert both to local timezone for comparison
             p_hour = price_point.hour
             compare_hour = hour
@@ -4011,7 +3440,7 @@ class BatteryOptimizer(hass.Hass):
                     "next_charge": next_charge,
                     "next_discharge": next_discharge,
                     "last_optimization": self.last_optimization.isoformat() if self.last_optimization else None,
-                    "prices_cached": len(self.cached_prices),
+                    "prices_cached": len(self._price_service.cached_prices),
                     "battery_avg_cost": round(self.battery_avg_cost, 4),
                     "discharge_threshold": round(self._get_discharge_threshold(), 4),
                     # Decision transparency attributes

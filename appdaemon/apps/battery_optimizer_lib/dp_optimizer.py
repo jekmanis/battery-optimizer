@@ -38,12 +38,9 @@ class DPOptimizerResult:
     schedule: Dict[datetime.datetime, ScheduleEntry]
     soc_trajectory: Dict[datetime.datetime, Tuple[float, float]]
     temp_trajectory: Dict[datetime.datetime, Tuple[Optional[float], Optional[float]]]
-    projected_costs: Dict[datetime.datetime, float]
-    min_charge_slots: int
     charge_count: int
     discharge_count: int
     hold_count: int
-    dp_best_value: float
 
 
 class DPOptimizer:
@@ -108,12 +105,9 @@ class DPOptimizer:
                 schedule={},
                 soc_trajectory={},
                 temp_trajectory={},
-                projected_costs={},
-                min_charge_slots=0,
                 charge_count=0,
                 discharge_count=0,
                 hold_count=0,
-                dp_best_value=0.0,
             )
 
         cfg = self._config
@@ -191,12 +185,9 @@ class DPOptimizer:
             schedule=schedule,
             soc_trajectory=soc_trajectory,
             temp_trajectory=temp_trajectory,
-            projected_costs={},  # Populated by caller if needed
-            min_charge_slots=min_charge_slots_hint,
             charge_count=charge_count,
             discharge_count=discharge_count,
             hold_count=hold_count,
-            dp_best_value=best_value,
         )
 
     def _compute_charge_rates_per_slot(

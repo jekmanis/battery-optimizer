@@ -19,7 +19,7 @@ from battery_optimizer import (
     PricePoint,
     ScheduleEntry,
 )
-from battery_optimizer_lib import BatteryCostTracker, BatteryCostConfig
+from battery_optimizer_lib import BatteryCostTracker, BatteryCostConfig, ScheduleFormatter, ScheduleFormatterConfig
 
 
 class MockOptimizer:
@@ -488,38 +488,82 @@ class TestLogScheduleTemperatureDisplay:
         self, optimizer, sample_schedule, learning_engine_with_warming_data
     ):
         """Log output should include temperature evolution."""
-        optimizer.learning_engine = learning_engine_with_warming_data
+        log_messages = []
+
+        def mock_log(message: str, level: str = "INFO"):
+            log_messages.append(message)
+
+        # Create formatter with learning engine that has warming data
+        formatter = ScheduleFormatter(
+            config=ScheduleFormatterConfig(
+                slot_minutes=60,
+                slot_hours=1.0,
+                battery_capacity=14.3,
+                charge_rate=4.5,
+                discharge_rate=4.5,
+                efficiency=0.85,
+                battery_wear_cost=0.0,
+                decision_log_level=1,
+            ),
+            log_func=mock_log,
+            learning_engine=learning_engine_with_warming_data,
+        )
 
         expected_soc = {list(sample_schedule.keys())[0]: 50.0}
         expected_temp = {list(sample_schedule.keys())[0]: 15.0}
 
-        # Bind the _log_schedule method
-        from battery_optimizer import BatteryOptimizer
-        MockOptimizer._log_schedule = BatteryOptimizer._log_schedule
-        MockOptimizer._get_expected_soc_for_hour = BatteryOptimizer._get_expected_soc_for_hour
-        MockOptimizer._get_expected_temp_for_hour = BatteryOptimizer._get_expected_temp_for_hour
-
-        optimizer._log_schedule(sample_schedule, expected_soc, expected_temp)
+        formatter.log_schedule(
+            schedule=sample_schedule,
+            expected_soc=expected_soc,
+            expected_temp=expected_temp,
+            local_tz=None,
+            predict_load_kw=lambda h: 0.5,
+            min_soc=10.0,
+            max_soc=100.0,
+        )
 
         # Check that temperature info is in the log
-        log_text = " ".join(optimizer.log_messages)
+        log_text = " ".join(log_messages)
         assert "C->" in log_text  # Temperature transition format
 
     def test_log_schedule_omits_temp_when_unavailable(
         self, optimizer, sample_schedule
     ):
         """Should not show temperature when not tracked."""
+        log_messages = []
+
+        def mock_log(message: str, level: str = "INFO"):
+            log_messages.append(message)
+
+        # Create formatter without learning engine
+        formatter = ScheduleFormatter(
+            config=ScheduleFormatterConfig(
+                slot_minutes=60,
+                slot_hours=1.0,
+                battery_capacity=14.3,
+                charge_rate=4.5,
+                discharge_rate=4.5,
+                efficiency=0.85,
+                battery_wear_cost=0.0,
+                decision_log_level=1,
+            ),
+            log_func=mock_log,
+            learning_engine=None,
+        )
+
         expected_soc = {list(sample_schedule.keys())[0]: 50.0}
         expected_temp = {}  # No temperature data
 
-        # Bind the _log_schedule method
-        from battery_optimizer import BatteryOptimizer
-        MockOptimizer._log_schedule = BatteryOptimizer._log_schedule
-        MockOptimizer._get_expected_soc_for_hour = BatteryOptimizer._get_expected_soc_for_hour
-        MockOptimizer._get_expected_temp_for_hour = BatteryOptimizer._get_expected_temp_for_hour
-
-        optimizer._log_schedule(sample_schedule, expected_soc, expected_temp)
+        formatter.log_schedule(
+            schedule=sample_schedule,
+            expected_soc=expected_soc,
+            expected_temp=expected_temp,
+            local_tz=None,
+            predict_load_kw=lambda h: 0.5,
+            min_soc=10.0,
+            max_soc=100.0,
+        )
 
         # Check that temperature info is NOT in the log
-        log_text = " ".join(optimizer.log_messages)
+        log_text = " ".join(log_messages)
         assert "C->" not in log_text

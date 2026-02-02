@@ -14,12 +14,6 @@ import traceback
 import json
 from typing import Dict, List, Optional, Tuple
 
-try:
-    import requests
-    REQUESTS_AVAILABLE = True
-except ImportError:
-    REQUESTS_AVAILABLE = False
-
 # Import from the battery_optimizer_lib package
 from battery_optimizer_lib import (
     BatteryMode,
@@ -39,14 +33,10 @@ from battery_optimizer_lib import (
     # Timezone utilities
     normalize_tz_pair,
     dt_ge,
-    dt_gt,
-    dt_lt,
     ensure_local_tz,
     align_to_slot,
     next_slot_time,
     next_interval_time,
-    lookup_by_hour,
-    duration_minutes,
     # HA helpers
     SensorReader,
     # Cost tracker
@@ -54,6 +44,12 @@ from battery_optimizer_lib import (
     BatteryCostConfig,
     # Charge rate utilities
     compute_charge_rates_per_slot,
+    # SOC deviation detection
+    SocDeviationDetector,
+    SocDeviationConfig,
+    # Schedule formatting
+    ScheduleFormatter,
+    ScheduleFormatterConfig,
 )
 
 
@@ -158,6 +154,22 @@ class BatteryOptimizer(hass.Hass):
             get_date_func=self.date,
             get_timezone_func=self._get_local_timezone,
             log_func=self.log,
+        )
+
+        # Schedule formatter for logging and sensor updates
+        self._schedule_formatter = ScheduleFormatter(
+            config=ScheduleFormatterConfig(
+                slot_minutes=self.slot_minutes,
+                slot_hours=self.slot_hours,
+                battery_capacity=self.battery_capacity,
+                charge_rate=self.charge_rate,
+                discharge_rate=self.discharge_rate,
+                efficiency=self.efficiency,
+                battery_wear_cost=self.battery_wear_cost,
+                decision_log_level=self.decision_log_level,
+            ),
+            log_func=self.log,
+            learning_engine=self.learning_engine,
         )
 
         # Battery cost tracker (must be after learning engine and price service)
@@ -371,32 +383,6 @@ class BatteryOptimizer(hass.Hass):
     # Optimization Algorithm
     # =========================================================================
 
-    def calculate_charge_hours(self, current_soc: float, target_soc: float = None) -> int:
-        """
-        Calculate how many slots of charging needed to reach target SOC.
-        This is a simple calculation used for basic estimates.
-        For actual scheduling, use calculate_min_charge_slots_for_horizon().
-        """
-        if target_soc is None:
-            target_soc = self.max_soc
-
-        if current_soc >= target_soc:
-            return 0
-
-        # Energy needed in kWh
-        soc_gap = target_soc - current_soc
-        energy_needed = soc_gap / 100 * self.battery_capacity
-
-        # Account for charging efficiency
-        grid_energy_needed = energy_needed / self.efficiency
-
-        # Slots at charge rate
-        energy_per_slot = self.charge_rate * self.slot_hours
-        if energy_per_slot <= 0:
-            return 0
-
-        return math.ceil(grid_energy_needed / energy_per_slot)
-
     def calculate_min_charge_slots_for_horizon(
         self,
         current_soc: float,
@@ -464,32 +450,6 @@ class BatteryOptimizer(hass.Hass):
             )
 
         return charge_slots
-
-    def calculate_discharge_hours(self, current_soc: float, target_soc: float = None) -> int:
-        """
-        Calculate how many hours of discharge available until target SOC.
-
-        During discharge mode:
-        - Battery powers the house load (base_consumption)
-        - Drain rate depends on actual consumption, not max inverter rate
-        """
-        if target_soc is None:
-            target_soc = self.min_soc
-
-        if current_soc <= target_soc:
-            return 0
-
-        # Energy available in kWh
-        energy_available = (current_soc - target_soc) / 100 * self.battery_capacity
-
-        # Battery drains at expected load rate, limited by discharge rate
-        base_consumption_kw = self.base_consumption / 1000  # Convert W to kW
-        if base_consumption_kw <= 0:
-            return 0
-
-        discharge_hours = energy_available / base_consumption_kw
-
-        return int(discharge_hours)
 
     def find_optimal_schedule(self, prices: List[PricePoint], charge_hours_needed: int,
                                current_soc: float = None) -> Dict[datetime.datetime, ScheduleEntry]:
@@ -600,8 +560,14 @@ class BatteryOptimizer(hass.Hass):
         # Log decision context for transparency
         if self.decision_log_level >= 1:
             load_kw = [self._predict_load_kw(p.hour) for p in hours_sorted_by_time]
-            self._log_schedule_decision_context(
-                hours_sorted_by_time, schedule, load_kw, current_soc_for_calc, min_charge_slots
+            self._last_charge_slots = self._schedule_formatter.log_decision_context(
+                prices_sorted=hours_sorted_by_time,
+                schedule=schedule,
+                load_kw=load_kw,
+                current_soc=current_soc_for_calc,
+                min_charge_slots=min_charge_slots,
+                battery_avg_cost=self.battery_avg_cost,
+                min_soc=self.min_soc,
             )
 
         # Store trajectories for use in _log_schedule
@@ -732,97 +698,6 @@ class BatteryOptimizer(hass.Hass):
             get_charge_rate_for_soc=get_charge_rate,
             predict_temp_after_duration=predict_temp,
         )
-
-    def _log_schedule_decision_context(
-        self,
-        prices_sorted: List[PricePoint],
-        schedule: Dict[datetime.datetime, ScheduleEntry],
-        load_kw: List[float],
-        current_soc: float,
-        min_charge_slots: int
-    ):
-        """
-        Log detailed decision context for transparency.
-        Shows why specific charge/discharge slots were selected.
-        """
-        # Extract charge and discharge slots from schedule
-        charge_slots = []
-        discharge_slots = []
-        for hour, entry in schedule.items():
-            price_point = next((p for p in prices_sorted if p.hour == hour), None)
-            price = price_point.price if price_point else 0.0
-            if entry.mode == BatteryMode.CHARGE:
-                charge_slots.append({"hour": hour, "price": price})
-            elif entry.mode == BatteryMode.DISCHARGE:
-                # Find corresponding load
-                idx = next((i for i, p in enumerate(prices_sorted) if p.hour == hour), 0)
-                load = load_kw[idx] if idx < len(load_kw) else 0.0
-                discharge_slots.append({"hour": hour, "price": price, "load": load})
-
-        # Sort all prices to rank candidates
-        all_prices_sorted = sorted(prices_sorted, key=lambda p: p.price)
-        price_rank = {p.hour: i + 1 for i, p in enumerate(all_prices_sorted)}
-
-        # Store charge slots for sensor exposure
-        self._last_charge_slots = [
-            {"time": s["hour"].isoformat(), "price": round(s["price"], 4)}
-            for s in sorted(charge_slots, key=lambda x: x["hour"])
-        ]
-
-        # Build decision context log
-        if self.decision_log_level >= 1:
-            self.log("=" * 70)
-            self.log("DECISION CONTEXT")
-            self.log("=" * 70)
-
-            # Input state
-            self.log(f"Input State:")
-            self.log(f"  Current SOC: {current_soc:.1f}%")
-            self.log(f"  Min SOC target: {self.min_soc:.1f}%")
-            self.log(f"  Min charge slots (informational): {min_charge_slots}")
-            self.log(f"  Battery avg cost: {self.battery_avg_cost:.4f} EUR/kWh")
-            self.log(f"  Discharge wear cost: {self.battery_wear_cost:.4f} EUR/kWh")
-            self.log(f"  Note: DP evaluates all options; discharge only costs wear (no double-counting)")
-
-        # Verbose logging (level 2): show candidates and analysis
-        if self.decision_log_level >= 2:
-            def _fmt_dt(dt: datetime.datetime) -> str:
-                return dt.strftime("%Y-%m-%d %H:%M")
-
-            # Cheapest charge candidates
-            self.log(f"\nCheapest 5 charge candidates:")
-            for i, p in enumerate(all_prices_sorted[:5]):
-                marker = " *" if any(s["hour"] == p.hour for s in charge_slots) else ""
-                self.log(f"  {i+1}. {_fmt_dt(p.hour)} @ {p.price:.4f} EUR/kWh{marker}")
-
-            # Selected charge slots with rankings
-            if charge_slots:
-                self.log(f"\nSelected charge slots ({len(charge_slots)}):")
-                for slot in sorted(charge_slots, key=lambda s: s["hour"]):
-                    rank = price_rank.get(slot["hour"], "?")
-                    total_prices = len(prices_sorted)
-                    self.log(f"  {_fmt_dt(slot['hour'])} @ {slot['price']:.4f} EUR/kWh (rank {rank}/{total_prices})")
-
-            # Selected discharge slots
-            if discharge_slots:
-                self.log(f"\nSelected discharge slots ({len(discharge_slots)}):")
-                for slot in sorted(discharge_slots, key=lambda s: s["hour"]):
-                    self.log(f"  {_fmt_dt(slot['hour'])} @ {slot['price']:.4f} EUR/kWh (load~{slot['load']:.2f}kW)")
-
-            # Arbitrage analysis
-            if charge_slots and discharge_slots:
-                avg_charge_price = sum(s["price"] for s in charge_slots) / len(charge_slots)
-                avg_discharge_price = sum(s["price"] for s in discharge_slots) / len(discharge_slots)
-                spread = avg_discharge_price - avg_charge_price
-                effective_spread = spread - (avg_charge_price * (1 - self.efficiency))
-
-                self.log(f"\nArbitrage Analysis:")
-                self.log(f"  Avg charge price: {avg_charge_price:.4f} EUR/kWh")
-                self.log(f"  Avg discharge price: {avg_discharge_price:.4f} EUR/kWh")
-                self.log(f"  Spread: {spread:.4f} EUR/kWh (after {self.efficiency*100:.0f}% efficiency: {effective_spread:.4f} EUR/kWh)")
-
-        if self.decision_log_level >= 1:
-            self.log("=" * 70)
 
     def calculate_expected_soc_schedule(
         self,
@@ -973,7 +848,18 @@ class BatteryOptimizer(hass.Hass):
         )
 
         # Log the generated schedule (with expected SOC and temperature)
-        self._log_schedule(self.schedule, self.expected_soc_schedule, self.expected_temp_schedule)
+        self._schedule_formatter.log_schedule(
+            schedule=self.schedule,
+            expected_soc=self.expected_soc_schedule,
+            expected_temp=self.expected_temp_schedule,
+            dp_soc_trajectory=self._last_dp_soc_trajectory,
+            dp_temp_trajectory=self._last_dp_temp_trajectory,
+            projected_costs=self._last_projected_costs,
+            local_tz=self._get_local_timezone(),
+            predict_load_kw=self._predict_load_kw,
+            min_soc=self.min_soc,
+            max_soc=self.max_soc,
+        )
 
         self.last_optimization = self.datetime()
 
@@ -1045,7 +931,18 @@ class BatteryOptimizer(hass.Hass):
                     h: e for h, e in self.schedule.items()
                     if dt_ge(h, current_slot, local_tz)
                 }
-                self._log_schedule(future_schedule, self.expected_soc_schedule, self.expected_temp_schedule)
+                self._schedule_formatter.log_schedule(
+                    schedule=future_schedule,
+                    expected_soc=self.expected_soc_schedule,
+                    expected_temp=self.expected_temp_schedule,
+                    dp_soc_trajectory=self._last_dp_soc_trajectory,
+                    dp_temp_trajectory=self._last_dp_temp_trajectory,
+                    projected_costs=self._last_projected_costs,
+                    local_tz=local_tz,
+                    predict_load_kw=self._predict_load_kw,
+                    min_soc=self.min_soc,
+                    max_soc=self.max_soc,
+                )
 
         # Check if TOU needs rolling update (every adaptive cycle)
         if self.tou_sync_enabled and self.device_id:
@@ -1108,10 +1005,17 @@ class BatteryOptimizer(hass.Hass):
 
         # Log recalculated schedule (current/future only)
         if self.decision_log_level >= 1:
-            self._log_schedule(
-                future_schedule,
-                self.expected_soc_schedule,
-                self.expected_temp_schedule
+            self._schedule_formatter.log_schedule(
+                schedule=future_schedule,
+                expected_soc=self.expected_soc_schedule,
+                expected_temp=self.expected_temp_schedule,
+                dp_soc_trajectory=self._last_dp_soc_trajectory,
+                dp_temp_trajectory=self._last_dp_temp_trajectory,
+                projected_costs=self._last_projected_costs,
+                local_tz=local_tz,
+                predict_load_kw=self._predict_load_kw,
+                min_soc=self.min_soc,
+                max_soc=self.max_soc,
             )
 
         # Sync updated schedule to inverter TOU registers (if configured)
@@ -1340,6 +1244,8 @@ class BatteryOptimizer(hass.Hass):
         """
         Check if SOC deviates significantly from expected and trigger recalculation.
 
+        Delegates to SocDeviationDetector for the actual deviation analysis.
+
         Args:
             current_soc: Current battery state of charge (%)
 
@@ -1349,261 +1255,62 @@ class BatteryOptimizer(hass.Hass):
         if not self._is_enabled() or self._is_override_active():
             return False
 
+        # Prepare timing context
         now = self.datetime()
         local_tz = self._get_local_timezone()
-        if now.tzinfo is not None and local_tz is not None:
-            now = now.astimezone(local_tz)
-        elif local_tz is not None:
-            now = now.replace(tzinfo=local_tz)
+        now = ensure_local_tz(now, local_tz)
         current_slot = self._align_to_slot(now)
-
-        expected_soc = self.expected_soc_schedule.get(current_slot)
-
-        # If not found, try matching by hour value with different timezone representations
-        if expected_soc is None and self.expected_soc_schedule:
-            for schedule_hour, soc_value in self.expected_soc_schedule.items():
-                compare_schedule = schedule_hour
-                if schedule_hour.tzinfo is not None and local_tz is not None:
-                    compare_schedule = schedule_hour.astimezone(local_tz)
-                compare_current = current_slot
-                if current_slot.tzinfo is not None and local_tz is not None:
-                    compare_current = current_slot.astimezone(local_tz)
-                if (compare_schedule.date() == compare_current.date() and
-                    compare_schedule.hour == compare_current.hour and
-                    compare_schedule.minute == compare_current.minute):
-                    expected_soc = soc_value
-                    break
-
-        if expected_soc is None:
-            return False
-
-        # Adjust expected SOC within the slot based on elapsed time
-        entry = self.schedule.get(current_slot)
-        if entry is None and self.schedule:
-            for schedule_hour, schedule_entry in self.schedule.items():
-                compare_schedule = schedule_hour
-                if schedule_hour.tzinfo is not None and local_tz is not None:
-                    compare_schedule = schedule_hour.astimezone(local_tz)
-                compare_current = current_slot
-                if current_slot.tzinfo is not None and local_tz is not None:
-                    compare_current = current_slot.astimezone(local_tz)
-                if (compare_schedule.date() == compare_current.date() and
-                    compare_schedule.hour == compare_current.hour and
-                    compare_schedule.minute == compare_current.minute):
-                    entry = schedule_entry
-                    break
-
-        minutes_into_slot = max(0.0, (now - current_slot).total_seconds() / 60.0)
-        fraction = min(1.0, minutes_into_slot / max(1, self.slot_minutes))
-        expected_soc_now = expected_soc
-
-        # Get current battery temperature for temperature-aware rate lookups
-        # (inverter charge rate varies significantly with temperature)
         current_temp = self._get_battery_temp()
 
-        if entry and fraction > 0:
-            if entry.mode == BatteryMode.CHARGE:
-                # Use learned charge rate if available for more accurate mid-slot projection
-                effective_charge_rate = self.charge_rate
-                if self.learning_engine:
-                    learned_rate = self.learning_engine.get_charge_rate_for_soc(current_soc, current_temp)
-                    if learned_rate is not None and learned_rate > 0:
-                        effective_charge_rate = learned_rate
+        # Create detector with current config (min_soc/max_soc are dynamic properties)
+        config = SocDeviationConfig(
+            slot_minutes=self.slot_minutes,
+            charge_rate=self.charge_rate,
+            discharge_rate=self.discharge_rate,
+            efficiency=self.efficiency,
+            battery_capacity=self.battery_capacity,
+            min_soc=self.min_soc,
+            max_soc=self.max_soc,
+            soc_deviation_threshold=self.soc_deviation_threshold,
+            grid_fee=self.grid_fee,
+            decision_log_level=self.decision_log_level,
+        )
+        detector = SocDeviationDetector(
+            config=config,
+            learning_engine=self.learning_engine,
+            log_func=self.log,
+        )
 
-                energy_added = effective_charge_rate * self.efficiency * self.slot_hours * fraction
-                expected_soc_now = min(
-                    self.max_soc,
-                    expected_soc + (energy_added / self.battery_capacity) * 100
-                )
-            elif entry.mode == BatteryMode.DISCHARGE:
-                load_kw = self._predict_load_kw(current_slot)
-                energy_removed = min(load_kw, self.discharge_rate) * self.slot_hours * fraction
-                expected_soc_now = max(
-                    self.min_soc,
-                    expected_soc - (energy_removed / self.battery_capacity) * 100
-                )
+        # Run deviation check
+        result = detector.check_deviation(
+            current_soc=current_soc,
+            schedule=self.schedule,
+            expected_soc_schedule=self.expected_soc_schedule,
+            now=now,
+            current_slot=current_slot,
+            local_tz=local_tz,
+            current_temp=current_temp,
+            predict_load_kw=self._predict_load_kw,
+            get_cheapest_upcoming_prices=self._get_cheapest_upcoming_prices,
+            get_discharge_threshold=self._get_discharge_threshold,
+        )
 
-        soc_delta = current_soc - expected_soc_now
+        # Output log messages from detector
+        for msg in result.log_messages:
+            self.log(msg)
 
-        if abs(soc_delta) > self.soc_deviation_threshold:
-            # During CHARGE: if behind schedule (negative delta), check if we'll still reach max_soc
-            # with remaining scheduled charge hours. If yes, skip recalculation - we're just
-            # charging slower than expected but will still reach the target.
-            if entry and entry.mode == BatteryMode.CHARGE and soc_delta < 0:
-                # Calculate remaining charge capacity from all scheduled charge hours
-                # Account for temperature warming: battery heats up during charging,
-                # which may cause the inverter to switch to a higher charge rate
-                remaining_charge_energy = 0.0
-                projected_temp = current_temp if current_temp is not None else 15.0  # Default assumption
-                effective_rate_for_log = self.charge_rate
+        # If no recalculation needed, we're done
+        if not result.should_recalculate:
+            return False
 
-                # Determine the temperature threshold where charge rate increases
-                # (typically around 16°C for many inverters)
-                temp_threshold = 16.0
+        # Store trigger context for sensor exposure
+        self._last_recalc_trigger = "soc_deviation"
+        self._last_recalc_time = self.datetime()
+        self._last_soc_deviation = result.deviation
 
-                # Helper for timezone-safe datetime comparison
-                def compare_hours(h1, h2):
-                    """Compare two datetimes, handling mixed timezone-aware/naive."""
-                    cmp_h1, cmp_h2 = h1, h2
-                    if local_tz is not None:
-                        if h1.tzinfo is not None:
-                            cmp_h1 = h1.astimezone(local_tz)
-                        if h2.tzinfo is not None:
-                            cmp_h2 = h2.astimezone(local_tz)
-                    # Handle mixed aware/naive by stripping tzinfo
-                    if cmp_h1.tzinfo is not None and cmp_h2.tzinfo is None:
-                        cmp_h1 = cmp_h1.replace(tzinfo=None)
-                    elif cmp_h1.tzinfo is None and cmp_h2.tzinfo is not None:
-                        cmp_h2 = cmp_h2.replace(tzinfo=None)
-                    return cmp_h1, cmp_h2
-
-                for future_hour in sorted(self.schedule.keys()):
-                    cmp_future, cmp_current = compare_hours(future_hour, current_slot)
-                    if cmp_future >= cmp_current:
-                        future_entry = self.schedule.get(future_hour)
-                        if future_entry and future_entry.mode == BatteryMode.CHARGE:
-                            # For current slot, only count remaining time
-                            if cmp_future == cmp_current:
-                                remaining_minutes = (1.0 - fraction) * self.slot_minutes
-                            else:
-                                remaining_minutes = self.slot_minutes
-
-                            # Use warming-aware projection if learning engine has the data
-                            if self.learning_engine and current_temp is not None:
-                                energy, projected_temp = self.learning_engine.predict_charge_energy_with_warming(
-                                    current_soc=current_soc,
-                                    start_temp=projected_temp,
-                                    duration_minutes=remaining_minutes,
-                                    temp_threshold=temp_threshold
-                                )
-                                remaining_charge_energy += energy * self.efficiency
-                                effective_rate_for_log = energy / (remaining_minutes / 60) if remaining_minutes > 0 else 0
-                            else:
-                                # Fallback: use simple rate-based calculation
-                                effective_charge_rate = self.charge_rate
-                                if self.learning_engine:
-                                    learned_rate = self.learning_engine.get_charge_rate_for_soc(current_soc, projected_temp)
-                                    if learned_rate is not None and learned_rate > 0:
-                                        effective_charge_rate = learned_rate
-                                remaining_charge_energy += effective_charge_rate * self.efficiency * (remaining_minutes / 60)
-                                effective_rate_for_log = effective_charge_rate
-
-                remaining_soc_gain = (remaining_charge_energy / self.battery_capacity) * 100
-                projected_final_soc = current_soc + remaining_soc_gain
-
-                # If we'll still reach max_soc (with 5% tolerance), don't recalculate
-                if projected_final_soc >= self.max_soc - 5:
-                    temp_info = f", temp={current_temp:.1f}C->~{projected_temp:.1f}C" if current_temp is not None else ""
-                    self.log(
-                        f"SOC behind by {abs(soc_delta):.1f}% during CHARGE (actual={current_soc:.1f}%, "
-                        f"expected={expected_soc_now:.1f}%), but projected to reach {projected_final_soc:.1f}% "
-                        f"with remaining charge hours (rate~{effective_rate_for_log:.2f}kW{temp_info}) - skipping recalculation"
-                    )
-                    return False
-
-            # During DISCHARGE: if ahead of schedule (positive delta means draining slower),
-            # this is actually favorable - we have more energy than expected. Only recalculate
-            # if significantly ahead, as this might indicate load predictions are off.
-            if entry and entry.mode == BatteryMode.DISCHARGE and soc_delta > 0:
-                # Being ahead during discharge is good - we have more buffer than expected
-                # Only recalculate if very significantly ahead (2x threshold) to update load predictions
-                if soc_delta <= self.soc_deviation_threshold * 2:
-                    self.log(
-                        f"SOC ahead by {soc_delta:.1f}% during DISCHARGE (actual={current_soc:.1f}%, "
-                        f"expected={expected_soc_now:.1f}%) - favorable deviation, skipping recalculation"
-                    )
-                    return False
-
-            # Store trigger context for sensor exposure
-            self._last_recalc_trigger = "soc_deviation"
-            self._last_recalc_time = self.datetime()
-            self._last_soc_deviation = soc_delta
-
-            # Calculate extra charge slots when behind schedule during CHARGE mode
-            extra_charge_slots = 0
-            if entry and entry.mode == BatteryMode.CHARGE and soc_delta < 0:
-                # We're behind schedule and won't reach max_soc with current schedule
-                # Calculate extra charge slots needed
-                soc_deficit = self.max_soc - projected_final_soc
-                energy_deficit_kwh = (soc_deficit / 100) * self.battery_capacity
-
-                # Use learned or configured charge rate for calculation
-                effective_charge_rate = self.charge_rate
-                if self.learning_engine:
-                    learned_rate = self.learning_engine.get_charge_rate_for_soc(current_soc, current_temp)
-                    if learned_rate is not None and learned_rate > 0:
-                        effective_charge_rate = learned_rate
-
-                energy_per_slot = effective_charge_rate * self.efficiency * self.slot_hours
-                extra_slots_needed = math.ceil(energy_deficit_kwh / energy_per_slot) if energy_per_slot > 0 else 0
-
-                if extra_slots_needed > 0:
-                    # Get remaining hours for price lookup (with timezone-safe comparison)
-                    def is_future_hour(h):
-                        """Compare hours handling mixed timezone-aware/naive datetimes."""
-                        compare_h = h
-                        compare_slot = current_slot
-                        if local_tz is not None:
-                            if h.tzinfo is not None:
-                                compare_h = h.astimezone(local_tz)
-                            if current_slot.tzinfo is not None:
-                                compare_slot = current_slot.astimezone(local_tz)
-                        # Handle mixed timezone-aware/naive by comparing as naive
-                        if compare_h.tzinfo is not None and compare_slot.tzinfo is None:
-                            compare_h = compare_h.replace(tzinfo=None)
-                        elif compare_h.tzinfo is None and compare_slot.tzinfo is not None:
-                            compare_slot = compare_slot.replace(tzinfo=None)
-                        return compare_h > compare_slot
-
-                    remaining_hours = [h for h in sorted(self.schedule.keys()) if is_future_hour(h)]
-
-                    # Only add extra slots if economically beneficial
-                    upcoming_prices = self._get_cheapest_upcoming_prices(remaining_hours, extra_slots_needed)
-                    if upcoming_prices:
-                        avg_extra_charge_price = sum(upcoming_prices) / len(upcoming_prices)
-                        discharge_threshold = self._get_discharge_threshold()
-
-                        # Economic check: charging cost < what we'd pay from grid during discharge
-                        # Charge price includes grid fee, threshold is already grid-aware
-                        charge_cost = avg_extra_charge_price + self.grid_fee
-                        if charge_cost < discharge_threshold:
-                            self.log(
-                                f"Charging behind schedule: projected {projected_final_soc:.1f}% vs target {self.max_soc}%, "
-                                f"adding {extra_slots_needed} slot(s) at avg {avg_extra_charge_price:.4f} EUR/kWh "
-                                f"(charge cost {charge_cost:.4f} < discharge threshold {discharge_threshold:.4f})"
-                            )
-                            extra_charge_slots = extra_slots_needed
-                        else:
-                            self.log(
-                                f"Charging behind schedule but extra charging not economical: "
-                                f"projected {projected_final_soc:.1f}% vs target {self.max_soc}%, "
-                                f"avg price {avg_extra_charge_price:.4f} + fee {self.grid_fee:.4f} = {charge_cost:.4f} "
-                                f">= threshold {discharge_threshold:.4f}"
-                            )
-                    else:
-                        self.log(
-                            f"Charging behind schedule: projected {projected_final_soc:.1f}% vs target {self.max_soc}%, "
-                            f"but no HOLD slots available for extra charging"
-                        )
-
-            # Enhanced logging for decision transparency
-            if self.decision_log_level >= 1:
-                self.log("=" * 70)
-                self.log("RECALCULATION TRIGGERED: SOC Deviation")
-                self.log("=" * 70)
-                self.log(f"  Expected SOC: {expected_soc_now:.1f}%")
-                self.log(f"  Actual SOC: {current_soc:.1f}%")
-                self.log(f"  Deviation: {soc_delta:+.1f}% (threshold: {self.soc_deviation_threshold}%)")
-                if extra_charge_slots > 0:
-                    self.log(f"  Extra charge slots requested: {extra_charge_slots}")
-                self.log("=" * 70)
-            else:
-                self.log(f"SOC deviation detected: actual={current_soc}%, expected={expected_soc_now:.1f}%, delta={soc_delta}%")
-
-            self._recalculate_remaining_schedule(current_soc, extra_charge_slots=extra_charge_slots)
-            return True
-
-        return False
+        # Trigger recalculation with extra charge slots if needed
+        self._recalculate_remaining_schedule(current_soc, extra_charge_slots=result.extra_charge_slots)
+        return True
 
     # =========================================================================
     # VPP Control
@@ -1811,9 +1518,8 @@ class BatteryOptimizer(hass.Hass):
         self._schedule_startup_optimization()
 
     def _init_learning_engine(self):
-        """Initialize learning engine from persistent storage"""
+        """Initialize learning engine from persistent storage (file-based)"""
         self.learning_data_file = self.args.get("learning_data_file", "")
-        self.learning_data_entity = self.args.get("learning_data_entity", "")
 
         # Track timing for learning observations
         self._charge_start_soc: Optional[float] = None
@@ -1821,7 +1527,6 @@ class BatteryOptimizer(hass.Hass):
         self._discharge_start_soc: Optional[float] = None
         self._discharge_start_time: Optional[datetime.datetime] = None
 
-        # Prefer file-based persistence if configured
         if self.learning_data_file:
             try:
                 with open(self.learning_data_file, "r", encoding="utf-8") as fh:
@@ -1834,18 +1539,6 @@ class BatteryOptimizer(hass.Hass):
                 pass
             except Exception as e:
                 self.log(f"Could not load learning data file: {e}", level="WARNING")
-
-        # Try to load learning data from HA
-        if self.learning_data_entity:
-            try:
-                state = self.get_state(self.learning_data_entity)
-                if state and state not in ("unknown", "unavailable", ""):
-                    if self.learning_engine.load_from_json(state):
-                        summary = self.learning_engine.get_learning_summary()
-                        self.log(f"Loaded learning data: {summary['total_observations']} observations")
-                        return
-            except Exception as e:
-                self.log(f"Could not load learning data: {e}", level="WARNING")
 
         self.log("Starting with fresh learning data")
 
@@ -2047,27 +1740,15 @@ class BatteryOptimizer(hass.Hass):
         self._save_load_profile()
 
     def _save_learning_data(self):
-        """Persist learning data to Home Assistant entity"""
+        """Persist learning data to file"""
+        if not self.learning_data_file:
+            return
         try:
             json_data = self.learning_engine.save_to_json()
-            if self.learning_data_file:
-                try:
-                    with open(self.learning_data_file, "w", encoding="utf-8") as fh:
-                        fh.write(json_data)
-                except Exception as e:
-                    self.log(f"Could not save learning data file: {e}", level="DEBUG")
-
-            # Optional HA entity persistence (limited to 255 chars)
-            if self.learning_data_entity:
-                if len(json_data) <= 255:
-                    self.call_service("input_text/set_value",
-                        entity_id=self.learning_data_entity,
-                        value=json_data
-                    )
-                else:
-                    self.log("Learning data exceeds 255 chars; skipping input_text persistence", level="DEBUG")
+            with open(self.learning_data_file, "w", encoding="utf-8") as fh:
+                fh.write(json_data)
         except Exception as e:
-            self.log(f"Could not save learning data: {e}", level="DEBUG")
+            self.log(f"Could not save learning data file: {e}", level="ERROR")
 
     def _update_learning_sensor(self):
         """Update learning stats sensor for dashboard display"""
@@ -2151,33 +1832,6 @@ class BatteryOptimizer(hass.Hass):
     def _align_to_slot(self, dt: datetime.datetime) -> datetime.datetime:
         """Floor datetime to the start of the current time slot."""
         return align_to_slot(dt, self.slot_minutes, self._get_local_timezone())
-
-    def _get_expected_soc_for_hour(
-        self,
-        expected_soc: Dict[datetime.datetime, float],
-        hour: datetime.datetime,
-        local_tz
-    ) -> Optional[float]:
-        """Get expected SOC for a specific hour, handling timezone differences."""
-        return lookup_by_hour(expected_soc, hour, local_tz)
-
-    def _get_expected_temp_for_hour(
-        self,
-        expected_temp: Dict[datetime.datetime, float],
-        hour: datetime.datetime,
-        local_tz
-    ) -> Optional[float]:
-        """Get expected temperature for a specific hour, handling timezone differences."""
-        return lookup_by_hour(expected_temp, hour, local_tz)
-
-    def _get_dp_trajectory_for_hour(
-        self,
-        trajectory: Dict[datetime.datetime, Tuple[float, float]],
-        hour: datetime.datetime,
-        local_tz
-    ) -> Optional[Tuple[float, float]]:
-        """Get DP trajectory data (start, end) tuple for a specific hour, handling timezone differences."""
-        return lookup_by_hour(trajectory, hour, local_tz)
 
     def _next_slot_time(self) -> datetime.datetime:
         """Get the next slot boundary time."""
@@ -2334,46 +1988,17 @@ class BatteryOptimizer(hass.Hass):
     def _update_schedule_sensor(self):
         """Update the schedule sensor in Home Assistant"""
         try:
-            # Format schedule for sensor
-            schedule_data = []
-            for hour in sorted(self.schedule.keys()):
-                entry = self.schedule[hour]
-                schedule_data.append({
-                    "time": hour.isoformat(),
-                    "mode": entry.mode.name,
-                    "reason": entry.reason
-                })
+            # Format schedule for sensor using formatter
+            schedule_data = self._schedule_formatter.format_schedule_list(self.schedule)
 
-            # Find next charge/discharge times
+            # Find next charge/discharge times using formatter
             now = self.datetime()
             local_tz = self._get_local_timezone()
-            # Convert now to local timezone
             if now.tzinfo is not None and local_tz is not None:
                 now = now.astimezone(local_tz)
-            next_charge = None
-            next_discharge = None
-
-            for hour in sorted(self.schedule.keys()):
-                # Convert both to local timezone for comparison
-                compare_hour = hour
-                compare_now = now
-                if local_tz is not None:
-                    if hour.tzinfo is not None:
-                        compare_hour = hour.astimezone(local_tz)
-                    if compare_now.tzinfo is not None:
-                        compare_now = compare_now.astimezone(local_tz)
-                # Handle mixed timezone-aware/naive
-                if compare_hour.tzinfo is not None and compare_now.tzinfo is None:
-                    compare_hour = compare_hour.replace(tzinfo=None)
-                elif compare_hour.tzinfo is None and compare_now.tzinfo is not None:
-                    compare_now = compare_now.replace(tzinfo=None)
-                if compare_hour < compare_now:
-                    continue
-                entry = self.schedule[hour]
-                if entry.mode == BatteryMode.CHARGE and next_charge is None:
-                    next_charge = hour.isoformat()
-                if entry.mode == BatteryMode.DISCHARGE and next_discharge is None:
-                    next_discharge = hour.isoformat()
+            next_charge, next_discharge = self._schedule_formatter.find_next_events(
+                self.schedule, now, local_tz
+            )
 
             # Get temperature-aware rate information
             current_temp = self._get_battery_temp()
@@ -2419,182 +2044,11 @@ class BatteryOptimizer(hass.Hass):
         except Exception as e:
             self.log(f"Error updating schedule sensor: {e}", level="WARNING")
 
-    # =========================================================================
-    # Statistics and Logging
-    # =========================================================================
-
-    def _log_schedule(
-        self,
-        schedule: Dict[datetime.datetime, ScheduleEntry],
-        expected_soc: Optional[Dict[datetime.datetime, float]] = None,
-        expected_temp: Optional[Dict[datetime.datetime, float]] = None
-    ):
-        """Log the full schedule in a readable format with optional expected SOC and temperature.
-
-        Prefers the DP optimizer's actual SOC trajectory (_last_dp_soc_trajectory) when available,
-        as this reflects the exact values the optimizer computed. Falls back to expected_soc
-        (from calculate_expected_soc_schedule) for backwards compatibility.
-        """
-        if not schedule:
-            self.log("No schedule to log")
-            return
-
-        self.log("=" * 60)
-        self.log("GENERATED SCHEDULE")
-        self.log("=" * 60)
-
-        local_tz = self._get_local_timezone()
-        sorted_hours = sorted(schedule.keys())
-
-        # Prefer DP trajectory if available (more accurate to what optimizer computed)
-        dp_soc_trajectory = getattr(self, '_last_dp_soc_trajectory', None)
-        dp_temp_trajectory = getattr(self, '_last_dp_temp_trajectory', None)
-
-        for i, hour in enumerate(sorted_hours):
-            entry = schedule[hour]
-            # Ensure time is displayed in local timezone
-            display_hour = hour
-            if hour.tzinfo is not None and local_tz is not None:
-                display_hour = hour.astimezone(local_tz)
-            time_str = display_hour.strftime("%Y-%m-%d %H:%M")
-            mode_str = entry.mode.name.ljust(9)
-
-            # Get SOC and temperature values
-            soc_str = ""
-
-            # Try DP trajectory first (exact values from optimizer)
-            dp_soc_data = self._get_dp_trajectory_for_hour(dp_soc_trajectory, hour, local_tz) if dp_soc_trajectory else None
-            dp_temp_data = self._get_dp_trajectory_for_hour(dp_temp_trajectory, hour, local_tz) if dp_temp_trajectory else None
-
-            if dp_soc_data is not None:
-                # Use DP's actual SOC trajectory
-                start_soc, end_soc = dp_soc_data
-                if dp_temp_data is not None:
-                    start_temp, end_temp = dp_temp_data
-                    if start_temp is not None and end_temp is not None:
-                        soc_str = f" {start_soc:5.1f}%->{end_soc:5.1f}% ({start_temp:.0f}C->{end_temp:.0f}C)"
-                    else:
-                        soc_str = f" {start_soc:5.1f}%->{end_soc:5.1f}%"
-                else:
-                    soc_str = f" {start_soc:5.1f}%->{end_soc:5.1f}%"
-            elif expected_soc:
-                # Fallback to recalculated SOC (for backwards compatibility)
-                start_soc = self._get_expected_soc_for_hour(expected_soc, hour, local_tz)
-                start_temp = self._get_expected_temp_for_hour(expected_temp, hour, local_tz) if expected_temp else None
-
-                if start_soc is not None:
-                    # Calculate end-of-slot SOC based on the action
-                    if entry.mode == BatteryMode.CHARGE:
-                        # Use temperature-aware charging if temp available
-                        if start_temp is not None and self.learning_engine:
-                            energy_added, end_temp = self.learning_engine.predict_charge_energy_with_warming(
-                                start_soc, start_temp, self.slot_minutes, temp_threshold=16.0
-                            )
-                            energy_to_battery = energy_added * self.efficiency
-                            end_soc = min(self.max_soc, start_soc + (energy_to_battery / self.battery_capacity) * 100)
-                            soc_str = f" {start_soc:5.1f}%->{end_soc:5.1f}% ({start_temp:.0f}C->{end_temp:.0f}C)"
-                        else:
-                            # Fallback: Use learned charge rate without temperature
-                            effective_charge_rate = self.charge_rate
-                            if self.learning_engine:
-                                learned_rate = self.learning_engine.get_charge_rate_for_soc(start_soc)
-                                if learned_rate is not None and learned_rate > 0:
-                                    effective_charge_rate = learned_rate
-                            energy_added = effective_charge_rate * self.efficiency * self.slot_hours
-                            end_soc = min(self.max_soc, start_soc + (energy_added / self.battery_capacity) * 100)
-                            soc_str = f" {start_soc:5.1f}%->{end_soc:5.1f}%"
-                    elif entry.mode == BatteryMode.DISCHARGE:
-                        load_kw = self._predict_load_kw(hour)
-                        energy_removed = min(load_kw, self.discharge_rate) * self.slot_hours
-                        end_soc = max(self.min_soc, start_soc - (energy_removed / self.battery_capacity) * 100)
-                        # Show cooling during discharge if temp available
-                        if start_temp is not None and self.learning_engine:
-                            end_temp = self.learning_engine.predict_temp_after_idle(
-                                start_temp, self.slot_minutes
-                            )
-                            soc_str = f" {start_soc:5.1f}%->{end_soc:5.1f}% ({start_temp:.0f}C->{end_temp:.0f}C)"
-                        else:
-                            soc_str = f" {start_soc:5.1f}%->{end_soc:5.1f}%"
-                    else:  # HOLD
-                        end_soc = start_soc
-                        # Show cooling during hold if temp available
-                        if start_temp is not None and self.learning_engine:
-                            end_temp = self.learning_engine.predict_temp_after_idle(
-                                start_temp, self.slot_minutes
-                            )
-                            soc_str = f" {start_soc:5.1f}%->{end_soc:5.1f}% ({start_temp:.0f}C->{end_temp:.0f}C)"
-                        else:
-                            soc_str = f" {start_soc:5.1f}%->{end_soc:5.1f}%"
-
-            # For discharge, show projected battery cost as primary, grid price in parentheses
-            reason_display = entry.reason
-            if entry.mode == BatteryMode.DISCHARGE and self._last_projected_costs:
-                proj_cost = self._last_projected_costs.get(hour)
-                if proj_cost is not None:
-                    # Parse grid price from reason: "X.XXXX EUR/kWh load~Y.YYkW"
-                    parts = entry.reason.split(" EUR/kWh")
-                    if len(parts) == 2:
-                        grid_price = parts[0]
-                        rest = parts[1]
-                        reason_display = f"{proj_cost:.4f} EUR/kWh (grid {grid_price}){rest}"
-
-            self.log(f"  {time_str}  {mode_str}  {reason_display}{soc_str}")
-
-        self.log("=" * 60)
-
-        # Summary counts
-        charge_count = len([e for e in schedule.values() if e.mode == BatteryMode.CHARGE])
-        discharge_count = len([e for e in schedule.values() if e.mode == BatteryMode.DISCHARGE])
-        hold_count = len([e for e in schedule.values() if e.mode == BatteryMode.HOLD])
-        self.log(f"Total: {charge_count} charge, {discharge_count} discharge, {hold_count} hold slots")
-
     def get_schedule_summary(self) -> str:
         """Generate a human-readable schedule summary"""
-        if not self.schedule:
-            return "No schedule available"
-
-        now = self.datetime()
-        local_tz = self._get_local_timezone()
-        # Convert now to local timezone
-        if now.tzinfo is not None and local_tz is not None:
-            now = now.astimezone(local_tz)
-        now_slot = self._align_to_slot(now)
-
-        def is_future_or_current(k):
-            compare_k = k
-            compare_now = now_slot
-            if local_tz is not None:
-                if k.tzinfo is not None:
-                    compare_k = k.astimezone(local_tz)
-                if compare_now.tzinfo is not None:
-                    compare_now = compare_now.astimezone(local_tz)
-            # Handle mixed timezone-aware/naive
-            if compare_k.tzinfo is not None and compare_now.tzinfo is None:
-                compare_k = compare_k.replace(tzinfo=None)
-            elif compare_k.tzinfo is None and compare_now.tzinfo is not None:
-                compare_now = compare_now.replace(tzinfo=None)
-            return compare_k >= compare_now
-
-        future_schedule = {k: v for k, v in self.schedule.items() if is_future_or_current(k)}
-
-        charge_hours = [h for h, e in future_schedule.items() if e.mode == BatteryMode.CHARGE]
-        discharge_hours = [h for h, e in future_schedule.items() if e.mode == BatteryMode.DISCHARGE]
-        hold_hours = [h for h, e in future_schedule.items() if e.mode == BatteryMode.HOLD]
-
-        summary = (f"Schedule: {len(charge_hours)} slots charge, "
-                   f"{len(discharge_hours)} slots discharge, "
-                   f"{len(hold_hours)} slots hold")
-
-        local_tz = self._get_local_timezone()
-        if charge_hours:
-            next_charge = min(charge_hours)
-            if next_charge.tzinfo is not None and local_tz is not None:
-                next_charge = next_charge.astimezone(local_tz)
-            summary += f"\nNext charge: {next_charge.strftime('%H:%M')}"
-        if discharge_hours:
-            next_discharge = min(discharge_hours)
-            if next_discharge.tzinfo is not None and local_tz is not None:
-                next_discharge = next_discharge.astimezone(local_tz)
-            summary += f"\nNext discharge: {next_discharge.strftime('%H:%M')}"
-
-        return summary
+        return self._schedule_formatter.format_summary(
+            schedule=self.schedule,
+            now=self.datetime(),
+            local_tz=self._get_local_timezone(),
+            align_to_slot_func=self._align_to_slot,
+        )

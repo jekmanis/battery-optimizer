@@ -94,46 +94,6 @@ def dt_ge(
     return cmp1 >= cmp2
 
 
-def dt_gt(
-    dt1: datetime.datetime,
-    dt2: datetime.datetime,
-    local_tz: Optional[datetime.tzinfo] = None
-) -> bool:
-    """
-    Check if dt1 > dt2 with timezone normalization.
-
-    Args:
-        dt1: First datetime
-        dt2: Second datetime
-        local_tz: Optional local timezone for conversion
-
-    Returns:
-        True if dt1 > dt2
-    """
-    cmp1, cmp2 = normalize_tz_pair(dt1, dt2, local_tz)
-    return cmp1 > cmp2
-
-
-def dt_lt(
-    dt1: datetime.datetime,
-    dt2: datetime.datetime,
-    local_tz: Optional[datetime.tzinfo] = None
-) -> bool:
-    """
-    Check if dt1 < dt2 with timezone normalization.
-
-    Args:
-        dt1: First datetime
-        dt2: Second datetime
-        local_tz: Optional local timezone for conversion
-
-    Returns:
-        True if dt1 < dt2
-    """
-    cmp1, cmp2 = normalize_tz_pair(dt1, dt2, local_tz)
-    return cmp1 < cmp2
-
-
 def ensure_local_tz(
     dt: datetime.datetime,
     local_tz: Optional[datetime.tzinfo]
@@ -284,21 +244,3 @@ def lookup_by_hour(
     return None
 
 
-def duration_minutes(
-    start: datetime.datetime,
-    end: datetime.datetime
-) -> float:
-    """
-    Calculate duration in minutes between two datetimes.
-
-    Handles timezone normalization to avoid errors from mixed aware/naive.
-
-    Args:
-        start: Start datetime
-        end: End datetime
-
-    Returns:
-        Duration in minutes (can be negative if end < start)
-    """
-    cmp_start, cmp_end = normalize_tz_pair(start, end)
-    return (cmp_end - cmp_start).total_seconds() / 60.0

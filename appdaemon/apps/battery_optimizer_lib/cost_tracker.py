@@ -136,24 +136,9 @@ class BatteryCostTracker:
         return self._energy_sensor_available
 
     @property
-    def cost_from_fallback(self) -> bool:
-        """True if using default fallback cost (not computed from real charging)."""
-        return self._cost_from_fallback
-
-    @property
     def last_soc(self) -> Optional[float]:
         """Last recorded SOC value."""
         return self._last_soc
-
-    @property
-    def idle_start_time(self) -> Optional[datetime.datetime]:
-        """Start time of current idle period (for cooling tracking)."""
-        return self._idle_start_time
-
-    @property
-    def idle_start_temp(self) -> Optional[float]:
-        """Temperature at start of current idle period."""
-        return self._idle_start_temp
 
     # =========================================================================
     # Helper Methods
@@ -702,11 +687,6 @@ class BatteryCostTracker:
                     self._last_discharge_today_kwh = discharge_kwh
                     energy_str = f" (charge: {charge_kwh:.2f} kWh, discharge: {discharge_kwh:.2f} kWh)"
                 self._log(f"Mode transition to DISCHARGE: reset learning baseline to {current_soc:.1f}%{energy_str}{temp_str}")
-
-    def clear_idle_tracking(self):
-        """Clear idle tracking state."""
-        self._idle_start_time = None
-        self._idle_start_temp = None
 
     # =========================================================================
     # Threshold Calculations

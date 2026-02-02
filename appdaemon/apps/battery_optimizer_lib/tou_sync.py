@@ -9,7 +9,6 @@ Handles:
 """
 
 import datetime
-import json
 from typing import Callable, Dict, List, Optional, Any
 
 from .models import BatteryMode, ScheduleEntry, TouPeriod

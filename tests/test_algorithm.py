@@ -17,7 +17,7 @@ from battery_optimizer import (
     PricePoint,
     ScheduleEntry,
 )
-from battery_optimizer_lib import BatteryCostTracker, BatteryCostConfig
+from battery_optimizer_lib import BatteryCostTracker, BatteryCostConfig, ScheduleFormatter, ScheduleFormatterConfig
 
 
 class MockOptimizer:
@@ -81,6 +81,22 @@ class MockOptimizer:
         self._last_charge_slots = []
         self._last_projected_costs = {}
         self.battery_wear_cost = 0.0
+
+        # Schedule formatter for logging
+        self._schedule_formatter = ScheduleFormatter(
+            config=ScheduleFormatterConfig(
+                slot_minutes=slot_minutes,
+                slot_hours=self.slot_hours,
+                battery_capacity=battery_capacity,
+                charge_rate=charge_rate,
+                discharge_rate=discharge_rate,
+                efficiency=efficiency,
+                battery_wear_cost=0.0,
+                decision_log_level=0,
+            ),
+            log_func=self.log,
+            learning_engine=self.learning_engine,
+        )
 
         # Create cost tracker for project_costs method
         self._cost_tracker = BatteryCostTracker(

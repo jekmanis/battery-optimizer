@@ -16,7 +16,6 @@ class TestLearningStats:
         """Default values should be set correctly."""
         stats = LearningStats()
         assert stats.charge_rates_by_soc == {}
-        assert stats.discharge_rates_by_soc == {}
         assert stats.efficiency_history == []
         assert stats.total_energy_charged_kwh == 0.0
         assert stats.total_energy_discharged_kwh == 0.0
@@ -29,7 +28,6 @@ class TestLearningStats:
         stats = LearningStats(
             charge_rates_by_soc={"25-50": [3.5, 3.6, 3.7]},
             total_energy_charged_kwh=100.0,
-            total_cycles=10,
         )
 
         data = stats.to_dict()
@@ -37,7 +35,6 @@ class TestLearningStats:
 
         assert restored.charge_rates_by_soc == {"25-50": [3.5, 3.6, 3.7]}
         assert restored.total_energy_charged_kwh == 100.0
-        assert restored.total_cycles == 10
 
     def test_from_dict_backward_compatibility(self):
         """Should handle missing fields from older versions."""

@@ -11,6 +11,7 @@ This package contains helper modules for the main BatteryOptimizer AppDaemon app
 - ha_helpers: Home Assistant state reading helpers
 - cost_tracker: Battery cost tracking with weighted average calculations
 - charge_rate_utils: Temperature-aware charge rate computation
+- schedule_formatter: Schedule logging and formatting for display
 """
 
 from .models import (
@@ -30,24 +31,17 @@ from .timezone_utils import (
     normalize_tz_pair,
     datetimes_match_slot,
     dt_ge,
-    dt_gt,
-    dt_lt,
     ensure_local_tz,
     align_to_slot,
     next_slot_time,
     next_interval_time,
     lookup_by_hour,
-    duration_minutes,
 )
-from .ha_helpers import (
-    is_state_valid,
-    get_float_state,
-    get_bool_state,
-    get_string_state,
-    SensorReader,
-)
+from .ha_helpers import SensorReader
 from .cost_tracker import BatteryCostTracker, BatteryCostConfig
 from .charge_rate_utils import compute_charge_rates_per_slot
+from .soc_deviation import SocDeviationDetector, SocDeviationConfig, DeviationCheckResult
+from .schedule_formatter import ScheduleFormatter, ScheduleFormatterConfig
 
 __all__ = [
     # Models
@@ -71,19 +65,11 @@ __all__ = [
     "normalize_tz_pair",
     "datetimes_match_slot",
     "dt_ge",
-    "dt_gt",
-    "dt_lt",
     "ensure_local_tz",
     "align_to_slot",
     "next_slot_time",
     "next_interval_time",
     "lookup_by_hour",
-    "duration_minutes",
-    # HA helpers
-    "is_state_valid",
-    "get_float_state",
-    "get_bool_state",
-    "get_string_state",
     # Functions
     "_quantile",
     # Cost tracker
@@ -91,4 +77,11 @@ __all__ = [
     "BatteryCostConfig",
     # Charge rate utilities
     "compute_charge_rates_per_slot",
+    # SOC deviation detection
+    "SocDeviationDetector",
+    "SocDeviationConfig",
+    "DeviationCheckResult",
+    # Schedule formatting
+    "ScheduleFormatter",
+    "ScheduleFormatterConfig",
 ]

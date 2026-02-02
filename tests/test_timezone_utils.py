@@ -7,14 +7,11 @@ from battery_optimizer_lib.timezone_utils import (
     normalize_tz_pair,
     datetimes_match_slot,
     dt_ge,
-    dt_gt,
-    dt_lt,
     ensure_local_tz,
     align_to_slot,
     next_slot_time,
     next_interval_time,
     lookup_by_hour,
-    duration_minutes,
 )
 
 
@@ -92,7 +89,7 @@ class TestDatetimesMatchSlot:
 
 
 class TestDtComparisons:
-    """Tests for dt_ge, dt_gt, dt_lt functions."""
+    """Tests for dt_ge function."""
 
     def test_dt_ge_equal(self):
         dt1 = datetime.datetime(2024, 1, 15, 10, 30)
@@ -108,20 +105,6 @@ class TestDtComparisons:
         dt1 = datetime.datetime(2024, 1, 15, 9, 30)
         dt2 = datetime.datetime(2024, 1, 15, 10, 30)
         assert dt_ge(dt1, dt2) is False
-
-    def test_dt_gt(self):
-        dt1 = datetime.datetime(2024, 1, 15, 11, 30)
-        dt2 = datetime.datetime(2024, 1, 15, 10, 30)
-        assert dt_gt(dt1, dt2) is True
-        assert dt_gt(dt2, dt1) is False
-        assert dt_gt(dt1, dt1) is False
-
-    def test_dt_lt(self):
-        dt1 = datetime.datetime(2024, 1, 15, 9, 30)
-        dt2 = datetime.datetime(2024, 1, 15, 10, 30)
-        assert dt_lt(dt1, dt2) is True
-        assert dt_lt(dt2, dt1) is False
-        assert dt_lt(dt1, dt1) is False
 
     def test_comparisons_with_mixed_tz(self):
         dt1 = datetime.datetime(2024, 1, 15, 10, 30, tzinfo=TZ_PLUS2)
@@ -223,26 +206,3 @@ class TestLookupByHour:
     def test_empty_dict(self):
         dt = datetime.datetime(2024, 1, 15, 10, 30)
         assert lookup_by_hour({}, dt) is None
-
-
-class TestDurationMinutes:
-    """Tests for duration_minutes function."""
-
-    def test_positive_duration(self):
-        start = datetime.datetime(2024, 1, 15, 10, 0)
-        end = datetime.datetime(2024, 1, 15, 10, 30)
-        assert duration_minutes(start, end) == 30.0
-
-    def test_negative_duration(self):
-        start = datetime.datetime(2024, 1, 15, 10, 30)
-        end = datetime.datetime(2024, 1, 15, 10, 0)
-        assert duration_minutes(start, end) == -30.0
-
-    def test_zero_duration(self):
-        dt = datetime.datetime(2024, 1, 15, 10, 0)
-        assert duration_minutes(dt, dt) == 0.0
-
-    def test_cross_day_duration(self):
-        start = datetime.datetime(2024, 1, 15, 23, 30)
-        end = datetime.datetime(2024, 1, 16, 0, 30)
-        assert duration_minutes(start, end) == 60.0

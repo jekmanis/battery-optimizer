@@ -9,7 +9,7 @@ Handles fetching electricity prices from Nord Pool via:
 import datetime
 import json
 import traceback
-from typing import Callable, Dict, List, Optional, Any
+from typing import Callable, Dict, List, Optional
 
 from .models import PricePoint
 

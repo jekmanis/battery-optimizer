@@ -379,12 +379,9 @@ class TestDPOptimizerResult:
         assert hasattr(result, 'schedule')
         assert hasattr(result, 'soc_trajectory')
         assert hasattr(result, 'temp_trajectory')
-        assert hasattr(result, 'projected_costs')
-        assert hasattr(result, 'min_charge_slots')
         assert hasattr(result, 'charge_count')
         assert hasattr(result, 'discharge_count')
         assert hasattr(result, 'hold_count')
-        assert hasattr(result, 'dp_best_value')
 
     def test_counts_match_schedule(
         self,

@@ -24,9 +24,6 @@ class PricePoint:
     hour: datetime.datetime
     price: float
 
-    def __lt__(self, other):
-        return self.price < other.price
-
 
 @dataclass
 class ScheduleEntry:
@@ -49,18 +46,13 @@ class LearningStats:
     """Aggregated learning statistics for battery performance."""
     # Charging rates by SOC range (kW observed at different SOC levels)
     charge_rates_by_soc: Dict[str, List[float]] = field(default_factory=dict)
-    # Discharge rates by SOC range
-    discharge_rates_by_soc: Dict[str, List[float]] = field(default_factory=dict)
     # Round-trip efficiency observations
     efficiency_history: List[float] = field(default_factory=list)
-    # Prediction accuracy (predicted vs actual charge time)
-    prediction_errors: List[float] = field(default_factory=list)
     # Totals
     total_energy_charged_kwh: float = 0.0
     total_energy_discharged_kwh: float = 0.0
     total_charge_cost_eur: float = 0.0
     total_discharge_revenue_eur: float = 0.0
-    total_cycles: int = 0
     # Timestamps
     first_observation: Optional[str] = None
     last_observation: Optional[str] = None

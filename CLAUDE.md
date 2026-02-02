@@ -11,17 +11,28 @@ Battery Optimizer for Growatt WIT Inverter - a Home Assistant AppDaemon applicat
 ### File Structure
 ```
 appdaemon/apps/
-├── battery_optimizer.py           # Main AppDaemon app (~4300 lines)
+├── battery_optimizer.py           # Main AppDaemon app (~2100 lines)
 ├── battery_optimizer_lib/         # Python package for helper modules
 │   ├── __init__.py                # Re-exports for convenience
-│   ├── models.py                  # Data classes and enums (~90 lines)
-│   ├── learning_engine.py         # BatteryLearningEngine (~290 lines)
-│   ├── load_profile.py            # LoadProfile (~90 lines)
-│   ├── price_service.py           # NordPoolPriceService (~420 lines)
-│   └── tou_sync.py                # TouSyncManager (~520 lines)
+│   ├── models.py                  # Data classes and enums (~100 lines)
+│   ├── learning_engine.py         # BatteryLearningEngine (~790 lines)
+│   ├── load_profile.py            # LoadProfile (~110 lines)
+│   ├── price_service.py           # NordPoolPriceService (~510 lines)
+│   ├── tou_sync.py                # TouSyncManager (~790 lines)
+│   ├── dp_optimizer.py            # DPOptimizer (~810 lines)
+│   ├── cost_tracker.py            # BatteryCostTracker (~820 lines)
+│   ├── schedule_formatter.py      # ScheduleFormatter (~610 lines)
+│   ├── soc_deviation.py           # SocDeviationDetector (~420 lines)
+│   ├── timezone_utils.py          # Timezone helpers (~300 lines)
+│   ├── ha_helpers.py              # HA state reading (~210 lines)
+│   └── charge_rate_utils.py       # Temperature-aware rates (~50 lines)
 ├── apps.yaml                      # AppDaemon configuration
 homeassistant/packages/
 └── battery_optimizer.yaml         # HA entities, automations, sensors
+tests/
+├── conftest.py                    # Pytest fixtures
+├── fixtures/mock_hass.py          # Mock Home Assistant
+└── test_*.py                      # Test modules (~336 tests)
 ```
 
 ### Package Modules (battery_optimizer_lib/)
@@ -29,10 +40,17 @@ homeassistant/packages/
 | Module | Classes/Functions | Purpose |
 |--------|-------------------|---------|
 | `models.py` | BatteryMode, PricePoint, ScheduleEntry, TouPeriod, LearningStats, LoadProfileStats | Pure data structures and enums |
+| `dp_optimizer.py` | DPOptimizer, DPOptimizerConfig, DPOptimizerResult | Dynamic programming SOC-aware scheduling algorithm |
 | `learning_engine.py` | BatteryLearningEngine | Self-learning charge rate and efficiency tracking |
 | `load_profile.py` | LoadProfile, _quantile | Statistical load forecasting by time-of-day |
 | `price_service.py` | NordPoolPriceService | Nord Pool price fetching via HA integration |
 | `tou_sync.py` | TouSyncManager | TOU schedule sync and device control via Modbus |
+| `cost_tracker.py` | BatteryCostTracker, BatteryCostConfig | Battery cost tracking with weighted average calculations |
+| `schedule_formatter.py` | ScheduleFormatter, ScheduleFormatterConfig | Schedule logging and formatting for HA sensors |
+| `soc_deviation.py` | SocDeviationDetector, SocDeviationConfig, DeviationCheckResult | Detects unexpected SOC changes for schedule revalidation |
+| `timezone_utils.py` | normalize_tz_pair, align_to_slot, dt_ge/dt_gt/dt_lt, etc. | Timezone-aware datetime comparison and slot alignment |
+| `ha_helpers.py` | SensorReader, get_float_state, get_bool_state, is_state_valid | Home Assistant state reading helpers |
+| `charge_rate_utils.py` | compute_charge_rates_per_slot | Temperature-aware charge rate computation |
 
 ### Key Code Sections in battery_optimizer.py
 
@@ -49,7 +67,7 @@ homeassistant/packages/
 | Manual Override | User intervention handling |
 | Battery Cost Tracking | Weighted average cost with persistence |
 | Helper Methods | SOC reading, timezone handling, slot alignment |
-| Properties & Logging | Dynamic config, schedule sensor, logging |
+| Properties & Sensor | Dynamic config, schedule sensor updates |
 
 ### Data Models
 - `BatteryMode` enum: HOLD (0), CHARGE (1), DISCHARGE (2)
@@ -61,7 +79,7 @@ homeassistant/packages/
 
 ## Core Algorithm
 
-### Scheduling Logic (`find_optimal_schedule`)
+### Scheduling Logic (`DPOptimizer.find_optimal_schedule`)
 Uses **dynamic programming** with SOC state tracking:
 1. Discretize SOC into energy levels (0.1 kWh steps)
 2. For each time slot, evaluate HOLD/CHARGE/DISCHARGE transitions
@@ -136,17 +154,26 @@ This is a Python AppDaemon project. Use `uv` for running Python scripts and synt
 # Check syntax
 uv run python -m py_compile appdaemon/apps/battery_optimizer.py
 
-# Run tests
+# Run all tests
 uv run pytest tests/ -v
 
-# Run a script
-uv run python script.py
+# Run a single test file
+uv run pytest tests/test_algorithm.py -v
+
+# Run a single test function
+uv run pytest tests/test_algorithm.py::TestFindOptimalSchedule::test_basic_charge_discharge_pattern -v
+
+# Run tests with coverage
+uv run pytest tests/ --cov=appdaemon/apps --cov-report=term-missing
 ```
 
 ### Deployment
 ```bash
 # Copy app to AppDaemon
 cp appdaemon/apps/battery_optimizer.py /config/appdaemon/apps/
+
+# Copy library package
+cp -r appdaemon/apps/battery_optimizer_lib /config/appdaemon/apps/
 
 # Copy configuration
 cp appdaemon/apps/apps.yaml /config/appdaemon/apps/

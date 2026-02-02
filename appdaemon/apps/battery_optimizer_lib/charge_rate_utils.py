@@ -40,7 +40,7 @@ def compute_charge_rates_per_slot(
 
     if current_temp is not None:
         projected_temp = current_temp
-        for i, price_point in enumerate(hours_sorted_by_time):
+        for i, _ in enumerate(hours_sorted_by_time):
             rate = get_charge_rate_for_soc(current_soc, projected_temp)
             charge_rates.append(rate)
             slot_duration_minutes = slot_minutes * slot_fractions[i]

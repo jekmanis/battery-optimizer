@@ -55,30 +55,6 @@ class TestPricePoint:
         assert pp.hour == dt
         assert pp.price == 0.15
 
-    def test_comparison_lt(self):
-        """Price comparison (__lt__) should compare prices."""
-        dt = datetime.datetime(2024, 1, 15, 10, 0, 0)
-        cheap = PricePoint(hour=dt, price=0.05)
-        expensive = PricePoint(hour=dt, price=0.20)
-
-        assert cheap < expensive
-        assert not expensive < cheap
-
-    def test_sorting(self):
-        """List of PricePoints should sort by price."""
-        base_dt = datetime.datetime(2024, 1, 15, 0, 0, 0)
-        prices = [
-            PricePoint(hour=base_dt + datetime.timedelta(hours=1), price=0.15),
-            PricePoint(hour=base_dt + datetime.timedelta(hours=2), price=0.05),
-            PricePoint(hour=base_dt + datetime.timedelta(hours=3), price=0.10),
-        ]
-
-        sorted_prices = sorted(prices)
-
-        assert sorted_prices[0].price == 0.05
-        assert sorted_prices[1].price == 0.10
-        assert sorted_prices[2].price == 0.15
-
     def test_negative_price(self):
         """Negative prices should be supported."""
         dt = datetime.datetime(2024, 1, 15, 2, 0, 0)

@@ -8,7 +8,6 @@ Tests for:
 """
 
 import datetime
-from typing import Dict
 
 import pytest
 

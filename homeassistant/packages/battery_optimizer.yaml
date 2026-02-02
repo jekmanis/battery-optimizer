@@ -139,9 +139,9 @@ input_number:
     name: "Battery Average Cost"
     icon: mdi:currency-eur
     min: 0
-    max: 1.00
+    max: 100.00
     step: 0.0001
-    unit_of_measurement: "EUR/kWh"
+    unit_of_measurement: "EUR/kWh"b
     mode: box
 
 # =============================================================================

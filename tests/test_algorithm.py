@@ -221,7 +221,7 @@ class TestFindOptimalSchedule:
             assert hour_naive.hour >= 12
 
     def test_extreme_prices_maximize_arbitrage(self, optimizer, extreme_prices):
-        """With extreme price differences, should maximize arbitrage through discharge."""
+        """With extreme price differences, should maximize arbitrage through charge/discharge."""
         optimizer.set_datetime(datetime.datetime(2024, 1, 15, 0, 0, 0))
 
         schedule = optimizer.find_optimal_schedule(extreme_prices, 4, current_soc=50)
@@ -236,13 +236,25 @@ class TestFindOptimalSchedule:
         discharges = [e for e in expensive_entries if e.mode == BatteryMode.DISCHARGE]
         assert len(discharges) > 0, "Should discharge during expensive hours"
 
-        # Should hold during cheap/negative hours (not waste energy)
-        cheap_entries = [
+        # At negative price hours (0, 1), should HOLD or CHARGE - not discharge
+        # (at negative prices, we get paid to import from grid!)
+        negative_price_entries = [
             e for e in schedule.values()
-            if e.hour.hour in [0, 1, 2, 3]
+            if e.hour.hour in [0, 1]  # Negative price hours
         ]
-        holds = [e for e in cheap_entries if e.mode == BatteryMode.HOLD]
-        assert len(holds) >= 2, "Should hold during cheap hours when already have enough energy"
+        negative_discharges = [e for e in negative_price_entries if e.mode == BatteryMode.DISCHARGE]
+        assert len(negative_discharges) == 0, "Should not discharge at negative price hours"
+
+        # Verify expensive hours have more discharges than cheap hours
+        # The DP should prioritize high-value discharge opportunities
+        cheap_positive_entries = [
+            e for e in schedule.values()
+            if e.hour.hour in [2, 3, 4, 5]  # Very cheap but positive prices
+        ]
+        cheap_discharges = [e for e in cheap_positive_entries if e.mode == BatteryMode.DISCHARGE]
+        # With zero wear cost, discharging at any positive price is valid
+        # But we should have MORE discharges at expensive hours than cheap hours
+        assert len(discharges) >= len(cheap_discharges), "Should prioritize expensive hour discharges"
 
     def test_flat_prices_minimal_activity(self, optimizer, flat_prices):
         """With flat prices, charging is only valuable if below battery cost."""

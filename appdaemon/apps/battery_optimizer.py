@@ -74,6 +74,7 @@ class BatteryOptimizer(hass.Hass):
 
         # Battery cost tracking (weighted average cost of energy in battery)
         self.battery_avg_cost: float = 0.0  # EUR/kWh
+        self._battery_cost_from_fallback: bool = False  # True if using fallback, not loaded from HA
         self._init_battery_cost()
 
         # Decision context tracking (for transparency logging and sensor exposure)
@@ -538,16 +539,8 @@ class BatteryOptimizer(hass.Hass):
         min_charge_slots = max(0, int(charge_hours_needed))
         if min_charge_slots > n_slots:
             min_charge_slots = n_slots
-        # Precompute which slots are "favorable" for charging (raw price basis)
-        charge_price_threshold = self.battery_avg_cost * 1.05
+        # discharge_threshold kept for logging/sensor exposure
         discharge_threshold = self._get_discharge_threshold()
-        favorable_flags = [p.price <= charge_price_threshold for p in hours_sorted_by_time]
-        favorable_remaining = [0] * n_slots
-        remaining = 0
-        for i in range(n_slots - 1, -1, -1):
-            if favorable_flags[i]:
-                remaining += 1
-            favorable_remaining[i] = remaining
 
         # Energy bounds in kWh
         current_soc_for_calc = current_soc if current_soc is not None else 50.0
@@ -626,28 +619,21 @@ class BatteryOptimizer(hass.Hass):
         tie_price_weight = 1e-5
         tie_time_weight = 1e-7
 
-        def _compute_favorable(prices_list: List[PricePoint]):
-            flags = [p.price <= charge_price_threshold for p in prices_list]
-            remaining_list = [0] * len(prices_list)
-            remaining_count = 0
-            for i in range(len(prices_list) - 1, -1, -1):
-                if flags[i]:
-                    remaining_count += 1
-                remaining_list[i] = remaining_count
-            return flags, remaining_list
-
-        favorable_flags, favorable_remaining = _compute_favorable(hours_sorted_by_time)
+        # Discharge cost: only wear cost (battery degradation)
+        # We do NOT include battery_avg_cost here because:
+        # - The cost of stored energy was already paid when we charged
+        # - If we discharge and recharge, including avg_cost would double-count
+        # - The DP naturally handles arbitrage: charge cheap, discharge expensive
+        # Wear cost is a real marginal cost of cycling the battery
+        discharge_cost_per_kwh = self.battery_wear_cost
 
         def _run_dp(
             hours_list: List[PricePoint],
             load_kw_list: List[float],
             charge_rates_list: List[float],
             slot_fractions_list: List[float],
-            favorable_flags_list: List[bool],
-            favorable_remaining_list: List[int],
             start_energy_kwh: float,
             start_c: int,
-            discharge_thresholds_list: Optional[List[float]] = None,
             start_idx_override: Optional[int] = None,
         ) -> Tuple[List[BatteryMode], List[bool], float, bool, List[int]]:
             n_list_slots = len(hours_list)
@@ -683,12 +669,6 @@ class BatteryOptimizer(hass.Hass):
             for t in range(n_list_slots):
                 price = hours_list[t].price
                 buy_price = price + self.grid_fee
-                slot_discharge_threshold = (
-                    discharge_thresholds_list[t]
-                    if discharge_thresholds_list is not None
-                    else discharge_threshold
-                )
-                discharge_allowed = buy_price >= (slot_discharge_threshold - 1e-6)
                 fraction = slot_fractions_list[t]
                 discharge_kwh = min(load_kw_list[t], self.discharge_rate) * self.slot_hours * fraction
                 slot_charge_rate = charge_rates_list[t]
@@ -707,12 +687,10 @@ class BatteryOptimizer(hass.Hass):
                 slot_trace = []
                 trace_this_slot = (
                     self.decision_log_level >= 3 and
-                    discharge_allowed and
                     fraction > 0.5  # Full slots only
                 )
 
-                # Deep trace: track paths from discharge-allowed slots
-                # Tag states that came from a discharge so we can follow their evolution
+                # Deep trace: track state evolution for first few slots
                 deep_trace_this_slot = self.decision_log_level >= 3 and t < 5
 
                 for c in range(max_charge_slots + 1):
@@ -741,12 +719,8 @@ class BatteryOptimizer(hass.Hass):
                         discharge_next_idx = None
                         discharge_next_val = None
 
-                        # CHARGE - only at favorable prices unless min_charge_slots requires it
-                        price_is_favorable = favorable_flags_list[t]
-                        must_use_unfavorable = (c + favorable_remaining_list[t]) < min_charge_slots
-                        allow_charge = price_is_favorable or must_use_unfavorable
-
-                        if allow_charge and charge_energy_kwh > 0 and c + charge_count_increment <= max_charge_slots:
+                        # CHARGE - let DP evaluate freely; value function handles economics
+                        if charge_energy_kwh > 0 and c + charge_count_increment <= max_charge_slots:
                             new_energy = energy_levels[idx] + charge_energy_kwh
                             actual_charge_energy = charge_energy_kwh
                             actual_charge_cost = charge_cost_kwh
@@ -775,27 +749,28 @@ class BatteryOptimizer(hass.Hass):
                                     next_prev_c[c_next][next_idx] = c
                                     next_prev_action[c_next][next_idx] = BatteryMode.CHARGE
 
-                        # DISCHARGE
-                        if discharge_allowed and discharge_kwh > 0:
+                        # DISCHARGE - let DP evaluate freely; value function handles economics
+                        if discharge_kwh > 0:
                             discharge_attempted = True
                             new_energy = energy_levels[idx] - discharge_kwh
                             is_partial = False
                             actual_discharge_kwh = discharge_kwh
 
                             if new_energy >= min_energy - 1e-6:
-                                # Full discharge - battery can cover entire load
-                                # Value = avoided grid import (no cost, vs HOLD which pays buy_price * load)
+                                # Full discharge - battery covers entire load
+                                # Cost = opportunity cost of depleted energy (what we paid + wear)
+                                # This ensures discharge only wins when buy_price > discharge_cost_per_kwh
                                 next_idx = int(round((new_energy - min_energy) / step_kwh))
                                 next_idx = min(max(next_idx, 0), n_states - 1)
-                                next_val = val  # No grid cost - battery covers load
+                                next_val = val - (discharge_cost_per_kwh * actual_discharge_kwh)
                             elif energy_levels[idx] > min_energy + discharge_kwh * 0.5:
                                 # Partial discharge - discharge until min_soc, grid covers remainder
                                 # Only allow if we have at least half the load's worth of energy
                                 is_partial = True
                                 actual_discharge_kwh = energy_levels[idx] - min_energy
                                 grid_import = discharge_kwh - actual_discharge_kwh
-                                # Value = avoided import for battery portion, pay grid for remainder
-                                next_val = val - (buy_price * grid_import)
+                                # Cost = grid import + opportunity cost of battery portion
+                                next_val = val - (buy_price * grid_import) - (discharge_cost_per_kwh * actual_discharge_kwh)
                                 next_idx = 0  # End up at min_energy
                                 new_energy = min_energy
                             else:
@@ -977,7 +952,7 @@ class BatteryOptimizer(hass.Hass):
 
             return actions, partial_flags, best_val, meets_min, idx_trajectory
 
-        def _build_schedule(discharge_thresholds: Optional[List[float]] = None) -> Tuple[Dict[datetime.datetime, ScheduleEntry], List[int]]:
+        def _build_schedule() -> Tuple[Dict[datetime.datetime, ScheduleEntry], List[int]]:
             schedule_local: Dict[datetime.datetime, ScheduleEntry] = {}
             partial_index = current_slot_index
             partial_fraction = (
@@ -991,12 +966,6 @@ class BatteryOptimizer(hass.Hass):
                 price_point = hours_sorted_by_time[partial_index]
                 price = price_point.price
                 buy_price = price + self.grid_fee
-                slot_threshold = (
-                    discharge_thresholds[partial_index]
-                    if discharge_thresholds is not None
-                    else discharge_threshold
-                )
-                discharge_allowed = buy_price >= (slot_threshold - 1e-6)
                 fraction = slot_fractions[partial_index]
                 slot_load_kw = load_kw[partial_index]
                 discharge_kwh = min(slot_load_kw, self.discharge_rate) * self.slot_hours * fraction
@@ -1010,12 +979,6 @@ class BatteryOptimizer(hass.Hass):
                 load_remaining = load_kw[remaining_slice]
                 charge_rates_remaining = charge_rates_per_slot[remaining_slice]
                 slot_fractions_remaining = slot_fractions[remaining_slice]
-                favorable_flags_remaining, favorable_remaining_list = _compute_favorable(hours_remaining)
-                discharge_thresholds_remaining = (
-                    discharge_thresholds[remaining_slice]
-                    if discharge_thresholds is not None
-                    else None
-                )
 
                 # Candidates: (action, new_energy, immediate_val, start_c, start_idx_override, is_partial)
                 candidates = []
@@ -1026,12 +989,9 @@ class BatteryOptimizer(hass.Hass):
                     (BatteryMode.HOLD, start_energy, -hold_cost, 0, None, False)
                 )
 
-                # CHARGE - only at favorable prices unless min_charge_slots requires it
-                price_is_favorable = favorable_flags[partial_index]
-                must_use_unfavorable = (0 + favorable_remaining[partial_index]) < min_charge_slots
-                allow_charge = price_is_favorable or must_use_unfavorable
+                # CHARGE - let DP evaluate freely; value function handles economics
                 partial_charge_increment = 1  # Always count - energy is tracked separately
-                if allow_charge and charge_energy_kwh > 0 and partial_charge_increment <= max_charge_slots:
+                if charge_energy_kwh > 0 and partial_charge_increment <= max_charge_slots:
                     new_energy = start_energy + charge_energy_kwh
                     actual_charge_energy = charge_energy_kwh
                     actual_charge_cost = charge_cost_kwh
@@ -1059,18 +1019,19 @@ class BatteryOptimizer(hass.Hass):
                             )
                         )
 
-                # DISCHARGE
-                if discharge_allowed and discharge_kwh > 0:
+                # DISCHARGE - value function includes opportunity cost of stored energy + wear
+                if discharge_kwh > 0:
                     new_energy = start_energy - discharge_kwh
                     if new_energy >= min_energy - 1e-6:
-                        # Full discharge - no grid cost (battery covers load)
+                        # Full discharge - cost is opportunity cost of depleted energy
                         idx_float = (new_energy - min_energy) / step_kwh
                         start_idx_override = int(math.ceil(idx_float - 1e-9))
+                        discharge_cost = -discharge_cost_per_kwh * discharge_kwh
                         candidates.append(
                             (
                                 BatteryMode.DISCHARGE,
                                 new_energy,
-                                0,  # No cost - battery covers load
+                                discharge_cost,
                                 0,
                                 start_idx_override,
                                 False,
@@ -1080,7 +1041,8 @@ class BatteryOptimizer(hass.Hass):
                         # Partial discharge - discharge until min_soc
                         actual_discharge_kwh = start_energy - min_energy
                         grid_import = discharge_kwh - actual_discharge_kwh
-                        partial_value = -buy_price * grid_import  # Pay only for grid portion
+                        # Cost = grid import + opportunity cost of battery portion
+                        partial_value = -buy_price * grid_import - discharge_cost_per_kwh * actual_discharge_kwh
                         candidates.append(
                             (
                                 BatteryMode.DISCHARGE,
@@ -1099,35 +1061,25 @@ class BatteryOptimizer(hass.Hass):
                 best_idx_trajectory_remaining: List[int] = []
                 best_first_slot_end_idx: int = int(round((start_energy - min_energy) / step_kwh))  # Default: HOLD keeps same idx
                 best_value = neg_inf
-                best_feasible_action: Optional[BatteryMode] = None
-                best_feasible_is_partial = False
-                best_feasible_actions_remaining: List[BatteryMode] = []
-                best_feasible_partial_flags_remaining: List[bool] = []
-                best_feasible_idx_trajectory_remaining: List[int] = []
-                best_feasible_first_slot_end_idx: int = int(round((start_energy - min_energy) / step_kwh))
-                best_feasible_value = neg_inf
 
                 # Log greedy lookahead candidates
                 if self.decision_log_level >= 3:
-                    self.log(f"[GreedyLookahead] Partial slot {price_point.hour.strftime('%H:%M')} @ {price:.4f}, discharge_allowed={discharge_allowed}")
+                    self.log(f"[GreedyLookahead] Partial slot {price_point.hour.strftime('%H:%M')} @ {price:.4f}")
                     self.log(f"  Candidates: {[(c[0].name, c[2]) for c in candidates]}")
 
                 greedy_results = []
                 for action, new_energy, immediate_val, start_c, start_idx_override, is_partial in candidates:
-                    actions_remaining, partial_flags_remaining, future_val, meets_min, idx_traj_remaining = _run_dp(
+                    actions_remaining, partial_flags_remaining, future_val, _, idx_traj_remaining = _run_dp(
                         hours_remaining,
                         load_remaining,
                         charge_rates_remaining,
                         slot_fractions_remaining,
-                        favorable_flags_remaining,
-                        favorable_remaining_list,
                         new_energy,
                         start_c,
-                        discharge_thresholds_list=discharge_thresholds_remaining,
                         start_idx_override=start_idx_override,
                     )
                     total_val = immediate_val + future_val
-                    greedy_results.append((action.name, immediate_val, future_val, total_val, meets_min))
+                    greedy_results.append((action.name, immediate_val, future_val, total_val))
                     # Calculate idx at end of first slot based on the action's new_energy
                     first_slot_end_idx = int(round((new_energy - min_energy) / step_kwh))
                     first_slot_end_idx = min(max(first_slot_end_idx, 0), n_states - 1)
@@ -1139,20 +1091,12 @@ class BatteryOptimizer(hass.Hass):
                         best_partial_flags_remaining = partial_flags_remaining
                         best_idx_trajectory_remaining = idx_traj_remaining
                         best_first_slot_end_idx = first_slot_end_idx
-                    if meets_min and total_val > best_feasible_value:
-                        best_feasible_value = total_val
-                        best_feasible_action = action
-                        best_feasible_is_partial = is_partial
-                        best_feasible_actions_remaining = actions_remaining
-                        best_feasible_partial_flags_remaining = partial_flags_remaining
-                        best_feasible_idx_trajectory_remaining = idx_traj_remaining
-                        best_feasible_first_slot_end_idx = first_slot_end_idx
 
                 # Log greedy lookahead results
                 if self.decision_log_level >= 3:
-                    for name, imm, fut, tot, meets in greedy_results:
-                        self.log(f"  {name}: immediate={imm:.4f}, future={fut:.4f}, total={tot:.4f}, meets_min={meets}")
-                    self.log(f"  -> Best feasible: {best_feasible_action.name if best_feasible_action else 'None'} (val={best_feasible_value:.4f})")
+                    for name, imm, fut, tot in greedy_results:
+                        self.log(f"  {name}: immediate={imm:.4f}, future={fut:.4f}, total={tot:.4f}")
+                    self.log(f"  -> Best: {best_action.name} (val={best_value:.4f})")
 
                     # Explain HOLD vs DISCHARGE decision if both were candidates
                     hold_result = next((r for r in greedy_results if r[0] == "HOLD"), None)
@@ -1160,40 +1104,32 @@ class BatteryOptimizer(hass.Hass):
                     if hold_result and discharge_result:
                         hold_imm, hold_fut, hold_tot = hold_result[1], hold_result[2], hold_result[3]
                         disc_imm, disc_fut, disc_tot = discharge_result[1], discharge_result[2], discharge_result[3]
-                        saved_by_discharge = disc_imm - hold_imm  # Should be positive (HOLD pays, DISCHARGE doesn't)
-                        extra_charge_cost = disc_fut - hold_fut  # Should be negative (DISCHARGE path costs more to recharge)
-                        net_benefit = disc_tot - hold_tot  # Positive = DISCHARGE better, Negative = HOLD better
+                        saved_by_discharge = disc_imm - hold_imm
+                        extra_charge_cost = disc_fut - hold_fut
+                        net_benefit = disc_tot - hold_tot
 
                         if net_benefit > 0.001:
                             self.log(f"  [DECISION] DISCHARGE wins: saves {saved_by_discharge:.4f} now, extra charge cost {-extra_charge_cost:.4f}, net benefit {net_benefit:.4f}")
                         elif net_benefit < -0.001:
-                            self.log(f"  [DECISION] HOLD wins: would save {saved_by_discharge:.4f} by discharging, but recharging costs {-extra_charge_cost:.4f} extra (>{saved_by_discharge:.4f})")
-                            # Calculate effective round-trip cost
+                            self.log(f"  [DECISION] HOLD wins: would save {saved_by_discharge:.4f} by discharging, but recharging costs {-extra_charge_cost:.4f} extra")
                             if discharge_kwh > 0.01:
                                 effective_recharge_cost_per_kwh = -extra_charge_cost / (discharge_kwh / self.efficiency)
                                 self.log(f"             Overnight recharge cost: ~{effective_recharge_cost_per_kwh:.4f}/kWh vs discharge value {buy_price:.4f}/kWh")
                         else:
                             self.log(f"  [DECISION] Tie (within 0.001): HOLD preferred by default")
 
-                if best_feasible_action is not None:
-                    actions = [best_feasible_action] + best_feasible_actions_remaining
-                    partial_flags = [best_feasible_is_partial] + best_feasible_partial_flags_remaining
-                    idx_trajectory = [best_feasible_first_slot_end_idx] + best_feasible_idx_trajectory_remaining
-                else:
-                    actions = [best_action] + best_actions_remaining
-                    partial_flags = [best_is_partial] + best_partial_flags_remaining
-                    idx_trajectory = [best_first_slot_end_idx] + best_idx_trajectory_remaining
+                # Always use economic optimum (min_charge_slots is informational only)
+                actions = [best_action] + best_actions_remaining
+                partial_flags = [best_is_partial] + best_partial_flags_remaining
+                idx_trajectory = [best_first_slot_end_idx] + best_idx_trajectory_remaining
             else:
                 actions, partial_flags, _, _, idx_trajectory = _run_dp(
                     hours_sorted_by_time,
                     load_kw,
                     charge_rates_per_slot,
                     slot_fractions,
-                    favorable_flags,
-                    favorable_remaining,
                     start_energy,
                     0,
-                    discharge_thresholds_list=discharge_thresholds,
                 )
 
             for price_point, action, lk, is_partial in zip(hours_sorted_by_time, actions, load_kw, partial_flags):
@@ -1207,9 +1143,8 @@ class BatteryOptimizer(hass.Hass):
 
         schedule, idx_trajectory = _build_schedule()
 
-        # === Two-pass enhancement: re-run if projected costs differ significantly ===
+        # Project costs for sensor exposure
         has_charge_slots = any(e.mode == BatteryMode.CHARGE for e in schedule.values())
-
         if has_charge_slots:
             prices_by_slot = {p.hour: p.price for p in hours_sorted_by_time}
             slot_charge_rates_by_slot = {
@@ -1218,7 +1153,7 @@ class BatteryOptimizer(hass.Hass):
             slot_fractions_by_slot = {
                 p.hour: slot_fractions[i] for i, p in enumerate(hours_sorted_by_time)
             }
-            projected_costs, final_cost = self._project_battery_costs(
+            projected_costs, _ = self._project_battery_costs(
                 schedule,
                 current_soc_for_calc,
                 self.battery_avg_cost,
@@ -1227,41 +1162,6 @@ class BatteryOptimizer(hass.Hass):
                 slot_fractions_by_slot=slot_fractions_by_slot,
             )
             self._last_projected_costs = projected_costs
-
-            # Check if projected costs differ enough to warrant second pass
-            final_cost = final_cost if projected_costs else self.battery_avg_cost
-            cost_change_pct = abs(final_cost - self.battery_avg_cost) / max(0.01, self.battery_avg_cost)
-
-            if cost_change_pct >= 0.01:  # >1% change
-                self.log(f"Two-pass DP: battery cost projected to change from {self.battery_avg_cost:.4f} to {final_cost:.4f} EUR/kWh ({cost_change_pct*100:.1f}%), re-running with dynamic thresholds")
-
-                # Build per-slot discharge thresholds based on projected costs
-                discharge_thresholds = [
-                    self._get_discharge_threshold_for_cost(
-                        projected_costs.get(hours_sorted_by_time[t].hour, self.battery_avg_cost)
-                    )
-                    for t in range(n_slots)
-                ]
-
-                # Re-run DP with per-slot thresholds
-                schedule, idx_trajectory = _build_schedule(discharge_thresholds=discharge_thresholds)
-
-                # Update projected costs for the final schedule
-                slot_charge_rates_by_slot = {
-                    p.hour: charge_rates_per_slot[i] for i, p in enumerate(hours_sorted_by_time)
-                }
-                slot_fractions_by_slot = {
-                    p.hour: slot_fractions[i] for i, p in enumerate(hours_sorted_by_time)
-                }
-                projected_costs, _ = self._project_battery_costs(
-                    schedule,
-                    current_soc_for_calc,
-                    self.battery_avg_cost,
-                    prices_by_slot,
-                    charge_rates_by_slot=slot_charge_rates_by_slot,
-                    slot_fractions_by_slot=slot_fractions_by_slot,
-                )
-                self._last_projected_costs = projected_costs
         else:
             self._last_projected_costs = {}
 
@@ -1381,15 +1281,13 @@ class BatteryOptimizer(hass.Hass):
             self.log("=" * 70)
 
             # Input state
-            charge_price_threshold = self.battery_avg_cost * 1.05  # Raw price threshold used in DP
-            discharge_threshold = self._get_discharge_threshold()
             self.log(f"Input State:")
             self.log(f"  Current SOC: {current_soc:.1f}%")
             self.log(f"  Min SOC target: {self.min_soc:.1f}%")
-            self.log(f"  Min charge slots required: {min_charge_slots} (to avoid hitting min SOC)")
+            self.log(f"  Min charge slots (informational): {min_charge_slots}")
             self.log(f"  Battery avg cost: {self.battery_avg_cost:.4f} EUR/kWh")
-            self.log(f"  Charge price threshold: {charge_price_threshold:.4f} EUR/kWh (raw price, excl. grid fee)")
-            self.log(f"  Discharge cost threshold: {discharge_threshold:.4f} EUR/kWh (avg/eff + grid fee + wear)")
+            self.log(f"  Discharge wear cost: {self.battery_wear_cost:.4f} EUR/kWh")
+            self.log(f"  Note: DP evaluates all options; discharge only costs wear (no double-counting)")
 
         # Verbose logging (level 2): show candidates and analysis
         if self.decision_log_level >= 2:
@@ -1428,15 +1326,6 @@ class BatteryOptimizer(hass.Hass):
                 self.log(f"  Avg discharge price: {avg_discharge_price:.4f} EUR/kWh")
                 self.log(f"  Spread: {spread:.4f} EUR/kWh (after {self.efficiency*100:.0f}% efficiency: {effective_spread:.4f} EUR/kWh)")
 
-        # Log projected cost evolution if two-pass DP was used
-        if self.decision_log_level >= 1 and self._last_projected_costs:
-            self.log(f"\nProjected cost evolution:")
-            prev_cost = self.battery_avg_cost
-            for slot, cost in sorted(self._last_projected_costs.items()):
-                if abs(cost - prev_cost) > 0.001:
-                    threshold = self._get_discharge_threshold_for_cost(cost)
-                    self.log(f"  After {slot.strftime('%Y-%m-%d %H:%M')}: avg_cost={cost:.4f}, threshold={threshold:.4f}")
-                    prev_cost = cost
         if self.decision_log_level >= 1:
             self.log("=" * 70)
 
@@ -2590,30 +2479,48 @@ class BatteryOptimizer(hass.Hass):
         elif self.use_inverter_energy_sensors:
             self.log("Inverter energy sensors unavailable, will use SOC-based calculation", level="WARNING")
 
-        # Try to load from persistent storage
+        # Check if HA is ready
+        ha_state = self.get_state("sun.sun")
+        if not ha_state or ha_state in ("unknown", "unavailable"):
+            self.log("HA not ready, waiting for homeassistant_start event")
+            self.listen_event(self._on_ha_start, "homeassistant_start")
+            return
+
+        # HA is ready - load cost and start
+        self._load_battery_cost()
+        self._schedule_startup_optimization()
+
+    def _load_battery_cost(self):
+        """Load battery cost from HA entity, using fallback if unavailable"""
         try:
             state = self.get_state(self.battery_cost_entity)
             if state and state not in ("unknown", "unavailable"):
                 self.battery_avg_cost = float(state)
-                self.log(f"Loaded battery avg cost from HA: {self.battery_avg_cost:.4f} EUR/kWh")
-                self._schedule_startup_optimization()
+                self._battery_cost_from_fallback = False
+                self.log(f"Loaded battery avg cost: {self.battery_avg_cost:.4f} EUR/kWh")
                 return
         except (ValueError, TypeError) as e:
-            self.log(f"Could not load battery cost from {self.battery_cost_entity}: {e}", level="WARNING")
+            self.log(f"Could not parse battery cost: {e}", level="WARNING")
 
-        # HA not ready yet - wait for homeassistant_start event to load cost and start optimizer
-        self.log("HA entities not available yet, waiting for homeassistant_start event")
-        self.listen_event(self._on_ha_start, "homeassistant_start")
+        self.battery_avg_cost = 0.10
+        self._battery_cost_from_fallback = True
+        self.log(f"Using default battery cost: {self.battery_avg_cost:.4f} EUR/kWh", level="WARNING")
 
     def _save_battery_cost(self):
         """Persist battery cost to Home Assistant entity"""
+        # Don't save if we're still using the fallback value (not computed from real charging)
+        if self._battery_cost_from_fallback:
+            self.log(f"Skipping save: battery cost {self.battery_avg_cost:.4f} is from fallback, not computed", level="DEBUG")
+            return
+
         try:
             self.call_service("input_number/set_value",
                 entity_id=self.battery_cost_entity,
                 value=round(self.battery_avg_cost, 4)
             )
+            self.log(f"Saved battery avg cost to HA: {self.battery_avg_cost:.4f} EUR/kWh", level="DEBUG")
         except Exception as e:
-            self.log(f"Could not save battery cost to {self.battery_cost_entity}: {e}", level="DEBUG")
+            self.log(f"Could not save battery cost to {self.battery_cost_entity}: {e}", level="WARNING")
 
     def _get_inverter_energy_readings(self) -> Tuple[Optional[float], Optional[float]]:
         """Read current values from inverter energy sensors."""
@@ -2767,6 +2674,7 @@ class BatteryOptimizer(hass.Hass):
 
             self.log(f"Battery charged: +{energy_kwh:.3f} kWh [inverter] at {charge_price:.4f} EUR/kWh, "
                      f"new avg cost: {self.battery_avg_cost:.4f} EUR/kWh")
+            self._battery_cost_from_fallback = False  # We computed a real value
             self._save_battery_cost()
 
             # Feed learning engine with actual measured energy
@@ -2817,19 +2725,8 @@ class BatteryOptimizer(hass.Hass):
         self.run_in(self.full_optimize, 1)
 
     def _on_ha_start(self, event_name, data, kwargs):
-        """Load battery cost after HA start and trigger startup optimization"""
-        try:
-            state = self.get_state(self.battery_cost_entity)
-            if state and state not in ("unknown", "unavailable"):
-                self.battery_avg_cost = float(state)
-                self.log(f"Loaded battery avg cost from HA: {self.battery_avg_cost:.4f} EUR/kWh")
-            else:
-                self.battery_avg_cost = 0.10  # Default fallback
-                self.log(f"Battery cost entity unavailable, using default: {self.battery_avg_cost:.4f} EUR/kWh", level="WARNING")
-        except (ValueError, TypeError) as e:
-            self.battery_avg_cost = 0.10
-            self.log(f"Could not load battery cost ({e}), using default: {self.battery_avg_cost:.4f} EUR/kWh", level="WARNING")
-
+        """HA started - load state and begin optimization"""
+        self._load_battery_cost()
         self._schedule_startup_optimization()
 
     def _init_learning_engine(self):
@@ -3196,6 +3093,7 @@ class BatteryOptimizer(hass.Hass):
             self.log(f"Battery charged: +{soc_change:.1f}% (+{energy_change_kwh:.2f} kWh) at {charge_price:.4f} EUR/kWh, "
                      f"new avg cost: {self.battery_avg_cost:.4f} EUR/kWh")
 
+            self._battery_cost_from_fallback = False  # We computed a real value
             self._save_battery_cost()
 
             # Feed learning engine with charging observation (include battery temp if available)
@@ -3892,7 +3790,7 @@ class BatteryOptimizer(hass.Hass):
                         else:
                             soc_str = f" {start_soc:5.1f}%->{end_soc:5.1f}%"
 
-            # For discharge, show battery avg cost as primary, grid price in parentheses
+            # For discharge, show projected battery cost as primary, grid price in parentheses
             reason_display = entry.reason
             if entry.mode == BatteryMode.DISCHARGE and self._last_projected_costs:
                 proj_cost = self._last_projected_costs.get(hour)

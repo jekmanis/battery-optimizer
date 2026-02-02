@@ -110,7 +110,8 @@ class BatteryLearningEngine:
         charge_price: float = 0.0,
         battery_temp: Optional[float] = None,
         battery_temp_start: Optional[float] = None,
-        battery_temp_end: Optional[float] = None
+        battery_temp_end: Optional[float] = None,
+        energy_to_battery_kwh: Optional[float] = None
     ):
         """
         Record a charging observation and update learned parameters.
@@ -124,12 +125,18 @@ class BatteryLearningEngine:
             battery_temp: Battery temperature in Celsius (if available) - used for charge rate bucketing
             battery_temp_start: Battery temperature at start of charging (for warming rate tracking)
             battery_temp_end: Battery temperature at end of charging (for warming rate tracking)
+            energy_to_battery_kwh: Actual energy stored in battery (from inverter sensor, more precise than SOC)
         """
         if duration_minutes <= 0 or soc_end <= soc_start:
             return
 
-        # Calculate energy added to battery
-        energy_added = (soc_end - soc_start) / 100 * self.battery_capacity
+        # Use measured energy if available, otherwise calculate from SOC
+        if energy_to_battery_kwh is not None and energy_to_battery_kwh > 0:
+            energy_added = energy_to_battery_kwh
+            energy_source = "inverter"
+        else:
+            energy_added = (soc_end - soc_start) / 100 * self.battery_capacity
+            energy_source = "soc"
 
         # Calculate observed charge rate
         charge_rate = energy_added / (duration_minutes / 60)
@@ -201,7 +208,7 @@ class BatteryLearningEngine:
         temp_str = f", temp={battery_temp:.1f}C" if battery_temp is not None else ""
         # Get observation count for this bucket
         obs_count = len(self.stats.charge_rates_by_soc.get(soc_range, []))
-        self.log(f"Learning: Recorded charge {soc_start:.1f}%->{soc_end:.1f}% "
+        self.log(f"Learning: Recorded charge {soc_start:.1f}%->{soc_end:.1f}% ({energy_added:.3f} kWh [{energy_source}]) "
                  f"in {duration_minutes:.0f}min, rate={charge_rate:.2f}kW{temp_str}, "
                  f"bucket={soc_range} ({obs_count} obs)")
 
@@ -217,12 +224,22 @@ class BatteryLearningEngine:
         if duration_minutes <= 0 or soc_start <= soc_end:
             return
 
-        if energy_delivered_kwh is None:
+        # Use measured energy if available, otherwise calculate from SOC
+        if energy_delivered_kwh is not None and energy_delivered_kwh > 0:
+            energy_source = "inverter"
+        else:
             energy_delivered_kwh = (soc_start - soc_end) / 100 * self.battery_capacity
+            energy_source = "soc"
+
+        # Calculate observed discharge rate
+        discharge_rate = energy_delivered_kwh / (duration_minutes / 60)
 
         # Update totals
         self.stats.total_energy_discharged_kwh += energy_delivered_kwh
         self.stats.total_discharge_revenue_eur += energy_delivered_kwh * price_eur_kwh
+
+        self.log(f"Learning: Recorded discharge {soc_start:.1f}%->{soc_end:.1f}% ({energy_delivered_kwh:.3f} kWh [{energy_source}]) "
+                 f"in {duration_minutes:.0f}min, rate={discharge_rate:.2f}kW")
 
     def record_temperature_observation(self, temp: float):
         """

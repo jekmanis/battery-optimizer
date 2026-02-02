@@ -47,6 +47,13 @@ battery_optimizer:
   # Leave empty to disable temperature-aware learning
   battery_temp_sensor: "sensor.growatt_battery_temperature"
 
+  # Inverter energy sensors for precise energy measurement (0.1 kWh precision)
+  # These cumulative daily sensors provide more accurate tracking than SOC-based calculation
+  # Set use_inverter_energy_sensors to false to fall back to SOC-based calculation
+  battery_charge_sensor: "sensor.growatt_battery_charge_today"
+  battery_discharge_sensor: "sensor.growatt_battery_discharge_today"
+  use_inverter_energy_sensors: true
+
   # ==========================================================================
   # Device Control
   # ==========================================================================

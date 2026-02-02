@@ -221,20 +221,28 @@ class TestFindOptimalSchedule:
             assert hour_naive.hour >= 12
 
     def test_extreme_prices_maximize_arbitrage(self, optimizer, extreme_prices):
-        """With extreme price differences, should maximize arbitrage."""
+        """With extreme price differences, should maximize arbitrage through discharge."""
         optimizer.set_datetime(datetime.datetime(2024, 1, 15, 0, 0, 0))
 
         schedule = optimizer.find_optimal_schedule(extreme_prices, 4, current_soc=50)
 
-        # Find the negative price hours (0, 1)
-        early_entries = [
+        # Find the expensive hours (peak prices)
+        expensive_entries = [
+            e for e in schedule.values()
+            if e.hour.hour in [7, 8, 9, 17, 18, 19]  # Peak price hours
+        ]
+
+        # With extreme price spikes, should discharge during expensive hours
+        discharges = [e for e in expensive_entries if e.mode == BatteryMode.DISCHARGE]
+        assert len(discharges) > 0, "Should discharge during expensive hours"
+
+        # Should hold during cheap/negative hours (not waste energy)
+        cheap_entries = [
             e for e in schedule.values()
             if e.hour.hour in [0, 1, 2, 3]
         ]
-
-        # With negative/low prices, should be charging
-        charges = [e for e in early_entries if e.mode == BatteryMode.CHARGE]
-        assert len(charges) > 0
+        holds = [e for e in cheap_entries if e.mode == BatteryMode.HOLD]
+        assert len(holds) >= 2, "Should hold during cheap hours when already have enough energy"
 
     def test_flat_prices_minimal_activity(self, optimizer, flat_prices):
         """With flat prices, charging is only valuable if below battery cost."""
@@ -298,18 +306,27 @@ class TestFindOptimalSchedule:
         )
         assert has_current_slot
 
-    def test_minimum_charge_slots_enforcement(self, optimizer, sample_prices):
-        """Should meet minimum charge slot requirement when possible."""
+    def test_minimum_charge_slots_is_soft_constraint(self, optimizer, sample_prices):
+        """min_charge_slots is now a soft constraint - algorithm optimizes economically."""
         optimizer.set_datetime(datetime.datetime(2024, 1, 15, 0, 0, 0))
 
-        # Request at least 5 charge slots
+        # Request 5 charge slots but algorithm may choose fewer if not economical
         schedule = optimizer.find_optimal_schedule(sample_prices, 5, current_soc=30)
 
-        charges = [e for e in schedule.values() if e.mode == BatteryMode.CHARGE]
+        # Verify schedule was generated
+        assert len(schedule) > 0
 
-        # Should have at least 5 charge slots (or as many as possible)
-        # Note: may be fewer if price threshold prevents it
-        assert len(charges) >= 1
+        # Verify algorithm makes economically rational choices:
+        # - Discharge during expensive hours (when above threshold)
+        # - Hold during moderate hours
+        discharges = [e for e in schedule.values() if e.mode == BatteryMode.DISCHARGE]
+        holds = [e for e in schedule.values() if e.mode == BatteryMode.HOLD]
+
+        # Should have discharge activity during peak hours
+        assert len(discharges) > 0, "Should discharge during expensive hours"
+
+        # With moderate SOC, shouldn't need to charge if existing energy suffices
+        # (this is the key behavior change - no forced charging)
 
     def test_schedule_covers_all_future_hours(self, optimizer, sample_prices):
         """Schedule should have entry for every future price point."""

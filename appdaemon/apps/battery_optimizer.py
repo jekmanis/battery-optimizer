@@ -32,6 +32,20 @@ from battery_optimizer_lib import (
     LoadProfile,
     NordPoolPriceService,
     TouSyncManager,
+    # Timezone utilities
+    normalize_tz_pair,
+    datetimes_match_slot,
+    dt_ge,
+    dt_gt,
+    dt_lt,
+    ensure_local_tz,
+    align_to_slot,
+    next_slot_time,
+    next_interval_time,
+    lookup_by_hour,
+    duration_minutes,
+    # HA helpers
+    SensorReader,
 )
 
 
@@ -62,6 +76,9 @@ class BatteryOptimizer(hass.Hass):
 
         # Load configuration
         self._load_config()
+
+        # Sensor reader for HA state access
+        self._sensors = SensorReader(self.get_state, self.log)
 
         # Internal state
         self.current_mode: BatteryMode = BatteryMode.HOLD
@@ -456,21 +473,9 @@ class BatteryOptimizer(hass.Hass):
         now = self.datetime()
         current_slot = self._align_to_slot(now)
         # Ensure consistent timezone awareness for arithmetic
-        if now.tzinfo is None and current_slot.tzinfo is not None:
-            now = now.replace(tzinfo=current_slot.tzinfo)
-        elif now.tzinfo is not None and current_slot.tzinfo is None:
-            current_slot = current_slot.replace(tzinfo=now.tzinfo)
+        now, current_slot = normalize_tz_pair(now, current_slot)
 
-        def is_future_price(p):
-            p_hour = p.hour
-            compare_time = current_slot
-            if p_hour.tzinfo is not None and compare_time.tzinfo is None:
-                p_hour = p_hour.replace(tzinfo=None)
-            elif p_hour.tzinfo is None and compare_time.tzinfo is not None:
-                compare_time = compare_time.replace(tzinfo=None)
-            return p_hour >= compare_time
-
-        future_prices = [p for p in prices if is_future_price(p)]
+        future_prices = [p for p in prices if dt_ge(p.hour, current_slot)]
         if not future_prices:
             return {}
 
@@ -1456,17 +1461,7 @@ class BatteryOptimizer(hass.Hass):
 
         # Filter to future prices only (avoid past slots inflating min-charge calculation)
         current_slot = self._align_to_slot(now)
-
-        def is_future_price(p):
-            p_hour = p.hour
-            compare_time = current_slot
-            if p_hour.tzinfo is not None and compare_time.tzinfo is None:
-                p_hour = p_hour.replace(tzinfo=None)
-            elif p_hour.tzinfo is None and compare_time.tzinfo is not None:
-                compare_time = compare_time.replace(tzinfo=None)
-            return p_hour >= compare_time
-
-        future_prices = [p for p in prices if is_future_price(p)]
+        future_prices = [p for p in prices if dt_ge(p.hour, current_slot)]
         if not future_prices:
             self.log("No future prices available, skipping optimization", level="WARNING")
             return
@@ -1556,20 +1551,9 @@ class BatteryOptimizer(hass.Hass):
                     changes.append(f"{len(changed_modes)} mode changes")
                 self.log(f"Schedule updated ({', '.join(changes)}), SOC: {current_soc}%")
                 # Log only current and future schedule entries (not past hours)
-                def is_current_or_future(h):
-                    compare_h = self._normalize_to_local(h, local_tz)
-                    compare_now = self._normalize_to_local(current_slot, local_tz)
-                    if compare_h is None or compare_now is None:
-                        return False
-                    if compare_h.tzinfo is not None and compare_now.tzinfo is None:
-                        compare_h = compare_h.replace(tzinfo=None)
-                    elif compare_h.tzinfo is None and compare_now.tzinfo is not None:
-                        compare_now = compare_now.replace(tzinfo=None)
-                    return compare_h >= compare_now
-
                 future_schedule = {
                     h: e for h, e in self.schedule.items()
-                    if is_current_or_future(h)
+                    if dt_ge(h, current_slot, local_tz)
                 }
                 self._log_schedule(future_schedule, self.expected_soc_schedule, self.expected_temp_schedule)
 
@@ -1586,32 +1570,13 @@ class BatteryOptimizer(hass.Hass):
             extra_charge_slots: Additional charge slots to add beyond minimum required
                                (used for catch-up charging when behind schedule)
         """
-        now = self.datetime()
         local_tz = self._get_local_timezone()
-        # Convert now to local timezone
-        if now.tzinfo is not None and local_tz is not None:
-            now = now.astimezone(local_tz)
+        now = ensure_local_tz(self.datetime(), local_tz)
         now_slot = self._align_to_slot(now)
         prices = self.get_prices()
-        compare_now_slot = self._align_to_slot(now)
 
-        # Filter to future prices only using proper timezone conversion
-        def is_future(p):
-            p_hour = p.hour
-            compare_now = compare_now_slot
-            if local_tz is not None:
-                if p_hour.tzinfo is not None:
-                    p_hour = p_hour.astimezone(local_tz)
-                if compare_now.tzinfo is not None:
-                    compare_now = compare_now.astimezone(local_tz)
-            # Handle mixed timezone-aware/naive by comparing as naive
-            if p_hour.tzinfo is not None and compare_now.tzinfo is None:
-                p_hour = p_hour.replace(tzinfo=None)
-            elif p_hour.tzinfo is None and compare_now.tzinfo is not None:
-                compare_now = compare_now.replace(tzinfo=None)
-            return p_hour >= compare_now
-
-        future_prices = [p for p in prices if is_future(p)]
+        # Filter to future prices only
+        future_prices = [p for p in prices if dt_ge(p.hour, now_slot, local_tz)]
 
         if not future_prices:
             self.log("No future prices available for recalculation")
@@ -1634,22 +1599,7 @@ class BatteryOptimizer(hass.Hass):
 
         # Remove all future entries and replace with new schedule
         # This prevents stale entries from persisting if price list shrinks
-        def is_future_hour(h):
-            compare_h = h
-            compare_now = compare_now_slot
-            if local_tz is not None:
-                if h.tzinfo is not None:
-                    compare_h = h.astimezone(local_tz)
-                if compare_now.tzinfo is not None:
-                    compare_now = compare_now.astimezone(local_tz)
-            # Handle mixed timezone-aware/naive
-            if compare_h.tzinfo is not None and compare_now.tzinfo is None:
-                compare_h = compare_h.replace(tzinfo=None)
-            elif compare_h.tzinfo is None and compare_now.tzinfo is not None:
-                compare_now = compare_now.replace(tzinfo=None)
-            return compare_h >= compare_now
-
-        hours_to_remove = [h for h in self.schedule.keys() if is_future_hour(h)]
+        hours_to_remove = [h for h in self.schedule.keys() if dt_ge(h, now_slot, local_tz)]
         for hour in hours_to_remove:
             del self.schedule[hour]
 
@@ -1658,26 +1608,10 @@ class BatteryOptimizer(hass.Hass):
             self.schedule[hour] = entry
 
         # Recalculate expected SOC
-        now_hour = compare_now_slot
-
-        def is_current_or_future(k):
-            compare_k = k
-            compare_now = now_hour
-            if local_tz is not None:
-                if k.tzinfo is not None:
-                    compare_k = k.astimezone(local_tz)
-                if compare_now.tzinfo is not None:
-                    compare_now = compare_now.astimezone(local_tz)
-            # Handle mixed timezone-aware/naive
-            if compare_k.tzinfo is not None and compare_now.tzinfo is None:
-                compare_k = compare_k.replace(tzinfo=None)
-            elif compare_k.tzinfo is None and compare_now.tzinfo is not None:
-                compare_now = compare_now.replace(tzinfo=None)
-            return compare_k >= compare_now
-
         current_temp = self._get_battery_temp()
+        future_schedule = {k: v for k, v in self.schedule.items() if dt_ge(k, now_slot, local_tz)}
         self.expected_soc_schedule, self.expected_temp_schedule = self.calculate_expected_soc_schedule(
-            {k: v for k, v in self.schedule.items() if is_current_or_future(k)},
+            future_schedule,
             current_soc,
             starting_temp=current_temp
         )
@@ -1685,7 +1619,7 @@ class BatteryOptimizer(hass.Hass):
         # Log recalculated schedule (current/future only)
         if self.decision_log_level >= 1:
             self._log_schedule(
-                {k: v for k, v in self.schedule.items() if is_current_or_future(k)},
+                future_schedule,
                 self.expected_soc_schedule,
                 self.expected_temp_schedule
             )
@@ -3213,18 +3147,7 @@ class BatteryOptimizer(hass.Hass):
         """Get the electricity price for a specific slot from price service cache."""
         local_tz = self._get_local_timezone()
         for price_point in self._price_service.cached_prices:
-            # Convert both to local timezone for comparison
-            p_hour = price_point.hour
-            compare_hour = hour
-            if p_hour.tzinfo is not None and local_tz is not None:
-                p_hour = p_hour.astimezone(local_tz)
-            if compare_hour.tzinfo is not None and local_tz is not None:
-                compare_hour = compare_hour.astimezone(local_tz)
-
-            # Compare date and slot components
-            if (p_hour.date() == compare_hour.date() and
-                p_hour.hour == compare_hour.hour and
-                p_hour.minute == compare_hour.minute):
+            if datetimes_match_slot(price_point.hour, hour, local_tz):
                 return price_point.price
         return None
 
@@ -3233,60 +3156,31 @@ class BatteryOptimizer(hass.Hass):
     # =========================================================================
 
     def _get_current_soc(self) -> Optional[float]:
-        """Get current battery SOC"""
-        try:
-            state = self.get_state(self.soc_sensor)
-            if state and state not in ("unknown", "unavailable"):
-                return float(state)
-        except (ValueError, TypeError) as e:
-            self.log(f"Error reading SOC: {e}", level="WARNING")
-        return None
+        """Get current battery SOC."""
+        return self._sensors.get_soc(self.soc_sensor)
 
     def _get_pv_power(self) -> float:
-        """Get current PV power production"""
-        try:
-            state = self.get_state(self.pv_power_sensor)
-            if state and state not in ("unknown", "unavailable"):
-                return float(state)
-        except (ValueError, TypeError):
-            pass
-        return 0.0
+        """Get current PV power production."""
+        return self._sensors.get_power(self.pv_power_sensor, default=0.0)
 
     def _get_battery_temp(self) -> Optional[float]:
-        """Get current battery temperature in Celsius.
-
-        Returns None if:
-        - No temp sensor configured
-        - Sensor is unavailable/unknown
-        - Sensor value cannot be parsed
-        """
-        if not self.battery_temp_sensor:
-            return None
-        try:
-            state = self.get_state(self.battery_temp_sensor)
-            if state and state not in ("unknown", "unavailable"):
-                return float(state)
-        except (ValueError, TypeError):
-            pass
-        return None
+        """Get current battery temperature in Celsius."""
+        return self._sensors.get_temperature(self.battery_temp_sensor)
 
     def _get_load_power(self) -> Optional[float]:
         """Get current household load in Watts (from configured sensor)."""
         if not self.load_power_sensor:
             return None
-        try:
-            state = self.get_state(self.load_power_sensor)
-            if state and state not in ("unknown", "unavailable"):
-                load_w = float(state)
-                if load_w <= 0:
-                    if self._last_nonzero_load_w is not None:
-                        return max(self._last_nonzero_load_w, self.load_zero_floor_w)
-                    return self.load_zero_floor_w
-                self._last_nonzero_load_w = load_w
-                return load_w
-        except (ValueError, TypeError):
-            pass
-        return None
+        load_w = self._sensors.get_float(self.load_power_sensor)
+        if load_w is None:
+            return None
+        if load_w <= 0:
+            # Use last known value or floor when sensor reports zero
+            if self._last_nonzero_load_w is not None:
+                return max(self._last_nonzero_load_w, self.load_zero_floor_w)
+            return self.load_zero_floor_w
+        self._last_nonzero_load_w = load_w
+        return load_w
 
     def _predict_load_kw(self, dt: datetime.datetime) -> float:
         """Predict expected load (kW) for a slot using load profile."""
@@ -3299,19 +3193,7 @@ class BatteryOptimizer(hass.Hass):
 
     def _align_to_slot(self, dt: datetime.datetime) -> datetime.datetime:
         """Floor datetime to the start of the current time slot."""
-        local_tz = self._get_local_timezone()
-        if dt.tzinfo is not None and local_tz is not None:
-            dt = dt.astimezone(local_tz)
-        elif local_tz is not None and dt.tzinfo is None:
-            dt = dt.replace(tzinfo=local_tz)
-        minutes = dt.hour * 60 + dt.minute
-        slot_start = (minutes // self.slot_minutes) * self.slot_minutes
-        return dt.replace(
-            hour=int(slot_start // 60),
-            minute=int(slot_start % 60),
-            second=0,
-            microsecond=0
-        )
+        return align_to_slot(dt, self.slot_minutes, self._get_local_timezone())
 
     def _get_expected_soc_for_hour(
         self,
@@ -3320,31 +3202,7 @@ class BatteryOptimizer(hass.Hass):
         local_tz
     ) -> Optional[float]:
         """Get expected SOC for a specific hour, handling timezone differences."""
-        # Direct lookup first
-        if hour in expected_soc:
-            return expected_soc[hour]
-
-        # Try matching by local time components
-        for sched_hour, soc_value in expected_soc.items():
-            compare_sched = sched_hour
-            compare_hour = hour
-            if local_tz is not None:
-                if sched_hour.tzinfo is not None:
-                    compare_sched = sched_hour.astimezone(local_tz)
-                if hour.tzinfo is not None:
-                    compare_hour = hour.astimezone(local_tz)
-            # Handle mixed timezone-aware/naive
-            if compare_sched.tzinfo is not None and compare_hour.tzinfo is None:
-                compare_sched = compare_sched.replace(tzinfo=None)
-            elif compare_sched.tzinfo is None and compare_hour.tzinfo is not None:
-                compare_hour = compare_hour.replace(tzinfo=None)
-
-            if (compare_sched.date() == compare_hour.date() and
-                compare_sched.hour == compare_hour.hour and
-                compare_sched.minute == compare_hour.minute):
-                return soc_value
-
-        return None
+        return lookup_by_hour(expected_soc, hour, local_tz)
 
     def _get_expected_temp_for_hour(
         self,
@@ -3353,31 +3211,7 @@ class BatteryOptimizer(hass.Hass):
         local_tz
     ) -> Optional[float]:
         """Get expected temperature for a specific hour, handling timezone differences."""
-        # Direct lookup first
-        if hour in expected_temp:
-            return expected_temp[hour]
-
-        # Try matching by local time components
-        for sched_hour, temp_value in expected_temp.items():
-            compare_sched = sched_hour
-            compare_hour = hour
-            if local_tz is not None:
-                if sched_hour.tzinfo is not None:
-                    compare_sched = sched_hour.astimezone(local_tz)
-                if hour.tzinfo is not None:
-                    compare_hour = hour.astimezone(local_tz)
-            # Handle mixed timezone-aware/naive
-            if compare_sched.tzinfo is not None and compare_hour.tzinfo is None:
-                compare_sched = compare_sched.replace(tzinfo=None)
-            elif compare_sched.tzinfo is None and compare_hour.tzinfo is not None:
-                compare_hour = compare_hour.replace(tzinfo=None)
-
-            if (compare_sched.date() == compare_hour.date() and
-                compare_sched.hour == compare_hour.hour and
-                compare_sched.minute == compare_hour.minute):
-                return temp_value
-
-        return None
+        return lookup_by_hour(expected_temp, hour, local_tz)
 
     def _get_dp_trajectory_for_hour(
         self,
@@ -3386,91 +3220,23 @@ class BatteryOptimizer(hass.Hass):
         local_tz
     ) -> Optional[Tuple[float, float]]:
         """Get DP trajectory data (start, end) tuple for a specific hour, handling timezone differences."""
-        if not trajectory:
-            return None
-
-        # Direct lookup first
-        if hour in trajectory:
-            return trajectory[hour]
-
-        # Try matching by local time components
-        for sched_hour, traj_value in trajectory.items():
-            compare_sched = sched_hour
-            compare_hour = hour
-            if local_tz is not None:
-                if sched_hour.tzinfo is not None:
-                    compare_sched = sched_hour.astimezone(local_tz)
-                if hour.tzinfo is not None:
-                    compare_hour = hour.astimezone(local_tz)
-            # Handle mixed timezone-aware/naive
-            if compare_sched.tzinfo is not None and compare_hour.tzinfo is None:
-                compare_sched = compare_sched.replace(tzinfo=None)
-            elif compare_sched.tzinfo is None and compare_hour.tzinfo is not None:
-                compare_hour = compare_hour.replace(tzinfo=None)
-
-            if (compare_sched.date() == compare_hour.date() and
-                compare_sched.hour == compare_hour.hour and
-                compare_sched.minute == compare_hour.minute):
-                return traj_value
-
-        return None
+        return lookup_by_hour(trajectory, hour, local_tz)
 
     def _next_slot_time(self) -> datetime.datetime:
         """Get the next slot boundary time."""
-        now = self.datetime()
-        local_tz = self._get_local_timezone()
-        if now.tzinfo is not None and local_tz is not None:
-            now = now.astimezone(local_tz)
-        elif local_tz is not None and now.tzinfo is None:
-            now = now.replace(tzinfo=local_tz)
-        minutes = now.hour * 60 + now.minute
-        next_slot = ((minutes // self.slot_minutes) + 1) * self.slot_minutes
-        if next_slot >= 1440:
-            next_slot = 0
-            now = now + datetime.timedelta(days=1)
-        return now.replace(
-            hour=int(next_slot // 60),
-            minute=int(next_slot % 60),
-            second=5,
-            microsecond=0
-        )
+        return next_slot_time(self.datetime(), self.slot_minutes, self._get_local_timezone())
 
     def _next_interval_time(self, interval_minutes: int) -> datetime.datetime:
         """Get the next boundary time for a given interval."""
-        interval_minutes = max(1, int(interval_minutes))
-        now = self.datetime()
-        local_tz = self._get_local_timezone()
-        if now.tzinfo is not None and local_tz is not None:
-            now = now.astimezone(local_tz)
-        elif local_tz is not None and now.tzinfo is None:
-            now = now.replace(tzinfo=local_tz)
-        minutes = now.hour * 60 + now.minute
-        next_boundary = ((minutes // interval_minutes) + 1) * interval_minutes
-        if next_boundary >= 1440:
-            next_boundary = 0
-            now = now + datetime.timedelta(days=1)
-        return now.replace(
-            hour=int(next_boundary // 60),
-            minute=int(next_boundary % 60),
-            second=5,
-            microsecond=0
-        )
+        return next_interval_time(self.datetime(), interval_minutes, self._get_local_timezone())
 
     def _is_enabled(self) -> bool:
-        """Check if optimizer is enabled"""
-        try:
-            state = self.get_state(self.enabled_entity)
-            return state == "on"
-        except:
-            return True  # Default to enabled if entity doesn't exist
+        """Check if optimizer is enabled."""
+        return self._sensors.is_on(self.enabled_entity, default=True)
 
     def _is_override_active(self) -> bool:
-        """Check if manual override is active"""
-        try:
-            state = self.get_state(self.override_entity)
-            return state == "on"
-        except:
-            return False
+        """Check if manual override is active."""
+        return self._sensors.is_on(self.override_entity, default=False)
 
     def _get_local_timezone(self):
         """
@@ -3508,9 +3274,7 @@ class BatteryOptimizer(hass.Hass):
         """Normalize a datetime to local timezone for comparison."""
         if dt is None:
             return dt
-        if local_tz is not None and dt.tzinfo is not None:
-            return dt.astimezone(local_tz)
-        return dt
+        return ensure_local_tz(dt, local_tz)
 
     @property
     def min_soc(self) -> float:

@@ -645,6 +645,17 @@ class BatteryOptimizer(hass.Hass):
                 synth_price = min(future_prices, key=lambda p: p.hour).price
                 self.log(f"Added missing current slot {current_slot} using next price {synth_price:.4f} EUR/kWh")
 
+        # Normalize timezone to match existing prices (avoid mixing aware/naive)
+        if future_prices:
+            sample_hour = future_prices[0].hour
+            if sample_hour.tzinfo is not None and current_slot.tzinfo is None:
+                # Prices are aware, current_slot is naive - add timezone
+                tz = self._get_local_timezone()
+                current_slot = ensure_local_tz(current_slot, tz)
+            elif sample_hour.tzinfo is None and current_slot.tzinfo is not None:
+                # Prices are naive, current_slot is aware - strip timezone
+                current_slot = current_slot.replace(tzinfo=None)
+
         current_slot_price = PricePoint(hour=current_slot, price=synth_price)
         return future_prices + [current_slot_price]
 

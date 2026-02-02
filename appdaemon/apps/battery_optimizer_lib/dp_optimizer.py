@@ -14,6 +14,37 @@ from .models import BatteryMode, PricePoint, ScheduleEntry
 from .charge_rate_utils import compute_charge_rates_per_slot
 
 
+def _energy_to_index(
+    energy: float,
+    min_energy: float,
+    step_kwh: float,
+    n_states: int,
+    direction: str = "round",
+) -> int:
+    """Convert energy to DP state index with specified rounding.
+
+    Args:
+        energy: Energy level in kWh
+        min_energy: Minimum energy bound in kWh
+        step_kwh: Energy step size in kWh
+        n_states: Number of DP states
+        direction: "floor" (after charge), "ceil" (after discharge), "round" (neutral)
+
+    Returns:
+        Clamped index in [0, n_states - 1]
+    """
+    idx_float = (energy - min_energy) / step_kwh
+
+    if direction == "floor":
+        idx = int(math.floor(idx_float + 1e-9))
+    elif direction == "ceil":
+        idx = int(math.ceil(idx_float - 1e-9))
+    else:
+        idx = int(round(idx_float))
+
+    return min(max(idx, 0), n_states - 1)
+
+
 @dataclass
 class DPOptimizerConfig:
     """Static configuration for DP optimizer."""
@@ -222,8 +253,7 @@ class DPOptimizer:
         cfg = self._config
 
         if idx_trajectory and len(idx_trajectory) == len(hours_sorted_by_time):
-            start_idx = int(round((start_energy - min_energy) / step_kwh))
-            start_idx = min(max(start_idx, 0), n_states - 1)
+            start_idx = _energy_to_index(start_energy, min_energy, step_kwh, n_states, "round")
 
             for t, price_point in enumerate(hours_sorted_by_time):
                 hour = price_point.hour
@@ -307,10 +337,9 @@ class DPOptimizer:
         dp_tie = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
 
         if start_idx_override is None:
-            start_idx_local = int(round((start_energy_kwh - min_energy) / step_kwh))
+            start_idx_local = _energy_to_index(start_energy_kwh, min_energy, step_kwh, n_states, "round")
         else:
-            start_idx_local = start_idx_override
-        start_idx_local = min(max(start_idx_local, 0), n_states - 1)
+            start_idx_local = min(max(start_idx_override, 0), n_states - 1)
         start_c = min(max(start_c, 0), max_charge_slots)
         dp[start_c][start_idx_local] = 0.0
         dp_tie[start_c][start_idx_local] = 0.0
@@ -391,8 +420,7 @@ class DPOptimizer:
                                 actual_charge_energy = 0
 
                         if actual_charge_energy > 0:
-                            next_idx = int(round((new_energy - min_energy) / step_kwh))
-                            next_idx = min(max(next_idx, 0), n_states - 1)
+                            next_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "floor")
                             next_val = val - (buy_price * actual_charge_cost) - (buy_price * discharge_kwh)
                             charge_tie_bias = (-price * tie_price_weight) + (t * tie_time_weight)
                             next_tie = curr_tie + charge_tie_bias
@@ -412,8 +440,7 @@ class DPOptimizer:
                         actual_discharge_kwh = discharge_kwh
 
                         if new_energy >= min_energy - 1e-6:
-                            next_idx = int(round((new_energy - min_energy) / step_kwh))
-                            next_idx = min(max(next_idx, 0), n_states - 1)
+                            next_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "ceil")
                             next_val = val - (discharge_cost_per_kwh * actual_discharge_kwh)
                         elif energy_levels[idx] > min_energy + discharge_kwh * 0.5:
                             is_partial = True
@@ -663,8 +690,7 @@ class DPOptimizer:
                     else:
                         actual_charge_energy = 0
                 if actual_charge_energy > 0:
-                    idx_float = (new_energy - min_energy) / step_kwh
-                    start_idx_override = int(math.floor(idx_float + 1e-9))
+                    start_idx_override = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "floor")
                     charge_immediate_cost = -buy_price * actual_charge_cost - buy_price * discharge_kwh
                     candidates.append((
                         BatteryMode.CHARGE,
@@ -679,8 +705,7 @@ class DPOptimizer:
             if discharge_kwh > 0:
                 new_energy = start_energy - discharge_kwh
                 if new_energy >= min_energy - 1e-6:
-                    idx_float = (new_energy - min_energy) / step_kwh
-                    start_idx_override = int(math.ceil(idx_float - 1e-9))
+                    start_idx_override = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "ceil")
                     discharge_cost = -discharge_cost_per_kwh * discharge_kwh
                     candidates.append((
                         BatteryMode.DISCHARGE,
@@ -708,7 +733,7 @@ class DPOptimizer:
             best_actions_remaining: List[BatteryMode] = []
             best_partial_flags_remaining: List[bool] = []
             best_idx_trajectory_remaining: List[int] = []
-            best_first_slot_end_idx: int = int(round((start_energy - min_energy) / step_kwh))
+            best_first_slot_end_idx: int = _energy_to_index(start_energy, min_energy, step_kwh, n_states, "round")
             best_value = neg_inf
 
             if self._decision_log_level >= 3:
@@ -735,8 +760,12 @@ class DPOptimizer:
                 )
                 total_val = immediate_val + future_val
                 greedy_results.append((action.name, immediate_val, future_val, total_val))
-                first_slot_end_idx = int(round((new_energy - min_energy) / step_kwh))
-                first_slot_end_idx = min(max(first_slot_end_idx, 0), n_states - 1)
+                if action == BatteryMode.CHARGE:
+                    first_slot_end_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "floor")
+                elif action == BatteryMode.DISCHARGE:
+                    first_slot_end_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "ceil")
+                else:
+                    first_slot_end_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "round")
                 if total_val > best_value:
                     best_value = total_val
                     best_action = action

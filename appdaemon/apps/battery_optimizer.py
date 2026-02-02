@@ -741,9 +741,10 @@ class BatteryOptimizer(hass.Hass):
                         discharge_next_idx = None
                         discharge_next_val = None
 
-                        # CHARGE - only at favorable prices (no forced charging at expensive rates)
+                        # CHARGE - only at favorable prices unless min_charge_slots requires it
                         price_is_favorable = favorable_flags_list[t]
-                        allow_charge = price_is_favorable
+                        must_use_unfavorable = (c + favorable_remaining_list[t]) < min_charge_slots
+                        allow_charge = price_is_favorable or must_use_unfavorable
 
                         if allow_charge and charge_energy_kwh > 0 and c + charge_count_increment <= max_charge_slots:
                             new_energy = energy_levels[idx] + charge_energy_kwh
@@ -1025,9 +1026,10 @@ class BatteryOptimizer(hass.Hass):
                     (BatteryMode.HOLD, start_energy, -hold_cost, 0, None, False)
                 )
 
-                # CHARGE - only at favorable prices (no forced charging at expensive rates)
+                # CHARGE - only at favorable prices unless min_charge_slots requires it
                 price_is_favorable = favorable_flags[partial_index]
-                allow_charge = price_is_favorable
+                must_use_unfavorable = (0 + favorable_remaining[partial_index]) < min_charge_slots
+                allow_charge = price_is_favorable or must_use_unfavorable
                 partial_charge_increment = 1  # Always count - energy is tracked separately
                 if allow_charge and charge_energy_kwh > 0 and partial_charge_increment <= max_charge_slots:
                     new_energy = start_energy + charge_energy_kwh

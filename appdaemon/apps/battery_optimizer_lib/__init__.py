@@ -9,6 +9,8 @@ This package contains helper modules for the main BatteryOptimizer AppDaemon app
 - tou_sync: TOU schedule sync and inverter control via Modbus
 - timezone_utils: Timezone-aware datetime comparison and slot alignment
 - ha_helpers: Home Assistant state reading helpers
+- cost_tracker: Battery cost tracking with weighted average calculations
+- charge_rate_utils: Temperature-aware charge rate computation
 """
 
 from .models import (
@@ -23,6 +25,7 @@ from .learning_engine import BatteryLearningEngine
 from .load_profile import LoadProfile, _quantile
 from .price_service import NordPoolPriceService
 from .tou_sync import TouSyncManager
+from .dp_optimizer import DPOptimizer, DPOptimizerConfig, DPOptimizerResult
 from .timezone_utils import (
     normalize_tz_pair,
     datetimes_match_slot,
@@ -43,6 +46,8 @@ from .ha_helpers import (
     get_string_state,
     SensorReader,
 )
+from .cost_tracker import BatteryCostTracker, BatteryCostConfig
+from .charge_rate_utils import compute_charge_rates_per_slot
 
 __all__ = [
     # Models
@@ -58,6 +63,10 @@ __all__ = [
     "NordPoolPriceService",
     "TouSyncManager",
     "SensorReader",
+    # DP Optimizer
+    "DPOptimizer",
+    "DPOptimizerConfig",
+    "DPOptimizerResult",
     # Timezone utilities
     "normalize_tz_pair",
     "datetimes_match_slot",
@@ -77,4 +86,9 @@ __all__ = [
     "get_string_state",
     # Functions
     "_quantile",
+    # Cost tracker
+    "BatteryCostTracker",
+    "BatteryCostConfig",
+    # Charge rate utilities
+    "compute_charge_rates_per_slot",
 ]

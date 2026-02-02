@@ -12,6 +12,7 @@ import datetime
 import pytest
 
 from battery_optimizer import BatteryMode, BatteryOptimizer, ScheduleEntry
+from battery_optimizer_lib import BatteryCostTracker, BatteryCostConfig, BatteryLearningEngine
 
 
 class MockCostOptimizer:
@@ -43,13 +44,60 @@ class MockCostOptimizer:
         self.max_soc = max_soc
         self.grid_fee = grid_fee
         self.battery_wear_cost = battery_wear_cost
-        self.battery_avg_cost = battery_avg_cost
+        self._battery_avg_cost = battery_avg_cost
         self.slot_minutes = slot_minutes
         self.slot_hours = slot_minutes / 60.0
 
         # Configurable load prediction
         self._predicted_load_kw = predicted_load_kw
         self._load_by_hour = {}
+
+        # Create learning engine (needed by cost tracker)
+        self._learning_engine = BatteryLearningEngine(
+            battery_capacity_kwh=battery_capacity,
+            nominal_charge_rate_kw=charge_rate,
+            nominal_efficiency=efficiency,
+        )
+
+        # Create real cost tracker
+        self._cost_tracker = BatteryCostTracker(
+            config=BatteryCostConfig(
+                battery_capacity=battery_capacity,
+                efficiency=efficiency,
+                slot_minutes=slot_minutes,
+                charge_rate=charge_rate,
+                discharge_rate=discharge_rate,
+                grid_fee=grid_fee,
+                battery_wear_cost=battery_wear_cost,
+                default_cost=battery_avg_cost,
+            ),
+            get_state_func=lambda e: None,
+            call_service_func=lambda *a, **k: None,
+            get_datetime_func=lambda: datetime.datetime(2024, 1, 1, 12, 0),
+            get_timezone_func=lambda: None,
+            align_to_slot_func=lambda dt: dt.replace(minute=0, second=0, microsecond=0),
+            get_min_soc_func=lambda: self.min_soc,
+            get_max_soc_func=lambda: self.max_soc,
+            get_current_soc_func=lambda: 50.0,
+            get_battery_temp_func=lambda: 20.0,
+            learning_engine=self._learning_engine,
+            get_cached_prices_func=lambda: [],
+            save_learning_data_func=lambda: None,
+            update_learning_sensor_func=lambda: None,
+            log_func=self.log,
+        )
+        # Set the avg_cost directly (bypassing the default load)
+        self._cost_tracker._avg_cost = battery_avg_cost
+
+    @property
+    def battery_avg_cost(self) -> float:
+        """Get battery average cost from cost tracker."""
+        return self._cost_tracker.avg_cost
+
+    @battery_avg_cost.setter
+    def battery_avg_cost(self, value: float):
+        """Set battery average cost in cost tracker."""
+        self._cost_tracker._avg_cost = value
 
     def log(self, message: str, level: str = "INFO"):
         """Silent logging for tests."""
@@ -65,9 +113,28 @@ class MockCostOptimizer:
         """Set specific load for a given hour."""
         self._load_by_hour[dt] = load_kw
 
+    def _project_battery_costs(
+        self,
+        schedule,
+        starting_soc,
+        starting_cost,
+        prices_by_slot,
+        charge_rates_by_slot=None,
+        slot_fractions_by_slot=None,
+    ):
+        """Wrapper that calls cost tracker's project_costs with predict_load_func."""
+        return self._cost_tracker.project_costs(
+            schedule=schedule,
+            starting_soc=starting_soc,
+            starting_cost=starting_cost,
+            prices_by_slot=prices_by_slot,
+            predict_load_func=self._predict_load_kw,
+            charge_rates_by_slot=charge_rates_by_slot,
+            slot_fractions_by_slot=slot_fractions_by_slot,
+        )
+
 
 # Bind the actual methods to our mock
-MockCostOptimizer._project_battery_costs = BatteryOptimizer._project_battery_costs
 MockCostOptimizer._get_discharge_threshold = BatteryOptimizer._get_discharge_threshold
 MockCostOptimizer._get_discharge_threshold_for_cost = (
     BatteryOptimizer._get_discharge_threshold_for_cost

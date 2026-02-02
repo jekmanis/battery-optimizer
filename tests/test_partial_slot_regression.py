@@ -7,6 +7,7 @@ from battery_optimizer import (
     LoadProfile,
     PricePoint,
 )
+from battery_optimizer_lib import BatteryCostTracker, BatteryCostConfig
 
 
 class PartialSlotOptimizer:
@@ -48,6 +49,33 @@ class PartialSlotOptimizer:
             default_load_w=base_consumption_w,
         )
 
+        # Create cost tracker for project_costs method
+        self._cost_tracker = BatteryCostTracker(
+            config=BatteryCostConfig(
+                battery_capacity=self.battery_capacity,
+                efficiency=self.efficiency,
+                slot_minutes=self.slot_minutes,
+                charge_rate=self.charge_rate,
+                discharge_rate=self.discharge_rate,
+                grid_fee=self.grid_fee,
+                battery_wear_cost=0.0,
+            ),
+            get_state_func=lambda e: None,
+            call_service_func=lambda *a, **k: None,
+            get_datetime_func=self.datetime,
+            get_timezone_func=self._get_local_timezone,
+            align_to_slot_func=self._align_to_slot,
+            get_min_soc_func=lambda: self.min_soc,
+            get_max_soc_func=lambda: self.max_soc,
+            get_current_soc_func=lambda: 50.0,
+            get_battery_temp_func=lambda: 20.0,
+            learning_engine=self.learning_engine,
+            get_cached_prices_func=lambda: [],
+            save_learning_data_func=lambda: None,
+            update_learning_sensor_func=lambda: None,
+            log_func=self.log,
+        )
+
     def datetime(self):
         return self._current_time
 
@@ -85,9 +113,19 @@ class PartialSlotOptimizer:
     def _log_schedule_decision_context(self, *args, **kwargs):
         pass
 
+    @property
+    def _price_service(self):
+        """Mock price service with get_prices_for_date method."""
+        class MockPriceService:
+            def get_prices_for_date(self, date, tz):
+                return []
+        return MockPriceService()
+
 
 PartialSlotOptimizer.find_optimal_schedule = BatteryOptimizer.find_optimal_schedule
-PartialSlotOptimizer._project_battery_costs = BatteryOptimizer._project_battery_costs
+PartialSlotOptimizer._ensure_current_slot_price = BatteryOptimizer._ensure_current_slot_price
+PartialSlotOptimizer._compute_slot_fractions = BatteryOptimizer._compute_slot_fractions
+PartialSlotOptimizer._compute_charge_rates_per_slot = BatteryOptimizer._compute_charge_rates_per_slot
 
 
 def _make_price_points():

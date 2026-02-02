@@ -32,9 +32,12 @@ from battery_optimizer_lib import (
     LoadProfile,
     NordPoolPriceService,
     TouSyncManager,
+    # DP Optimizer
+    DPOptimizer,
+    DPOptimizerConfig,
+    DPOptimizerResult,
     # Timezone utilities
     normalize_tz_pair,
-    datetimes_match_slot,
     dt_ge,
     dt_gt,
     dt_lt,
@@ -46,6 +49,11 @@ from battery_optimizer_lib import (
     duration_minutes,
     # HA helpers
     SensorReader,
+    # Cost tracker
+    BatteryCostTracker,
+    BatteryCostConfig,
+    # Charge rate utilities
+    compute_charge_rates_per_slot,
 )
 
 
@@ -88,11 +96,6 @@ class BatteryOptimizer(hass.Hass):
         self.expected_temp_schedule: Dict[datetime.datetime, float] = {}
         self._last_nonzero_load_w: Optional[float] = None
         self._previous_schedule_from_sensor: Optional[Dict[datetime.datetime, BatteryMode]] = None
-
-        # Battery cost tracking (weighted average cost of energy in battery)
-        self.battery_avg_cost: float = 0.0  # EUR/kWh
-        self._battery_cost_from_fallback: bool = False  # True if using fallback, not loaded from HA
-        self._init_battery_cost()
 
         # Decision context tracking (for transparency logging and sensor exposure)
         self._last_recalc_trigger: str = "startup"  # "startup", "daily_13:15", "soc_deviation", "manual"
@@ -156,6 +159,38 @@ class BatteryOptimizer(hass.Hass):
             get_timezone_func=self._get_local_timezone,
             log_func=self.log,
         )
+
+        # Battery cost tracker (must be after learning engine and price service)
+        self._cost_tracker = BatteryCostTracker(
+            config=BatteryCostConfig(
+                battery_cost_entity=self.args.get("battery_cost_entity", "input_number.battery_avg_cost"),
+                battery_charge_sensor=self.battery_charge_sensor,
+                battery_discharge_sensor=self.battery_discharge_sensor,
+                use_inverter_energy_sensors=self.use_inverter_energy_sensors,
+                battery_capacity=self.battery_capacity,
+                efficiency=self.efficiency,
+                slot_minutes=self.slot_minutes,
+                charge_rate=self.charge_rate,
+                discharge_rate=self.discharge_rate,
+                grid_fee=self.grid_fee,
+                battery_wear_cost=self.battery_wear_cost,
+            ),
+            get_state_func=self.get_state,
+            call_service_func=self.call_service,
+            get_datetime_func=self.datetime,
+            get_timezone_func=self._get_local_timezone,
+            align_to_slot_func=self._align_to_slot,
+            get_min_soc_func=lambda: self.min_soc,
+            get_max_soc_func=lambda: self.max_soc,
+            get_current_soc_func=self._get_current_soc,
+            get_battery_temp_func=self._get_battery_temp,
+            learning_engine=self.learning_engine,
+            get_cached_prices_func=lambda: self._price_service.cached_prices,
+            save_learning_data_func=self._save_learning_data,
+            update_learning_sensor_func=self._update_learning_sensor,
+            log_func=self.log,
+        )
+        self._init_battery_cost()
 
         # Restore previous schedule from sensor (for continuity on restart)
         self._restore_previous_schedule_from_sensor()
@@ -480,6 +515,113 @@ class BatteryOptimizer(hass.Hass):
             return {}
 
         # Ensure current slot is included (Nord Pool may exclude current hour as "past")
+        future_prices = self._ensure_current_slot_price(prices, future_prices, current_slot)
+
+        # Calculate min_charge_slots for informational purposes
+        hours_sorted_by_time = sorted(future_prices, key=lambda p: p.hour)
+        n_slots = len(hours_sorted_by_time)
+        min_charge_slots = max(0, int(charge_hours_needed))
+        if min_charge_slots > n_slots:
+            min_charge_slots = n_slots
+
+        # Prepare inputs for optimizer
+        current_soc_for_calc = current_soc if current_soc is not None else 50.0
+        minutes_into_slot = max(0.0, (now - current_slot).total_seconds() / 60.0)
+        current_temp = self._get_battery_temp()
+
+        # Create optimizer with fresh config (min_soc/max_soc are dynamic properties)
+        optimizer = DPOptimizer(
+            config=DPOptimizerConfig(
+                battery_capacity=self.battery_capacity,
+                min_soc=self.min_soc,
+                max_soc=self.max_soc,
+                efficiency=self.efficiency,
+                discharge_rate=self.discharge_rate,
+                slot_minutes=self.slot_minutes,
+                soc_step_percent=self.soc_step_percent,
+                grid_fee=self.grid_fee,
+                battery_wear_cost=self.battery_wear_cost,
+            ),
+            load_predictor=self._predict_load_kw,
+            charge_rate_predictor=self.learning_engine.get_charge_rate_for_soc,
+            temp_after_charge_predictor=self.learning_engine.predict_temp_after_duration,
+            temp_after_idle_predictor=self.learning_engine.predict_temp_after_idle,
+            log_fn=self.log,
+            decision_log_level=self.decision_log_level,
+        )
+
+        # Run optimization
+        result = optimizer.optimize(
+            prices=future_prices,
+            current_slot=current_slot,
+            current_soc=current_soc_for_calc,
+            current_temp=current_temp,
+            minutes_into_slot=minutes_into_slot,
+            min_charge_slots_hint=min_charge_slots,
+        )
+
+        schedule = result.schedule
+
+        # Project costs for sensor exposure
+        has_charge_slots = any(e.mode == BatteryMode.CHARGE for e in schedule.values())
+        if has_charge_slots:
+            prices_by_slot = {p.hour: p.price for p in hours_sorted_by_time}
+            # Re-compute charge rates per slot for cost projection
+            slot_fractions = self._compute_slot_fractions(hours_sorted_by_time, current_slot, minutes_into_slot)
+            charge_rates_per_slot = self._compute_charge_rates_per_slot(
+                hours_sorted_by_time, slot_fractions, current_soc_for_calc, current_temp
+            )
+            slot_charge_rates_by_slot = {
+                p.hour: charge_rates_per_slot[i] for i, p in enumerate(hours_sorted_by_time)
+            }
+            slot_fractions_by_slot = {
+                p.hour: slot_fractions[i] for i, p in enumerate(hours_sorted_by_time)
+            }
+            projected_costs, _ = self._cost_tracker.project_costs(
+                schedule,
+                current_soc_for_calc,
+                self.battery_avg_cost,
+                prices_by_slot,
+                predict_load_func=self._predict_load_kw,
+                charge_rates_by_slot=slot_charge_rates_by_slot,
+                slot_fractions_by_slot=slot_fractions_by_slot,
+            )
+            self._last_projected_costs = projected_costs
+        else:
+            self._last_projected_costs = {}
+
+        self.log(f"Schedule generated: {result.charge_count} charge, {result.discharge_count} discharge, "
+                 f"{result.hold_count} hold slots (slot={self.slot_minutes}min, load_quantile={self.load_quantile:.2f}, "
+                 f"min_charge_slots={min_charge_slots})")
+
+        # Store min_charge_slots for sensor exposure
+        self._last_min_charge_slots = min_charge_slots
+
+        # Log decision context for transparency
+        if self.decision_log_level >= 1:
+            load_kw = [self._predict_load_kw(p.hour) for p in hours_sorted_by_time]
+            self._log_schedule_decision_context(
+                hours_sorted_by_time, schedule, load_kw, current_soc_for_calc, min_charge_slots
+            )
+
+        # Store trajectories for use in _log_schedule
+        self._last_dp_soc_trajectory = result.soc_trajectory
+        self._last_dp_temp_trajectory = result.temp_trajectory
+
+        return schedule
+
+    def _ensure_current_slot_price(
+        self,
+        all_prices: List[PricePoint],
+        future_prices: List[PricePoint],
+        current_slot: datetime.datetime,
+    ) -> List[PricePoint]:
+        """
+        Ensure current slot is included in future_prices.
+
+        Nord Pool may exclude current hour as "past", so we try to
+        synthesize the price from yesterday's data or previous prices.
+        """
         def prices_contains_slot(prices_list, slot):
             slot_naive = slot.replace(tzinfo=None) if slot.tzinfo else slot
             for p in prices_list:
@@ -488,81 +630,69 @@ class BatteryOptimizer(hass.Hass):
                     return True
             return False
 
-        if not prices_contains_slot(future_prices, current_slot):
-            # Current slot missing - try yesterday's Nord Pool data (timezone shift around midnight)
-            tz = self._get_local_timezone()
-            yesterday = current_slot.date() - datetime.timedelta(days=1)
-            yesterday_prices = self._price_service.get_prices_for_date(yesterday, tz)
+        if prices_contains_slot(future_prices, current_slot):
+            return future_prices
 
-            def find_slot_price(prices_list, slot):
-                slot_naive = slot.replace(tzinfo=None) if slot.tzinfo else slot
-                for p in prices_list:
-                    p_naive = p.hour.replace(tzinfo=None) if p.hour.tzinfo else p.hour
-                    if p_naive == slot_naive:
-                        return p
-                return None
+        # Current slot missing - try yesterday's Nord Pool data (timezone shift around midnight)
+        tz = self._get_local_timezone()
+        yesterday = current_slot.date() - datetime.timedelta(days=1)
+        yesterday_prices = self._price_service.get_prices_for_date(yesterday, tz)
 
-            slot_price_point = find_slot_price(yesterday_prices, current_slot)
-            if slot_price_point is not None:
-                synth_price = slot_price_point.price
+        def find_slot_price(prices_list, slot):
+            slot_naive = slot.replace(tzinfo=None) if slot.tzinfo else slot
+            for p in prices_list:
+                p_naive = p.hour.replace(tzinfo=None) if p.hour.tzinfo else p.hour
+                if p_naive == slot_naive:
+                    return p
+            return None
+
+        slot_price_point = find_slot_price(yesterday_prices, current_slot)
+        if slot_price_point is not None:
+            synth_price = slot_price_point.price
+            self.log(
+                f"Added missing current slot {current_slot} using yesterday's price "
+                f"{synth_price:.4f} EUR/kWh from {slot_price_point.hour}"
+            )
+        else:
+            # If still missing, synthesize using most recent past price if available
+            current_slot_naive = current_slot.replace(tzinfo=None) if current_slot.tzinfo else current_slot
+            prev_price_point = None
+            for p in all_prices:
+                p_hour = p.hour
+                p_naive = p_hour.replace(tzinfo=None) if p_hour.tzinfo else p_hour
+                if p_naive <= current_slot_naive:
+                    if prev_price_point is None:
+                        prev_price_point = p
+                    else:
+                        prev_naive = prev_price_point.hour.replace(tzinfo=None) if prev_price_point.hour.tzinfo else prev_price_point.hour
+                        if p_naive > prev_naive:
+                            prev_price_point = p
+
+            if prev_price_point is not None:
+                synth_price = prev_price_point.price
                 self.log(
-                    f"Added missing current slot {current_slot} using yesterday's price "
-                    f"{synth_price:.4f} EUR/kWh from {slot_price_point.hour}"
+                    f"Added missing current slot {current_slot} using previous price "
+                    f"{synth_price:.4f} EUR/kWh from {prev_price_point.hour}"
                 )
             else:
-                # If still missing, synthesize using most recent past price if available
-                current_slot_naive = current_slot.replace(tzinfo=None) if current_slot.tzinfo else current_slot
-                prev_price_point = None
-                for p in prices:
-                    p_hour = p.hour
-                    p_naive = p_hour.replace(tzinfo=None) if p_hour.tzinfo else p_hour
-                    if p_naive <= current_slot_naive:
-                        if prev_price_point is None:
-                            prev_price_point = p
-                        else:
-                            prev_naive = prev_price_point.hour.replace(tzinfo=None) if prev_price_point.hour.tzinfo else prev_price_point.hour
-                            if p_naive > prev_naive:
-                                prev_price_point = p
+                # Fallback: use first available future price
+                synth_price = min(future_prices, key=lambda p: p.hour).price
+                self.log(f"Added missing current slot {current_slot} using next price {synth_price:.4f} EUR/kWh")
 
-                if prev_price_point is not None:
-                    synth_price = prev_price_point.price
-                    self.log(
-                        f"Added missing current slot {current_slot} using previous price "
-                        f"{synth_price:.4f} EUR/kWh from {prev_price_point.hour}"
-                    )
-                else:
-                    # Fallback: use first available future price
-                    synth_price = min(future_prices, key=lambda p: p.hour).price
-                    self.log(f"Added missing current slot {current_slot} using next price {synth_price:.4f} EUR/kWh")
+        current_slot_price = PricePoint(hour=current_slot, price=synth_price)
+        return future_prices + [current_slot_price]
 
-            current_slot_price = PricePoint(hour=current_slot, price=synth_price)
-            future_prices.append(current_slot_price)
-
-        schedule = {}
-        hours_sorted_by_time = sorted(future_prices, key=lambda p: p.hour)
+    def _compute_slot_fractions(
+        self,
+        hours_sorted_by_time: List[PricePoint],
+        current_slot: datetime.datetime,
+        minutes_into_slot: float,
+    ) -> List[float]:
+        """Compute fraction of each slot that is usable (partial first slot)."""
         n_slots = len(hours_sorted_by_time)
-        min_charge_slots = max(0, int(charge_hours_needed))
-        if min_charge_slots > n_slots:
-            min_charge_slots = n_slots
-        # discharge_threshold kept for logging/sensor exposure
-        discharge_threshold = self._get_discharge_threshold()
-
-        # Energy bounds in kWh
-        current_soc_for_calc = current_soc if current_soc is not None else 50.0
-        min_energy = (self.min_soc / 100) * self.battery_capacity
-        max_energy = (self.max_soc / 100) * self.battery_capacity
-        start_energy = min(max_energy, max(min_energy, (current_soc_for_calc / 100) * self.battery_capacity))
-
-        # DP resolution
-        step_kwh = max(0.01, (self.soc_step_percent / 100) * self.battery_capacity)
-        n_states = int(round((max_energy - min_energy) / step_kwh)) + 1
-        energy_levels = [min_energy + i * step_kwh for i in range(n_states)]
-
-        # Per-slot energy changes (adjust first slot if partial)
-        minutes_into_slot = max(0.0, (now - current_slot).total_seconds() / 60.0)
         first_fraction = min(1.0, max(0.0, (self.slot_minutes - minutes_into_slot) / max(1, self.slot_minutes)))
         slot_fractions = [1.0] * n_slots
-        current_slot_index = None
+
         for i, p in enumerate(hours_sorted_by_time):
             p_hour = p.hour
             compare_current = current_slot
@@ -572,676 +702,36 @@ class BatteryOptimizer(hass.Hass):
                 compare_current = compare_current.replace(tzinfo=None)
             if p_hour == compare_current:
                 slot_fractions[i] = first_fraction
-                current_slot_index = i
                 break
 
-        # Get temperature-aware charge rate if temperature sensor is available
-        # This improves scheduling accuracy for batteries that charge slower when cold
-        current_temp = self._get_battery_temp()
-        learned_charge_rate = self.learning_engine.get_charge_rate_for_soc(
-            current_soc_for_calc, current_temp
+        return slot_fractions
+
+    def _compute_charge_rates_per_slot(
+        self,
+        hours_sorted_by_time: List[PricePoint],
+        slot_fractions: List[float],
+        current_soc: float,
+        current_temp: Optional[float],
+    ) -> List[float]:
+        """Pre-compute temperature-aware charge rates for each slot."""
+        # Use learning_engine callbacks if available, otherwise use simple fallback
+        if self.learning_engine:
+            get_charge_rate = self.learning_engine.get_charge_rate_for_soc
+            predict_temp = self.learning_engine.predict_temp_after_duration
+        else:
+            # Fallback when no learning engine is available
+            get_charge_rate = lambda soc, temp: self.charge_rate
+            predict_temp = lambda temp, duration: temp if temp is not None else 25.0
+
+        return compute_charge_rates_per_slot(
+            hours_sorted_by_time=hours_sorted_by_time,
+            slot_fractions=slot_fractions,
+            slot_minutes=self.slot_minutes,
+            current_soc=current_soc,
+            current_temp=current_temp if self.learning_engine else None,
+            get_charge_rate_for_soc=get_charge_rate,
+            predict_temp_after_duration=predict_temp,
         )
-
-        # Pre-compute temperature-aware charge rates for each slot.
-        # Project temperature evolution assuming continuous charging to estimate warming trajectory.
-        # This gives the DP optimizer accurate rate estimates for later slots.
-        # Important: Use actual slot duration (accounting for partial first slot) for accurate warming.
-        charge_rates_per_slot = []
-        if current_temp is not None and self.learning_engine:
-            projected_temp = current_temp
-            for i, price_point in enumerate(hours_sorted_by_time):
-                # Get rate for this slot's projected temperature
-                rate = self.learning_engine.get_charge_rate_for_soc(
-                    current_soc_for_calc, projected_temp
-                )
-                charge_rates_per_slot.append(rate)
-                # Project temperature after this slot (assuming charging to estimate warming)
-                # Use actual slot duration: partial first slot, full for rest
-                slot_duration_minutes = self.slot_minutes * slot_fractions[i]
-                projected_temp = self.learning_engine.predict_temp_after_duration(
-                    projected_temp, slot_duration_minutes
-                )
-        else:
-            # Fallback: use single learned rate for all slots (existing behavior)
-            charge_rates_per_slot = [learned_charge_rate for _ in hours_sorted_by_time]
-
-        # Use learned rate for base calculation (falls back to nominal if no data)
-        base_charge_rate = learned_charge_rate
-        base_charge_energy_kwh = base_charge_rate * self.efficiency * self.slot_hours
-        base_charge_cost_kwh = base_charge_rate * self.slot_hours
-        load_kw = [self._predict_load_kw(p.hour) for p in hours_sorted_by_time]
-        discharge_energy_kwh = [
-            min(lk, self.discharge_rate) * self.slot_hours * slot_fractions[i]
-            for i, lk in enumerate(load_kw)
-        ]
-
-        # DP helpers
-        neg_inf = -1e18
-        max_charge_slots = n_slots
-        # Tiny tie-breakers to prefer cheaper/later charge slots when values are effectively equal
-        tie_val_eps = 1e-6
-        tie_tie_eps = 1e-12
-        tie_price_weight = 1e-5
-        tie_time_weight = 1e-7
-
-        # Discharge cost: only wear cost (battery degradation)
-        # We do NOT include battery_avg_cost here because:
-        # - The cost of stored energy was already paid when we charged
-        # - If we discharge and recharge, including avg_cost would double-count
-        # - The DP naturally handles arbitrage: charge cheap, discharge expensive
-        # Wear cost is a real marginal cost of cycling the battery
-        discharge_cost_per_kwh = self.battery_wear_cost
-
-        def _run_dp(
-            hours_list: List[PricePoint],
-            load_kw_list: List[float],
-            charge_rates_list: List[float],
-            slot_fractions_list: List[float],
-            start_energy_kwh: float,
-            start_c: int,
-            start_idx_override: Optional[int] = None,
-        ) -> Tuple[List[BatteryMode], List[bool], float, bool, List[int]]:
-            n_list_slots = len(hours_list)
-            if n_list_slots == 0:
-                return [], [], 0.0, True, []
-
-            dp = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
-            dp_tie = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
-            if start_idx_override is None:
-                start_idx_local = int(round((start_energy_kwh - min_energy) / step_kwh))
-            else:
-                start_idx_local = start_idx_override
-            start_idx_local = min(max(start_idx_local, 0), n_states - 1)
-            start_c = min(max(start_c, 0), max_charge_slots)
-            dp[start_c][start_idx_local] = 0.0
-            dp_tie[start_c][start_idx_local] = 0.0
-
-            prev_idx = [[[None] * n_states for _ in range(max_charge_slots + 1)] for _ in range(n_list_slots)]
-            prev_c = [[[None] * n_states for _ in range(max_charge_slots + 1)] for _ in range(n_list_slots)]
-            prev_action = [[[None] * n_states for _ in range(max_charge_slots + 1)] for _ in range(n_list_slots)]
-            prev_partial = [[[False] * n_states for _ in range(max_charge_slots + 1)] for _ in range(n_list_slots)]
-
-            def _should_update(curr_val: float, curr_tie: float, cand_val: float, cand_tie: float) -> bool:
-                if cand_val > curr_val + tie_val_eps:
-                    return True
-                if abs(cand_val - curr_val) <= tie_val_eps and cand_tie > curr_tie + tie_tie_eps:
-                    return True
-                return False
-
-            # Collect DP trace info for diagnostic logging
-            dp_trace_slots = []  # Will store (slot_hour, traces) for interesting slots
-
-            for t in range(n_list_slots):
-                price = hours_list[t].price
-                buy_price = price + self.grid_fee
-                fraction = slot_fractions_list[t]
-                discharge_kwh = min(load_kw_list[t], self.discharge_rate) * self.slot_hours * fraction
-                slot_charge_rate = charge_rates_list[t]
-                charge_energy_kwh = slot_charge_rate * self.efficiency * self.slot_hours * fraction
-                charge_cost_kwh = slot_charge_rate * self.slot_hours * fraction
-                charge_count_increment = 1  # Always count - energy is tracked separately
-
-                next_dp = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
-                next_dp_tie = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
-                next_prev_idx = [[None] * n_states for _ in range(max_charge_slots + 1)]
-                next_prev_c = [[None] * n_states for _ in range(max_charge_slots + 1)]
-                next_prev_action = [[None] * n_states for _ in range(max_charge_slots + 1)]
-                next_prev_partial = [[False] * n_states for _ in range(max_charge_slots + 1)]
-
-                # Trace info for this slot (for diagnostic logging)
-                slot_trace = []
-                trace_this_slot = (
-                    self.decision_log_level >= 3 and
-                    fraction > 0.5  # Full slots only
-                )
-
-                # Deep trace: track state evolution for first few slots
-                deep_trace_this_slot = self.decision_log_level >= 3 and t < 5
-
-                for c in range(max_charge_slots + 1):
-                    for idx, val in enumerate(dp[c]):
-                        if val <= neg_inf / 2:
-                            continue
-                        curr_tie = dp_tie[c][idx]
-                        curr_soc = self.min_soc + (idx * step_kwh / self.battery_capacity) * 100
-
-                        # HOLD - costs grid price for load (we import from grid during HOLD)
-                        hold_updated = False
-                        hold_cost = buy_price * discharge_kwh  # discharge_kwh = load consumption
-                        hold_val = val - hold_cost
-                        if _should_update(next_dp[c][idx], next_dp_tie[c][idx], hold_val, curr_tie):
-                            next_dp[c][idx] = hold_val
-                            next_dp_tie[c][idx] = curr_tie
-                            next_prev_idx[c][idx] = idx
-                            next_prev_c[c][idx] = c
-                            next_prev_action[c][idx] = BatteryMode.HOLD
-                            hold_updated = True
-
-                        # Track DISCHARGE attempt for tracing
-                        discharge_attempted = False
-                        discharge_updated = False
-                        discharge_blocked_reason = None
-                        discharge_next_idx = None
-                        discharge_next_val = None
-
-                        # CHARGE - let DP evaluate freely; value function handles economics
-                        if charge_energy_kwh > 0 and c + charge_count_increment <= max_charge_slots:
-                            new_energy = energy_levels[idx] + charge_energy_kwh
-                            actual_charge_energy = charge_energy_kwh
-                            actual_charge_cost = charge_cost_kwh
-
-                            if new_energy > max_energy + 1e-6:
-                                headroom = max_energy - energy_levels[idx]
-                                if headroom >= step_kwh:
-                                    actual_charge_energy = headroom
-                                    actual_charge_cost = headroom / self.efficiency
-                                    new_energy = max_energy
-                                else:
-                                    actual_charge_energy = 0
-
-                            if actual_charge_energy > 0:
-                                next_idx = int(round((new_energy - min_energy) / step_kwh))
-                                next_idx = min(max(next_idx, 0), n_states - 1)
-                                # Charge cost + load cost (must import both from grid)
-                                next_val = val - (buy_price * actual_charge_cost) - (buy_price * discharge_kwh)
-                                charge_tie_bias = (-price * tie_price_weight) + (t * tie_time_weight)
-                                next_tie = curr_tie + charge_tie_bias
-                                c_next = c + charge_count_increment
-                                if _should_update(next_dp[c_next][next_idx], next_dp_tie[c_next][next_idx], next_val, next_tie):
-                                    next_dp[c_next][next_idx] = next_val
-                                    next_dp_tie[c_next][next_idx] = next_tie
-                                    next_prev_idx[c_next][next_idx] = idx
-                                    next_prev_c[c_next][next_idx] = c
-                                    next_prev_action[c_next][next_idx] = BatteryMode.CHARGE
-
-                        # DISCHARGE - let DP evaluate freely; value function handles economics
-                        if discharge_kwh > 0:
-                            discharge_attempted = True
-                            new_energy = energy_levels[idx] - discharge_kwh
-                            is_partial = False
-                            actual_discharge_kwh = discharge_kwh
-
-                            if new_energy >= min_energy - 1e-6:
-                                # Full discharge - battery covers entire load
-                                # Cost = opportunity cost of depleted energy (what we paid + wear)
-                                # This ensures discharge only wins when buy_price > discharge_cost_per_kwh
-                                next_idx = int(round((new_energy - min_energy) / step_kwh))
-                                next_idx = min(max(next_idx, 0), n_states - 1)
-                                next_val = val - (discharge_cost_per_kwh * actual_discharge_kwh)
-                            elif energy_levels[idx] > min_energy + discharge_kwh * 0.5:
-                                # Partial discharge - discharge until min_soc, grid covers remainder
-                                # Only allow if we have at least half the load's worth of energy
-                                is_partial = True
-                                actual_discharge_kwh = energy_levels[idx] - min_energy
-                                grid_import = discharge_kwh - actual_discharge_kwh
-                                # Cost = grid import + opportunity cost of battery portion
-                                next_val = val - (buy_price * grid_import) - (discharge_cost_per_kwh * actual_discharge_kwh)
-                                next_idx = 0  # End up at min_energy
-                                new_energy = min_energy
-                            else:
-                                discharge_blocked_reason = f"would_hit_min_soc ({new_energy:.2f} < {min_energy:.2f})"
-                                next_val = None
-                                next_idx = None
-
-                            if next_val is not None:
-                                discharge_next_idx = next_idx
-                                discharge_next_val = next_val
-                                if _should_update(next_dp[c][next_idx], next_dp_tie[c][next_idx], next_val, curr_tie):
-                                    next_dp[c][next_idx] = next_val
-                                    next_dp_tie[c][next_idx] = curr_tie
-                                    next_prev_idx[c][next_idx] = idx
-                                    next_prev_c[c][next_idx] = c
-                                    next_prev_action[c][next_idx] = BatteryMode.DISCHARGE
-                                    next_prev_partial[c][next_idx] = is_partial
-                                    discharge_updated = True
-                                else:
-                                    # Discharge transition was blocked - another path was better
-                                    discharge_blocked_reason = (
-                                        f"existing_val={next_dp[c][next_idx]:.4f} >= discharge_val={next_val:.4f}"
-                                    )
-
-                        # Collect trace for this state if interesting
-                        # Log all charge counts for high-SOC states (to debug post-charge HOLD issues)
-                        trace_high_soc = curr_soc >= 95.0 and c >= min_charge_slots
-                        if trace_this_slot and discharge_attempted and (c == 0 or trace_high_soc):
-                            next_soc_discharge = self.min_soc + (discharge_next_idx * step_kwh / self.battery_capacity) * 100 if discharge_next_idx is not None else 0
-                            slot_trace.append({
-                                "charge_count": c,
-                                "from_soc": curr_soc,
-                                "from_idx": idx,
-                                "from_val": val,
-                                "hold_val": hold_val,
-                                "hold_cost": hold_cost,
-                                "hold_updated": hold_updated,
-                                "discharge_attempted": discharge_attempted,
-                                "discharge_updated": discharge_updated,
-                                "discharge_blocked": discharge_blocked_reason,
-                                "discharge_to_soc": next_soc_discharge,
-                                "discharge_to_idx": discharge_next_idx,
-                                "discharge_val": discharge_next_val,
-                            })
-
-                # Store trace for this slot
-                if trace_this_slot and slot_trace:
-                    dp_trace_slots.append((hours_list[t].hour, price, slot_trace))
-
-                # Deep trace: log state evolution for first few slots
-                if deep_trace_this_slot:
-                    self.log(f"[DeepTrace] After slot {t} ({hours_list[t].hour.strftime('%H:%M')} @ {price:.4f}):")
-                    # Show states with valid values, grouped by charge count
-                    for c in range(min(3, max_charge_slots + 1)):
-                        active_states = [
-                            (i, next_dp[c][i], next_prev_action[c][i])
-                            for i in range(n_states)
-                            if next_dp[c][i] > neg_inf / 2
-                        ]
-                        if active_states:
-                            # Show top 3 by value
-                            active_states.sort(key=lambda x: x[1], reverse=True)
-                            top_states = active_states[:3]
-                            self.log(f"  c={c}: " + ", ".join(
-                                f"idx={i} ({self.min_soc + i*step_kwh/self.battery_capacity*100:.1f}%) val={v:.4f} via {a.name if a else 'None'}"
-                                for i, v, a in top_states
-                            ))
-
-                dp = next_dp
-                dp_tie = next_dp_tie
-                prev_idx[t] = next_prev_idx
-                prev_c[t] = next_prev_c
-                prev_action[t] = next_prev_action
-                prev_partial[t] = next_prev_partial
-
-            best_val = neg_inf
-            best_tie = neg_inf
-            best_idx = None
-            best_c = None
-            max_charge_achieved = 0
-            # Find best final state - no longer constrained by min_charge_slots
-            # The DP naturally finds the economically optimal solution
-            for c in range(max_charge_slots + 1):
-                for i in range(n_states):
-                    if dp[c][i] > neg_inf / 2:
-                        if c > max_charge_achieved:
-                            max_charge_achieved = c
-                        if _should_update(best_val, best_tie, dp[c][i], dp_tie[c][i]):
-                            best_val = dp[c][i]
-                            best_tie = dp_tie[c][i]
-                            best_idx = i
-                            best_c = c
-
-            # Log if charge slots are below calculated minimum (informational only)
-            meets_min = best_c is not None and best_c >= min_charge_slots
-            if not meets_min and min_charge_slots > 0:
-                self.log(
-                    f"Charge slots below calculated minimum ({best_c or 0} vs {min_charge_slots}) - "
-                    f"using grid during cheap hours instead",
-                    level="INFO",
-                )
-
-            actions: List[BatteryMode] = []
-            partial_flags: List[bool] = []
-            idx_trajectory: List[int] = []  # Track idx (energy level) at end of each slot
-            idx = best_idx if best_idx is not None else start_idx_local
-            c = best_c if best_c is not None else start_c
-
-            # Deep trace: log backtracking
-            if self.decision_log_level >= 3:
-                self.log(f"[DeepTrace] Backtracking from best final state: c={c}, idx={idx}, val={best_val:.4f}")
-
-            backtrack_trace = []
-            for t in range(n_list_slots - 1, -1, -1):
-                action = prev_action[t][c][idx] or BatteryMode.HOLD
-                is_partial = prev_partial[t][c][idx] if action == BatteryMode.DISCHARGE else False
-                actions.append(action)
-                partial_flags.append(is_partial)
-                idx_trajectory.append(idx)  # idx is the energy level at END of slot t
-                prev_i = prev_idx[t][c][idx]
-                prev_c_val = prev_c[t][c][idx]
-
-                # Record backtrack info for first few slots
-                if t < 5 and self.decision_log_level >= 3:
-                    soc_at_t = self.min_soc + (idx * step_kwh / self.battery_capacity) * 100
-                    backtrack_trace.append(f"t={t} ({hours_list[t].hour.strftime('%H:%M')}): action={action.name}, c={c}->prev_c={prev_c_val}, idx={idx} ({soc_at_t:.1f}%)->prev_i={prev_i}")
-
-                if prev_i is None or prev_c_val is None:
-                    idx = idx
-                    c = c
-                else:
-                    idx = prev_i
-                    c = prev_c_val
-            actions.reverse()
-            partial_flags.reverse()
-            idx_trajectory.reverse()  # Now idx_trajectory[t] = end-of-slot idx for slot t
-
-            # Log backtrack trace in chronological order
-            if backtrack_trace and self.decision_log_level >= 3:
-                self.log("[DeepTrace] Backtrack path (first 5 slots):")
-                for line in reversed(backtrack_trace):
-                    self.log(f"  {line}")
-
-            # Log DP trace for diagnostic slots
-            if dp_trace_slots and self.decision_log_level >= 3:
-                self.log("=" * 70)
-                self.log("DP TRACE: Detailed state transitions for discharge-allowed slots")
-                self.log("=" * 70)
-                for slot_hour, slot_price, traces in dp_trace_slots:
-                    # Find what action was chosen for this slot
-                    slot_idx = next((i for i, h in enumerate(hours_list) if h.hour == slot_hour), -1)
-                    chosen_action = actions[slot_idx] if 0 <= slot_idx < len(actions) else None
-                    self.log(f"\n{slot_hour.strftime('%Y-%m-%d %H:%M')} @ {slot_price:.4f} EUR/kWh -> {chosen_action.name if chosen_action else '?'}")
-
-                    # Show traces for states that were active (had valid values)
-                    # Focus on the most relevant states (near the current SOC trajectory)
-                    relevant_traces = [t for t in traces if t["from_val"] > -1e10]
-                    if relevant_traces:
-                        # Sort by SOC to show trajectory
-                        relevant_traces.sort(key=lambda x: x["from_soc"], reverse=True)
-                        for trace in relevant_traces[:5]:  # Show top 5 by SOC
-                            status = ""
-                            if trace["discharge_updated"]:
-                                status = "[OK] DISCHARGE wins"
-                            elif trace["discharge_blocked"]:
-                                status = f"[X] blocked: {trace['discharge_blocked']}"
-                            elif trace["hold_updated"]:
-                                status = "-> HOLD set (no discharge attempted)"
-
-                            c_info = f"c={trace['charge_count']}, " if trace.get('charge_count', 0) > 0 else ""
-                            delta = (trace['discharge_val'] - trace['hold_val']) if trace['discharge_val'] is not None else None
-                            delta_str = f"+{delta:.4f}" if delta is not None and delta >= 0 else (f"{delta:.4f}" if delta is not None else "N/A")
-                            discharge_val_str = f"{trace['discharge_val']:.4f}" if trace['discharge_val'] is not None else "N/A"
-                            self.log(
-                                f"  SOC {trace['from_soc']:.1f}% ({c_info}idx={trace['from_idx']}): "
-                                f"hold={trace['hold_val']:.4f} vs discharge={discharge_val_str} (delta={delta_str}) -> {status}"
-                            )
-                self.log("=" * 70)
-
-            return actions, partial_flags, best_val, meets_min, idx_trajectory
-
-        def _build_schedule() -> Tuple[Dict[datetime.datetime, ScheduleEntry], List[int]]:
-            schedule_local: Dict[datetime.datetime, ScheduleEntry] = {}
-            partial_index = current_slot_index
-            partial_fraction = (
-                slot_fractions[partial_index]
-                if partial_index is not None
-                else 1.0
-            )
-            has_partial = partial_index is not None and partial_fraction < 0.999
-
-            if has_partial:
-                price_point = hours_sorted_by_time[partial_index]
-                price = price_point.price
-                buy_price = price + self.grid_fee
-                fraction = slot_fractions[partial_index]
-                slot_load_kw = load_kw[partial_index]
-                discharge_kwh = min(slot_load_kw, self.discharge_rate) * self.slot_hours * fraction
-                slot_charge_rate = charge_rates_per_slot[partial_index]
-                charge_energy_kwh = slot_charge_rate * self.efficiency * self.slot_hours * fraction
-                charge_cost_kwh = slot_charge_rate * self.slot_hours * fraction
-
-                # Remaining slots for DP
-                remaining_slice = slice(partial_index + 1, None)
-                hours_remaining = hours_sorted_by_time[remaining_slice]
-                load_remaining = load_kw[remaining_slice]
-                charge_rates_remaining = charge_rates_per_slot[remaining_slice]
-                slot_fractions_remaining = slot_fractions[remaining_slice]
-
-                # Candidates: (action, new_energy, immediate_val, start_c, start_idx_override, is_partial)
-                candidates = []
-
-                # HOLD - must pay grid price for load (same as main DP)
-                hold_cost = buy_price * discharge_kwh
-                candidates.append(
-                    (BatteryMode.HOLD, start_energy, -hold_cost, 0, None, False)
-                )
-
-                # CHARGE - let DP evaluate freely; value function handles economics
-                partial_charge_increment = 1  # Always count - energy is tracked separately
-                if charge_energy_kwh > 0 and partial_charge_increment <= max_charge_slots:
-                    new_energy = start_energy + charge_energy_kwh
-                    actual_charge_energy = charge_energy_kwh
-                    actual_charge_cost = charge_cost_kwh
-                    if new_energy > max_energy + 1e-6:
-                        headroom = max_energy - start_energy
-                        if headroom >= step_kwh:
-                            actual_charge_energy = headroom
-                            actual_charge_cost = headroom / self.efficiency
-                            new_energy = max_energy
-                        else:
-                            actual_charge_energy = 0
-                    if actual_charge_energy > 0:
-                        idx_float = (new_energy - min_energy) / step_kwh
-                        start_idx_override = int(math.floor(idx_float + 1e-9))
-                        # Charge cost + load cost (must import both from grid)
-                        charge_immediate_cost = -buy_price * actual_charge_cost - buy_price * discharge_kwh
-                        candidates.append(
-                            (
-                                BatteryMode.CHARGE,
-                                new_energy,
-                                charge_immediate_cost,
-                                partial_charge_increment,
-                                start_idx_override,
-                                False,
-                            )
-                        )
-
-                # DISCHARGE - value function includes opportunity cost of stored energy + wear
-                if discharge_kwh > 0:
-                    new_energy = start_energy - discharge_kwh
-                    if new_energy >= min_energy - 1e-6:
-                        # Full discharge - cost is opportunity cost of depleted energy
-                        idx_float = (new_energy - min_energy) / step_kwh
-                        start_idx_override = int(math.ceil(idx_float - 1e-9))
-                        discharge_cost = -discharge_cost_per_kwh * discharge_kwh
-                        candidates.append(
-                            (
-                                BatteryMode.DISCHARGE,
-                                new_energy,
-                                discharge_cost,
-                                0,
-                                start_idx_override,
-                                False,
-                            )
-                        )
-                    elif start_energy > min_energy + discharge_kwh * 0.5:
-                        # Partial discharge - discharge until min_soc
-                        actual_discharge_kwh = start_energy - min_energy
-                        grid_import = discharge_kwh - actual_discharge_kwh
-                        # Cost = grid import + opportunity cost of battery portion
-                        partial_value = -buy_price * grid_import - discharge_cost_per_kwh * actual_discharge_kwh
-                        candidates.append(
-                            (
-                                BatteryMode.DISCHARGE,
-                                min_energy,
-                                partial_value,
-                                0,
-                                0,  # End at min_energy = index 0
-                                True,
-                            )
-                        )
-
-                best_action = BatteryMode.HOLD
-                best_is_partial = False
-                best_actions_remaining: List[BatteryMode] = []
-                best_partial_flags_remaining: List[bool] = []
-                best_idx_trajectory_remaining: List[int] = []
-                best_first_slot_end_idx: int = int(round((start_energy - min_energy) / step_kwh))  # Default: HOLD keeps same idx
-                best_value = neg_inf
-
-                # Log greedy lookahead candidates
-                if self.decision_log_level >= 3:
-                    self.log(f"[GreedyLookahead] Partial slot {price_point.hour.strftime('%H:%M')} @ {price:.4f}")
-                    self.log(f"  Candidates: {[(c[0].name, c[2]) for c in candidates]}")
-
-                greedy_results = []
-                for action, new_energy, immediate_val, start_c, start_idx_override, is_partial in candidates:
-                    actions_remaining, partial_flags_remaining, future_val, _, idx_traj_remaining = _run_dp(
-                        hours_remaining,
-                        load_remaining,
-                        charge_rates_remaining,
-                        slot_fractions_remaining,
-                        new_energy,
-                        start_c,
-                        start_idx_override=start_idx_override,
-                    )
-                    total_val = immediate_val + future_val
-                    greedy_results.append((action.name, immediate_val, future_val, total_val))
-                    # Calculate idx at end of first slot based on the action's new_energy
-                    first_slot_end_idx = int(round((new_energy - min_energy) / step_kwh))
-                    first_slot_end_idx = min(max(first_slot_end_idx, 0), n_states - 1)
-                    if total_val > best_value:
-                        best_value = total_val
-                        best_action = action
-                        best_is_partial = is_partial
-                        best_actions_remaining = actions_remaining
-                        best_partial_flags_remaining = partial_flags_remaining
-                        best_idx_trajectory_remaining = idx_traj_remaining
-                        best_first_slot_end_idx = first_slot_end_idx
-
-                # Log greedy lookahead results
-                if self.decision_log_level >= 3:
-                    for name, imm, fut, tot in greedy_results:
-                        self.log(f"  {name}: immediate={imm:.4f}, future={fut:.4f}, total={tot:.4f}")
-                    self.log(f"  -> Best: {best_action.name} (val={best_value:.4f})")
-
-                    # Explain HOLD vs DISCHARGE decision if both were candidates
-                    hold_result = next((r for r in greedy_results if r[0] == "HOLD"), None)
-                    discharge_result = next((r for r in greedy_results if r[0] == "DISCHARGE"), None)
-                    if hold_result and discharge_result:
-                        hold_imm, hold_fut, hold_tot = hold_result[1], hold_result[2], hold_result[3]
-                        disc_imm, disc_fut, disc_tot = discharge_result[1], discharge_result[2], discharge_result[3]
-                        saved_by_discharge = disc_imm - hold_imm
-                        extra_charge_cost = disc_fut - hold_fut
-                        net_benefit = disc_tot - hold_tot
-
-                        if net_benefit > 0.001:
-                            self.log(f"  [DECISION] DISCHARGE wins: saves {saved_by_discharge:.4f} now, extra charge cost {-extra_charge_cost:.4f}, net benefit {net_benefit:.4f}")
-                        elif net_benefit < -0.001:
-                            self.log(f"  [DECISION] HOLD wins: would save {saved_by_discharge:.4f} by discharging, but recharging costs {-extra_charge_cost:.4f} extra")
-                            if discharge_kwh > 0.01:
-                                effective_recharge_cost_per_kwh = -extra_charge_cost / (discharge_kwh / self.efficiency)
-                                self.log(f"             Overnight recharge cost: ~{effective_recharge_cost_per_kwh:.4f}/kWh vs discharge value {buy_price:.4f}/kWh")
-                        else:
-                            self.log(f"  [DECISION] Tie (within 0.001): HOLD preferred by default")
-
-                # Always use economic optimum (min_charge_slots is informational only)
-                actions = [best_action] + best_actions_remaining
-                partial_flags = [best_is_partial] + best_partial_flags_remaining
-                idx_trajectory = [best_first_slot_end_idx] + best_idx_trajectory_remaining
-            else:
-                actions, partial_flags, _, _, idx_trajectory = _run_dp(
-                    hours_sorted_by_time,
-                    load_kw,
-                    charge_rates_per_slot,
-                    slot_fractions,
-                    start_energy,
-                    0,
-                )
-
-            for price_point, action, lk, is_partial in zip(hours_sorted_by_time, actions, load_kw, partial_flags):
-                hour = price_point.hour
-                price = price_point.price
-                reason = f"{price:.4f} EUR/kWh load~{lk:.2f}kW"
-                if is_partial:
-                    reason += " (until depleted)"
-                schedule_local[hour] = ScheduleEntry(hour=hour, mode=action, reason=reason)
-            return schedule_local, idx_trajectory
-
-        schedule, idx_trajectory = _build_schedule()
-
-        # Project costs for sensor exposure
-        has_charge_slots = any(e.mode == BatteryMode.CHARGE for e in schedule.values())
-        if has_charge_slots:
-            prices_by_slot = {p.hour: p.price for p in hours_sorted_by_time}
-            slot_charge_rates_by_slot = {
-                p.hour: charge_rates_per_slot[i] for i, p in enumerate(hours_sorted_by_time)
-            }
-            slot_fractions_by_slot = {
-                p.hour: slot_fractions[i] for i, p in enumerate(hours_sorted_by_time)
-            }
-            projected_costs, _ = self._project_battery_costs(
-                schedule,
-                current_soc_for_calc,
-                self.battery_avg_cost,
-                prices_by_slot,
-                charge_rates_by_slot=slot_charge_rates_by_slot,
-                slot_fractions_by_slot=slot_fractions_by_slot,
-            )
-            self._last_projected_costs = projected_costs
-        else:
-            self._last_projected_costs = {}
-
-        charge_count = len([s for s in schedule.values() if s.mode == BatteryMode.CHARGE])
-        discharge_count = len([s for s in schedule.values() if s.mode == BatteryMode.DISCHARGE])
-        hold_count = len([s for s in schedule.values() if s.mode == BatteryMode.HOLD])
-
-        self.log(f"Schedule generated: {charge_count} charge, {discharge_count} discharge, {hold_count} hold slots "
-                 f"(slot={self.slot_minutes}min, load_quantile={self.load_quantile:.2f}, "
-                 f"min_charge_slots={min_charge_slots})")
-
-        # Store min_charge_slots for sensor exposure
-        self._last_min_charge_slots = min_charge_slots
-
-        # Log decision context for transparency
-        if self.decision_log_level >= 1:
-            self._log_schedule_decision_context(
-                hours_sorted_by_time, schedule, load_kw, current_soc_for_calc, min_charge_slots
-            )
-
-        # Convert idx_trajectory to SOC trajectory and store for logging
-        # idx_trajectory[t] = energy index at END of slot t
-        # SOC trajectory maps slot hour -> (start_soc, end_soc)
-        # Temperature trajectory maps slot hour -> (start_temp, end_temp)
-        dp_soc_trajectory: Dict[datetime.datetime, Tuple[float, float]] = {}
-        dp_temp_trajectory: Dict[datetime.datetime, Tuple[Optional[float], Optional[float]]] = {}
-
-        if idx_trajectory and len(idx_trajectory) == len(hours_sorted_by_time):
-            # Starting idx from current SOC
-            start_idx = int(round((start_energy - min_energy) / step_kwh))
-            start_idx = min(max(start_idx, 0), n_states - 1)
-
-            for t, price_point in enumerate(hours_sorted_by_time):
-                hour = price_point.hour
-                # Start SOC for this slot
-                if t == 0:
-                    slot_start_idx = start_idx
-                else:
-                    slot_start_idx = idx_trajectory[t - 1]  # Previous slot's end = this slot's start
-                slot_end_idx = idx_trajectory[t]
-
-                # Convert idx to SOC percentage
-                start_soc = self.min_soc + (slot_start_idx * step_kwh / self.battery_capacity) * 100
-                end_soc = self.min_soc + (slot_end_idx * step_kwh / self.battery_capacity) * 100
-                dp_soc_trajectory[hour] = (start_soc, end_soc)
-
-            # Build temperature trajectory based on scheduled mode for each slot
-            # CHARGE: battery warms up (predict_temp_after_duration)
-            # HOLD/DISCHARGE: battery cools toward ambient (predict_temp_after_idle)
-            if current_temp is not None and self.learning_engine:
-                projected_temp = current_temp
-                for t, price_point in enumerate(hours_sorted_by_time):
-                    hour = price_point.hour
-                    start_temp = projected_temp
-                    slot_duration_minutes = self.slot_minutes * slot_fractions[t]
-
-                    # Look up the mode for this slot
-                    entry = schedule.get(hour)
-                    if entry is not None and entry.mode == BatteryMode.CHARGE:
-                        # Charging: battery warms up
-                        projected_temp = self.learning_engine.predict_temp_after_duration(
-                            projected_temp, slot_duration_minutes
-                        )
-                    else:
-                        # HOLD or DISCHARGE: battery cools toward ambient
-                        projected_temp = self.learning_engine.predict_temp_after_idle(
-                            projected_temp, slot_duration_minutes
-                        )
-                    dp_temp_trajectory[hour] = (start_temp, projected_temp)
-
-        # Store trajectories for use in _log_schedule
-        self._last_dp_soc_trajectory = dp_soc_trajectory
-        self._last_dp_temp_trajectory = dp_temp_trajectory
-
-        return schedule
 
     def _log_schedule_decision_context(
         self,
@@ -1846,17 +1336,6 @@ class BatteryOptimizer(hass.Hass):
         hold_prices.sort()
         return hold_prices[:count]
 
-    def safety_check(self, kwargs=None):
-        """
-        Safety check - ensures SOC stays within bounds.
-        Now called via SOC state listener for instant response.
-        Kept for backward compatibility.
-        """
-        current_soc = self._get_current_soc()
-        if current_soc is None:
-            return
-        self._check_soc_boundaries(current_soc)
-
     def _check_soc_deviation(self, current_soc: float) -> bool:
         """
         Check if SOC deviates significantly from expected and trigger recalculation.
@@ -2133,100 +1612,33 @@ class BatteryOptimizer(hass.Hass):
     def _handle_mode_transition(self, new_mode: BatteryMode):
         """
         Handle mode transition for learning engine tracking.
-
-        When transitioning to CHARGE or DISCHARGE, resets the learning baseline
-        so duration is measured from when the new mode actually starts, not from
-        the last significant SOC change (which could be hours ago during HOLD).
-
-        Also tracks idle periods (HOLD/DISCHARGE) for cooling rate learning.
+        Delegates to BatteryCostTracker for tracking state updates.
         """
         old_mode = self.current_mode
-        now = self.datetime()
-        current_temp = self._get_battery_temp()
+        current_soc = self._get_current_soc()
 
-        # Record temperature observation for ambient estimation
-        if current_temp is not None and self.learning_engine:
-            self.learning_engine.record_temperature_observation(current_temp)
+        # Get energy sensor readings if available
+        charge_kwh = None
+        discharge_kwh = None
+        if self._cost_tracker.is_energy_sensor_available:
+            try:
+                charge_state = self.get_state(self.battery_charge_sensor)
+                discharge_state = self.get_state(self.battery_discharge_sensor)
+                if charge_state not in ("unknown", "unavailable", None) and \
+                   discharge_state not in ("unknown", "unavailable", None):
+                    charge_kwh = float(charge_state)
+                    discharge_kwh = float(discharge_state)
+            except (ValueError, TypeError):
+                pass
 
-        # Transitioning TO CHARGE: record cooling if we were idle, then reset baseline
-        if new_mode == BatteryMode.CHARGE and old_mode != BatteryMode.CHARGE:
-            # Record cooling observation if we have idle tracking data
-            if (self._idle_start_time is not None and
-                self._idle_start_temp is not None and
-                current_temp is not None and
-                self.learning_engine):
-                duration_minutes = (now - self._idle_start_time).total_seconds() / 60
-                if duration_minutes >= 10:  # Only record if idle for at least 10 minutes
-                    self.learning_engine.record_cooling(
-                        temp_start=self._idle_start_temp,
-                        temp_end=current_temp,
-                        duration_minutes=duration_minutes
-                    )
-                    self._save_learning_data()
-
-            # Clear idle tracking
-            self._idle_start_time = None
-            self._idle_start_temp = None
-
-            # Reset learning baseline for charging
-            current_soc = self._get_current_soc()
-            if current_soc is not None:
-                self._last_sig_soc = current_soc
-                self._last_sig_soc_time = now
-                self._last_sig_temp = current_temp
-                temp_str = f", temp={current_temp:.1f}C" if current_temp is not None else ""
-                # Include energy sensor values when available
-                energy_str = ""
-                if self._energy_sensor_available:
-                    charge_kwh, discharge_kwh = self._get_inverter_energy_readings()
-                    if charge_kwh is not None:
-                        self._last_charge_today_kwh = charge_kwh
-                        self._last_discharge_today_kwh = discharge_kwh
-                        energy_str = f" (charge: {charge_kwh:.2f} kWh, discharge: {discharge_kwh:.2f} kWh)"
-                self.log(f"Mode transition to CHARGE: reset learning baseline to {current_soc:.1f}%{energy_str}{temp_str}")
-
-        # Transitioning TO HOLD or DISCHARGE: start idle tracking
-        elif new_mode in (BatteryMode.HOLD, BatteryMode.DISCHARGE) and old_mode == BatteryMode.CHARGE:
-            # Start tracking idle period for cooling rate learning
-            self._idle_start_time = now
-            self._idle_start_temp = current_temp
-            temp_str = f", temp={current_temp:.1f}C" if current_temp is not None else ""
-            self.log(f"Mode transition to {new_mode.name}: started idle tracking{temp_str}")
-
-            # Also reset learning baseline for discharge tracking
-            if new_mode == BatteryMode.DISCHARGE:
-                current_soc = self._get_current_soc()
-                if current_soc is not None:
-                    self._last_sig_soc = current_soc
-                    self._last_sig_soc_time = now
-                    self._last_sig_temp = current_temp
-                    # Include energy sensor values when available
-                    energy_str = ""
-                    if self._energy_sensor_available:
-                        charge_kwh, discharge_kwh = self._get_inverter_energy_readings()
-                        if charge_kwh is not None:
-                            self._last_charge_today_kwh = charge_kwh
-                            self._last_discharge_today_kwh = discharge_kwh
-                            energy_str = f" (charge: {charge_kwh:.2f} kWh, discharge: {discharge_kwh:.2f} kWh)"
-                    self.log(f"Mode transition to DISCHARGE: reset learning baseline to {current_soc:.1f}%{energy_str}{temp_str}")
-
-        # Transitioning between HOLD and DISCHARGE: keep idle tracking, update discharge baseline
-        elif new_mode == BatteryMode.DISCHARGE and old_mode == BatteryMode.HOLD:
-            current_soc = self._get_current_soc()
-            if current_soc is not None:
-                self._last_sig_soc = current_soc
-                self._last_sig_soc_time = now
-                self._last_sig_temp = current_temp
-                temp_str = f", temp={current_temp:.1f}C" if current_temp is not None else ""
-                # Include energy sensor values when available
-                energy_str = ""
-                if self._energy_sensor_available:
-                    charge_kwh, discharge_kwh = self._get_inverter_energy_readings()
-                    if charge_kwh is not None:
-                        self._last_charge_today_kwh = charge_kwh
-                        self._last_discharge_today_kwh = discharge_kwh
-                        energy_str = f" (charge: {charge_kwh:.2f} kWh, discharge: {discharge_kwh:.2f} kWh)"
-                self.log(f"Mode transition to DISCHARGE: reset learning baseline to {current_soc:.1f}%{energy_str}{temp_str}")
+        # Delegate to cost tracker for tracking state updates
+        self._cost_tracker.on_mode_transition(
+            old_mode=old_mode,
+            new_mode=new_mode,
+            current_soc=current_soc,
+            charge_kwh=charge_kwh,
+            discharge_kwh=discharge_kwh
+        )
 
         self.current_mode = new_mode
         self._update_schedule_sensor()
@@ -2366,52 +1778,9 @@ class BatteryOptimizer(hass.Hass):
     # =========================================================================
 
     def _init_battery_cost(self):
-        """Initialize battery cost from persistent storage or estimate"""
-        # Entity for persisting battery cost
-        self.battery_cost_entity = self.args.get("battery_cost_entity", "input_number.battery_avg_cost")
-
-        # Track SOC for measuring actual charge/discharge
-        self._last_soc: Optional[float] = self._get_current_soc()
-        self._last_mode: BatteryMode = BatteryMode.HOLD
-        # Track SOC sample timing and pricing slot separately
-        self._last_soc_time: Optional[datetime.datetime] = self.datetime()
-        # Track last significant SOC change (>=1%) for learning durations
-        self._last_sig_soc: Optional[float] = self._last_soc
-        self._last_sig_soc_time: Optional[datetime.datetime] = self._last_soc_time
-        # Track battery temperature at start of charge session (for warming rate learning)
-        self._last_sig_temp: Optional[float] = self._get_battery_temp()
-        # Track idle period start (for cooling rate learning)
-        self._idle_start_time: Optional[datetime.datetime] = None
-        self._idle_start_temp: Optional[float] = None
-        self._last_price_slot: Optional[datetime.datetime] = self._align_to_slot(self.datetime())
-
-        # Inverter energy sensor tracking
-        self._last_charge_today_kwh: Optional[float] = None
-        self._last_discharge_today_kwh: Optional[float] = None
-        self._energy_sensor_available: bool = False
-        # Track stored energy (above min_soc) for inverter-delta cost weighting
-        self._stored_energy_kwh: Optional[float] = None
-        if self._last_soc is not None:
-            self._stored_energy_kwh = max(
-                0.0,
-                (self._last_soc - self.min_soc) / 100 * self.battery_capacity
-            )
-
-        # Initialize inverter energy sensor readings
-        charge_today, discharge_today = self._get_inverter_energy_readings()
-        if charge_today is not None:
-            self._last_charge_today_kwh = charge_today
-            self._last_discharge_today_kwh = discharge_today
-            self._energy_sensor_available = True
-            current_soc = self._get_current_soc()
-            if current_soc is not None:
-                self._stored_energy_kwh = max(
-                    0.0,
-                    (current_soc - self.min_soc) / 100 * self.battery_capacity
-                )
-            self.log(f"Initialized energy sensors: charge={charge_today:.2f}, discharge={discharge_today:.2f} kWh")
-        elif self.use_inverter_energy_sensors:
-            self.log("Inverter energy sensors unavailable, will use SOC-based calculation", level="WARNING")
+        """Initialize battery cost tracking via BatteryCostTracker."""
+        # Initialize the cost tracker
+        self._cost_tracker.initialize()
 
         # Check if HA is ready
         ha_state = self.get_state("sun.sun")
@@ -2421,237 +1790,15 @@ class BatteryOptimizer(hass.Hass):
             return
 
         # HA is ready - load cost and start
-        self._load_battery_cost()
+        self._cost_tracker.load_from_ha()
         self._schedule_startup_optimization()
-
-    def _load_battery_cost(self):
-        """Load battery cost from HA entity, using fallback if unavailable"""
-        try:
-            state = self.get_state(self.battery_cost_entity)
-            if state and state not in ("unknown", "unavailable"):
-                self.battery_avg_cost = float(state)
-                self._battery_cost_from_fallback = False
-                self.log(f"Loaded battery avg cost: {self.battery_avg_cost:.4f} EUR/kWh")
-                return
-        except (ValueError, TypeError) as e:
-            self.log(f"Could not parse battery cost: {e}", level="WARNING")
-
-        self.battery_avg_cost = 0.10
-        self._battery_cost_from_fallback = True
-        self.log(f"Using default battery cost: {self.battery_avg_cost:.4f} EUR/kWh", level="WARNING")
-
-    def _save_battery_cost(self):
-        """Persist battery cost to Home Assistant entity"""
-        # Don't save if we're still using the fallback value (not computed from real charging)
-        if self._battery_cost_from_fallback:
-            self.log(f"Skipping save: battery cost {self.battery_avg_cost:.4f} is from fallback, not computed", level="DEBUG")
-            return
-
-        try:
-            self.call_service("input_number/set_value",
-                entity_id=self.battery_cost_entity,
-                value=round(self.battery_avg_cost, 4)
-            )
-            self.log(f"Saved battery avg cost to HA: {self.battery_avg_cost:.4f} EUR/kWh", level="DEBUG")
-        except Exception as e:
-            self.log(f"Could not save battery cost to {self.battery_cost_entity}: {e}", level="WARNING")
-
-    def _get_inverter_energy_readings(self) -> Tuple[Optional[float], Optional[float]]:
-        """Read current values from inverter energy sensors."""
-        if not self.use_inverter_energy_sensors:
-            return None, None
-        try:
-            charge_state = self.get_state(self.battery_charge_sensor)
-            discharge_state = self.get_state(self.battery_discharge_sensor)
-            if charge_state in ("unknown", "unavailable", None) or \
-               discharge_state in ("unknown", "unavailable", None):
-                return None, None
-            return float(charge_state), float(discharge_state)
-        except (ValueError, TypeError):
-            return None, None
-
-    def _is_midnight_reset(self, current: float, previous: float, now: datetime.datetime) -> bool:
-        """
-        Detect if value drop is due to midnight reset.
-
-        Note: `now` comes from self.datetime() which returns HA's configured timezone
-        (local time), matching the inverter's midnight reset behavior.
-        """
-        if current >= previous:
-            return False
-        minutes_since_midnight = now.hour * 60 + now.minute
-        # Within 5 min of local midnight and current value is small (post-reset)
-        return (minutes_since_midnight < 5 or minutes_since_midnight > 1435) and current < 1.0
 
     def _on_energy_sensor_change(self, entity, attribute, old, new, kwargs):
         """
         Handle changes to inverter energy sensors.
-        This is the PRIMARY trigger for cost tracking and learning when energy sensors are enabled.
+        Delegates to BatteryCostTracker for cost tracking and learning.
         """
-        if new in ("unknown", "unavailable", None):
-            if self._energy_sensor_available:
-                self.log(f"Energy sensor {entity} became unavailable, falling back to SOC-based tracking")
-                self._energy_sensor_available = False
-                self._stored_energy_kwh = None
-            return
-        if old in ("unknown", "unavailable", None):
-            # Sensor just became available - check if both sensors are now available
-            charge_today, discharge_today = self._get_inverter_energy_readings()
-            if charge_today is not None:
-                self._last_charge_today_kwh = charge_today
-                self._last_discharge_today_kwh = discharge_today
-                if not self._energy_sensor_available:
-                    self._energy_sensor_available = True
-                    current_soc = self._get_current_soc()
-                    if current_soc is not None:
-                        self._stored_energy_kwh = max(
-                            0.0,
-                            (current_soc - self.min_soc) / 100 * self.battery_capacity
-                        )
-                    self.log(f"Energy sensors recovered: charge={charge_today:.2f}, discharge={discharge_today:.2f} kWh")
-            return
-
-        try:
-            current_value = float(new)
-            old_value = float(old)
-        except (ValueError, TypeError):
-            return
-
-        if not self._energy_sensor_available:
-            # Avoid double-counting: SOC fallback handles cost/learning when sensors are unavailable.
-            return
-
-        now = self.datetime()
-
-        # Detect midnight reset
-        if self._is_midnight_reset(current_value, old_value, now):
-            self.log(f"Midnight reset on {entity}: {old_value:.2f} -> {current_value:.2f} kWh")
-            # Reset tracking for new day
-            if entity == self.battery_charge_sensor:
-                self._last_charge_today_kwh = current_value
-            else:
-                self._last_discharge_today_kwh = current_value
-            return
-
-        # Calculate energy delta
-        energy_delta = current_value - old_value
-        if energy_delta < 0.05:  # Ignore tiny changes (noise)
-            return
-
-        # Determine if this is charge or discharge
-        is_charge = (entity == self.battery_charge_sensor)
-
-        # Get current SOC for context
-        current_soc = self._get_current_soc()
-        if current_soc is None:
-            return
-
-        # Process the energy change
-        self._process_energy_change(
-            energy_kwh=energy_delta,
-            is_charge=is_charge,
-            current_soc=current_soc,
-            now=now
-        )
-
-    def _process_energy_change(
-        self,
-        energy_kwh: float,
-        is_charge: bool,
-        current_soc: float,
-        now: datetime.datetime
-    ):
-        """
-        Process an energy change event from inverter sensors.
-        Updates battery cost tracking and learning engine.
-        """
-        current_slot = self._align_to_slot(now)
-
-        # Calculate duration since last significant event
-        if self._last_sig_soc_time:
-            last_time = self._last_sig_soc_time
-            if now.tzinfo is not None and last_time.tzinfo is None:
-                last_time = last_time.replace(tzinfo=now.tzinfo)
-            duration_minutes = (now - last_time).total_seconds() / 60
-        else:
-            duration_minutes = 1.0
-
-        if self._stored_energy_kwh is None:
-            base_soc = self._last_soc if self._last_soc is not None else current_soc
-            self._stored_energy_kwh = max(
-                0.0,
-                (base_soc - self.min_soc) / 100 * self.battery_capacity
-            )
-
-        if is_charge:
-            # Get price for charging period
-            charge_price = self._get_price_for_hour(self._last_price_slot) if self._last_price_slot else None
-            if charge_price is None:
-                charge_price = self.battery_avg_cost
-
-            # Update weighted average cost
-            # Use stored-energy accumulator to keep base in sync with inverter deltas
-            old_energy = self._stored_energy_kwh or 0.0
-            old_total_cost = old_energy * self.battery_avg_cost
-            new_total_cost = old_total_cost + (energy_kwh * charge_price)
-            new_total_energy = old_energy + energy_kwh
-
-            if new_total_energy > 0:
-                self.battery_avg_cost = new_total_cost / new_total_energy
-            self._stored_energy_kwh = max(
-                0.0,
-                min(
-                    new_total_energy,
-                    (self.max_soc - self.min_soc) / 100 * self.battery_capacity
-                )
-            )
-
-            self.log(f"Battery charged: +{energy_kwh:.3f} kWh [inverter] at {charge_price:.4f} EUR/kWh, "
-                     f"new avg cost: {self.battery_avg_cost:.4f} EUR/kWh")
-            self._battery_cost_from_fallback = False  # We computed a real value
-            self._save_battery_cost()
-
-            # Feed learning engine with actual measured energy
-            battery_temp = self._get_battery_temp()
-            self.learning_engine.record_charging(
-                soc_start=self._last_soc if self._last_soc else current_soc,
-                soc_end=current_soc,
-                duration_minutes=duration_minutes,
-                energy_from_grid_kwh=energy_kwh / self.efficiency,  # Estimate grid energy
-                charge_price=charge_price,
-                battery_temp=battery_temp,
-                battery_temp_start=self._last_sig_temp,
-                battery_temp_end=battery_temp,
-                energy_to_battery_kwh=energy_kwh  # Actual measured energy from inverter
-            )
-        else:
-            # Discharge
-            discharge_price = self._get_price_for_hour(self._last_price_slot) if self._last_price_slot else 0.0
-            self.log(f"Battery discharged: -{energy_kwh:.3f} kWh [inverter]")
-            if self._stored_energy_kwh is not None:
-                self._stored_energy_kwh = max(
-                    0.0,
-                    self._stored_energy_kwh - energy_kwh
-                )
-
-            self.learning_engine.record_discharging(
-                soc_start=self._last_soc if self._last_soc else current_soc,
-                soc_end=current_soc,
-                duration_minutes=duration_minutes,
-                energy_delivered_kwh=energy_kwh,
-                price_eur_kwh=discharge_price or 0.0
-            )
-
-        self._save_learning_data()
-        self._update_learning_sensor()
-
-        # Update tracking state
-        self._last_soc = current_soc
-        self._last_soc_time = now
-        self._last_sig_soc = current_soc
-        self._last_sig_soc_time = now
-        self._last_sig_temp = self._get_battery_temp()
-        self._last_price_slot = current_slot
+        self._cost_tracker.on_energy_sensor_change(entity, old, new)
 
     def _schedule_startup_optimization(self):
         """Schedule the startup optimization"""
@@ -2660,7 +1807,7 @@ class BatteryOptimizer(hass.Hass):
 
     def _on_ha_start(self, event_name, data, kwargs):
         """HA started - load state and begin optimization"""
-        self._load_battery_cost()
+        self._cost_tracker.load_from_ha()
         self._schedule_startup_optimization()
 
     def _init_learning_engine(self):
@@ -2949,207 +2096,17 @@ class BatteryOptimizer(hass.Hass):
     def _process_soc_change_event(self, current_soc: float):
         """
         Process SOC change for battery cost tracking and learning.
-        Called by _on_soc_change when SOC state changes.
-
-        Args:
-            current_soc: Current battery state of charge (%)
+        Delegates to BatteryCostTracker.
         """
-        now = self.datetime()
-        current_slot = self._align_to_slot(now)
-
-        # Record temperature observation for ambient estimation
-        current_temp = self._get_battery_temp()
-        if current_temp is not None and self.learning_engine:
-            self.learning_engine.record_temperature_observation(current_temp)
-
-        if self._last_soc is None:
-            self._last_soc = current_soc
-            self._last_soc_time = now
-            self._last_sig_soc = current_soc
-            self._last_sig_soc_time = now
-            self._last_price_slot = current_slot
-            return
-
-        soc_change = current_soc - self._last_soc
-
-        # Only process significant changes (> 1%)
-        if abs(soc_change) < 1.0:
-            self._last_soc = current_soc
-            self._last_soc_time = now
-            self._last_price_slot = current_slot  # Always update slot to prevent stale pricing
-            return
-
-        # If energy sensors are enabled and available, they handle cost/learning processing
-        # We only do SOC-based processing as fallback
-        if self._energy_sensor_available:
-            # Update tracking state, but skip cost/learning (handled by energy sensor listener)
-            self._last_soc = current_soc
-            self._last_soc_time = now
-            self._last_sig_soc = current_soc
-            self._last_sig_soc_time = now
-            self._last_sig_temp = self._get_battery_temp()
-            self._last_price_slot = current_slot
-            return
-
-        # Fallback: SOC-based energy calculation (when energy sensors unavailable)
-        energy_change_kwh = abs(soc_change) / 100 * self.battery_capacity
-
-        # Calculate time since last observation
-        if self._last_sig_soc_time:
-            # Ensure consistent timezone handling to avoid naive/aware mismatch
-            last_time = self._last_sig_soc_time
-            compare_now = now
-            if compare_now.tzinfo is not None and last_time.tzinfo is None:
-                last_time = last_time.replace(tzinfo=compare_now.tzinfo)
-            elif compare_now.tzinfo is None and last_time.tzinfo is not None:
-                compare_now = compare_now.replace(tzinfo=last_time.tzinfo)
-            duration_minutes = (compare_now - last_time).total_seconds() / 60
-        else:
-            duration_minutes = 1.0  # Fallback
-
-        if soc_change > 0:
-            # Battery charged - get price for the charging period
-            charge_price = self._get_price_for_hour(self._last_price_slot) if self._last_price_slot else None
-            if charge_price is None:
-                charge_price = self.battery_avg_cost  # Fallback to current avg
-
-            # Calculate energy BEFORE this charge (at old SOC)
-            old_energy = max(0, (self._last_soc - self.min_soc) / 100 * self.battery_capacity)
-
-            # Weighted average: (old_energy * old_cost + new_energy * charge_price) / total
-            old_total_cost = old_energy * self.battery_avg_cost
-            new_total_cost = old_total_cost + (energy_change_kwh * charge_price)
-            new_total_energy = old_energy + energy_change_kwh
-
-            if new_total_energy > 0:
-                self.battery_avg_cost = new_total_cost / new_total_energy
-
-            self.log(f"Battery charged: +{soc_change:.1f}% (+{energy_change_kwh:.2f} kWh) at {charge_price:.4f} EUR/kWh, "
-                     f"new avg cost: {self.battery_avg_cost:.4f} EUR/kWh")
-
-            self._battery_cost_from_fallback = False  # We computed a real value
-            self._save_battery_cost()
-
-            # Feed learning engine with charging observation (include battery temp if available)
-            battery_temp_end = self._get_battery_temp()
-            self.learning_engine.record_charging(
-                soc_start=self._last_soc,
-                soc_end=current_soc,
-                duration_minutes=duration_minutes,
-                charge_price=charge_price,
-                battery_temp=battery_temp_end,
-                battery_temp_start=self._last_sig_temp,
-                battery_temp_end=battery_temp_end
-            )
-            self._save_learning_data()
-            self._update_learning_sensor()
-
-        elif soc_change < 0:
-            # Battery discharged - cost per kWh stays same, just less energy
-            discharge_price = self._get_price_for_hour(self._last_price_slot) if self._last_price_slot else 0.0
-
-            self.log(f"Battery discharged: {soc_change:.1f}% ({energy_change_kwh:.2f} kWh)")
-
-            # Feed learning engine with discharging observation
-            self.learning_engine.record_discharging(
-                soc_start=self._last_soc,
-                soc_end=current_soc,
-                duration_minutes=duration_minutes,
-                price_eur_kwh=discharge_price or 0.0
-            )
-            self._save_learning_data()
-            self._update_learning_sensor()
-
-        self._last_soc = current_soc
-        self._last_soc_time = now
-        self._last_sig_soc = current_soc
-        self._last_sig_soc_time = now
-        self._last_sig_temp = self._get_battery_temp()  # Track temp at start of next session
-        self._last_price_slot = current_slot
-
-    def _update_battery_cost_from_soc_change(self, kwargs=None):
-        """
-        Update battery cost based on actual SOC change since last check.
-        Kept for backward compatibility - now delegates to _process_soc_change_event.
-        """
-        current_soc = self._get_current_soc()
-        if current_soc is None:
-            return
-        self._process_soc_change_event(current_soc)
+        self._cost_tracker.process_soc_change(current_soc)
 
     def _get_discharge_threshold(self) -> float:
-        """Calculate discharge threshold based on actual battery cost"""
-        # Threshold = (what we paid + grid fees) / efficiency + wear cost
-        # Only discharge if we can "sell" above this price
-        threshold = ((self.battery_avg_cost + self.grid_fee) / self.efficiency) + self.battery_wear_cost
-        return threshold
+        """Calculate discharge threshold based on actual battery cost."""
+        return self._cost_tracker.get_discharge_threshold()
 
     def _get_discharge_threshold_for_cost(self, avg_cost: float) -> float:
-        """Calculate discharge threshold for a given battery average cost"""
-        return ((avg_cost + self.grid_fee) / self.efficiency) + self.battery_wear_cost
-
-    def _project_battery_costs(
-        self,
-        schedule: Dict[datetime.datetime, ScheduleEntry],
-        starting_soc: float,
-        starting_cost: float,
-        prices_by_slot: Dict[datetime.datetime, float],
-        charge_rates_by_slot: Optional[Dict[datetime.datetime, float]] = None,
-        slot_fractions_by_slot: Optional[Dict[datetime.datetime, float]] = None,
-    ) -> Tuple[Dict[datetime.datetime, float], float]:
-        """
-        Project battery avg cost evolution through a schedule.
-        Returns (dict mapping slot -> projected cost at START of that slot, final avg cost).
-        """
-        projected_costs = {}
-        current_soc = starting_soc
-        current_cost = starting_cost
-
-        for hour in sorted(schedule.keys()):
-            projected_costs[hour] = current_cost
-            entry = schedule[hour]
-
-            if entry.mode == BatteryMode.CHARGE:
-                charge_price = prices_by_slot.get(hour, current_cost)
-                old_energy = max(0, (current_soc - self.min_soc) / 100 * self.battery_capacity)
-                slot_charge_rate = (
-                    charge_rates_by_slot.get(hour, self.charge_rate)
-                    if charge_rates_by_slot is not None
-                    else self.charge_rate
-                )
-                fraction = (
-                    slot_fractions_by_slot.get(hour, 1.0)
-                    if slot_fractions_by_slot is not None
-                    else 1.0
-                )
-                energy_added = slot_charge_rate * self.efficiency * self.slot_hours * fraction
-                headroom_kwh = max(0.0, (self.max_soc - current_soc) / 100 * self.battery_capacity)
-                energy_added = max(0.0, min(energy_added, headroom_kwh))
-
-                if old_energy + energy_added > 0:
-                    current_cost = (old_energy * current_cost + energy_added * charge_price) / (old_energy + energy_added)
-
-                current_soc = min(self.max_soc, current_soc + (energy_added / self.battery_capacity) * 100)
-
-            elif entry.mode == BatteryMode.DISCHARGE:
-                load_kw = self._predict_load_kw(hour)
-                fraction = (
-                    slot_fractions_by_slot.get(hour, 1.0)
-                    if slot_fractions_by_slot is not None
-                    else 1.0
-                )
-                energy_removed = min(load_kw, self.discharge_rate) * self.slot_hours * fraction
-                current_soc = max(self.min_soc, current_soc - (energy_removed / self.battery_capacity) * 100)
-
-        return projected_costs, current_cost
-
-    def _get_price_for_hour(self, hour: datetime.datetime) -> Optional[float]:
-        """Get the electricity price for a specific slot from price service cache."""
-        local_tz = self._get_local_timezone()
-        for price_point in self._price_service.cached_prices:
-            if datetimes_match_slot(price_point.hour, hour, local_tz):
-                return price_point.price
-        return None
+        """Calculate discharge threshold for a given battery average cost."""
+        return self._cost_tracker.get_discharge_threshold_for_cost(avg_cost)
 
     # =========================================================================
     # Helper Methods
@@ -3308,6 +2265,21 @@ class BatteryOptimizer(hass.Hass):
         except (ValueError, TypeError):
             pass
         return self._default_pv_threshold
+
+    @property
+    def battery_avg_cost(self) -> float:
+        """Get the weighted average cost of energy in the battery (EUR/kWh)."""
+        return self._cost_tracker.avg_cost
+
+    @property
+    def _energy_sensor_available(self) -> bool:
+        """Check if inverter energy sensors are available."""
+        return self._cost_tracker.is_energy_sensor_available
+
+    @property
+    def _last_soc(self) -> Optional[float]:
+        """Get last recorded SOC from cost tracker."""
+        return self._cost_tracker.last_soc
 
     def _get_load_profile_stats(self) -> List[Dict]:
         """

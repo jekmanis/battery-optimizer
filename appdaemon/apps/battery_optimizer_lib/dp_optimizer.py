@@ -193,8 +193,6 @@ class DPOptimizer:
             step_kwh=step_kwh,
             n_states=n_states,
             energy_levels=energy_levels,
-            n_slots=n_slots,
-            min_charge_slots=min_charge_slots_hint,
         )
 
         # Build SOC trajectory
@@ -303,26 +301,23 @@ class DPOptimizer:
         charge_rates_list: List[float],
         slot_fractions_list: List[float],
         start_energy_kwh: float,
-        start_c: int,
         min_energy: float,
         max_energy: float,
         step_kwh: float,
         n_states: int,
         energy_levels: List[float],
-        max_charge_slots: int,
-        min_charge_slots: int,
         start_idx_override: Optional[int] = None,
-    ) -> Tuple[List[BatteryMode], List[bool], float, bool, List[int]]:
+    ) -> Tuple[List[BatteryMode], List[bool], float, List[int]]:
         """
         Core DP algorithm.
 
         Returns:
-            (actions, partial_flags, best_value, meets_min, idx_trajectory)
+            (actions, partial_flags, best_value, idx_trajectory)
         """
         cfg = self._config
         n_list_slots = len(hours_list)
         if n_list_slots == 0:
-            return [], [], 0.0, True, []
+            return [], [], 0.0, []
 
         neg_inf = -1e18
         tie_val_eps = 1e-6
@@ -333,27 +328,25 @@ class DPOptimizer:
         # Discharge cost: only wear cost (battery degradation)
         discharge_cost_per_kwh = cfg.battery_wear_cost
 
-        # Allocate DP buffers and template row for efficient reset
+        # Allocate 1D DP buffers and template row for efficient reset
         _neg_inf_row = [neg_inf] * n_states
-        dp_a = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
-        dp_b = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
-        dp_tie_a = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
-        dp_tie_b = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
+        dp_a = [neg_inf] * n_states
+        dp_b = [neg_inf] * n_states
+        dp_tie_a = [neg_inf] * n_states
+        dp_tie_b = [neg_inf] * n_states
 
         if start_idx_override is None:
             start_idx_local = _energy_to_index(start_energy_kwh, min_energy, step_kwh, n_states, "round")
         else:
             start_idx_local = min(max(start_idx_override, 0), n_states - 1)
-        start_c = min(max(start_c, 0), max_charge_slots)
 
         # Initialize starting state in dp_a
-        dp_a[start_c][start_idx_local] = 0.0
-        dp_tie_a[start_c][start_idx_local] = 0.0
+        dp_a[start_idx_local] = 0.0
+        dp_tie_a[start_idx_local] = 0.0
         dp, next_dp = dp_a, dp_b
         dp_tie, next_dp_tie = dp_tie_a, dp_tie_b
 
         prev_idx = [None] * n_list_slots
-        prev_c = [None] * n_list_slots
         prev_action = [None] * n_list_slots
         prev_partial = [None] * n_list_slots
 
@@ -374,156 +367,144 @@ class DPOptimizer:
             slot_charge_rate = charge_rates_list[t]
             charge_energy_kwh = slot_charge_rate * cfg.efficiency * cfg.slot_hours * fraction
             charge_cost_kwh = slot_charge_rate * cfg.slot_hours * fraction
-            charge_count_increment = 1
 
             # Reset next_dp buffers using slice assignment (faster than nested loop)
-            for c in range(max_charge_slots + 1):
-                next_dp[c][:] = _neg_inf_row
-                next_dp_tie[c][:] = _neg_inf_row
-            next_prev_idx = [[None] * n_states for _ in range(max_charge_slots + 1)]
-            next_prev_c = [[None] * n_states for _ in range(max_charge_slots + 1)]
-            next_prev_action = [[None] * n_states for _ in range(max_charge_slots + 1)]
-            next_prev_partial = [[False] * n_states for _ in range(max_charge_slots + 1)]
+            next_dp[:] = _neg_inf_row
+            next_dp_tie[:] = _neg_inf_row
+            next_prev_idx = [None] * n_states
+            next_prev_action = [None] * n_states
+            next_prev_partial = [False] * n_states
 
             slot_trace = []
             trace_this_slot = self._decision_log_level >= 3 and fraction > 0.5
             deep_trace_this_slot = self._decision_log_level >= 3 and t < 5
 
-            for c in range(max_charge_slots + 1):
-                for idx, val in enumerate(dp[c]):
-                    if val <= neg_inf / 2:
-                        continue
-                    curr_tie = dp_tie[c][idx]
-                    curr_soc = cfg.min_soc + (idx * step_kwh / cfg.battery_capacity) * 100
+            for idx, val in enumerate(dp):
+                if val <= neg_inf / 2:
+                    continue
+                curr_tie = dp_tie[idx]
+                curr_soc = cfg.min_soc + (idx * step_kwh / cfg.battery_capacity) * 100
 
-                    # HOLD - costs grid price for load
-                    hold_updated = False
-                    hold_cost = buy_price * discharge_kwh
-                    hold_val = val - hold_cost
-                    if _should_update(next_dp[c][idx], next_dp_tie[c][idx], hold_val, curr_tie):
-                        next_dp[c][idx] = hold_val
-                        next_dp_tie[c][idx] = curr_tie
-                        next_prev_idx[c][idx] = idx
-                        next_prev_c[c][idx] = c
-                        next_prev_action[c][idx] = BatteryMode.HOLD
-                        hold_updated = True
+                # HOLD - costs grid price for load
+                hold_updated = False
+                hold_cost = buy_price * discharge_kwh
+                hold_val = val - hold_cost
+                if _should_update(next_dp[idx], next_dp_tie[idx], hold_val, curr_tie):
+                    next_dp[idx] = hold_val
+                    next_dp_tie[idx] = curr_tie
+                    next_prev_idx[idx] = idx
+                    next_prev_action[idx] = BatteryMode.HOLD
+                    hold_updated = True
 
-                    discharge_attempted = False
-                    discharge_updated = False
-                    discharge_blocked_reason = None
-                    discharge_next_idx = None
-                    discharge_next_val = None
+                discharge_attempted = False
+                discharge_updated = False
+                discharge_blocked_reason = None
+                discharge_next_idx = None
+                discharge_next_val = None
 
-                    # CHARGE
-                    if charge_energy_kwh > 0 and c + charge_count_increment <= max_charge_slots:
-                        new_energy = energy_levels[idx] + charge_energy_kwh
-                        actual_charge_energy = charge_energy_kwh
-                        actual_charge_cost = charge_cost_kwh
+                # CHARGE
+                if charge_energy_kwh > 0:
+                    new_energy = energy_levels[idx] + charge_energy_kwh
+                    actual_charge_energy = charge_energy_kwh
+                    actual_charge_cost = charge_cost_kwh
 
-                        if new_energy > max_energy + 1e-6:
-                            headroom = max_energy - energy_levels[idx]
-                            if headroom >= step_kwh:
-                                actual_charge_energy = headroom
-                                actual_charge_cost = headroom / cfg.efficiency
-                                new_energy = max_energy
-                            else:
-                                actual_charge_energy = 0
-
-                        if actual_charge_energy > 0:
-                            next_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "floor")
-                            next_val = val - (buy_price * actual_charge_cost) - (buy_price * discharge_kwh)
-                            charge_tie_bias = (-price * tie_price_weight) + (t * tie_time_weight)
-                            next_tie = curr_tie + charge_tie_bias
-                            c_next = c + charge_count_increment
-                            if _should_update(next_dp[c_next][next_idx], next_dp_tie[c_next][next_idx], next_val, next_tie):
-                                next_dp[c_next][next_idx] = next_val
-                                next_dp_tie[c_next][next_idx] = next_tie
-                                next_prev_idx[c_next][next_idx] = idx
-                                next_prev_c[c_next][next_idx] = c
-                                next_prev_action[c_next][next_idx] = BatteryMode.CHARGE
-
-                    # DISCHARGE
-                    if discharge_kwh > 0:
-                        discharge_attempted = True
-                        new_energy = energy_levels[idx] - discharge_kwh
-                        is_partial = False
-                        actual_discharge_kwh = discharge_kwh
-
-                        if new_energy >= min_energy - 1e-6:
-                            next_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "ceil")
-                            next_val = val - (discharge_cost_per_kwh * actual_discharge_kwh)
-                        elif energy_levels[idx] > min_energy + discharge_kwh * 0.5:
-                            is_partial = True
-                            actual_discharge_kwh = energy_levels[idx] - min_energy
-                            grid_import = discharge_kwh - actual_discharge_kwh
-                            next_val = val - (buy_price * grid_import) - (discharge_cost_per_kwh * actual_discharge_kwh)
-                            next_idx = 0
-                            new_energy = min_energy
+                    if new_energy > max_energy + 1e-6:
+                        headroom = max_energy - energy_levels[idx]
+                        if headroom >= step_kwh:
+                            actual_charge_energy = headroom
+                            actual_charge_cost = headroom / cfg.efficiency
+                            new_energy = max_energy
                         else:
-                            discharge_blocked_reason = f"would_hit_min_soc ({new_energy:.2f} < {min_energy:.2f})"
-                            next_val = None
-                            next_idx = None
+                            actual_charge_energy = 0
 
-                        if next_val is not None:
-                            discharge_next_idx = next_idx
-                            discharge_next_val = next_val
-                            if _should_update(next_dp[c][next_idx], next_dp_tie[c][next_idx], next_val, curr_tie):
-                                next_dp[c][next_idx] = next_val
-                                next_dp_tie[c][next_idx] = curr_tie
-                                next_prev_idx[c][next_idx] = idx
-                                next_prev_c[c][next_idx] = c
-                                next_prev_action[c][next_idx] = BatteryMode.DISCHARGE
-                                next_prev_partial[c][next_idx] = is_partial
-                                discharge_updated = True
-                            else:
-                                discharge_blocked_reason = (
-                                    f"existing_val={next_dp[c][next_idx]:.4f} >= discharge_val={next_val:.4f}"
-                                )
+                    if actual_charge_energy > 0:
+                        next_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "floor")
+                        next_val = val - (buy_price * actual_charge_cost) - (buy_price * discharge_kwh)
+                        charge_tie_bias = (-price * tie_price_weight) + (t * tie_time_weight)
+                        next_tie = curr_tie + charge_tie_bias
+                        if _should_update(next_dp[next_idx], next_dp_tie[next_idx], next_val, next_tie):
+                            next_dp[next_idx] = next_val
+                            next_dp_tie[next_idx] = next_tie
+                            next_prev_idx[next_idx] = idx
+                            next_prev_action[next_idx] = BatteryMode.CHARGE
 
-                    # Trace collection for logging
-                    trace_high_soc = curr_soc >= 95.0 and c >= min_charge_slots
-                    if trace_this_slot and discharge_attempted and (c == 0 or trace_high_soc):
-                        next_soc_discharge = cfg.min_soc + (discharge_next_idx * step_kwh / cfg.battery_capacity) * 100 if discharge_next_idx is not None else 0
-                        slot_trace.append({
-                            "charge_count": c,
-                            "from_soc": curr_soc,
-                            "from_idx": idx,
-                            "from_val": val,
-                            "hold_val": hold_val,
-                            "hold_cost": hold_cost,
-                            "hold_updated": hold_updated,
-                            "discharge_attempted": discharge_attempted,
-                            "discharge_updated": discharge_updated,
-                            "discharge_blocked": discharge_blocked_reason,
-                            "discharge_to_soc": next_soc_discharge,
-                            "discharge_to_idx": discharge_next_idx,
-                            "discharge_val": discharge_next_val,
-                        })
+                # DISCHARGE
+                if discharge_kwh > 0:
+                    discharge_attempted = True
+                    new_energy = energy_levels[idx] - discharge_kwh
+                    is_partial = False
+                    actual_discharge_kwh = discharge_kwh
+
+                    if new_energy >= min_energy - 1e-6:
+                        next_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "ceil")
+                        next_val = val - (discharge_cost_per_kwh * actual_discharge_kwh)
+                    elif energy_levels[idx] > min_energy + discharge_kwh * 0.5:
+                        is_partial = True
+                        actual_discharge_kwh = energy_levels[idx] - min_energy
+                        grid_import = discharge_kwh - actual_discharge_kwh
+                        next_val = val - (buy_price * grid_import) - (discharge_cost_per_kwh * actual_discharge_kwh)
+                        next_idx = 0
+                        new_energy = min_energy
+                    else:
+                        discharge_blocked_reason = f"would_hit_min_soc ({new_energy:.2f} < {min_energy:.2f})"
+                        next_val = None
+                        next_idx = None
+
+                    if next_val is not None:
+                        discharge_next_idx = next_idx
+                        discharge_next_val = next_val
+                        if _should_update(next_dp[next_idx], next_dp_tie[next_idx], next_val, curr_tie):
+                            next_dp[next_idx] = next_val
+                            next_dp_tie[next_idx] = curr_tie
+                            next_prev_idx[next_idx] = idx
+                            next_prev_action[next_idx] = BatteryMode.DISCHARGE
+                            next_prev_partial[next_idx] = is_partial
+                            discharge_updated = True
+                        else:
+                            discharge_blocked_reason = (
+                                f"existing_val={next_dp[next_idx]:.4f} >= discharge_val={next_val:.4f}"
+                            )
+
+                # Trace collection for logging
+                if trace_this_slot and discharge_attempted:
+                    next_soc_discharge = cfg.min_soc + (discharge_next_idx * step_kwh / cfg.battery_capacity) * 100 if discharge_next_idx is not None else 0
+                    slot_trace.append({
+                        "from_soc": curr_soc,
+                        "from_idx": idx,
+                        "from_val": val,
+                        "hold_val": hold_val,
+                        "hold_cost": hold_cost,
+                        "hold_updated": hold_updated,
+                        "discharge_attempted": discharge_attempted,
+                        "discharge_updated": discharge_updated,
+                        "discharge_blocked": discharge_blocked_reason,
+                        "discharge_to_soc": next_soc_discharge,
+                        "discharge_to_idx": discharge_next_idx,
+                        "discharge_val": discharge_next_val,
+                    })
 
             if trace_this_slot and slot_trace:
                 dp_trace_slots.append((hours_list[t].hour, price, slot_trace))
 
             if deep_trace_this_slot:
                 self._log(f"[DeepTrace] After slot {t} ({hours_list[t].hour.strftime('%H:%M')} @ {price:.4f}):")
-                for c in range(min(3, max_charge_slots + 1)):
-                    active_states = [
-                        (i, next_dp[c][i], next_prev_action[c][i])
-                        for i in range(n_states)
-                        if next_dp[c][i] > neg_inf / 2
-                    ]
-                    if active_states:
-                        active_states.sort(key=lambda x: x[1], reverse=True)
-                        top_states = active_states[:3]
-                        self._log(f"  c={c}: " + ", ".join(
-                            f"idx={i} ({cfg.min_soc + i*step_kwh/cfg.battery_capacity*100:.1f}%) val={v:.4f} via {a.name if a else 'None'}"
-                            for i, v, a in top_states
-                        ))
+                active_states = [
+                    (i, next_dp[i], next_prev_action[i])
+                    for i in range(n_states)
+                    if next_dp[i] > neg_inf / 2
+                ]
+                if active_states:
+                    active_states.sort(key=lambda x: x[1], reverse=True)
+                    top_states = active_states[:3]
+                    self._log("  " + ", ".join(
+                        f"idx={i} ({cfg.min_soc + i*step_kwh/cfg.battery_capacity*100:.1f}%) val={v:.4f} via {a.name if a else 'None'}"
+                        for i, v, a in top_states
+                    ))
 
             # Swap buffers instead of reassigning
             dp, next_dp = next_dp, dp
             dp_tie, next_dp_tie = next_dp_tie, dp_tie
             prev_idx[t] = next_prev_idx
-            prev_c[t] = next_prev_c
             prev_action[t] = next_prev_action
             prev_partial[t] = next_prev_partial
 
@@ -531,58 +512,40 @@ class DPOptimizer:
         best_val = neg_inf
         best_tie = neg_inf
         best_idx = None
-        best_c = None
-        max_charge_achieved = 0
 
-        for c in range(max_charge_slots + 1):
-            for i in range(n_states):
-                if dp[c][i] > neg_inf / 2:
-                    if c > max_charge_achieved:
-                        max_charge_achieved = c
-                    if _should_update(best_val, best_tie, dp[c][i], dp_tie[c][i]):
-                        best_val = dp[c][i]
-                        best_tie = dp_tie[c][i]
-                        best_idx = i
-                        best_c = c
-
-        meets_min = best_c is not None and best_c >= min_charge_slots
-        if not meets_min and min_charge_slots > 0:
-            self._log(
-                f"Charge slots below calculated minimum ({best_c or 0} vs {min_charge_slots}) - "
-                f"using grid during cheap hours instead",
-                level="INFO",
-            )
+        for i in range(n_states):
+            if dp[i] > neg_inf / 2:
+                if _should_update(best_val, best_tie, dp[i], dp_tie[i]):
+                    best_val = dp[i]
+                    best_tie = dp_tie[i]
+                    best_idx = i
 
         # Backtrack to extract actions
         actions: List[BatteryMode] = []
         partial_flags: List[bool] = []
         idx_trajectory: List[int] = []
         idx = best_idx if best_idx is not None else start_idx_local
-        c = best_c if best_c is not None else start_c
 
         if self._decision_log_level >= 3:
-            self._log(f"[DeepTrace] Backtracking from best final state: c={c}, idx={idx}, val={best_val:.4f}")
+            self._log(f"[DeepTrace] Backtracking from best final state: idx={idx}, val={best_val:.4f}")
 
         backtrack_trace = []
         for t in range(n_list_slots - 1, -1, -1):
-            action = prev_action[t][c][idx] or BatteryMode.HOLD
-            is_partial = prev_partial[t][c][idx] if action == BatteryMode.DISCHARGE else False
+            action = prev_action[t][idx] or BatteryMode.HOLD
+            is_partial = prev_partial[t][idx] if action == BatteryMode.DISCHARGE else False
             actions.append(action)
             partial_flags.append(is_partial)
             idx_trajectory.append(idx)
-            prev_i = prev_idx[t][c][idx]
-            prev_c_val = prev_c[t][c][idx]
+            prev_i = prev_idx[t][idx]
 
             if t < 5 and self._decision_log_level >= 3:
                 soc_at_t = cfg.min_soc + (idx * step_kwh / cfg.battery_capacity) * 100
-                backtrack_trace.append(f"t={t} ({hours_list[t].hour.strftime('%H:%M')}): action={action.name}, c={c}->prev_c={prev_c_val}, idx={idx} ({soc_at_t:.1f}%)->prev_i={prev_i}")
+                backtrack_trace.append(f"t={t} ({hours_list[t].hour.strftime('%H:%M')}): action={action.name}, idx={idx} ({soc_at_t:.1f}%)->prev_i={prev_i}")
 
-            if prev_i is None or prev_c_val is None:
+            if prev_i is None:
                 idx = idx
-                c = c
             else:
                 idx = prev_i
-                c = prev_c_val
 
         actions.reverse()
         partial_flags.reverse()
@@ -615,17 +578,16 @@ class DPOptimizer:
                         elif trace["hold_updated"]:
                             status = "-> HOLD set (no discharge attempted)"
 
-                        c_info = f"c={trace['charge_count']}, " if trace.get('charge_count', 0) > 0 else ""
                         delta = (trace['discharge_val'] - trace['hold_val']) if trace['discharge_val'] is not None else None
                         delta_str = f"+{delta:.4f}" if delta is not None and delta >= 0 else (f"{delta:.4f}" if delta is not None else "N/A")
                         discharge_val_str = f"{trace['discharge_val']:.4f}" if trace['discharge_val'] is not None else "N/A"
                         self._log(
-                            f"  SOC {trace['from_soc']:.1f}% ({c_info}idx={trace['from_idx']}): "
+                            f"  SOC {trace['from_soc']:.1f}% (idx={trace['from_idx']}): "
                             f"hold={trace['hold_val']:.4f} vs discharge={discharge_val_str} (delta={delta_str}) -> {status}"
                         )
             self._log("=" * 70)
 
-        return actions, partial_flags, best_val, meets_min, idx_trajectory
+        return actions, partial_flags, best_val, idx_trajectory
 
     def _build_schedule(
         self,
@@ -640,8 +602,6 @@ class DPOptimizer:
         step_kwh: float,
         n_states: int,
         energy_levels: List[float],
-        n_slots: int,
-        min_charge_slots: int,
     ) -> Tuple[Dict[datetime.datetime, ScheduleEntry], List[int], float]:
         """
         Build schedule using DP with greedy lookahead for partial first slot.
@@ -650,7 +610,6 @@ class DPOptimizer:
             (schedule, idx_trajectory, best_value)
         """
         cfg = self._config
-        max_charge_slots = n_slots
         neg_inf = -1e18
 
         # Discharge cost
@@ -679,16 +638,15 @@ class DPOptimizer:
             charge_rates_remaining = charge_rates_per_slot[remaining_slice]
             slot_fractions_remaining = slot_fractions[remaining_slice]
 
-            # Candidates: (action, new_energy, immediate_val, start_c, start_idx_override, is_partial)
+            # Candidates: (action, new_energy, immediate_val, start_idx_override, is_partial)
             candidates = []
 
             # HOLD
             hold_cost = buy_price * discharge_kwh
-            candidates.append((BatteryMode.HOLD, start_energy, -hold_cost, 0, None, False))
+            candidates.append((BatteryMode.HOLD, start_energy, -hold_cost, None, False))
 
             # CHARGE
-            partial_charge_increment = 1
-            if charge_energy_kwh > 0 and partial_charge_increment <= max_charge_slots:
+            if charge_energy_kwh > 0:
                 new_energy = start_energy + charge_energy_kwh
                 actual_charge_energy = charge_energy_kwh
                 actual_charge_cost = charge_cost_kwh
@@ -707,7 +665,6 @@ class DPOptimizer:
                         BatteryMode.CHARGE,
                         new_energy,
                         charge_immediate_cost,
-                        partial_charge_increment,
                         start_idx_override,
                         False,
                     ))
@@ -722,7 +679,6 @@ class DPOptimizer:
                         BatteryMode.DISCHARGE,
                         new_energy,
                         discharge_cost,
-                        0,
                         start_idx_override,
                         False,
                     ))
@@ -734,7 +690,6 @@ class DPOptimizer:
                         BatteryMode.DISCHARGE,
                         min_energy,
                         partial_value,
-                        0,
                         0,
                         True,
                     ))
@@ -752,21 +707,18 @@ class DPOptimizer:
                 self._log(f"  Candidates: {[(c[0].name, c[2]) for c in candidates]}")
 
             greedy_results = []
-            for action, new_energy, immediate_val, start_c, start_idx_override, is_partial in candidates:
-                actions_remaining, partial_flags_remaining, future_val, _, idx_traj_remaining = self._run_dp(
+            for action, new_energy, immediate_val, start_idx_override, is_partial in candidates:
+                actions_remaining, partial_flags_remaining, future_val, idx_traj_remaining = self._run_dp(
                     hours_remaining,
                     load_remaining,
                     charge_rates_remaining,
                     slot_fractions_remaining,
                     new_energy,
-                    start_c,
                     min_energy,
                     max_energy,
                     step_kwh,
                     n_states,
                     energy_levels,
-                    max_charge_slots,
-                    min_charge_slots,
                     start_idx_override=start_idx_override,
                 )
                 total_val = immediate_val + future_val
@@ -814,20 +766,17 @@ class DPOptimizer:
             partial_flags = [best_is_partial] + best_partial_flags_remaining
             idx_trajectory = [best_first_slot_end_idx] + best_idx_trajectory_remaining
         else:
-            actions, partial_flags, best_value, _, idx_trajectory = self._run_dp(
+            actions, partial_flags, best_value, idx_trajectory = self._run_dp(
                 hours_sorted_by_time,
                 load_kw,
                 charge_rates_per_slot,
                 slot_fractions,
                 start_energy,
-                0,
                 min_energy,
                 max_energy,
                 step_kwh,
                 n_states,
                 energy_levels,
-                max_charge_slots,
-                min_charge_slots,
             )
 
         for price_point, action, lk, is_partial in zip(hours_sorted_by_time, actions, load_kw, partial_flags):

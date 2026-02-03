@@ -17,7 +17,7 @@ apps_dir = Path(__file__).parent.parent / "appdaemon" / "apps"
 sys.path.insert(0, str(apps_dir))
 
 from battery_optimizer import BatteryMode, ScheduleEntry, TouPeriod, BatteryOptimizer
-from battery_optimizer_lib import TouSyncManager
+from battery_optimizer_lib import TouSyncManager, BatteryOptimizerConfig
 
 
 class MockInsertHoldOptimizer:
@@ -29,18 +29,22 @@ class MockInsertHoldOptimizer:
         self.schedule: Dict[datetime.datetime, ScheduleEntry] = {}
         self._current_datetime = datetime.datetime(2024, 1, 15, 9, 55, 0)
         self._current_date = datetime.date(2024, 1, 15)
-        self.slot_minutes = 60
         self.current_mode = BatteryMode.CHARGE
-        self.tou_sync_enabled = True
-        self.device_id = "test_device"
         self._schedule_tou_sync_calls = []
         self._handle_mode_transition_calls = []
         self._update_schedule_sensor_calls = 0
 
+        # Create config object
+        self.config = BatteryOptimizerConfig(
+            slot_minutes=60,
+            tou_sync_enabled=True,
+            device_id="test_device",
+        )
+
         # Create TouSyncManager for delegation
         self._tou_sync_manager = TouSyncManager(
-            device_id=self.device_id,
-            slot_minutes=self.slot_minutes,
+            device_id=self.config.device_id,
+            slot_minutes=self.config.slot_minutes,
             ha_url="",
             ha_token="",
             call_service_func=lambda *args, **kwargs: None,
@@ -241,7 +245,7 @@ class TestInsertHoldAndResync:
 
     def test_no_tou_sync_when_disabled(self, optimizer):
         """Should NOT call _schedule_tou_sync when TOU sync is disabled."""
-        optimizer.tou_sync_enabled = False
+        optimizer.config.tou_sync_enabled = False
         slot_09 = datetime.datetime(2024, 1, 15, 9, 0, 0)
         optimizer.schedule = {
             slot_09: ScheduleEntry(hour=slot_09, mode=BatteryMode.CHARGE, reason="charge"),
@@ -254,7 +258,7 @@ class TestInsertHoldAndResync:
 
     def test_no_tou_sync_when_no_device(self, optimizer):
         """Should NOT call _schedule_tou_sync when device_id is empty."""
-        optimizer.device_id = ""
+        optimizer.config.device_id = ""
         slot_09 = datetime.datetime(2024, 1, 15, 9, 0, 0)
         optimizer.schedule = {
             slot_09: ScheduleEntry(hour=slot_09, mode=BatteryMode.CHARGE, reason="charge"),

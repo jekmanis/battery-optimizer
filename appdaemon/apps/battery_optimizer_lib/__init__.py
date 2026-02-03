@@ -2,6 +2,7 @@
 Battery Optimizer package.
 
 This package contains helper modules for the main BatteryOptimizer AppDaemon app:
+- config: Configuration dataclass with typed fields and validation
 - models: Data classes and enums (BatteryMode, PricePoint, ScheduleEntry, etc.)
 - learning_engine: Self-learning battery performance tracking
 - load_profile: Statistical load forecasting by time-of-day
@@ -14,6 +15,7 @@ This package contains helper modules for the main BatteryOptimizer AppDaemon app
 - schedule_formatter: Schedule logging and formatting for display
 """
 
+from .config import BatteryOptimizerConfig
 from .models import (
     BatteryMode,
     PricePoint,
@@ -44,6 +46,8 @@ from .soc_deviation import SocDeviationDetector, SocDeviationConfig, DeviationCh
 from .schedule_formatter import ScheduleFormatter, ScheduleFormatterConfig
 
 __all__ = [
+    # Config
+    "BatteryOptimizerConfig",
     # Models
     "BatteryMode",
     "PricePoint",

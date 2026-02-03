@@ -7,7 +7,7 @@ from battery_optimizer import (
     LoadProfile,
     PricePoint,
 )
-from battery_optimizer_lib import BatteryCostTracker, BatteryCostConfig
+from battery_optimizer_lib import BatteryCostTracker, BatteryCostConfig, BatteryOptimizerConfig
 
 
 class PartialSlotOptimizer:
@@ -19,46 +19,52 @@ class PartialSlotOptimizer:
         soc_step_percent: float = 1.0,
         base_consumption_w: float = 850.0,
     ):
-        self.battery_capacity = 14.3
-        self.charge_rate = 4.5
-        self.discharge_rate = 4.5
-        self.efficiency = 0.95
-        self.grid_fee = 0.0
-        self.slot_minutes = 60
-        self.slot_hours = 1.0
+        # Create config object
+        self.config = BatteryOptimizerConfig(
+            battery_capacity=14.3,
+            charge_rate=4.5,
+            discharge_rate=4.5,
+            efficiency=0.95,
+            grid_fee=0.0,
+            slot_minutes=60,
+            base_consumption=base_consumption_w,
+            load_quantile=0.75,
+            soc_step_percent=soc_step_percent,
+            default_min_soc=10.0,
+            default_max_soc=100.0,
+            decision_log_level=0,
+            battery_wear_cost=0.0,
+        )
+
+        # Legacy attributes for tests
         self.battery_avg_cost = 0.1046
-        self.base_consumption = base_consumption_w
-        self.load_quantile = 0.75
-        self.soc_step_percent = soc_step_percent
-        self.decision_log_level = 0
         self.min_soc = 10.0
         self.max_soc = 100.0
         self._current_time = now
-        self.battery_wear_cost = 0.0
         self._last_projected_costs = {}
         self._last_min_charge_slots = 0
         self._last_charge_slots = []
 
         self.learning_engine = BatteryLearningEngine(
-            battery_capacity_kwh=self.battery_capacity,
-            nominal_charge_rate_kw=self.charge_rate,
-            nominal_efficiency=self.efficiency,
+            battery_capacity_kwh=self.config.battery_capacity,
+            nominal_charge_rate_kw=self.config.charge_rate,
+            nominal_efficiency=self.config.efficiency,
         )
         self.load_profile = LoadProfile(
-            slot_minutes=self.slot_minutes,
-            default_load_w=base_consumption_w,
+            slot_minutes=self.config.slot_minutes,
+            default_load_w=self.config.base_consumption,
         )
 
         # Create cost tracker for project_costs method
         self._cost_tracker = BatteryCostTracker(
             config=BatteryCostConfig(
-                battery_capacity=self.battery_capacity,
-                efficiency=self.efficiency,
-                slot_minutes=self.slot_minutes,
-                charge_rate=self.charge_rate,
-                discharge_rate=self.discharge_rate,
-                grid_fee=self.grid_fee,
-                battery_wear_cost=0.0,
+                battery_capacity=self.config.battery_capacity,
+                efficiency=self.config.efficiency,
+                slot_minutes=self.config.slot_minutes,
+                charge_rate=self.config.charge_rate,
+                discharge_rate=self.config.discharge_rate,
+                grid_fee=self.config.grid_fee,
+                battery_wear_cost=self.config.battery_wear_cost,
             ),
             get_state_func=lambda e: None,
             call_service_func=lambda *a, **k: None,
@@ -84,7 +90,7 @@ class PartialSlotOptimizer:
 
     def _align_to_slot(self, dt: datetime.datetime) -> datetime.datetime:
         minutes = dt.hour * 60 + dt.minute
-        slot_start = (minutes // self.slot_minutes) * self.slot_minutes
+        slot_start = (minutes // self.config.slot_minutes) * self.config.slot_minutes
         return dt.replace(
             hour=slot_start // 60,
             minute=slot_start % 60,
@@ -99,16 +105,16 @@ class PartialSlotOptimizer:
         return 20.0
 
     def _predict_load_kw(self, dt: datetime.datetime) -> float:
-        return self.load_profile.predict_kw(dt, self.load_quantile)
+        return self.load_profile.predict_kw(dt, self.config.load_quantile)
 
     def _get_prices_for_date(self, date, tz):
         return []
 
     def _get_discharge_threshold(self) -> float:
-        return (self.battery_avg_cost / self.efficiency) + self.grid_fee + self.battery_wear_cost
+        return (self.battery_avg_cost / self.config.efficiency) + self.config.grid_fee + self.config.battery_wear_cost
 
     def _get_discharge_threshold_for_cost(self, avg_cost: float) -> float:
-        return (avg_cost / self.efficiency) + self.grid_fee + self.battery_wear_cost
+        return (avg_cost / self.config.efficiency) + self.config.grid_fee + self.config.battery_wear_cost
 
     def _log_schedule_decision_context(self, *args, **kwargs):
         pass

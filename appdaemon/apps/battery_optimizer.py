@@ -16,6 +16,9 @@ from typing import Dict, List, Optional, Tuple
 
 # Import from the battery_optimizer_lib package
 from battery_optimizer_lib import (
+    # Config
+    BatteryOptimizerConfig,
+    # Models
     BatteryMode,
     PricePoint,
     ScheduleEntry,
@@ -105,31 +108,31 @@ class BatteryOptimizer(hass.Hass):
 
         # Self-learning engine for adaptive optimization
         self.learning_engine = BatteryLearningEngine(
-            battery_capacity_kwh=self.battery_capacity,
-            nominal_charge_rate_kw=self.charge_rate,
-            nominal_efficiency=self.efficiency,
-            min_soc=self._default_min_soc,
-            max_soc=self._default_max_soc,
+            battery_capacity_kwh=self.config.battery_capacity,
+            nominal_charge_rate_kw=self.config.charge_rate,
+            nominal_efficiency=self.config.efficiency,
+            min_soc=self.config.default_min_soc,
+            max_soc=self.config.default_max_soc,
             log_func=self.log,
         )
         self._init_learning_engine()
 
         # Load profile for probabilistic scheduling
         self.load_profile = LoadProfile(
-            slot_minutes=self.slot_minutes,
-            default_load_w=self.base_consumption,
-            max_samples=self.load_profile_max_samples,
-            min_samples=self.load_profile_min_samples,
+            slot_minutes=self.config.slot_minutes,
+            default_load_w=self.config.base_consumption,
+            max_samples=self.config.load_profile_max_samples,
+            min_samples=self.config.load_profile_min_samples,
             log_func=self.log,
         )
         self._init_load_profile()
 
         # TOU sync manager for inverter schedule sync
         self._tou_sync_manager = TouSyncManager(
-            device_id=self.device_id,
-            slot_minutes=self.slot_minutes,
-            ha_url=self.args.get("ha_url", ""),
-            ha_token=self.args.get("ha_token", ""),
+            device_id=self.config.device_id,
+            slot_minutes=self.config.slot_minutes,
+            ha_url=self.config.ha_url,
+            ha_token=self.config.ha_token,
             call_service_func=self.call_service,
             get_datetime_func=self.datetime,
             get_timezone_func=self._get_local_timezone,
@@ -141,13 +144,13 @@ class BatteryOptimizer(hass.Hass):
 
         # Nord Pool price service for fetching electricity prices
         self._price_service = NordPoolPriceService(
-            nordpool_config_entry=self.nordpool_config_entry,
-            nordpool_area=self.nordpool_area,
-            nordpool_sensor=self.nordpool_sensor,
-            ha_url=self.args.get("ha_url", ""),
-            ha_token=self.args.get("ha_token", ""),
-            tomorrow_prices_hour=self.tomorrow_prices_hour,
-            slot_minutes=self.slot_minutes,
+            nordpool_config_entry=self.config.nordpool_config_entry,
+            nordpool_area=self.config.nordpool_area,
+            nordpool_sensor=self.config.nordpool_sensor,
+            ha_url=self.config.ha_url,
+            ha_token=self.config.ha_token,
+            tomorrow_prices_hour=self.config.tomorrow_prices_hour,
+            slot_minutes=self.config.slot_minutes,
             get_state_func=self.get_state,
             call_service_func=self.call_service,
             get_datetime_func=self.datetime,
@@ -159,14 +162,14 @@ class BatteryOptimizer(hass.Hass):
         # Schedule formatter for logging and sensor updates
         self._schedule_formatter = ScheduleFormatter(
             config=ScheduleFormatterConfig(
-                slot_minutes=self.slot_minutes,
-                slot_hours=self.slot_hours,
-                battery_capacity=self.battery_capacity,
-                charge_rate=self.charge_rate,
-                discharge_rate=self.discharge_rate,
-                efficiency=self.efficiency,
-                battery_wear_cost=self.battery_wear_cost,
-                decision_log_level=self.decision_log_level,
+                slot_minutes=self.config.slot_minutes,
+                slot_hours=self.config.slot_hours,
+                battery_capacity=self.config.battery_capacity,
+                charge_rate=self.config.charge_rate,
+                discharge_rate=self.config.discharge_rate,
+                efficiency=self.config.efficiency,
+                battery_wear_cost=self.config.battery_wear_cost,
+                decision_log_level=self.config.decision_log_level,
             ),
             log_func=self.log,
             learning_engine=self.learning_engine,
@@ -175,17 +178,17 @@ class BatteryOptimizer(hass.Hass):
         # Battery cost tracker (must be after learning engine and price service)
         self._cost_tracker = BatteryCostTracker(
             config=BatteryCostConfig(
-                battery_cost_entity=self.args.get("battery_cost_entity", "input_number.battery_avg_cost"),
-                battery_charge_sensor=self.battery_charge_sensor,
-                battery_discharge_sensor=self.battery_discharge_sensor,
-                use_inverter_energy_sensors=self.use_inverter_energy_sensors,
-                battery_capacity=self.battery_capacity,
-                efficiency=self.efficiency,
-                slot_minutes=self.slot_minutes,
-                charge_rate=self.charge_rate,
-                discharge_rate=self.discharge_rate,
-                grid_fee=self.grid_fee,
-                battery_wear_cost=self.battery_wear_cost,
+                battery_cost_entity=self.config.battery_cost_entity,
+                battery_charge_sensor=self.config.battery_charge_sensor,
+                battery_discharge_sensor=self.config.battery_discharge_sensor,
+                use_inverter_energy_sensors=self.config.use_inverter_energy_sensors,
+                battery_capacity=self.config.battery_capacity,
+                efficiency=self.config.efficiency,
+                slot_minutes=self.config.slot_minutes,
+                charge_rate=self.config.charge_rate,
+                discharge_rate=self.config.discharge_rate,
+                grid_fee=self.config.grid_fee,
+                battery_wear_cost=self.config.battery_wear_cost,
             ),
             get_state_func=self.get_state,
             call_service_func=self.call_service,
@@ -209,7 +212,7 @@ class BatteryOptimizer(hass.Hass):
 
         # Full re-optimization after Nord Pool publishes tomorrow's prices
         # Uses configured hour (default 14 for EET = 13 CET) plus 15 minutes buffer
-        optimize_hour = self.tomorrow_prices_hour
+        optimize_hour = self.config.tomorrow_prices_hour
         self.run_daily(self.full_optimize, datetime.time(optimize_hour, 15))
 
         # Startup optimization is triggered from _init_battery_cost() after battery cost is loaded
@@ -218,34 +221,34 @@ class BatteryOptimizer(hass.Hass):
         # Adaptive re-evaluation (can be more frequent than schedule slots)
         self.run_every(
             self.adaptive_optimize,
-            self._next_interval_time(self.adaptive_recalc_minutes),
-            self.adaptive_recalc_minutes * 60
+            self._next_interval_time(self.config.adaptive_recalc_minutes),
+            self.config.adaptive_recalc_minutes * 60
         )
 
         # Schedule execution every slot (hourly if slot_minutes=60)
-        self.run_every(self.execute_scheduled_mode, self._next_slot_time(), self.slot_minutes * 60)
+        self.run_every(self.execute_scheduled_mode, self._next_slot_time(), self.config.slot_minutes * 60)
 
         # Record load observations (can be more frequent than schedule slots)
         self.run_every(
             self.record_load_observation,
-            self._next_interval_time(self.load_observation_minutes),
-            self.load_observation_minutes * 60
+            self._next_interval_time(self.config.load_observation_minutes),
+            self.config.load_observation_minutes * 60
         )
 
         # Listen for manual override changes
-        if self.args.get("override_entity"):
-            self.listen_state(self.on_override_change, self.args["override_entity"])
-        if self.args.get("manual_mode_entity"):
-            self.listen_state(self.on_manual_mode_change, self.args["manual_mode_entity"])
+        if self.config.override_entity:
+            self.listen_state(self.on_override_change, self.config.override_entity)
+        if self.config.manual_mode_entity:
+            self.listen_state(self.on_manual_mode_change, self.config.manual_mode_entity)
 
         # Listen to SOC changes for instant response (replaces polling-based checks)
-        self.listen_state(self._on_soc_change, self.soc_sensor)
+        self.listen_state(self._on_soc_change, self.config.soc_sensor)
 
         # Listen to inverter energy sensors (primary trigger when available)
-        if self.use_inverter_energy_sensors:
-            self.listen_state(self._on_energy_sensor_change, self.battery_charge_sensor)
-            self.listen_state(self._on_energy_sensor_change, self.battery_discharge_sensor)
-            self.log(f"Listening to energy sensors: {self.battery_charge_sensor}, {self.battery_discharge_sensor}")
+        if self.config.use_inverter_energy_sensors:
+            self.listen_state(self._on_energy_sensor_change, self.config.battery_charge_sensor)
+            self.listen_state(self._on_energy_sensor_change, self.config.battery_discharge_sensor)
+            self.log(f"Listening to energy sensors: {self.config.battery_charge_sensor}, {self.config.battery_discharge_sensor}")
 
         # Run initial SOC check on startup (listener only fires on changes)
         startup_soc = self._get_current_soc()
@@ -261,115 +264,9 @@ class BatteryOptimizer(hass.Hass):
         self.log("Battery Optimizer initialized successfully")
 
     def _load_config(self):
-        """Load configuration from apps.yaml"""
-        # Nord Pool configuration
-        # For built-in HA integration: set nordpool_config_entry (from diagnostics or HA URL)
-        # For HACS custom component: set nordpool_sensor
-        self.nordpool_config_entry = self.args.get("nordpool_config_entry", "")
-        self.nordpool_area = self.args.get("nordpool_area", "LV")
-        self.nordpool_sensor = self.args.get("nordpool_sensor", "sensor.nord_pool_lv_current_price")
-
-        # Other sensor entities
-        self.soc_sensor = self.args.get("soc_sensor", "sensor.growatt_battery_soc")
-        self.pv_power_sensor = self.args.get("pv_power_sensor", "sensor.growatt_pv_power")
-        self.battery_temp_sensor = self.args.get("battery_temp_sensor", "")
-
-        # Inverter energy sensors for precise energy measurement
-        self.battery_charge_sensor = self.args.get("battery_charge_sensor", "sensor.growatt_battery_charge_today")
-        self.battery_discharge_sensor = self.args.get("battery_discharge_sensor", "sensor.growatt_battery_discharge_today")
-        self.use_inverter_energy_sensors = self.args.get("use_inverter_energy_sensors", True)
-
-        # Nord Pool publishes tomorrow's prices at 13:00 CET
-        # Default to 14 for EET (Latvia, Lithuania, Estonia) which is 13:00 CET
-        # Adjust this based on your local timezone relative to CET
-        self.tomorrow_prices_hour = int(self.args.get("tomorrow_prices_hour", 14))
-
-        self.log(f"Nord Pool config: config_entry='{self.nordpool_config_entry}', area='{self.nordpool_area}', sensor='{self.nordpool_sensor}'")
-        self.log(f"HA connection: ha_url='{self.args.get('ha_url', 'NOT SET')}', ha_token={'SET' if self.args.get('ha_token') else 'NOT SET'}")
-
-        # Device control
-        self.device_id = self.args.get("device_id", "")
-
-        # TOU schedule sync (uses growatt_modbus integration)
-        # When device_id is set and tou_sync_enabled is true, writes schedule to inverter TOU registers
-        self.tou_sync_enabled = self.args.get("tou_sync_enabled", True)
-        if self.tou_sync_enabled and self.device_id:
-            self.log(f"TOU sync enabled via growatt_modbus (device: {self.device_id})")
-
-        # Battery parameters (static - from apps.yaml)
-        self.battery_capacity = float(self.args.get("battery_capacity_kwh", 14.3))
-        self.charge_rate = float(self.args.get("charge_rate_kw", 4.5))
-        self.discharge_rate = float(self.args.get("discharge_rate_kw", self.charge_rate))
-        self.efficiency = float(self.args.get("efficiency", 0.85))
-        self.base_consumption = float(self.args.get("base_consumption_w", 500))
-
-        # Scheduling resolution (minutes per slot)
-        self.slot_minutes = int(self.args.get("slot_minutes", 30))
-        if self.slot_minutes <= 0 or 1440 % self.slot_minutes != 0:
-            self.log(f"Invalid slot_minutes={self.slot_minutes}, falling back to 30", level="WARNING")
-            self.slot_minutes = 30
-        self.slot_hours = self.slot_minutes / 60.0
-
-        # Recalculation and observation intervals (minutes)
-        self.adaptive_recalc_minutes = int(self.args.get("adaptive_recalc_minutes", 30))
-        if self.adaptive_recalc_minutes <= 0 or 1440 % self.adaptive_recalc_minutes != 0:
-            self.log(f"Invalid adaptive_recalc_minutes={self.adaptive_recalc_minutes}, falling back to 30", level="WARNING")
-            self.adaptive_recalc_minutes = 30
-        self.load_observation_minutes = int(self.args.get("load_observation_minutes", self.adaptive_recalc_minutes))
-        if self.load_observation_minutes <= 0 or 1440 % self.load_observation_minutes != 0:
-            self.log(f"Invalid load_observation_minutes={self.load_observation_minutes}, falling back to 30", level="WARNING")
-            self.load_observation_minutes = 30
-
-        # DP resolution for SOC (percent step)
-        self.soc_step_percent = float(self.args.get("soc_step_percent", 1.0))
-        if self.soc_step_percent <= 0:
-            self.soc_step_percent = 1.0
-
-        # Load profile configuration
-        self.load_power_sensor = self.args.get("load_power_sensor", "")
-        self.load_quantile = float(self.args.get("load_quantile", 0.75))
-        self.load_quantile = min(1.0, max(0.0, self.load_quantile))
-        self.load_profile_entity = self.args.get("load_profile_entity", "input_text.battery_load_profile")
-        self.load_profile_max_samples = int(self.args.get("load_profile_max_samples", 60))
-        self.load_profile_min_samples = int(self.args.get("load_profile_min_samples", 6))
-        self.load_zero_floor_w = float(self.args.get("load_zero_floor_w", 450))
-        self.load_profile_file = self.args.get("load_profile_file", "/config/load_profile.json")
-        self.load_profile_last_obs_entity = self.args.get(
-            "load_profile_last_observation_entity",
-            "sensor.load_profile_last_observation"
-        )
-        self.load_profile_count_entity = self.args.get(
-            "load_profile_observation_count_entity",
-            "sensor.load_profile_observation_count"
-        )
-        # Default values (can be overridden by HA input_numbers at runtime)
-        self._default_min_soc = float(self.args.get("min_soc", 10))
-        self._default_max_soc = float(self.args.get("max_soc", 100))
-        self._default_pv_threshold = float(self.args.get("pv_threshold_w", 500))
-
-        # Pricing
-        self.grid_fee = float(self.args.get("grid_fee_eur_kwh", 0.05))
-        self.battery_wear_cost = float(self.args.get("battery_wear_cost_eur_kwh", 0.0))
-        self.export_rate_multiplier = float(self.args.get("export_rate_multiplier", 1.0))
-        self.log(f"Loaded grid_fee: {self.grid_fee} EUR/kWh")
-
-        # HA entities for dynamic config (optional - falls back to defaults)
-        self.min_soc_entity = self.args.get("min_soc_entity", "input_number.battery_min_soc")
-        self.max_soc_entity = self.args.get("max_soc_entity", "input_number.battery_max_soc")
-        self.pv_threshold_entity = self.args.get("pv_threshold_entity", "input_number.battery_pv_threshold")
-        self.soc_deviation_threshold = float(self.args.get("soc_deviation_threshold", 10))
-
-        # Decision transparency logging (0=minimal, 1=summary, 2=verbose)
-        self.decision_log_level = int(self.args.get("decision_log_level", 1))
-
-        # Control entities
-        self.enabled_entity = self.args.get("enabled_entity", "input_boolean.battery_optimizer_enabled")
-        self.override_entity = self.args.get("override_entity", "input_boolean.battery_optimizer_override")
-        self.manual_mode_entity = self.args.get("manual_mode_entity", "input_select.battery_manual_mode")
-
-        self.log(f"Config loaded: capacity={self.battery_capacity}kWh, "
-                 f"charge_rate={self.charge_rate}kW, discharge_rate={self.discharge_rate}kW, "
-                 f"efficiency={self.efficiency}, slot={self.slot_minutes}min")
+        """Load configuration from apps.yaml into typed config object."""
+        self.config = BatteryOptimizerConfig.from_args(self.args, log_func=self.log)
+        self.config.log_summary(self.log)
 
     # =========================================================================
     # Price Fetching (delegates to NordPoolPriceService)
@@ -406,18 +303,18 @@ class BatteryOptimizer(hass.Hass):
         for price_point in sorted(prices, key=lambda p: p.hour):
             # Predict load for this slot
             load_kw = self._predict_load_kw(price_point.hour)
-            load_kwh = min(load_kw, self.discharge_rate) * self.slot_hours
+            load_kwh = min(load_kw, self.config.discharge_rate) * self.config.slot_hours
             total_load_kwh += load_kwh
 
         # Energy available above min_soc
-        usable_energy_kwh = (current_soc - self.min_soc) / 100 * self.battery_capacity
+        usable_energy_kwh = (current_soc - self.min_soc) / 100 * self.config.battery_capacity
 
         # Energy deficit (how much we'd be short)
         energy_deficit_kwh = total_load_kwh - usable_energy_kwh
 
         if energy_deficit_kwh <= 0:
             # We have enough battery to survive the horizon
-            if self.decision_log_level >= 1:
+            if self.config.decision_log_level >= 1:
                 self.log(
                     f"Charge calculation: SOC {current_soc:.1f}% | "
                     f"Usable energy: {usable_energy_kwh:.2f} kWh (above {self.min_soc}% min) | "
@@ -429,17 +326,17 @@ class BatteryOptimizer(hass.Hass):
 
         # We need to charge to avoid hitting min_soc
         # Account for charging efficiency
-        grid_energy_needed = energy_deficit_kwh / self.efficiency
+        grid_energy_needed = energy_deficit_kwh / self.config.efficiency
 
         # Slots at charge rate
-        energy_per_slot = self.charge_rate * self.efficiency * self.slot_hours  # Energy INTO battery per slot
+        energy_per_slot = self.config.charge_rate * self.config.efficiency * self.config.slot_hours  # Energy INTO battery per slot
         if energy_per_slot <= 0:
             return 0
 
         charge_slots_raw = energy_deficit_kwh / energy_per_slot
         charge_slots = math.ceil(charge_slots_raw)
 
-        if self.decision_log_level >= 1:
+        if self.config.decision_log_level >= 1:
             self.log(
                 f"Charge calculation: SOC {current_soc:.1f}% | "
                 f"Usable energy: {usable_energy_kwh:.2f} kWh (above {self.min_soc}% min) | "
@@ -492,22 +389,22 @@ class BatteryOptimizer(hass.Hass):
         # Create optimizer with fresh config (min_soc/max_soc are dynamic properties)
         optimizer = DPOptimizer(
             config=DPOptimizerConfig(
-                battery_capacity=self.battery_capacity,
+                battery_capacity=self.config.battery_capacity,
                 min_soc=self.min_soc,
                 max_soc=self.max_soc,
-                efficiency=self.efficiency,
-                discharge_rate=self.discharge_rate,
-                slot_minutes=self.slot_minutes,
-                soc_step_percent=self.soc_step_percent,
-                grid_fee=self.grid_fee,
-                battery_wear_cost=self.battery_wear_cost,
+                efficiency=self.config.efficiency,
+                discharge_rate=self.config.discharge_rate,
+                slot_minutes=self.config.slot_minutes,
+                soc_step_percent=self.config.soc_step_percent,
+                grid_fee=self.config.grid_fee,
+                battery_wear_cost=self.config.battery_wear_cost,
             ),
             load_predictor=self._predict_load_kw,
             charge_rate_predictor=self.learning_engine.get_charge_rate_for_soc,
             temp_after_charge_predictor=self.learning_engine.predict_temp_after_duration,
             temp_after_idle_predictor=self.learning_engine.predict_temp_after_idle,
             log_fn=self.log,
-            decision_log_level=self.decision_log_level,
+            decision_log_level=self.config.decision_log_level,
         )
 
         # Run optimization
@@ -551,14 +448,14 @@ class BatteryOptimizer(hass.Hass):
             self._last_projected_costs = {}
 
         self.log(f"Schedule generated: {result.charge_count} charge, {result.discharge_count} discharge, "
-                 f"{result.hold_count} hold slots (slot={self.slot_minutes}min, load_quantile={self.load_quantile:.2f}, "
+                 f"{result.hold_count} hold slots (slot={self.config.slot_minutes}min, load_quantile={self.config.load_quantile:.2f}, "
                  f"min_charge_slots={min_charge_slots})")
 
         # Store min_charge_slots for sensor exposure
         self._last_min_charge_slots = min_charge_slots
 
         # Log decision context for transparency
-        if self.decision_log_level >= 1:
+        if self.config.decision_log_level >= 1:
             load_kw = [self._predict_load_kw(p.hour) for p in hours_sorted_by_time]
             self._last_charge_slots = self._schedule_formatter.log_decision_context(
                 prices_sorted=hours_sorted_by_time,
@@ -667,7 +564,7 @@ class BatteryOptimizer(hass.Hass):
     ) -> List[float]:
         """Compute fraction of each slot that is usable (partial first slot)."""
         n_slots = len(hours_sorted_by_time)
-        first_fraction = min(1.0, max(0.0, (self.slot_minutes - minutes_into_slot) / max(1, self.slot_minutes)))
+        first_fraction = min(1.0, max(0.0, (self.config.slot_minutes - minutes_into_slot) / max(1, self.config.slot_minutes)))
         slot_fractions = [1.0] * n_slots
 
         for i, p in enumerate(hours_sorted_by_time):
@@ -697,13 +594,13 @@ class BatteryOptimizer(hass.Hass):
             predict_temp = self.learning_engine.predict_temp_after_duration
         else:
             # Fallback when no learning engine is available
-            get_charge_rate = lambda soc, temp: self.charge_rate
+            get_charge_rate = lambda soc, temp: self.config.charge_rate
             predict_temp = lambda temp, duration: temp if temp is not None else 25.0
 
         return compute_charge_rates_per_slot(
             hours_sorted_by_time=hours_sorted_by_time,
             slot_fractions=slot_fractions,
-            slot_minutes=self.slot_minutes,
+            slot_minutes=self.config.slot_minutes,
             current_soc=current_soc,
             current_temp=current_temp if self.learning_engine else None,
             get_charge_rate_for_soc=get_charge_rate,
@@ -751,37 +648,37 @@ class BatteryOptimizer(hass.Hass):
                     energy_added, end_temp = self.learning_engine.predict_charge_energy_with_warming(
                         current_soc,
                         current_temp,
-                        self.slot_minutes,
+                        self.config.slot_minutes,
                         temp_threshold=16.0
                     )
                     # Apply efficiency (predict_charge_energy_with_warming returns grid energy)
-                    energy_to_battery = energy_added * self.efficiency
-                    soc_increase = (energy_to_battery / self.battery_capacity) * 100
+                    energy_to_battery = energy_added * self.config.efficiency
+                    soc_increase = (energy_to_battery / self.config.battery_capacity) * 100
                     current_soc = min(self.max_soc, current_soc + soc_increase)
                     current_temp = end_temp
                 else:
                     # Fallback: Use SOC-only learned charge rate
-                    effective_charge_rate = self.charge_rate
+                    effective_charge_rate = self.config.charge_rate
                     if self.learning_engine:
                         learned_rate = self.learning_engine.get_charge_rate_for_soc(current_soc)
                         if learned_rate is not None and learned_rate > 0:
                             effective_charge_rate = learned_rate
 
                     # Charging: grid energy * efficiency goes into battery
-                    energy_added = effective_charge_rate * self.efficiency * self.slot_hours
-                    soc_increase = (energy_added / self.battery_capacity) * 100
+                    energy_added = effective_charge_rate * self.config.efficiency * self.config.slot_hours
+                    soc_increase = (energy_added / self.config.battery_capacity) * 100
                     current_soc = min(self.max_soc, current_soc + soc_increase)
 
             elif entry.mode == BatteryMode.DISCHARGE:
                 # Discharging: battery drains at predicted load rate (limited by discharge rate)
                 load_kw = self._predict_load_kw(hour)
-                energy_removed = min(load_kw, self.discharge_rate) * self.slot_hours
-                soc_decrease = (energy_removed / self.battery_capacity) * 100
+                energy_removed = min(load_kw, self.config.discharge_rate) * self.config.slot_hours
+                soc_decrease = (energy_removed / self.config.battery_capacity) * 100
                 current_soc = max(self.min_soc, current_soc - soc_decrease)
                 # Temperature cools toward ambient during discharge (no active warming)
                 if current_temp is not None and self.learning_engine:
                     current_temp = self.learning_engine.predict_temp_after_idle(
-                        current_temp, self.slot_minutes
+                        current_temp, self.config.slot_minutes
                     )
 
             else:  # HOLD
@@ -790,7 +687,7 @@ class BatteryOptimizer(hass.Hass):
                 # Temperature cools toward ambient during idle
                 if current_temp is not None and self.learning_engine:
                     current_temp = self.learning_engine.predict_temp_after_idle(
-                        current_temp, self.slot_minutes
+                        current_temp, self.config.slot_minutes
                     )
 
         return expected_soc, expected_temp
@@ -811,7 +708,7 @@ class BatteryOptimizer(hass.Hass):
             self._last_recalc_trigger = "startup"
         else:
             # Check if this is around the scheduled daily time (within 30 min of tomorrow_prices_hour:15)
-            scheduled_hour = self.tomorrow_prices_hour
+            scheduled_hour = self.config.tomorrow_prices_hour
             if now.hour == scheduled_hour and 0 <= now.minute <= 45:
                 self._last_recalc_trigger = "daily_scheduled"
             else:
@@ -875,7 +772,7 @@ class BatteryOptimizer(hass.Hass):
         self.last_optimization = self.datetime()
 
         # Sync schedule to inverter TOU registers (if configured)
-        if self.tou_sync_enabled and self.device_id:
+        if self.config.tou_sync_enabled and self.config.device_id:
             self._schedule_tou_sync(reason="full_optimize")
 
         # Apply current hour's mode
@@ -907,7 +804,7 @@ class BatteryOptimizer(hass.Hass):
         # Check for solar override
         if pv_power > self.pv_threshold and self.current_mode == BatteryMode.CHARGE:
             self.log(f"Solar override: PV={pv_power}W, switching from charge to hold")
-            if self.tou_sync_enabled and self.device_id:
+            if self.config.tou_sync_enabled and self.config.device_id:
                 self._insert_hold_and_resync("solar_override")
             else:
                 self.set_mode(BatteryMode.HOLD)
@@ -956,7 +853,7 @@ class BatteryOptimizer(hass.Hass):
                 )
 
         # Check if TOU needs rolling update (every adaptive cycle)
-        if self.tou_sync_enabled and self.device_id:
+        if self.config.tou_sync_enabled and self.config.device_id:
             self._check_and_sync_rolling_tou()
 
     def _recalculate_remaining_schedule(self, current_soc: float, extra_charge_slots: int = 0):
@@ -1015,7 +912,7 @@ class BatteryOptimizer(hass.Hass):
         )
 
         # Log recalculated schedule (current/future only)
-        if self.decision_log_level >= 1:
+        if self.config.decision_log_level >= 1:
             self._schedule_formatter.log_schedule(
                 schedule=future_schedule,
                 expected_soc=self.expected_soc_schedule,
@@ -1030,7 +927,7 @@ class BatteryOptimizer(hass.Hass):
             )
 
         # Sync updated schedule to inverter TOU registers (if configured)
-        if self.tou_sync_enabled and self.device_id:
+        if self.config.tou_sync_enabled and self.config.device_id:
             self._schedule_tou_sync(reason="recalculate")
 
         self._update_schedule_sensor()
@@ -1084,7 +981,7 @@ class BatteryOptimizer(hass.Hass):
             self.log(f"Executing scheduled mode for {current_slot}: {entry.mode.name} ({entry.reason})")
 
             # When TOU sync is enabled, avoid hourly set_mode which clears TOU periods (30411=0)
-            if self.tou_sync_enabled and self.device_id:
+            if self.config.tou_sync_enabled and self.config.device_id:
                 # Still track mode transitions for learning engine baseline reset
                 self._handle_mode_transition(entry.mode)
                 self.log("TOU sync enabled; skipping hourly set_mode to preserve inverter TOU schedule")
@@ -1092,7 +989,7 @@ class BatteryOptimizer(hass.Hass):
             self.set_mode(entry.mode)
         else:
             self.log(f"No schedule entry for {current_slot}, defaulting to HOLD")
-            if self.tou_sync_enabled and self.device_id:
+            if self.config.tou_sync_enabled and self.config.device_id:
                 self._handle_mode_transition(BatteryMode.HOLD)
                 self.log("TOU sync enabled; skipping hourly set_mode to preserve inverter TOU schedule")
                 return
@@ -1144,7 +1041,7 @@ class BatteryOptimizer(hass.Hass):
         self._update_schedule_sensor()
 
         # Resync TOU with updated schedule (uses existing async wrapper)
-        if self.tou_sync_enabled and self.device_id:
+        if self.config.tou_sync_enabled and self.config.device_id:
             self._schedule_tou_sync(skip_fit_check=True, reason=f"{reason}_hold_resync")
 
     def _check_soc_boundaries(self, current_soc: float) -> bool:
@@ -1164,7 +1061,7 @@ class BatteryOptimizer(hass.Hass):
         # Stop discharge if SOC too low
         if current_soc <= self.min_soc and self.current_mode == BatteryMode.DISCHARGE:
             self.log(f"Safety: HOLD (battery depleted at {current_soc}%)")
-            if self.tou_sync_enabled and self.device_id:
+            if self.config.tou_sync_enabled and self.config.device_id:
                 self._insert_hold_and_resync("battery_depleted")
             else:
                 self.set_mode(BatteryMode.HOLD)
@@ -1173,7 +1070,7 @@ class BatteryOptimizer(hass.Hass):
         # Stop charge if SOC full
         if current_soc >= self.max_soc and self.current_mode == BatteryMode.CHARGE:
             self.log(f"Safety: Stopping charge, SOC at maximum ({current_soc}%)")
-            if self.tou_sync_enabled and self.device_id:
+            if self.config.tou_sync_enabled and self.config.device_id:
                 self._insert_hold_and_resync("safety_max_soc")
             else:
                 self.set_mode(BatteryMode.HOLD)
@@ -1275,16 +1172,16 @@ class BatteryOptimizer(hass.Hass):
 
         # Create detector with current config (min_soc/max_soc are dynamic properties)
         config = SocDeviationConfig(
-            slot_minutes=self.slot_minutes,
-            charge_rate=self.charge_rate,
-            discharge_rate=self.discharge_rate,
-            efficiency=self.efficiency,
-            battery_capacity=self.battery_capacity,
+            slot_minutes=self.config.slot_minutes,
+            charge_rate=self.config.charge_rate,
+            discharge_rate=self.config.discharge_rate,
+            efficiency=self.config.efficiency,
+            battery_capacity=self.config.battery_capacity,
             min_soc=self.min_soc,
             max_soc=self.max_soc,
-            soc_deviation_threshold=self.soc_deviation_threshold,
-            grid_fee=self.grid_fee,
-            decision_log_level=self.decision_log_level,
+            soc_deviation_threshold=self.config.soc_deviation_threshold,
+            grid_fee=self.config.grid_fee,
+            decision_log_level=self.config.decision_log_level,
         )
         detector = SocDeviationDetector(
             config=config,
@@ -1340,8 +1237,8 @@ class BatteryOptimizer(hass.Hass):
         discharge_kwh = None
         if self._cost_tracker.is_energy_sensor_available:
             try:
-                charge_state = self.get_state(self.battery_charge_sensor)
-                discharge_state = self.get_state(self.battery_discharge_sensor)
+                charge_state = self.get_state(self.config.battery_charge_sensor)
+                discharge_state = self.get_state(self.config.battery_discharge_sensor)
                 if charge_state not in ("unknown", "unavailable", None) and \
                    discharge_state not in ("unknown", "unavailable", None):
                     charge_kwh = float(charge_state)
@@ -1381,7 +1278,7 @@ class BatteryOptimizer(hass.Hass):
 
         # Update mode tracking on success, or always in dry-run mode (no device_id)
         # for state consistency during testing/simulation
-        if success or not self.device_id:
+        if success or not self.config.device_id:
             self._handle_mode_transition(mode)
 
     # =========================================================================
@@ -1419,7 +1316,7 @@ class BatteryOptimizer(hass.Hass):
         if new == "on":
             self.log("Manual override activated")
             # Read and apply manual mode
-            manual_mode = self.get_state(self.manual_mode_entity)
+            manual_mode = self.get_state(self.config.manual_mode_entity)
             self._apply_manual_mode(manual_mode)
         else:
             self.log("Manual override deactivated, resuming schedule")
@@ -1449,7 +1346,7 @@ class BatteryOptimizer(hass.Hass):
             self.log("Manual mode set to Auto, turning off override and resuming schedule")
             try:
                 self.call_service("input_boolean/turn_off",
-                    entity_id=self.override_entity
+                    entity_id=self.config.override_entity
                 )
             except Exception as e:
                 self.log(f"Could not turn off override: {e}", level="WARNING")
@@ -1530,17 +1427,15 @@ class BatteryOptimizer(hass.Hass):
 
     def _init_learning_engine(self):
         """Initialize learning engine from persistent storage (file-based)"""
-        self.learning_data_file = self.args.get("learning_data_file", "")
-
         # Track timing for learning observations
         self._charge_start_soc: Optional[float] = None
         self._charge_start_time: Optional[datetime.datetime] = None
         self._discharge_start_soc: Optional[float] = None
         self._discharge_start_time: Optional[datetime.datetime] = None
 
-        if self.learning_data_file:
+        if self.config.learning_data_file:
             try:
-                with open(self.learning_data_file, "r", encoding="utf-8") as fh:
+                with open(self.config.learning_data_file, "r", encoding="utf-8") as fh:
                     data = fh.read()
                 if data and self.learning_engine.load_from_json(data):
                     summary = self.learning_engine.get_learning_summary()
@@ -1556,9 +1451,9 @@ class BatteryOptimizer(hass.Hass):
     def _init_load_profile(self):
         """Initialize load profile from persistent storage"""
         # Prefer file-based persistence if configured
-        if self.load_profile_file:
+        if self.config.load_profile_file:
             try:
-                with open(self.load_profile_file, "r", encoding="utf-8") as fh:
+                with open(self.config.load_profile_file, "r", encoding="utf-8") as fh:
                     data = fh.read()
                 if data and self.load_profile.load_from_json(data):
                     self.log(f"Loaded load profile from file: {self.load_profile.stats.observation_count} observations")
@@ -1570,9 +1465,9 @@ class BatteryOptimizer(hass.Hass):
                 self.log(f"Could not load load profile file: {e}", level="WARNING")
 
         # Fallback to HA entity if configured
-        if self.load_profile_entity:
+        if self.config.load_profile_entity:
             try:
-                state = self.get_state(self.load_profile_entity)
+                state = self.get_state(self.config.load_profile_entity)
                 if state and state not in ("unknown", "unavailable", ""):
                     if self.load_profile.load_from_json(state):
                         self.log(f"Loaded load profile: {self.load_profile.stats.observation_count} observations")
@@ -1695,22 +1590,22 @@ class BatteryOptimizer(hass.Hass):
         json_data = self.load_profile.to_json()
 
         # Prefer file-based persistence if configured
-        if self.load_profile_file:
+        if self.config.load_profile_file:
             try:
-                with open(self.load_profile_file, "w", encoding="utf-8") as fh:
+                with open(self.config.load_profile_file, "w", encoding="utf-8") as fh:
                     fh.write(json_data)
             except Exception as e:
                 self.log(f"Could not save load profile file: {e}", level="DEBUG")
 
         # Optional HA entity persistence
-        if self.load_profile_entity:
+        if self.config.load_profile_entity:
             try:
                 self.call_service("input_text/set_value",
-                    entity_id=self.load_profile_entity,
+                    entity_id=self.config.load_profile_entity,
                     value=json_data
                 )
             except Exception as e:
-                self.log(f"Could not save load profile to {self.load_profile_entity}: {e}", level="DEBUG")
+                self.log(f"Could not save load profile to {self.config.load_profile_entity}: {e}", level="DEBUG")
 
         self._update_load_profile_sensors()
 
@@ -1719,18 +1614,18 @@ class BatteryOptimizer(hass.Hass):
         try:
             count = self.load_profile.stats.observation_count
             last_obs = self.load_profile.stats.last_observation or ""
-            if self.load_profile_count_entity:
+            if self.config.load_profile_count_entity:
                 self.set_state(
-                    self.load_profile_count_entity,
+                    self.config.load_profile_count_entity,
                     state=str(count),
                     attributes={
                         "friendly_name": "Load Profile Observation Count",
                         "unit_of_measurement": "samples"
                     }
                 )
-            if self.load_profile_last_obs_entity:
+            if self.config.load_profile_last_obs_entity:
                 self.set_state(
-                    self.load_profile_last_obs_entity,
+                    self.config.load_profile_last_obs_entity,
                     state=last_obs,
                     attributes={
                         "friendly_name": "Load Profile Last Observation"
@@ -1741,7 +1636,7 @@ class BatteryOptimizer(hass.Hass):
 
     def record_load_observation(self, kwargs=None):
         """Record current house load into the statistical load profile."""
-        if not self.load_power_sensor:
+        if not self.config.load_power_sensor:
             return
         load_w = self._get_load_power()
         if load_w is None:
@@ -1752,11 +1647,11 @@ class BatteryOptimizer(hass.Hass):
 
     def _save_learning_data(self):
         """Persist learning data to file"""
-        if not self.learning_data_file:
+        if not self.config.learning_data_file:
             return
         try:
             json_data = self.learning_engine.save_to_json()
-            with open(self.learning_data_file, "w", encoding="utf-8") as fh:
+            with open(self.config.learning_data_file, "w", encoding="utf-8") as fh:
                 fh.write(json_data)
         except Exception as e:
             self.log(f"Could not save learning data file: {e}", level="ERROR")
@@ -1806,47 +1701,47 @@ class BatteryOptimizer(hass.Hass):
 
     def _get_current_soc(self) -> Optional[float]:
         """Get current battery SOC."""
-        return self._sensors.get_soc(self.soc_sensor)
+        return self._sensors.get_soc(self.config.soc_sensor)
 
     def _get_pv_power(self) -> float:
         """Get current PV power production."""
-        return self._sensors.get_power(self.pv_power_sensor, default=0.0)
+        return self._sensors.get_power(self.config.pv_power_sensor, default=0.0)
 
     def _get_battery_temp(self) -> Optional[float]:
         """Get current battery temperature in Celsius."""
-        return self._sensors.get_temperature(self.battery_temp_sensor)
+        return self._sensors.get_temperature(self.config.battery_temp_sensor)
 
     def _get_load_power(self) -> Optional[float]:
         """Get current household load in Watts (from configured sensor)."""
-        if not self.load_power_sensor:
+        if not self.config.load_power_sensor:
             return None
-        load_w = self._sensors.get_float(self.load_power_sensor)
+        load_w = self._sensors.get_float(self.config.load_power_sensor)
         if load_w is None:
             return None
         if load_w <= 0:
             # Use last known value or floor when sensor reports zero
             if self._last_nonzero_load_w is not None:
-                return max(self._last_nonzero_load_w, self.load_zero_floor_w)
-            return self.load_zero_floor_w
+                return max(self._last_nonzero_load_w, self.config.load_zero_floor_w)
+            return self.config.load_zero_floor_w
         self._last_nonzero_load_w = load_w
         return load_w
 
     def _predict_load_kw(self, dt: datetime.datetime) -> float:
         """Predict expected load (kW) for a slot using load profile."""
         if self.load_profile:
-            predicted = self.load_profile.predict_kw(dt, self.load_quantile)
+            predicted = self.load_profile.predict_kw(dt, self.config.load_quantile)
         else:
-            predicted = self.base_consumption / 1000.0
+            predicted = self.config.base_consumption / 1000.0
 
         return predicted
 
     def _align_to_slot(self, dt: datetime.datetime) -> datetime.datetime:
         """Floor datetime to the start of the current time slot."""
-        return align_to_slot(dt, self.slot_minutes, self._get_local_timezone())
+        return align_to_slot(dt, self.config.slot_minutes, self._get_local_timezone())
 
     def _next_slot_time(self) -> datetime.datetime:
         """Get the next slot boundary time."""
-        return next_slot_time(self.datetime(), self.slot_minutes, self._get_local_timezone())
+        return next_slot_time(self.datetime(), self.config.slot_minutes, self._get_local_timezone())
 
     def _next_interval_time(self, interval_minutes: int) -> datetime.datetime:
         """Get the next boundary time for a given interval."""
@@ -1854,11 +1749,11 @@ class BatteryOptimizer(hass.Hass):
 
     def _is_enabled(self) -> bool:
         """Check if optimizer is enabled."""
-        return self._sensors.is_on(self.enabled_entity, default=True)
+        return self._sensors.is_on(self.config.enabled_entity, default=True)
 
     def _is_override_active(self) -> bool:
         """Check if manual override is active."""
-        return self._sensors.is_on(self.override_entity, default=False)
+        return self._sensors.is_on(self.config.override_entity, default=False)
 
     def _get_local_timezone(self):
         """
@@ -1902,34 +1797,34 @@ class BatteryOptimizer(hass.Hass):
     def min_soc(self) -> float:
         """Get min SOC from HA entity or default"""
         try:
-            state = self.get_state(self.min_soc_entity)
+            state = self.get_state(self.config.min_soc_entity)
             if state and state not in ("unknown", "unavailable"):
                 return float(state)
         except (ValueError, TypeError):
             pass
-        return self._default_min_soc
+        return self.config.default_min_soc
 
     @property
     def max_soc(self) -> float:
         """Get max SOC from HA entity or default"""
         try:
-            state = self.get_state(self.max_soc_entity)
+            state = self.get_state(self.config.max_soc_entity)
             if state and state not in ("unknown", "unavailable"):
                 return float(state)
         except (ValueError, TypeError):
             pass
-        return self._default_max_soc
+        return self.config.default_max_soc
 
     @property
     def pv_threshold(self) -> float:
         """Get PV threshold from HA entity or default"""
         try:
-            state = self.get_state(self.pv_threshold_entity)
+            state = self.get_state(self.config.pv_threshold_entity)
             if state and state not in ("unknown", "unavailable"):
                 return float(state)
         except (ValueError, TypeError):
             pass
-        return self._default_pv_threshold
+        return self.config.default_pv_threshold
 
     @property
     def battery_avg_cost(self) -> float:
@@ -1962,7 +1857,7 @@ class BatteryOptimizer(hass.Hass):
         from battery_optimizer_lib.load_profile import _quantile
 
         stats = []
-        slots_per_hour = max(1, 60 // self.slot_minutes)
+        slots_per_hour = max(1, 60 // self.config.slot_minutes)
 
         for hour in range(24):
             # Collect samples from all slots in this hour

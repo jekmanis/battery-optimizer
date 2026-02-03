@@ -17,7 +17,13 @@ from battery_optimizer import (
     PricePoint,
     ScheduleEntry,
 )
-from battery_optimizer_lib import BatteryCostTracker, BatteryCostConfig, ScheduleFormatter, ScheduleFormatterConfig
+from battery_optimizer_lib import (
+    BatteryCostTracker,
+    BatteryCostConfig,
+    BatteryOptimizerConfig,
+    ScheduleFormatter,
+    ScheduleFormatterConfig,
+)
 
 
 class MockOptimizer:
@@ -42,19 +48,25 @@ class MockOptimizer:
         load_quantile: float = 0.75,
         soc_step_percent: float = 1.0,
     ):
-        # Battery parameters
-        self.battery_capacity = battery_capacity
-        self.charge_rate = charge_rate
-        self.discharge_rate = discharge_rate
-        self.efficiency = efficiency
-        self.grid_fee = grid_fee
-        self.slot_minutes = slot_minutes
-        self.slot_hours = slot_minutes / 60.0
+        # Create config object (new pattern)
+        self.config = BatteryOptimizerConfig(
+            battery_capacity=battery_capacity,
+            charge_rate=charge_rate,
+            discharge_rate=discharge_rate,
+            efficiency=efficiency,
+            grid_fee=grid_fee,
+            slot_minutes=slot_minutes,
+            base_consumption=base_consumption,
+            load_quantile=load_quantile,
+            soc_step_percent=soc_step_percent,
+            default_min_soc=min_soc,
+            default_max_soc=max_soc,
+            decision_log_level=0,
+            battery_wear_cost=0.0,
+        )
+
+        # Legacy attributes for backward compatibility with tests
         self.battery_avg_cost = battery_avg_cost
-        self.base_consumption = base_consumption
-        self.load_quantile = load_quantile
-        self.soc_step_percent = soc_step_percent
-        self.decision_log_level = 0
 
         # Dynamic properties (simulated as simple values)
         self.min_soc = min_soc
@@ -65,34 +77,33 @@ class MockOptimizer:
 
         # Learning engine
         self.learning_engine = BatteryLearningEngine(
-            battery_capacity_kwh=battery_capacity,
-            nominal_charge_rate_kw=charge_rate,
-            nominal_efficiency=efficiency,
+            battery_capacity_kwh=self.config.battery_capacity,
+            nominal_charge_rate_kw=self.config.charge_rate,
+            nominal_efficiency=self.config.efficiency,
         )
 
         # Load profile
         self.load_profile = LoadProfile(
-            slot_minutes=slot_minutes,
-            default_load_w=base_consumption,
+            slot_minutes=self.config.slot_minutes,
+            default_load_w=self.config.base_consumption,
         )
 
         # Internal state
         self._last_min_charge_slots = 0
         self._last_charge_slots = []
         self._last_projected_costs = {}
-        self.battery_wear_cost = 0.0
 
         # Schedule formatter for logging
         self._schedule_formatter = ScheduleFormatter(
             config=ScheduleFormatterConfig(
-                slot_minutes=slot_minutes,
-                slot_hours=self.slot_hours,
-                battery_capacity=battery_capacity,
-                charge_rate=charge_rate,
-                discharge_rate=discharge_rate,
-                efficiency=efficiency,
-                battery_wear_cost=0.0,
-                decision_log_level=0,
+                slot_minutes=self.config.slot_minutes,
+                slot_hours=self.config.slot_hours,
+                battery_capacity=self.config.battery_capacity,
+                charge_rate=self.config.charge_rate,
+                discharge_rate=self.config.discharge_rate,
+                efficiency=self.config.efficiency,
+                battery_wear_cost=self.config.battery_wear_cost,
+                decision_log_level=self.config.decision_log_level,
             ),
             log_func=self.log,
             learning_engine=self.learning_engine,
@@ -101,13 +112,13 @@ class MockOptimizer:
         # Create cost tracker for project_costs method
         self._cost_tracker = BatteryCostTracker(
             config=BatteryCostConfig(
-                battery_capacity=battery_capacity,
-                efficiency=efficiency,
-                slot_minutes=slot_minutes,
-                charge_rate=charge_rate,
-                discharge_rate=discharge_rate,
-                grid_fee=grid_fee,
-                battery_wear_cost=0.0,
+                battery_capacity=self.config.battery_capacity,
+                efficiency=self.config.efficiency,
+                slot_minutes=self.config.slot_minutes,
+                charge_rate=self.config.charge_rate,
+                discharge_rate=self.config.discharge_rate,
+                grid_fee=self.config.grid_fee,
+                battery_wear_cost=self.config.battery_wear_cost,
             ),
             get_state_func=lambda e: None,
             call_service_func=lambda *a, **k: None,
@@ -140,7 +151,7 @@ class MockOptimizer:
     def _align_to_slot(self, dt: datetime.datetime) -> datetime.datetime:
         """Align datetime to slot boundary."""
         minutes = dt.hour * 60 + dt.minute
-        slot_start = (minutes // self.slot_minutes) * self.slot_minutes
+        slot_start = (minutes // self.config.slot_minutes) * self.config.slot_minutes
         return dt.replace(
             hour=slot_start // 60,
             minute=slot_start % 60,
@@ -158,7 +169,7 @@ class MockOptimizer:
 
     def _predict_load_kw(self, dt: datetime.datetime) -> float:
         """Predict load for given time."""
-        return self.load_profile.predict_kw(dt, self.load_quantile)
+        return self.load_profile.predict_kw(dt, self.config.load_quantile)
 
     def _get_prices_for_date(self, date, tz):
         """Return empty list (no yesterday prices in tests)."""
@@ -166,7 +177,7 @@ class MockOptimizer:
 
     def _get_discharge_threshold(self) -> float:
         """Calculate discharge price threshold."""
-        return (self.battery_avg_cost / self.efficiency) + self.grid_fee
+        return (self.battery_avg_cost / self.config.efficiency) + self.config.grid_fee
 
     def _log_schedule_decision_context(self, *args, **kwargs):
         """No-op for tests."""
@@ -582,7 +593,7 @@ class TestDischargeVsHoldDecision:
             battery_avg_cost=0.05,
             base_consumption=500,  # 0.5 kW load
         )
-        optimizer.decision_log_level = 3  # Enable deep tracing
+        optimizer.config.decision_log_level = 3  # Enable deep tracing
 
         # Override log to capture output
         log_output = []
@@ -666,7 +677,7 @@ class TestDischargeVsHoldDecision:
             battery_avg_cost=0.10,  # Higher battery cost - this raises discharge threshold
             base_consumption=500,
         )
-        optimizer.decision_log_level = 3
+        optimizer.config.decision_log_level = 3
 
         log_output = []
         def capture_log(message, level="INFO"):
@@ -719,8 +730,8 @@ class TestDischargeVsHoldDecision:
         first_entry = schedule.get(first_slot)
 
         # Calculate expected discharge threshold
-        discharge_threshold = (optimizer.battery_avg_cost / optimizer.efficiency) + optimizer.grid_fee
-        buy_price_23 = 0.1257 + optimizer.grid_fee
+        discharge_threshold = (optimizer.battery_avg_cost / optimizer.config.efficiency) + optimizer.config.grid_fee
+        buy_price_23 = 0.1257 + optimizer.config.grid_fee
         print(f"\nDischarge threshold: {discharge_threshold:.4f}")
         print(f"Buy price at 23:00: {buy_price_23:.4f}")
         print(f"Discharge allowed: {buy_price_23 >= discharge_threshold}")

@@ -19,7 +19,7 @@ apps_dir = Path(__file__).parent.parent / "appdaemon" / "apps"
 sys.path.insert(0, str(apps_dir))
 
 from battery_optimizer import BatteryMode, ScheduleEntry, BatteryOptimizer
-from battery_optimizer_lib import BatteryLearningEngine, ScheduleFormatter, ScheduleFormatterConfig
+from battery_optimizer_lib import BatteryLearningEngine, BatteryOptimizerConfig, ScheduleFormatter, ScheduleFormatterConfig
 
 
 class MockSocDeviationOptimizer:
@@ -31,18 +31,22 @@ class MockSocDeviationOptimizer:
         self.schedule: Dict[datetime.datetime, ScheduleEntry] = {}
         self.expected_soc_schedule: Dict[datetime.datetime, float] = {}
         self._current_datetime = datetime.datetime(2024, 1, 15, 5, 22, 0)
-        self.slot_minutes = 60
-        self.slot_hours = 1.0
-        self.soc_deviation_threshold = 4.0
-        self.battery_capacity = 14.3  # kWh
-        self.charge_rate = 4.27  # kW (theoretical)
-        self.discharge_rate = 4.27  # kW
-        self.efficiency = 0.95
         self.max_soc = 100.0
         self.min_soc = 10.0
         self.current_mode = BatteryMode.CHARGE
-        self.decision_log_level = 1
         self.learning_engine: Optional[BatteryLearningEngine] = None
+
+        # Create config object
+        self.config = BatteryOptimizerConfig(
+            slot_minutes=60,
+            battery_capacity=14.3,
+            charge_rate=4.27,
+            discharge_rate=4.27,
+            efficiency=0.95,
+            soc_deviation_threshold=4.0,
+            decision_log_level=1,
+            grid_fee=0.05,
+        )
 
         # Tracking
         self._recalculate_calls = []
@@ -92,7 +96,7 @@ class MockSocDeviationOptimizer:
     @property
     def grid_fee(self):
         """Return mock grid fee (can be overridden in tests)."""
-        return getattr(self, '_grid_fee', 0.05)
+        return getattr(self, '_grid_fee', self.config.grid_fee)
 
     @grid_fee.setter
     def grid_fee(self, value):
@@ -280,7 +284,7 @@ class TestSocDeviationDuringDischarge:
             slot_10: 80.0,
         }
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 10, 30, 0)
-        optimizer.soc_deviation_threshold = 4.0
+        optimizer.config.soc_deviation_threshold = 4.0
 
         # Expected at 30 min: 80 - 1.75 = 78.25%
         # Actual: 90% (11.75% ahead - way more than 2x threshold of 8%)
@@ -337,7 +341,7 @@ class TestSocDeviationEdgeCases:
             slot_10: 50.0,
         }
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 10, 30, 0)
-        optimizer.soc_deviation_threshold = 4.0
+        optimizer.config.soc_deviation_threshold = 4.0
 
         # During HOLD mode, expected_soc_now = 50.0 (no change)
         # Actual: 52% (2% deviation, within threshold)
@@ -723,11 +727,15 @@ class TestExpectedSocCalculationWithLearnedRate:
         # Create a mock optimizer with just the needed attributes
         class MockCalculateOptimizer:
             def __init__(self):
-                self.charge_rate = 4.27  # Theoretical
-                self.discharge_rate = 4.27
-                self.efficiency = 0.95
-                self.slot_hours = 1.0
-                self.battery_capacity = 14.3
+                self.config = BatteryOptimizerConfig(
+                    charge_rate=4.27,
+                    discharge_rate=4.27,
+                    efficiency=0.95,
+                    slot_minutes=60,
+                    battery_capacity=14.3,
+                    default_min_soc=10.0,
+                    default_max_soc=100.0,
+                )
                 self.max_soc = 100.0
                 self.min_soc = 10.0
                 self.learning_engine = BatteryLearningEngine(battery_capacity_kwh=14.3)
@@ -1025,7 +1033,7 @@ class TestExtraChargeSlotsWhenBehindSchedule:
 
         # Mock _get_discharge_threshold to return a high value (so charging is economical)
         optimizer._get_discharge_threshold = lambda: 0.20  # Higher than charge price + grid fee
-        optimizer.grid_fee = 0.05
+        optimizer.config.grid_fee = 0.05
 
         current_soc = 55.0
 
@@ -1082,7 +1090,7 @@ class TestExtraChargeSlotsWhenBehindSchedule:
 
         # Low discharge threshold - charging is not economical
         optimizer._get_discharge_threshold = lambda: 0.20  # Lower than 0.25 + 0.05 grid fee
-        optimizer.grid_fee = 0.05
+        optimizer.config.grid_fee = 0.05
 
         current_soc = 55.0
 
@@ -1140,7 +1148,7 @@ class TestExtraChargeSlotsWhenBehindSchedule:
         optimizer.get_prices = lambda: optimizer._prices
 
         optimizer._get_discharge_threshold = lambda: 0.20
-        optimizer.grid_fee = 0.05
+        optimizer.config.grid_fee = 0.05
 
         current_soc = 55.0
 
@@ -1187,7 +1195,7 @@ class TestExtraChargeSlotsWhenBehindSchedule:
         ]
         optimizer.get_prices = lambda: optimizer._prices
         optimizer._get_discharge_threshold = lambda: 0.20
-        optimizer.grid_fee = 0.05
+        optimizer.config.grid_fee = 0.05
 
         result = optimizer._check_soc_deviation(current_soc)
 
@@ -1251,7 +1259,7 @@ class TestExtraChargeSlotsWhenBehindSchedule:
         optimizer.get_prices = lambda: optimizer._prices
 
         optimizer._get_discharge_threshold = lambda: 0.20
-        optimizer.grid_fee = 0.05
+        optimizer.config.grid_fee = 0.05
 
         current_soc = 55.0
 
@@ -1368,8 +1376,12 @@ class TestRecalculateRemainingScheduleWithExtraSlots:
         # This test verifies the logging behavior to confirm the parameter is used
         class MockRecalculateOptimizer:
             def __init__(self):
-                self.slot_minutes = 60
-                self.slot_hours = 1.0
+                self.config = BatteryOptimizerConfig(
+                    slot_minutes=60,
+                    tou_sync_enabled=False,
+                    device_id="",
+                    decision_log_level=1,
+                )
                 self._log_messages = []
                 self._min_charge_slots_used = None
 
@@ -1419,9 +1431,6 @@ class TestRecalculateRemainingScheduleWithExtraSlots:
         opt.schedule = {}
         opt.expected_soc_schedule = {}
         opt.expected_temp_schedule = {}
-        opt.tou_sync_enabled = False
-        opt.device_id = ""
-        opt.decision_log_level = 1
         opt.min_soc = 10.0
         opt.max_soc = 100.0
         opt._last_dp_soc_trajectory = {}

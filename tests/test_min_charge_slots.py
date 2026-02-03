@@ -11,6 +11,7 @@ from typing import List
 import pytest
 
 from battery_optimizer import BatteryOptimizer, PricePoint
+from battery_optimizer_lib import BatteryOptimizerConfig
 
 
 class MockMinChargeOptimizer:
@@ -30,14 +31,19 @@ class MockMinChargeOptimizer:
         slot_minutes: int = 60,
         predicted_load_kw: float = 0.5,  # Default constant load
     ):
-        self.battery_capacity = battery_capacity
-        self.charge_rate = charge_rate
-        self.discharge_rate = discharge_rate
-        self.efficiency = efficiency
+        # Create config object
+        self.config = BatteryOptimizerConfig(
+            battery_capacity=battery_capacity,
+            charge_rate=charge_rate,
+            discharge_rate=discharge_rate,
+            efficiency=efficiency,
+            default_min_soc=min_soc,
+            slot_minutes=slot_minutes,
+            decision_log_level=0,
+        )
+
+        # Dynamic properties
         self.min_soc = min_soc
-        self.slot_minutes = slot_minutes
-        self.slot_hours = slot_minutes / 60.0
-        self.decision_log_level = 0
 
         # Configurable load prediction
         self._predicted_load_kw = predicted_load_kw
@@ -278,7 +284,7 @@ class TestMinChargeSlots:
         # discharge_rate is 4.5 kW
         # Setting load above this should be capped
         optimizer._predicted_load_kw = 10.0  # Well above discharge rate
-        optimizer.discharge_rate = 4.5
+        optimizer.config.discharge_rate = 4.5
         prices = make_prices(base_time, 4)
 
         # Load is capped: min(10.0, 4.5) * 4 hours = 18.0 kWh

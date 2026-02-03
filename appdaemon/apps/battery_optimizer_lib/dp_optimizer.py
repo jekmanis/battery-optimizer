@@ -333,21 +333,29 @@ class DPOptimizer:
         # Discharge cost: only wear cost (battery degradation)
         discharge_cost_per_kwh = cfg.battery_wear_cost
 
-        dp = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
-        dp_tie = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
+        # Allocate DP buffers and template row for efficient reset
+        _neg_inf_row = [neg_inf] * n_states
+        dp_a = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
+        dp_b = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
+        dp_tie_a = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
+        dp_tie_b = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
 
         if start_idx_override is None:
             start_idx_local = _energy_to_index(start_energy_kwh, min_energy, step_kwh, n_states, "round")
         else:
             start_idx_local = min(max(start_idx_override, 0), n_states - 1)
         start_c = min(max(start_c, 0), max_charge_slots)
-        dp[start_c][start_idx_local] = 0.0
-        dp_tie[start_c][start_idx_local] = 0.0
 
-        prev_idx = [[[None] * n_states for _ in range(max_charge_slots + 1)] for _ in range(n_list_slots)]
-        prev_c = [[[None] * n_states for _ in range(max_charge_slots + 1)] for _ in range(n_list_slots)]
-        prev_action = [[[None] * n_states for _ in range(max_charge_slots + 1)] for _ in range(n_list_slots)]
-        prev_partial = [[[False] * n_states for _ in range(max_charge_slots + 1)] for _ in range(n_list_slots)]
+        # Initialize starting state in dp_a
+        dp_a[start_c][start_idx_local] = 0.0
+        dp_tie_a[start_c][start_idx_local] = 0.0
+        dp, next_dp = dp_a, dp_b
+        dp_tie, next_dp_tie = dp_tie_a, dp_tie_b
+
+        prev_idx = [None] * n_list_slots
+        prev_c = [None] * n_list_slots
+        prev_action = [None] * n_list_slots
+        prev_partial = [None] * n_list_slots
 
         def _should_update(curr_val: float, curr_tie: float, cand_val: float, cand_tie: float) -> bool:
             if cand_val > curr_val + tie_val_eps:
@@ -368,8 +376,10 @@ class DPOptimizer:
             charge_cost_kwh = slot_charge_rate * cfg.slot_hours * fraction
             charge_count_increment = 1
 
-            next_dp = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
-            next_dp_tie = [[neg_inf] * n_states for _ in range(max_charge_slots + 1)]
+            # Reset next_dp buffers using slice assignment (faster than nested loop)
+            for c in range(max_charge_slots + 1):
+                next_dp[c][:] = _neg_inf_row
+                next_dp_tie[c][:] = _neg_inf_row
             next_prev_idx = [[None] * n_states for _ in range(max_charge_slots + 1)]
             next_prev_c = [[None] * n_states for _ in range(max_charge_slots + 1)]
             next_prev_action = [[None] * n_states for _ in range(max_charge_slots + 1)]
@@ -509,8 +519,9 @@ class DPOptimizer:
                             for i, v, a in top_states
                         ))
 
-            dp = next_dp
-            dp_tie = next_dp_tie
+            # Swap buffers instead of reassigning
+            dp, next_dp = next_dp, dp
+            dp_tie, next_dp_tie = next_dp_tie, dp_tie
             prev_idx[t] = next_prev_idx
             prev_c[t] = next_prev_c
             prev_action[t] = next_prev_action

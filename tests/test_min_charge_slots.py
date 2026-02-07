@@ -74,7 +74,7 @@ MockMinChargeOptimizer.calculate_min_charge_slots_for_horizon = (
 def make_prices(start_time: datetime.datetime, count: int) -> List[PricePoint]:
     """Create a list of price points starting from given time."""
     return [
-        PricePoint(hour=start_time + datetime.timedelta(hours=i), price=0.10)
+        PricePoint(time=start_time + datetime.timedelta(hours=i), price=0.10)
         for i in range(count)
     ]
 

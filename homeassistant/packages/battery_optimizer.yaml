@@ -179,9 +179,12 @@ template:
         state: >-
           {% set schedule = state_attr('sensor.battery_optimizer', 'schedule') %}
           {% if schedule %}
+            {% set slot_min = state_attr('sensor.battery_optimizer', 'slot_minutes') | default(15) | float %}
             {% set charge = schedule | selectattr('mode', 'eq', 'CHARGE') | list | count %}
             {% set discharge = schedule | selectattr('mode', 'eq', 'DISCHARGE') | list | count %}
-            {{ charge }}h charge / {{ discharge }}h discharge
+            {% set ch = (charge * slot_min / 60) | round(1) %}
+            {% set dh = (discharge * slot_min / 60) | round(1) %}
+            {{ ch }}h charge / {{ dh }}h discharge
           {% else %}
             No schedule
           {% endif %}
@@ -189,21 +192,24 @@ template:
           charge_hours: >-
             {% set schedule = state_attr('sensor.battery_optimizer', 'schedule') %}
             {% if schedule %}
-              {{ schedule | selectattr('mode', 'eq', 'CHARGE') | list | count }}
+              {% set slot_min = state_attr('sensor.battery_optimizer', 'slot_minutes') | default(15) | float %}
+              {{ (schedule | selectattr('mode', 'eq', 'CHARGE') | list | count * slot_min / 60) | round(2) }}
             {% else %}
               0
             {% endif %}
           discharge_hours: >-
             {% set schedule = state_attr('sensor.battery_optimizer', 'schedule') %}
             {% if schedule %}
-              {{ schedule | selectattr('mode', 'eq', 'DISCHARGE') | list | count }}
+              {% set slot_min = state_attr('sensor.battery_optimizer', 'slot_minutes') | default(15) | float %}
+              {{ (schedule | selectattr('mode', 'eq', 'DISCHARGE') | list | count * slot_min / 60) | round(2) }}
             {% else %}
               0
             {% endif %}
           hold_hours: >-
             {% set schedule = state_attr('sensor.battery_optimizer', 'schedule') %}
             {% if schedule %}
-              {{ schedule | selectattr('mode', 'eq', 'HOLD') | list | count }}
+              {% set slot_min = state_attr('sensor.battery_optimizer', 'slot_minutes') | default(15) | float %}
+              {{ (schedule | selectattr('mode', 'eq', 'HOLD') | list | count * slot_min / 60) | round(2) }}
             {% else %}
               0
             {% endif %}
@@ -291,9 +297,10 @@ automation:
           message: >-
             {% set schedule = state_attr('sensor.battery_optimizer', 'schedule') %}
             {% if schedule %}
+              {% set slot_min = state_attr('sensor.battery_optimizer', 'slot_minutes') | default(15) | float %}
               {% set charge = schedule | selectattr('mode', 'eq', 'CHARGE') | list | count %}
               {% set discharge = schedule | selectattr('mode', 'eq', 'DISCHARGE') | list | count %}
-              New schedule: {{ charge }}h charge, {{ discharge }}h discharge.
+              New schedule: {{ (charge * slot_min / 60) | round(1) }}h charge, {{ (discharge * slot_min / 60) | round(1) }}h discharge.
               Next charge: {{ state_attr('sensor.battery_optimizer', 'next_charge') | default('None') }}
               Next discharge: {{ state_attr('sensor.battery_optimizer', 'next_discharge') | default('None') }}
             {% else %}

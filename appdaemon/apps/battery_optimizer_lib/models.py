@@ -21,14 +21,14 @@ class BatteryMode(Enum):
 @dataclass
 class PricePoint:
     """Represents a single time-slot price data point."""
-    hour: datetime.datetime
+    time: datetime.datetime
     price: float
 
 
 @dataclass
 class ScheduleEntry:
     """Represents a scheduled battery mode for a specific time slot."""
-    hour: datetime.datetime
+    time: datetime.datetime
     mode: BatteryMode
     reason: str
 

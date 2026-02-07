@@ -242,12 +242,12 @@ class TestFindOptimalSchedule:
         # If we have both, charge prices should generally be lower than discharge
         if charge_slots and discharge_slots:
             avg_charge_price = sum(
-                next(p.price for p in sample_prices if p.hour == e.hour)
+                next(p.price for p in sample_prices if p.time == e.time)
                 for e in charge_slots
             ) / len(charge_slots)
 
             avg_discharge_price = sum(
-                next(p.price for p in sample_prices if p.hour == e.hour)
+                next(p.price for p in sample_prices if p.time == e.time)
                 for e in discharge_slots
             ) / len(discharge_slots)
 
@@ -264,7 +264,7 @@ class TestFindOptimalSchedule:
         schedule = optimizer.find_optimal_schedule(sample_prices, 3, current_soc=25)
 
         # With low starting SOC, first few actions should include charging
-        sorted_entries = sorted(schedule.values(), key=lambda e: e.hour)
+        sorted_entries = sorted(schedule.values(), key=lambda e: e.time)
         early_entries = sorted_entries[:6]  # First 6 hours
 
         early_charges = sum(1 for e in early_entries if e.mode == BatteryMode.CHARGE)
@@ -294,7 +294,7 @@ class TestFindOptimalSchedule:
         # Find the expensive hours (peak prices)
         expensive_entries = [
             e for e in schedule.values()
-            if e.hour.hour in [7, 8, 9, 17, 18, 19]  # Peak price hours
+            if e.time.hour in [7, 8, 9, 17, 18, 19]  # Peak price hours
         ]
 
         # With extreme price spikes, should discharge during expensive hours
@@ -305,7 +305,7 @@ class TestFindOptimalSchedule:
         # (at negative prices, we get paid to import from grid!)
         negative_price_entries = [
             e for e in schedule.values()
-            if e.hour.hour in [0, 1]  # Negative price hours
+            if e.time.hour in [0, 1]  # Negative price hours
         ]
         negative_discharges = [e for e in negative_price_entries if e.mode == BatteryMode.DISCHARGE]
         assert len(negative_discharges) == 0, "Should not discharge at negative price hours"
@@ -314,7 +314,7 @@ class TestFindOptimalSchedule:
         # The DP should prioritize high-value discharge opportunities
         cheap_positive_entries = [
             e for e in schedule.values()
-            if e.hour.hour in [2, 3, 4, 5]  # Very cheap but positive prices
+            if e.time.hour in [2, 3, 4, 5]  # Very cheap but positive prices
         ]
         cheap_discharges = [e for e in cheap_positive_entries if e.mode == BatteryMode.DISCHARGE]
         # With zero wear cost, discharging at any positive price is valid
@@ -428,7 +428,7 @@ class TestFindOptimalSchedule:
             assert isinstance(entry, ScheduleEntry)
 
             # Entry hour should match key
-            assert entry.hour == hour
+            assert entry.time == hour
 
             # Mode should be valid
             assert entry.mode in [BatteryMode.HOLD, BatteryMode.CHARGE, BatteryMode.DISCHARGE]
@@ -442,7 +442,7 @@ class TestFindOptimalSchedule:
 
         base_time = datetime.datetime(2024, 1, 15, 0, 0, 0)
         prices = [
-            PricePoint(hour=base_time + datetime.timedelta(minutes=30 * i), price=0.05 + i * 0.01)
+            PricePoint(time=base_time + datetime.timedelta(minutes=30 * i), price=0.05 + i * 0.01)
             for i in range(48)  # 24 hours at 30-min slots
         ]
 
@@ -461,7 +461,7 @@ class TestFindOptimalSchedule:
 
         base_time = datetime.datetime(2024, 1, 15, 0, 0, 0)
         prices = [
-            PricePoint(hour=base_time + datetime.timedelta(hours=i), price=0.05 + i * 0.01)
+            PricePoint(time=base_time + datetime.timedelta(hours=i), price=0.05 + i * 0.01)
             for i in range(24)
         ]
 
@@ -516,7 +516,7 @@ class TestScheduleConsistency:
         schedule = optimizer.find_optimal_schedule(sample_prices, 0, current_soc=35)
 
         # Count consecutive discharges from start
-        sorted_entries = sorted(schedule.values(), key=lambda e: e.hour)
+        sorted_entries = sorted(schedule.values(), key=lambda e: e.time)
 
         consecutive_discharges = 0
         for entry in sorted_entries:
@@ -534,7 +534,7 @@ class TestScheduleConsistency:
         """Should handle schedule with single price point."""
         single_price = [
             PricePoint(
-                hour=datetime.datetime(2024, 1, 15, 10, 0, 0),
+                time=datetime.datetime(2024, 1, 15, 10, 0, 0),
                 price=0.10
             )
         ]
@@ -551,7 +551,7 @@ class TestScheduleConsistency:
         # 48 hours of prices
         long_prices = [
             PricePoint(
-                hour=base_time + datetime.timedelta(hours=i),
+                time=base_time + datetime.timedelta(hours=i),
                 price=0.05 + (i % 24) * 0.005
             )
             for i in range(48)
@@ -607,28 +607,28 @@ class TestDischargeVsHoldDecision:
         base_time = datetime.datetime(2024, 1, 15, 23, 0, 0)
         prices = [
             # Today 23:00 - moderate price, discharge should be allowed
-            PricePoint(hour=base_time, price=0.1257),
+            PricePoint(time=base_time, price=0.1257),
             # Tomorrow 00:00-06:00 - cheap overnight (some negative)
-            PricePoint(hour=base_time + datetime.timedelta(hours=1), price=-0.02),
-            PricePoint(hour=base_time + datetime.timedelta(hours=2), price=-0.01),
-            PricePoint(hour=base_time + datetime.timedelta(hours=3), price=0.01),
-            PricePoint(hour=base_time + datetime.timedelta(hours=4), price=0.02),
-            PricePoint(hour=base_time + datetime.timedelta(hours=5), price=0.03),
-            PricePoint(hour=base_time + datetime.timedelta(hours=6), price=0.05),
+            PricePoint(time=base_time + datetime.timedelta(hours=1), price=-0.02),
+            PricePoint(time=base_time + datetime.timedelta(hours=2), price=-0.01),
+            PricePoint(time=base_time + datetime.timedelta(hours=3), price=0.01),
+            PricePoint(time=base_time + datetime.timedelta(hours=4), price=0.02),
+            PricePoint(time=base_time + datetime.timedelta(hours=5), price=0.03),
+            PricePoint(time=base_time + datetime.timedelta(hours=6), price=0.05),
             # Tomorrow 07:00-12:00 - moderate morning
-            PricePoint(hour=base_time + datetime.timedelta(hours=7), price=0.10),
-            PricePoint(hour=base_time + datetime.timedelta(hours=8), price=0.12),
-            PricePoint(hour=base_time + datetime.timedelta(hours=9), price=0.10),
-            PricePoint(hour=base_time + datetime.timedelta(hours=10), price=0.08),
-            PricePoint(hour=base_time + datetime.timedelta(hours=11), price=0.07),
-            PricePoint(hour=base_time + datetime.timedelta(hours=12), price=0.08),
+            PricePoint(time=base_time + datetime.timedelta(hours=7), price=0.10),
+            PricePoint(time=base_time + datetime.timedelta(hours=8), price=0.12),
+            PricePoint(time=base_time + datetime.timedelta(hours=9), price=0.10),
+            PricePoint(time=base_time + datetime.timedelta(hours=10), price=0.08),
+            PricePoint(time=base_time + datetime.timedelta(hours=11), price=0.07),
+            PricePoint(time=base_time + datetime.timedelta(hours=12), price=0.08),
             # Tomorrow 13:00-17:00 - expensive peak
-            PricePoint(hour=base_time + datetime.timedelta(hours=13), price=0.15),
-            PricePoint(hour=base_time + datetime.timedelta(hours=14), price=0.20),
-            PricePoint(hour=base_time + datetime.timedelta(hours=15), price=0.25),
-            PricePoint(hour=base_time + datetime.timedelta(hours=16), price=0.30),
-            PricePoint(hour=base_time + datetime.timedelta(hours=17), price=0.25),
-            PricePoint(hour=base_time + datetime.timedelta(hours=18), price=0.18),
+            PricePoint(time=base_time + datetime.timedelta(hours=13), price=0.15),
+            PricePoint(time=base_time + datetime.timedelta(hours=14), price=0.20),
+            PricePoint(time=base_time + datetime.timedelta(hours=15), price=0.25),
+            PricePoint(time=base_time + datetime.timedelta(hours=16), price=0.30),
+            PricePoint(time=base_time + datetime.timedelta(hours=17), price=0.25),
+            PricePoint(time=base_time + datetime.timedelta(hours=18), price=0.18),
         ]
 
         optimizer.set_datetime(base_time)
@@ -692,30 +692,30 @@ class TestDischargeVsHoldDecision:
         base_time = datetime.datetime(2024, 1, 15, 23, 0, 0)
         prices = [
             # Today 23:00
-            PricePoint(hour=base_time, price=0.1257),
+            PricePoint(time=base_time, price=0.1257),
             # Tomorrow 00:00-06:00 - cheap overnight
-            PricePoint(hour=base_time + datetime.timedelta(hours=1), price=-0.02),
-            PricePoint(hour=base_time + datetime.timedelta(hours=2), price=-0.01),
-            PricePoint(hour=base_time + datetime.timedelta(hours=3), price=0.01),
-            PricePoint(hour=base_time + datetime.timedelta(hours=4), price=0.02),
-            PricePoint(hour=base_time + datetime.timedelta(hours=5), price=0.03),
-            PricePoint(hour=base_time + datetime.timedelta(hours=6), price=0.05),
-            PricePoint(hour=base_time + datetime.timedelta(hours=7), price=0.08),
+            PricePoint(time=base_time + datetime.timedelta(hours=1), price=-0.02),
+            PricePoint(time=base_time + datetime.timedelta(hours=2), price=-0.01),
+            PricePoint(time=base_time + datetime.timedelta(hours=3), price=0.01),
+            PricePoint(time=base_time + datetime.timedelta(hours=4), price=0.02),
+            PricePoint(time=base_time + datetime.timedelta(hours=5), price=0.03),
+            PricePoint(time=base_time + datetime.timedelta(hours=6), price=0.05),
+            PricePoint(time=base_time + datetime.timedelta(hours=7), price=0.08),
             # Tomorrow 08:00-16:00 - moderate
-            PricePoint(hour=base_time + datetime.timedelta(hours=8), price=0.10),
-            PricePoint(hour=base_time + datetime.timedelta(hours=9), price=0.12),
-            PricePoint(hour=base_time + datetime.timedelta(hours=10), price=0.10),
-            PricePoint(hour=base_time + datetime.timedelta(hours=11), price=0.08),
-            PricePoint(hour=base_time + datetime.timedelta(hours=12), price=0.07),
-            PricePoint(hour=base_time + datetime.timedelta(hours=13), price=0.08),
-            PricePoint(hour=base_time + datetime.timedelta(hours=14), price=0.10),
-            PricePoint(hour=base_time + datetime.timedelta(hours=15), price=0.15),
-            PricePoint(hour=base_time + datetime.timedelta(hours=16), price=0.20),
+            PricePoint(time=base_time + datetime.timedelta(hours=8), price=0.10),
+            PricePoint(time=base_time + datetime.timedelta(hours=9), price=0.12),
+            PricePoint(time=base_time + datetime.timedelta(hours=10), price=0.10),
+            PricePoint(time=base_time + datetime.timedelta(hours=11), price=0.08),
+            PricePoint(time=base_time + datetime.timedelta(hours=12), price=0.07),
+            PricePoint(time=base_time + datetime.timedelta(hours=13), price=0.08),
+            PricePoint(time=base_time + datetime.timedelta(hours=14), price=0.10),
+            PricePoint(time=base_time + datetime.timedelta(hours=15), price=0.15),
+            PricePoint(time=base_time + datetime.timedelta(hours=16), price=0.20),
             # Tomorrow 17:00-18:00 - HIGH peak (this is what user's log showed)
-            PricePoint(hour=base_time + datetime.timedelta(hours=17), price=0.30),  # High!
-            PricePoint(hour=base_time + datetime.timedelta(hours=18), price=0.3157),  # User's 17:00 price
-            PricePoint(hour=base_time + datetime.timedelta(hours=19), price=0.25),
-            PricePoint(hour=base_time + datetime.timedelta(hours=20), price=0.18),
+            PricePoint(time=base_time + datetime.timedelta(hours=17), price=0.30),  # High!
+            PricePoint(time=base_time + datetime.timedelta(hours=18), price=0.3157),  # User's 17:00 price
+            PricePoint(time=base_time + datetime.timedelta(hours=19), price=0.25),
+            PricePoint(time=base_time + datetime.timedelta(hours=20), price=0.18),
         ]
 
         optimizer.set_datetime(base_time)
@@ -750,3 +750,112 @@ class TestDischargeVsHoldDecision:
                 f"Expected DISCHARGE at 23:00 even with high battery cost. "
                 f"Got {first_entry.mode.name}. Reason: {first_entry.reason}"
             )
+
+
+class TestFifteenMinuteSlots:
+    """Test cases for 15-minute slot scheduling."""
+
+    def test_15_minute_slots(self):
+        """Algorithm should generate 96 entries for 24 hours of 15-min slots."""
+        optimizer = MockOptimizer(slot_minutes=15)
+
+        base_time = datetime.datetime(2024, 1, 15, 0, 0, 0)
+        prices = []
+        for i in range(96):
+            dt = base_time + datetime.timedelta(minutes=15 * i)
+            hour = dt.hour
+            # Cheap at night (00:00-06:00), expensive during day (07:00-22:00)
+            if hour < 6:
+                price = 0.03
+            elif hour < 9:
+                price = 0.10
+            elif hour < 17:
+                price = 0.15
+            elif hour < 21:
+                price = 0.12
+            else:
+                price = 0.05
+            prices.append(PricePoint(time=dt, price=price))
+
+        optimizer.set_datetime(base_time)
+        schedule = optimizer.find_optimal_schedule(prices, 4, current_soc=50)
+
+        # Should have 96 entries (one per 15-min slot)
+        assert len(schedule) == 96
+
+        # All entries should have valid BatteryMode
+        for hour, entry in schedule.items():
+            assert isinstance(entry, ScheduleEntry)
+            assert entry.mode in [BatteryMode.HOLD, BatteryMode.CHARGE, BatteryMode.DISCHARGE]
+
+    def test_15min_charge_at_cheapest_slots(self):
+        """Should charge during cheap (negative price) 15-min slots."""
+        optimizer = MockOptimizer(slot_minutes=15)
+
+        base_time = datetime.datetime(2024, 1, 15, 0, 0, 0)
+        prices = []
+        cheap_slots = set()
+        for i in range(96):
+            dt = base_time + datetime.timedelta(minutes=15 * i)
+            # 4 cheap slots at 01:00, 01:15, 01:30, 01:45 (indices 4-7)
+            # Use negative prices to clearly incentivize charging
+            if 4 <= i <= 7:
+                price = -0.05
+                cheap_slots.add(dt)
+            elif dt.hour >= 17 and dt.hour < 18:
+                price = 0.30  # Expensive peak
+            else:
+                price = 0.10
+            prices.append(PricePoint(time=dt, price=price))
+
+        optimizer.set_datetime(base_time)
+        schedule = optimizer.find_optimal_schedule(prices, 4, current_soc=50)
+
+        assert len(schedule) == 96
+
+        # Verify charging happens during the cheap (negative price) slots
+        charge_entries = [
+            e for e in schedule.values()
+            if e.mode == BatteryMode.CHARGE
+        ]
+        assert len(charge_entries) > 0, "Should have charge slots at negative prices"
+
+        # Check that the cheap slots are used for charging
+        cheap_charges = [
+            e for e in charge_entries
+            if e.time in cheap_slots
+        ]
+        assert len(cheap_charges) > 0, (
+            "Should charge during the cheapest slots (01:00-01:45)"
+        )
+
+    def test_15min_partial_slot(self):
+        """Algorithm should handle partial 15-min slot correctly."""
+        optimizer = MockOptimizer(slot_minutes=15)
+
+        # Set current time to 10:07 (7 min into the 10:00-10:15 slot)
+        optimizer.set_datetime(datetime.datetime(2024, 1, 15, 10, 7, 0))
+
+        base_time = datetime.datetime(2024, 1, 15, 10, 0, 0)
+        prices = [
+            PricePoint(
+                time=base_time + datetime.timedelta(minutes=15 * i),
+                price=0.05 + i * 0.005,
+            )
+            for i in range(20)  # 5 hours of 15-min slots
+        ]
+
+        schedule = optimizer.find_optimal_schedule(
+            prices, 2, current_soc=50
+        )
+
+        # Schedule should be generated successfully
+        assert len(schedule) > 0
+
+        # First slot (10:00) should be included
+        slot_10 = datetime.datetime(2024, 1, 15, 10, 0, 0)
+        has_current_slot = any(
+            (h.replace(tzinfo=None) if h.tzinfo else h) == slot_10
+            for h in schedule.keys()
+        )
+        assert has_current_slot, "Current partial slot (10:00) should be in schedule"

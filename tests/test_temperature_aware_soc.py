@@ -216,22 +216,22 @@ class TestTemperatureAwareSOCProjection:
         base_time = datetime.datetime(2024, 1, 15, 0, 0, 0)
         return {
             base_time + datetime.timedelta(hours=0): ScheduleEntry(
-                hour=base_time + datetime.timedelta(hours=0),
+                time=base_time + datetime.timedelta(hours=0),
                 mode=BatteryMode.CHARGE,
                 reason="cheap"
             ),
             base_time + datetime.timedelta(hours=1): ScheduleEntry(
-                hour=base_time + datetime.timedelta(hours=1),
+                time=base_time + datetime.timedelta(hours=1),
                 mode=BatteryMode.CHARGE,
                 reason="cheap"
             ),
             base_time + datetime.timedelta(hours=2): ScheduleEntry(
-                hour=base_time + datetime.timedelta(hours=2),
+                time=base_time + datetime.timedelta(hours=2),
                 mode=BatteryMode.HOLD,
                 reason="neutral"
             ),
             base_time + datetime.timedelta(hours=3): ScheduleEntry(
-                hour=base_time + datetime.timedelta(hours=3),
+                time=base_time + datetime.timedelta(hours=3),
                 mode=BatteryMode.DISCHARGE,
                 reason="expensive"
             ),
@@ -287,7 +287,7 @@ class TestTemperatureAwareSOCProjection:
         base_time = datetime.datetime(2024, 1, 15, 0, 0, 0)
         hold_schedule = {
             base_time + datetime.timedelta(hours=i): ScheduleEntry(
-                hour=base_time + datetime.timedelta(hours=i),
+                time=base_time + datetime.timedelta(hours=i),
                 mode=BatteryMode.HOLD,
                 reason="hold"
             )
@@ -336,7 +336,7 @@ class TestTemperatureAwareSOCProjection:
         base_time = datetime.datetime(2024, 1, 15, 0, 0, 0)
         charge_schedule = {
             base_time + datetime.timedelta(hours=i): ScheduleEntry(
-                hour=base_time + datetime.timedelta(hours=i),
+                time=base_time + datetime.timedelta(hours=i),
                 mode=BatteryMode.CHARGE,
                 reason="cheap"
             )
@@ -368,7 +368,7 @@ class TestTemperatureAwareSOCProjection:
         base_time = datetime.datetime(2024, 1, 15, 0, 0, 0)
         charge_schedule = {
             base_time + datetime.timedelta(hours=i): ScheduleEntry(
-                hour=base_time + datetime.timedelta(hours=i),
+                time=base_time + datetime.timedelta(hours=i),
                 mode=BatteryMode.CHARGE,
                 reason="cheap"
             )
@@ -403,7 +403,7 @@ class TestDPOptimizerTemperatureAwareRates:
         prices_cents = [3.0, 3.5, 4.0, 8.0, 12.0, 15.0]
         return [
             PricePoint(
-                hour=base_time + datetime.timedelta(hours=i),
+                time=base_time + datetime.timedelta(hours=i),
                 price=price / 100
             )
             for i, price in enumerate(prices_cents)
@@ -489,7 +489,7 @@ class TestLogScheduleTemperatureDisplay:
         base_time = datetime.datetime(2024, 1, 15, 0, 0, 0)
         return {
             base_time: ScheduleEntry(
-                hour=base_time,
+                time=base_time,
                 mode=BatteryMode.CHARGE,
                 reason="0.03 EUR/kWh"
             ),

@@ -145,7 +145,7 @@ def make_schedule_entry(
     hour: datetime.datetime, mode: BatteryMode, reason: str = "Test"
 ) -> ScheduleEntry:
     """Create a schedule entry."""
-    return ScheduleEntry(hour=hour, mode=mode, reason=reason)
+    return ScheduleEntry(time=hour, mode=mode, reason=reason)
 
 
 class TestProjectBatteryCosts:
@@ -643,3 +643,60 @@ class TestCostTrackingIntegration:
 
         # Verify threshold is between them
         assert low_price < threshold < high_price
+
+
+class TestFifteenMinCostTracking:
+    """Test battery cost calculations with 15-minute slots."""
+
+    def test_15min_charge_energy_calculation(self):
+        """Cost tracker should compute energy for a 15-min slot correctly.
+
+        With charge_rate=4.5 kW, efficiency=0.85, slot_minutes=15:
+            energy = 4.5 * 0.85 * 0.25 = 0.95625 kWh per full slot
+
+        Not 0.5h (30-min) or 1.0h (60-min).
+        """
+        optimizer = MockCostOptimizer(
+            charge_rate=4.5,
+            efficiency=0.85,
+            slot_minutes=15,
+        )
+
+        base_time = datetime.datetime(2024, 1, 15, 0, 0, 0)
+        hour = base_time
+        schedule = {hour: make_schedule_entry(hour, BatteryMode.CHARGE)}
+        prices_by_slot = {hour: 0.05}
+
+        # Starting at 50% SOC with 0.10 avg cost
+        starting_soc = 50.0
+        starting_cost = 0.10
+
+        _, final_cost = optimizer._project_battery_costs(
+            schedule=schedule,
+            starting_soc=starting_soc,
+            starting_cost=starting_cost,
+            prices_by_slot=prices_by_slot,
+        )
+
+        # Calculate expected values with 15-min slot (0.25 hours)
+        old_energy = (starting_soc - optimizer.min_soc) / 100 * optimizer.battery_capacity
+        energy_added = 4.5 * 0.85 * 0.25  # 0.95625 kWh for 15-min slot
+        expected_cost = (old_energy * starting_cost + energy_added * 0.05) / (
+            old_energy + energy_added
+        )
+        assert abs(final_cost - expected_cost) < 0.001
+
+        # Verify the energy is specifically for a 15-min slot, not 30-min or 60-min
+        energy_30min = 4.5 * 0.85 * 0.5  # would be 1.9125 for 30-min
+        energy_60min = 4.5 * 0.85 * 1.0  # would be 3.825 for 60-min
+
+        cost_if_30min = (old_energy * starting_cost + energy_30min * 0.05) / (
+            old_energy + energy_30min
+        )
+        cost_if_60min = (old_energy * starting_cost + energy_60min * 0.05) / (
+            old_energy + energy_60min
+        )
+
+        # final_cost should NOT match 30-min or 60-min calculations
+        assert abs(final_cost - cost_if_30min) > 0.001
+        assert abs(final_cost - cost_if_60min) > 0.001

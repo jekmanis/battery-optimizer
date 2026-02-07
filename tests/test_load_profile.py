@@ -226,14 +226,44 @@ class TestLoadProfile:
         assert success
         assert new_profile.stats.observation_count == profile.stats.observation_count
 
-    def test_load_json_different_slot_size(self, load_profile):
-        """Loading with different slot size should fail."""
+    def test_load_json_migrates_coarser_to_finer_slots(self, load_profile):
+        """Loading from coarser to finer divisible slots should migrate."""
+        # Record some data in 60-minute profile (slot 10 = hour 10)
+        dt = datetime.datetime(2024, 1, 15, 10, 0, 0)
+        load_profile.record(dt, 500.0)
+        json_str = load_profile.to_json()
+
+        # Load into 30-minute profile (factor=2)
+        profile_30 = LoadProfile(slot_minutes=30, default_load_w=500.0)
+        success = profile_30.load_from_json(json_str)
+
+        assert success is True
+        # Old slot 10 should be split into new slots 20 and 21
+        assert "20" in profile_30.stats.samples_by_slot
+        assert "21" in profile_30.stats.samples_by_slot
+        assert profile_30.stats.samples_by_slot["20"] == [500.0]
+        assert profile_30.stats.samples_by_slot["21"] == [500.0]
+
+    def test_load_json_rejects_incompatible_slot_size(self, load_profile):
+        """Loading from finer to coarser slots should fail (cannot migrate)."""
         # Save with 60-minute slots
         json_str = load_profile.to_json()
 
-        # Try to load into 30-minute profile
-        profile_30 = LoadProfile(slot_minutes=30, default_load_w=500.0)
-        success = profile_30.load_from_json(json_str)
+        # Try to load into 120-minute profile (60 < 120, so not migrateable)
+        profile_120 = LoadProfile(slot_minutes=120, default_load_w=500.0)
+        success = profile_120.load_from_json(json_str)
+
+        assert success is False
+
+    def test_load_json_rejects_non_divisible_slot_size(self):
+        """Loading from non-divisible coarser slots should fail."""
+        # Create and save a 45-minute profile
+        profile_45 = LoadProfile(slot_minutes=45, default_load_w=500.0)
+        json_str = profile_45.to_json()
+
+        # Try to load into 20-minute profile (45 > 20 but 45 % 20 != 0)
+        profile_20 = LoadProfile(slot_minutes=20, default_load_w=500.0)
+        success = profile_20.load_from_json(json_str)
 
         assert success is False
 
@@ -255,3 +285,149 @@ class TestLoadProfile:
         samples = load_profile.stats.samples_by_slot["10"]
         assert 500.0 in samples
         assert 600.0 in samples
+
+
+class TestFifteenMinuteSlotLoadProfile:
+    """Test cases for LoadProfile with 15-minute slots."""
+
+    def test_slot_index_15min_slots(self):
+        """Verify slot index mapping for 15-minute slots."""
+        profile = LoadProfile(slot_minutes=15, default_load_w=500)
+
+        # Verify slots_per_day
+        assert profile.slots_per_day == 96
+
+        # Test specific slot indices
+        assert profile._slot_index(datetime.datetime(2024, 1, 15, 0, 0, 0)) == 0
+        assert profile._slot_index(datetime.datetime(2024, 1, 15, 0, 15, 0)) == 1
+        assert profile._slot_index(datetime.datetime(2024, 1, 15, 0, 30, 0)) == 2
+        assert profile._slot_index(datetime.datetime(2024, 1, 15, 0, 45, 0)) == 3
+        assert profile._slot_index(datetime.datetime(2024, 1, 15, 1, 0, 0)) == 4
+        assert profile._slot_index(datetime.datetime(2024, 1, 15, 12, 0, 0)) == 48
+        assert profile._slot_index(datetime.datetime(2024, 1, 15, 23, 45, 0)) == 95
+
+    def test_15min_record_and_predict(self):
+        """Record observations at 15-min boundaries and verify predictions."""
+        profile = LoadProfile(
+            slot_minutes=15,
+            default_load_w=500.0,
+            min_samples=3,
+        )
+
+        # Record observations at 15-min boundaries
+        base = datetime.datetime(2024, 1, 15, 10, 0, 0)
+        for day in range(5):
+            dt_slot0 = base + datetime.timedelta(days=day)
+            profile.record(dt_slot0, 800.0 + day * 10)  # 10:00 slot
+
+            dt_slot1 = base + datetime.timedelta(days=day, minutes=15)
+            profile.record(dt_slot1, 600.0 + day * 10)  # 10:15 slot
+
+            dt_slot2 = base + datetime.timedelta(days=day, minutes=30)
+            profile.record(dt_slot2, 400.0 + day * 10)  # 10:30 slot
+
+        # Predict for each slot and verify they differ
+        pred_1000 = profile.predict_kw(
+            datetime.datetime(2024, 1, 20, 10, 0, 0), quantile=0.5
+        )
+        pred_1015 = profile.predict_kw(
+            datetime.datetime(2024, 1, 20, 10, 15, 0), quantile=0.5
+        )
+        pred_1030 = profile.predict_kw(
+            datetime.datetime(2024, 1, 20, 10, 30, 0), quantile=0.5
+        )
+
+        # Predictions should reflect the recorded data pattern
+        # 10:00 had highest load, 10:30 had lowest
+        assert pred_1000 > pred_1015, (
+            f"10:00 prediction ({pred_1000:.3f}) should exceed 10:15 ({pred_1015:.3f})"
+        )
+        assert pred_1015 > pred_1030, (
+            f"10:15 prediction ({pred_1015:.3f}) should exceed 10:30 ({pred_1030:.3f})"
+        )
+
+    def test_migrate_30min_to_15min(self):
+        """Migrating from 30-min slots to 15-min slots should split data."""
+        profile = LoadProfile(slot_minutes=15, default_load_w=500.0)
+
+        # Create JSON data with 30-min slots
+        json_data = json.dumps({
+            "version": 1,
+            "slot_minutes": 30,
+            "stats": {
+                "samples_by_slot": {
+                    "0": [300.0, 350.0],
+                    "1": [400.0],
+                },
+                "observation_count": 3,
+                "last_observation": "2024-01-15T01:00:00",
+            },
+        })
+
+        success = profile.load_from_json(json_data)
+        assert success is True
+
+        # Old slot "0" (00:00-00:30) -> new slots "0" (00:00-00:15) and "1" (00:15-00:30)
+        assert "0" in profile.stats.samples_by_slot
+        assert "1" in profile.stats.samples_by_slot
+        assert profile.stats.samples_by_slot["0"] == [300.0, 350.0]
+        assert profile.stats.samples_by_slot["1"] == [300.0, 350.0]
+
+        # Old slot "1" (00:30-01:00) -> new slots "2" (00:30-00:45) and "3" (00:45-01:00)
+        assert "2" in profile.stats.samples_by_slot
+        assert "3" in profile.stats.samples_by_slot
+        assert profile.stats.samples_by_slot["2"] == [400.0]
+        assert profile.stats.samples_by_slot["3"] == [400.0]
+
+    def test_migrate_60min_to_15min(self):
+        """Migrating from 60-min slots to 15-min slots (factor=4)."""
+        profile = LoadProfile(slot_minutes=15, default_load_w=500.0)
+
+        json_data = json.dumps({
+            "version": 1,
+            "slot_minutes": 60,
+            "stats": {
+                "samples_by_slot": {
+                    "0": [250.0, 275.0],   # Hour 0 (00:00-01:00)
+                    "12": [900.0, 950.0],  # Hour 12 (12:00-13:00)
+                },
+                "observation_count": 4,
+                "last_observation": "2024-01-15T12:00:00",
+            },
+        })
+
+        success = profile.load_from_json(json_data)
+        assert success is True
+
+        # Old slot "0" (hour 0) -> new slots "0", "1", "2", "3" (factor=4)
+        for new_slot in ["0", "1", "2", "3"]:
+            assert new_slot in profile.stats.samples_by_slot, (
+                f"Slot {new_slot} should exist after migration"
+            )
+            assert profile.stats.samples_by_slot[new_slot] == [250.0, 275.0]
+
+        # Old slot "12" (hour 12) -> new slots "48", "49", "50", "51"
+        for new_slot in ["48", "49", "50", "51"]:
+            assert new_slot in profile.stats.samples_by_slot, (
+                f"Slot {new_slot} should exist after migration"
+            )
+            assert profile.stats.samples_by_slot[new_slot] == [900.0, 950.0]
+
+    def test_migrate_incompatible_rejected(self):
+        """Migrating from 20-min to 15-min slots should fail (20 % 15 != 0)."""
+        profile = LoadProfile(slot_minutes=15, default_load_w=500.0)
+
+        json_data = json.dumps({
+            "version": 1,
+            "slot_minutes": 20,
+            "stats": {
+                "samples_by_slot": {
+                    "0": [100.0],
+                },
+                "observation_count": 1,
+                "last_observation": "2024-01-15T00:00:00",
+            },
+        })
+
+        success = profile.load_from_json(json_data)
+        assert success is False

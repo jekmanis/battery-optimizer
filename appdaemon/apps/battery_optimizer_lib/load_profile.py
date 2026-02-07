@@ -99,9 +99,38 @@ class LoadProfile:
         try:
             data = json.loads(json_str)
             if data.get("version", 0) >= 1:
-                if data.get("slot_minutes") != self.slot_minutes:
-                    self.log("Load profile slot size changed, ignoring saved data")
-                    return False
+                stored_slot_minutes = data.get("slot_minutes")
+                if stored_slot_minutes != self.slot_minutes:
+                    if (stored_slot_minutes and
+                            stored_slot_minutes > self.slot_minutes and
+                            stored_slot_minutes % self.slot_minutes == 0):
+                        # Migrate: split each old bucket into N new buckets
+                        factor = stored_slot_minutes // self.slot_minutes
+                        self.log(
+                            f"Migrating load profile from {stored_slot_minutes}min "
+                            f"to {self.slot_minutes}min slots (factor={factor})"
+                        )
+                        old_stats = data.get("stats", {})
+                        old_samples = old_stats.get("samples_by_slot", {})
+                        new_samples = {}
+                        for old_slot_str, samples in old_samples.items():
+                            old_slot = int(old_slot_str)
+                            for i in range(factor):
+                                new_slot = old_slot * factor + i
+                                new_samples[str(new_slot)] = list(samples)
+                        self.stats = LoadProfileStats(
+                            samples_by_slot=new_samples,
+                            observation_count=old_stats.get("observation_count", 0),
+                            last_observation=old_stats.get("last_observation"),
+                        )
+                        return True
+                    else:
+                        self.log(
+                            f"Load profile slot size changed "
+                            f"({stored_slot_minutes}\u2192{self.slot_minutes}), "
+                            f"cannot migrate"
+                        )
+                        return False
                 if "stats" in data:
                     self.stats = LoadProfileStats.from_dict(data["stats"])
                 return True

@@ -300,9 +300,9 @@ class BatteryOptimizer(hass.Hass):
         simulated_soc = current_soc
         total_load_kwh = 0.0
 
-        for price_point in sorted(prices, key=lambda p: p.hour):
+        for price_point in sorted(prices, key=lambda p: p.time):
             # Predict load for this slot
-            load_kw = self._predict_load_kw(price_point.hour)
+            load_kw = self._predict_load_kw(price_point.time)
             load_kwh = min(load_kw, self.config.discharge_rate) * self.config.slot_hours
             total_load_kwh += load_kwh
 
@@ -367,7 +367,7 @@ class BatteryOptimizer(hass.Hass):
         # Ensure consistent timezone awareness for arithmetic
         now, current_slot = normalize_tz_pair(now, current_slot)
 
-        future_prices = [p for p in prices if dt_ge(p.hour, current_slot)]
+        future_prices = [p for p in prices if dt_ge(p.time, current_slot)]
         if not future_prices:
             return {}
 
@@ -375,8 +375,8 @@ class BatteryOptimizer(hass.Hass):
         future_prices = self._ensure_current_slot_price(prices, future_prices, current_slot)
 
         # Calculate min_charge_slots for informational purposes
-        hours_sorted_by_time = sorted(future_prices, key=lambda p: p.hour)
-        n_slots = len(hours_sorted_by_time)
+        slots_sorted_by_time = sorted(future_prices, key=lambda p: p.time)
+        n_slots = len(slots_sorted_by_time)
         min_charge_slots = max(0, int(charge_hours_needed))
         if min_charge_slots > n_slots:
             min_charge_slots = n_slots
@@ -422,17 +422,17 @@ class BatteryOptimizer(hass.Hass):
         # Project costs for sensor exposure
         has_charge_slots = any(e.mode == BatteryMode.CHARGE for e in schedule.values())
         if has_charge_slots:
-            prices_by_slot = {p.hour: p.price for p in hours_sorted_by_time}
+            prices_by_slot = {p.time: p.price for p in slots_sorted_by_time}
             # Re-compute charge rates per slot for cost projection
-            slot_fractions = self._compute_slot_fractions(hours_sorted_by_time, current_slot, minutes_into_slot)
+            slot_fractions = self._compute_slot_fractions(slots_sorted_by_time, current_slot, minutes_into_slot)
             charge_rates_per_slot = self._compute_charge_rates_per_slot(
-                hours_sorted_by_time, slot_fractions, current_soc_for_calc, current_temp
+                slots_sorted_by_time, slot_fractions, current_soc_for_calc, current_temp
             )
             slot_charge_rates_by_slot = {
-                p.hour: charge_rates_per_slot[i] for i, p in enumerate(hours_sorted_by_time)
+                p.time: charge_rates_per_slot[i] for i, p in enumerate(slots_sorted_by_time)
             }
             slot_fractions_by_slot = {
-                p.hour: slot_fractions[i] for i, p in enumerate(hours_sorted_by_time)
+                p.time: slot_fractions[i] for i, p in enumerate(slots_sorted_by_time)
             }
             projected_costs, _ = self._cost_tracker.project_costs(
                 schedule,
@@ -456,9 +456,9 @@ class BatteryOptimizer(hass.Hass):
 
         # Log decision context for transparency
         if self.config.decision_log_level >= 1:
-            load_kw = [self._predict_load_kw(p.hour) for p in hours_sorted_by_time]
+            load_kw = [self._predict_load_kw(p.time) for p in slots_sorted_by_time]
             self._last_charge_slots = self._schedule_formatter.log_decision_context(
-                prices_sorted=hours_sorted_by_time,
+                prices_sorted=slots_sorted_by_time,
                 schedule=schedule,
                 load_kw=load_kw,
                 current_soc=current_soc_for_calc,
@@ -488,7 +488,7 @@ class BatteryOptimizer(hass.Hass):
         def prices_contains_slot(prices_list, slot):
             slot_naive = slot.replace(tzinfo=None) if slot.tzinfo else slot
             for p in prices_list:
-                p_naive = p.hour.replace(tzinfo=None) if p.hour.tzinfo else p.hour
+                p_naive = p.time.replace(tzinfo=None) if p.time.tzinfo else p.time
                 if p_naive == slot_naive:
                     return True
             return False
@@ -504,7 +504,7 @@ class BatteryOptimizer(hass.Hass):
         def find_slot_price(prices_list, slot):
             slot_naive = slot.replace(tzinfo=None) if slot.tzinfo else slot
             for p in prices_list:
-                p_naive = p.hour.replace(tzinfo=None) if p.hour.tzinfo else p.hour
+                p_naive = p.time.replace(tzinfo=None) if p.time.tzinfo else p.time
                 if p_naive == slot_naive:
                     return p
             return None
@@ -514,20 +514,20 @@ class BatteryOptimizer(hass.Hass):
             synth_price = slot_price_point.price
             self.log(
                 f"Added missing current slot {current_slot} using yesterday's price "
-                f"{synth_price:.4f} EUR/kWh from {slot_price_point.hour}"
+                f"{synth_price:.4f} EUR/kWh from {slot_price_point.time}"
             )
         else:
             # If still missing, synthesize using most recent past price if available
             current_slot_naive = current_slot.replace(tzinfo=None) if current_slot.tzinfo else current_slot
             prev_price_point = None
             for p in all_prices:
-                p_hour = p.hour
+                p_hour = p.time
                 p_naive = p_hour.replace(tzinfo=None) if p_hour.tzinfo else p_hour
                 if p_naive <= current_slot_naive:
                     if prev_price_point is None:
                         prev_price_point = p
                     else:
-                        prev_naive = prev_price_point.hour.replace(tzinfo=None) if prev_price_point.hour.tzinfo else prev_price_point.hour
+                        prev_naive = prev_price_point.time.replace(tzinfo=None) if prev_price_point.time.tzinfo else prev_price_point.time
                         if p_naive > prev_naive:
                             prev_price_point = p
 
@@ -535,16 +535,16 @@ class BatteryOptimizer(hass.Hass):
                 synth_price = prev_price_point.price
                 self.log(
                     f"Added missing current slot {current_slot} using previous price "
-                    f"{synth_price:.4f} EUR/kWh from {prev_price_point.hour}"
+                    f"{synth_price:.4f} EUR/kWh from {prev_price_point.time}"
                 )
             else:
                 # Fallback: use first available future price
-                synth_price = min(future_prices, key=lambda p: p.hour).price
+                synth_price = min(future_prices, key=lambda p: p.time).price
                 self.log(f"Added missing current slot {current_slot} using next price {synth_price:.4f} EUR/kWh")
 
         # Normalize timezone to match existing prices (avoid mixing aware/naive)
         if future_prices:
-            sample_hour = future_prices[0].hour
+            sample_hour = future_prices[0].time
             if sample_hour.tzinfo is not None and current_slot.tzinfo is None:
                 # Prices are aware, current_slot is naive - add timezone
                 tz = self._get_local_timezone()
@@ -553,22 +553,22 @@ class BatteryOptimizer(hass.Hass):
                 # Prices are naive, current_slot is aware - strip timezone
                 current_slot = current_slot.replace(tzinfo=None)
 
-        current_slot_price = PricePoint(hour=current_slot, price=synth_price)
+        current_slot_price = PricePoint(time=current_slot, price=synth_price)
         return future_prices + [current_slot_price]
 
     def _compute_slot_fractions(
         self,
-        hours_sorted_by_time: List[PricePoint],
+        slots_sorted_by_time: List[PricePoint],
         current_slot: datetime.datetime,
         minutes_into_slot: float,
     ) -> List[float]:
         """Compute fraction of each slot that is usable (partial first slot)."""
-        n_slots = len(hours_sorted_by_time)
+        n_slots = len(slots_sorted_by_time)
         first_fraction = min(1.0, max(0.0, (self.config.slot_minutes - minutes_into_slot) / max(1, self.config.slot_minutes)))
         slot_fractions = [1.0] * n_slots
 
-        for i, p in enumerate(hours_sorted_by_time):
-            p_hour = p.hour
+        for i, p in enumerate(slots_sorted_by_time):
+            p_hour = p.time
             compare_current = current_slot
             if p_hour.tzinfo is not None and compare_current.tzinfo is None:
                 p_hour = p_hour.replace(tzinfo=None)
@@ -582,7 +582,7 @@ class BatteryOptimizer(hass.Hass):
 
     def _compute_charge_rates_per_slot(
         self,
-        hours_sorted_by_time: List[PricePoint],
+        slots_sorted_by_time: List[PricePoint],
         slot_fractions: List[float],
         current_soc: float,
         current_temp: Optional[float],
@@ -598,7 +598,7 @@ class BatteryOptimizer(hass.Hass):
             predict_temp = lambda temp, duration: temp if temp is not None else 25.0
 
         return compute_charge_rates_per_slot(
-            hours_sorted_by_time=hours_sorted_by_time,
+            slots_sorted_by_time=slots_sorted_by_time,
             slot_fractions=slot_fractions,
             slot_minutes=self.config.slot_minutes,
             current_soc=current_soc,
@@ -734,7 +734,7 @@ class BatteryOptimizer(hass.Hass):
 
         # Filter to future prices only (avoid past slots inflating min-charge calculation)
         current_slot = self._align_to_slot(now)
-        future_prices = [p for p in prices if dt_ge(p.hour, current_slot)]
+        future_prices = [p for p in prices if dt_ge(p.time, current_slot)]
         if not future_prices:
             self.log("No future prices available, skipping optimization", level="WARNING")
             return
@@ -871,14 +871,14 @@ class BatteryOptimizer(hass.Hass):
         prices = self.get_prices()
 
         # Filter to future prices only
-        future_prices = [p for p in prices if dt_ge(p.hour, now_slot, local_tz)]
+        future_prices = [p for p in prices if dt_ge(p.time, now_slot, local_tz)]
 
         if not future_prices:
             self.log("No future prices available for recalculation")
             return
 
         self.log(f"Recalculating with {len(future_prices)} future price points "
-                 f"({future_prices[0].hour.strftime('%m-%d %H:%M')} to {future_prices[-1].hour.strftime('%m-%d %H:%M')})")
+                 f"({future_prices[0].time.strftime('%m-%d %H:%M')} to {future_prices[-1].time.strftime('%m-%d %H:%M')})")
 
         # Recalculate minimum charge slots needed to survive the remaining horizon
         charge_hours_needed = self.calculate_min_charge_slots_for_horizon(current_soc, future_prices)
@@ -1021,7 +1021,7 @@ class BatteryOptimizer(hass.Hass):
             if old_entry.mode != BatteryMode.HOLD:
                 # Schedule needs updating
                 self.schedule[current_slot] = ScheduleEntry(
-                    hour=current_slot,
+                    time=current_slot,
                     mode=BatteryMode.HOLD,
                     reason=f"{reason}_hold (was {old_entry.mode.name})"
                 )
@@ -1031,7 +1031,7 @@ class BatteryOptimizer(hass.Hass):
                 self.log(f"Enforcing HOLD at {current_slot} (schedule was HOLD but mode was {self.current_mode.name})")
         else:
             self.schedule[current_slot] = ScheduleEntry(
-                hour=current_slot,
+                time=current_slot,
                 mode=BatteryMode.HOLD,
                 reason=f"{reason}_hold"
             )
@@ -1096,7 +1096,7 @@ class BatteryOptimizer(hass.Hass):
             return []
 
         prices = self.get_prices()
-        price_map = {p.hour: p.price for p in prices}
+        price_map = {p.time: p.price for p in prices}
 
         # Get prices for remaining hours that are HOLD in current schedule
         hold_prices = []
@@ -1577,7 +1577,7 @@ class BatteryOptimizer(hass.Hass):
                 f"(was {mode_name.lower()}ing before restart, algorithm chose HOLD due to partial slot)"
             )
             self.schedule[current_key] = ScheduleEntry(
-                hour=current_entry.hour,
+                time=current_entry.time,
                 mode=previous_mode,
                 reason=f"continuing_{mode_name.lower()}_from_restart"
             )
@@ -1944,6 +1944,7 @@ class BatteryOptimizer(hass.Hass):
                     # Load profile statistics for visualization
                     "load_profile_stats": self._get_load_profile_stats(),
                     "load_profile_observations": self.load_profile.stats.observation_count,
+                    "slot_minutes": self.config.slot_minutes,
                     "friendly_name": "Battery Optimizer"
                 }
             )

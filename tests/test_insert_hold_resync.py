@@ -102,7 +102,7 @@ class TestInsertHoldAndResync:
         """Inserting HOLD on a CHARGE slot should change it to HOLD."""
         slot_09 = datetime.datetime(2024, 1, 15, 9, 0, 0)
         optimizer.schedule = {
-            slot_09: ScheduleEntry(hour=slot_09, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_09: ScheduleEntry(time=slot_09, mode=BatteryMode.CHARGE, reason="cheap"),
         }
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 9, 55, 0)
 
@@ -116,7 +116,7 @@ class TestInsertHoldAndResync:
         """Inserting HOLD on a DISCHARGE slot should change it to HOLD."""
         slot_09 = datetime.datetime(2024, 1, 15, 9, 0, 0)
         optimizer.schedule = {
-            slot_09: ScheduleEntry(hour=slot_09, mode=BatteryMode.DISCHARGE, reason="expensive"),
+            slot_09: ScheduleEntry(time=slot_09, mode=BatteryMode.DISCHARGE, reason="expensive"),
         }
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 9, 30, 0)
 
@@ -129,7 +129,7 @@ class TestInsertHoldAndResync:
     def test_already_hold_schedule_and_mode_does_nothing(self, optimizer):
         """If both schedule AND current_mode are HOLD, should not modify or resync."""
         slot_09 = datetime.datetime(2024, 1, 15, 9, 0, 0)
-        original_entry = ScheduleEntry(hour=slot_09, mode=BatteryMode.HOLD, reason="already_hold")
+        original_entry = ScheduleEntry(time=slot_09, mode=BatteryMode.HOLD, reason="already_hold")
         optimizer.schedule = {slot_09: original_entry}
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 9, 30, 0)
         optimizer.current_mode = BatteryMode.HOLD  # Both schedule and mode are HOLD
@@ -152,7 +152,7 @@ class TestInsertHoldAndResync:
         and we MUST force HOLD even though schedule already shows HOLD.
         """
         slot_09 = datetime.datetime(2024, 1, 15, 9, 0, 0)
-        original_entry = ScheduleEntry(hour=slot_09, mode=BatteryMode.HOLD, reason="already_hold")
+        original_entry = ScheduleEntry(time=slot_09, mode=BatteryMode.HOLD, reason="already_hold")
         optimizer.schedule = {slot_09: original_entry}
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 9, 30, 0)
         optimizer.current_mode = BatteryMode.CHARGE  # Inverter is charging despite HOLD schedule!
@@ -174,7 +174,7 @@ class TestInsertHoldAndResync:
         Similar to above but with DISCHARGE mode - must enforce HOLD.
         """
         slot_09 = datetime.datetime(2024, 1, 15, 9, 0, 0)
-        original_entry = ScheduleEntry(hour=slot_09, mode=BatteryMode.HOLD, reason="already_hold")
+        original_entry = ScheduleEntry(time=slot_09, mode=BatteryMode.HOLD, reason="already_hold")
         optimizer.schedule = {slot_09: original_entry}
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 9, 30, 0)
         optimizer.current_mode = BatteryMode.DISCHARGE  # Inverter is discharging despite HOLD schedule!
@@ -192,7 +192,7 @@ class TestInsertHoldAndResync:
         """If current slot is not in schedule, should create HOLD entry."""
         slot_10 = datetime.datetime(2024, 1, 15, 10, 0, 0)
         optimizer.schedule = {
-            slot_10: ScheduleEntry(hour=slot_10, mode=BatteryMode.DISCHARGE, reason="later"),
+            slot_10: ScheduleEntry(time=slot_10, mode=BatteryMode.DISCHARGE, reason="later"),
         }
         # Current time is 09:30, but 09:00 slot is missing
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 9, 30, 0)
@@ -208,7 +208,7 @@ class TestInsertHoldAndResync:
         """Should call _handle_mode_transition with HOLD."""
         slot_09 = datetime.datetime(2024, 1, 15, 9, 0, 0)
         optimizer.schedule = {
-            slot_09: ScheduleEntry(hour=slot_09, mode=BatteryMode.CHARGE, reason="charge"),
+            slot_09: ScheduleEntry(time=slot_09, mode=BatteryMode.CHARGE, reason="charge"),
         }
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 9, 55, 0)
 
@@ -220,7 +220,7 @@ class TestInsertHoldAndResync:
         """Should call _update_schedule_sensor."""
         slot_09 = datetime.datetime(2024, 1, 15, 9, 0, 0)
         optimizer.schedule = {
-            slot_09: ScheduleEntry(hour=slot_09, mode=BatteryMode.CHARGE, reason="charge"),
+            slot_09: ScheduleEntry(time=slot_09, mode=BatteryMode.CHARGE, reason="charge"),
         }
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 9, 55, 0)
 
@@ -232,7 +232,7 @@ class TestInsertHoldAndResync:
         """Should call _schedule_tou_sync when TOU sync is enabled."""
         slot_09 = datetime.datetime(2024, 1, 15, 9, 0, 0)
         optimizer.schedule = {
-            slot_09: ScheduleEntry(hour=slot_09, mode=BatteryMode.CHARGE, reason="charge"),
+            slot_09: ScheduleEntry(time=slot_09, mode=BatteryMode.CHARGE, reason="charge"),
         }
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 9, 55, 0)
 
@@ -248,7 +248,7 @@ class TestInsertHoldAndResync:
         optimizer.config.tou_sync_enabled = False
         slot_09 = datetime.datetime(2024, 1, 15, 9, 0, 0)
         optimizer.schedule = {
-            slot_09: ScheduleEntry(hour=slot_09, mode=BatteryMode.CHARGE, reason="charge"),
+            slot_09: ScheduleEntry(time=slot_09, mode=BatteryMode.CHARGE, reason="charge"),
         }
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 9, 55, 0)
 
@@ -261,7 +261,7 @@ class TestInsertHoldAndResync:
         optimizer.config.device_id = ""
         slot_09 = datetime.datetime(2024, 1, 15, 9, 0, 0)
         optimizer.schedule = {
-            slot_09: ScheduleEntry(hour=slot_09, mode=BatteryMode.CHARGE, reason="charge"),
+            slot_09: ScheduleEntry(time=slot_09, mode=BatteryMode.CHARGE, reason="charge"),
         }
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 9, 55, 0)
 
@@ -289,10 +289,10 @@ class TestInsertHoldPreservesSchedule:
         slot_12 = datetime.datetime(2024, 1, 15, 12, 0, 0)
 
         optimizer.schedule = {
-            slot_09: ScheduleEntry(hour=slot_09, mode=BatteryMode.CHARGE, reason="cheap"),
-            slot_10: ScheduleEntry(hour=slot_10, mode=BatteryMode.DISCHARGE, reason="expensive"),
-            slot_11: ScheduleEntry(hour=slot_11, mode=BatteryMode.DISCHARGE, reason="expensive"),
-            slot_12: ScheduleEntry(hour=slot_12, mode=BatteryMode.DISCHARGE, reason="expensive"),
+            slot_09: ScheduleEntry(time=slot_09, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_10: ScheduleEntry(time=slot_10, mode=BatteryMode.DISCHARGE, reason="expensive"),
+            slot_11: ScheduleEntry(time=slot_11, mode=BatteryMode.DISCHARGE, reason="expensive"),
+            slot_12: ScheduleEntry(time=slot_12, mode=BatteryMode.DISCHARGE, reason="expensive"),
         }
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 9, 55, 0)
 
@@ -319,10 +319,10 @@ class TestInsertHoldPreservesSchedule:
         slot_12 = datetime.datetime(2024, 1, 15, 12, 0, 0)
 
         optimizer.schedule = {
-            slot_09: ScheduleEntry(hour=slot_09, mode=BatteryMode.CHARGE, reason="cheap"),
-            slot_10: ScheduleEntry(hour=slot_10, mode=BatteryMode.DISCHARGE, reason="expensive"),
-            slot_11: ScheduleEntry(hour=slot_11, mode=BatteryMode.DISCHARGE, reason="expensive"),
-            slot_12: ScheduleEntry(hour=slot_12, mode=BatteryMode.DISCHARGE, reason="expensive"),
+            slot_09: ScheduleEntry(time=slot_09, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_10: ScheduleEntry(time=slot_10, mode=BatteryMode.DISCHARGE, reason="expensive"),
+            slot_11: ScheduleEntry(time=slot_11, mode=BatteryMode.DISCHARGE, reason="expensive"),
+            slot_12: ScheduleEntry(time=slot_12, mode=BatteryMode.DISCHARGE, reason="expensive"),
         }
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 9, 55, 0)
 
@@ -332,11 +332,10 @@ class TestInsertHoldPreservesSchedule:
         # Convert to TOU periods
         periods = optimizer.schedule_to_tou_periods()
 
-        # Find the HOLD period (power=1)
+        # Find the HOLD period at 09:00 (may also have midnight HOLD pad)
         hold_periods = [p for p in periods if p.power == 1]
         assert len(hold_periods) >= 1
-        hold_period = hold_periods[0]
-        assert hold_period.start == 9 * 60  # 09:00
+        hold_period = next(p for p in hold_periods if p.start == 9 * 60)
         assert hold_period.end == 9 * 60 + 59  # 09:59
 
         # Find the DISCHARGE period (power=-100)
@@ -368,7 +367,7 @@ class TestInsertHoldPreservesSchedule:
                 mode = BatteryMode.DISCHARGE
                 reason = "day_discharge"
 
-            optimizer.schedule[dt] = ScheduleEntry(hour=dt, mode=mode, reason=reason)
+            optimizer.schedule[dt] = ScheduleEntry(time=dt, mode=mode, reason=reason)
 
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 9, 55, 0)
 
@@ -438,13 +437,13 @@ class TestInsertHoldWithRollingBoundary:
         for hour in range(9, 13):
             dt = datetime.datetime(2024, 1, 15, hour, 0, 0)
             mode = BatteryMode.CHARGE if hour == 9 else BatteryMode.DISCHARGE
-            optimizer.schedule[dt] = ScheduleEntry(hour=dt, mode=mode, reason="today")
+            optimizer.schedule[dt] = ScheduleEntry(time=dt, mode=mode, reason="today")
 
         # Tomorrow's schedule (early hours)
         for hour in range(0, 9):
             dt = datetime.datetime(2024, 1, 16, hour, 0, 0)
             optimizer.schedule[dt] = ScheduleEntry(
-                hour=dt, mode=BatteryMode.DISCHARGE, reason="tomorrow"
+                time=dt, mode=BatteryMode.DISCHARGE, reason="tomorrow"
             )
 
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 9, 55, 0)
@@ -501,8 +500,8 @@ class TestInsertHoldWithRollingBoundary:
         slot_06 = datetime.datetime(2024, 1, 15, 6, 0, 0)
 
         optimizer.schedule = {
-            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="early_charge"),
-            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.DISCHARGE, reason="morning"),
+            slot_05: ScheduleEntry(time=slot_05, mode=BatteryMode.CHARGE, reason="early_charge"),
+            slot_06: ScheduleEntry(time=slot_06, mode=BatteryMode.DISCHARGE, reason="morning"),
         }
 
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 5, 55, 0)
@@ -531,9 +530,9 @@ class TestSolarOverrideHoldInsertion:
         slot_12 = datetime.datetime(2024, 1, 15, 12, 0, 0)
 
         optimizer.schedule = {
-            slot_10: ScheduleEntry(hour=slot_10, mode=BatteryMode.CHARGE, reason="cheap"),
-            slot_11: ScheduleEntry(hour=slot_11, mode=BatteryMode.CHARGE, reason="cheap"),
-            slot_12: ScheduleEntry(hour=slot_12, mode=BatteryMode.DISCHARGE, reason="expensive"),
+            slot_10: ScheduleEntry(time=slot_10, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_11: ScheduleEntry(time=slot_11, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_12: ScheduleEntry(time=slot_12, mode=BatteryMode.DISCHARGE, reason="expensive"),
         }
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 10, 30, 0)
 
@@ -551,7 +550,7 @@ class TestSolarOverrideHoldInsertion:
         """Solar override should pass correct reason to TOU sync."""
         slot_10 = datetime.datetime(2024, 1, 15, 10, 0, 0)
         optimizer.schedule = {
-            slot_10: ScheduleEntry(hour=slot_10, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_10: ScheduleEntry(time=slot_10, mode=BatteryMode.CHARGE, reason="cheap"),
         }
         optimizer._current_datetime = datetime.datetime(2024, 1, 15, 10, 30, 0)
 

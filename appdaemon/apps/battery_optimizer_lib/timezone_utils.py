@@ -210,9 +210,9 @@ def next_interval_time(
     )
 
 
-def lookup_by_hour(
+def lookup_by_time(
     data: Dict[datetime.datetime, T],
-    hour: datetime.datetime,
+    slot_time: datetime.datetime,
     local_tz: Optional[datetime.tzinfo] = None
 ) -> Optional[T]:
     """
@@ -223,7 +223,7 @@ def lookup_by_hour(
 
     Args:
         data: Dictionary keyed by datetime
-        hour: The hour to look up
+        slot_time: The slot time to look up
         local_tz: Optional local timezone for normalization
 
     Returns:
@@ -233,12 +233,12 @@ def lookup_by_hour(
         return None
 
     # Direct lookup first (fast path)
-    if hour in data:
-        return data[hour]
+    if slot_time in data:
+        return data[slot_time]
 
     # Fallback: match by local time components
-    for sched_hour, value in data.items():
-        if datetimes_match_slot(sched_hour, hour, local_tz):
+    for sched_time, value in data.items():
+        if datetimes_match_slot(sched_time, slot_time, local_tz):
             return value
 
     return None

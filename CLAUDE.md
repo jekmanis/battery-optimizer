@@ -11,71 +11,63 @@ Battery Optimizer for Growatt WIT Inverter - a Home Assistant AppDaemon applicat
 ### File Structure
 ```
 appdaemon/apps/
-├── battery_optimizer.py           # Main AppDaemon app (~2100 lines)
+├── battery_optimizer.py           # Main AppDaemon app (orchestrator)
 ├── battery_optimizer_lib/         # Python package for helper modules
-│   ├── __init__.py                # Re-exports for convenience
-│   ├── models.py                  # Data classes and enums (~100 lines)
-│   ├── learning_engine.py         # BatteryLearningEngine (~790 lines)
-│   ├── load_profile.py            # LoadProfile (~110 lines)
-│   ├── price_service.py           # NordPoolPriceService (~510 lines)
-│   ├── tou_sync.py                # TouSyncManager (~790 lines)
-│   ├── dp_optimizer.py            # DPOptimizer (~810 lines)
-│   ├── cost_tracker.py            # BatteryCostTracker (~820 lines)
-│   ├── schedule_formatter.py      # ScheduleFormatter (~610 lines)
-│   ├── soc_deviation.py           # SocDeviationDetector (~420 lines)
-│   ├── timezone_utils.py          # Timezone helpers (~300 lines)
-│   ├── ha_helpers.py              # HA state reading (~210 lines)
-│   └── charge_rate_utils.py       # Temperature-aware rates (~50 lines)
-├── apps.yaml                      # AppDaemon configuration
+│   ├── __init__.py                # Re-exports all public classes
+│   ├── config.py                  # BatteryOptimizerConfig dataclass
+│   ├── models.py                  # Data classes and enums
+│   ├── dp_optimizer.py            # Dynamic programming optimizer
+│   ├── learning_engine.py         # Self-learning charge rate tracker
+│   ├── load_profile.py            # Statistical load forecasting
+│   ├── price_service.py           # Nord Pool price fetching
+│   ├── tou_sync.py                # TOU schedule sync via Modbus
+│   ├── cost_tracker.py            # Battery cost tracking
+│   ├── schedule_formatter.py      # Schedule logging/formatting
+│   ├── soc_deviation.py           # SOC deviation detection
+│   ├── timezone_utils.py          # Timezone-aware datetime helpers
+│   ├── ha_helpers.py              # HA state reading helpers
+│   └── charge_rate_utils.py       # Temperature-aware rate computation
+├── apps.yaml                      # AppDaemon configuration (contains secrets!)
 homeassistant/packages/
 └── battery_optimizer.yaml         # HA entities, automations, sensors
 tests/
-├── conftest.py                    # Pytest fixtures
+├── conftest.py                    # Pytest fixtures + mock AppDaemon setup
 ├── fixtures/mock_hass.py          # Mock Home Assistant
-└── test_*.py                      # Test modules (~336 tests)
+└── test_*.py                      # Test modules
 ```
 
 ### Package Modules (battery_optimizer_lib/)
 
-| Module | Classes/Functions | Purpose |
-|--------|-------------------|---------|
-| `models.py` | BatteryMode, PricePoint, ScheduleEntry, TouPeriod, LearningStats, LoadProfileStats | Pure data structures and enums |
-| `dp_optimizer.py` | DPOptimizer, DPOptimizerConfig, DPOptimizerResult | Dynamic programming SOC-aware scheduling algorithm |
+| Module | Key Classes | Purpose |
+|--------|-------------|---------|
+| `config.py` | BatteryOptimizerConfig | Typed config dataclass with `from_args()` loader |
+| `models.py` | BatteryMode, PricePoint, ScheduleEntry, TouPeriod | Pure data structures and enums |
+| `dp_optimizer.py` | DPOptimizer, DPOptimizerConfig, DPOptimizerResult | Dynamic programming SOC-aware scheduling |
 | `learning_engine.py` | BatteryLearningEngine | Self-learning charge rate and efficiency tracking |
-| `load_profile.py` | LoadProfile, _quantile | Statistical load forecasting by time-of-day |
-| `price_service.py` | NordPoolPriceService | Nord Pool price fetching via HA integration |
-| `tou_sync.py` | TouSyncManager | TOU schedule sync and device control via Modbus |
-| `cost_tracker.py` | BatteryCostTracker, BatteryCostConfig | Battery cost tracking with weighted average calculations |
-| `schedule_formatter.py` | ScheduleFormatter, ScheduleFormatterConfig | Schedule logging and formatting for HA sensors |
-| `soc_deviation.py` | SocDeviationDetector, SocDeviationConfig, DeviationCheckResult | Detects unexpected SOC changes for schedule revalidation |
-| `timezone_utils.py` | normalize_tz_pair, align_to_slot, dt_ge/dt_gt/dt_lt, etc. | Timezone-aware datetime comparison and slot alignment |
-| `ha_helpers.py` | SensorReader, get_float_state, get_bool_state, is_state_valid | Home Assistant state reading helpers |
+| `load_profile.py` | LoadProfile | Statistical load forecasting by time-of-day |
+| `price_service.py` | NordPoolPriceService | Nord Pool price fetching (built-in HA + HACS) |
+| `tou_sync.py` | TouSyncManager | TOU schedule sync and Modbus device control |
+| `cost_tracker.py` | BatteryCostTracker, BatteryCostConfig | Battery cost tracking with weighted averages |
+| `schedule_formatter.py` | ScheduleFormatter, ScheduleFormatterConfig | Schedule logging and HA sensor formatting |
+| `soc_deviation.py` | SocDeviationDetector, SocDeviationConfig | Detects unexpected SOC changes for revalidation |
+| `timezone_utils.py` | normalize_tz_pair, align_to_slot, lookup_by_time, dt_ge | Timezone-aware datetime comparison and alignment |
+| `ha_helpers.py` | SensorReader | HA state reading with validation |
 | `charge_rate_utils.py` | compute_charge_rates_per_slot | Temperature-aware charge rate computation |
-
-### Key Code Sections in battery_optimizer.py
-
-| Section | Purpose |
-|---------|---------|
-| Initialization | AppDaemon setup, config loading, scheduled tasks |
-| Price Fetching | Nord Pool API/sensor data retrieval with caching |
-| Price Analysis | Statistics and charge/discharge hour calculations |
-| Optimization Algorithm | Dynamic programming SOC-aware scheduling |
-| Schedule Execution | Full/adaptive optimization, recalculation |
-| Mode Execution | Hourly mode application, safety checks |
-| Device Control | Growatt Modbus register writes (VPP protocol) |
-| TOU Sync | Schedule sync to inverter TOU registers |
-| Manual Override | User intervention handling |
-| Battery Cost Tracking | Weighted average cost with persistence |
-| Helper Methods | SOC reading, timezone handling, slot alignment |
-| Properties & Sensor | Dynamic config, schedule sensor updates |
 
 ### Data Models
 - `BatteryMode` enum: HOLD (0), CHARGE (1), DISCHARGE (2)
-- `PricePoint` dataclass: Hour + price
-- `ScheduleEntry` dataclass: Hour + mode + reason
+- `PricePoint` dataclass: Time (datetime) + price
+- `ScheduleEntry` dataclass: Time (datetime) + mode + reason
 - `TouPeriod` dataclass: Start/end minutes + power percentage
 - `LoadProfileStats` dataclass: Min/max/sum/count for load observations
 - `LearningStats` dataclass: Charge rate learning data per SOC range
+
+### Slot Resolution
+- Default `slot_minutes=15` (96 slots/day) — matches Nord Pool 15-minute pricing periods
+- Configurable via `apps.yaml` (`slot_minutes: 15`)
+- Price service requests 15-min resolution from Nord Pool (`resolution` parameter)
+- `_normalize_prices()` handles expansion if source data is coarser (e.g., hourly → 4x15min)
+- Load profile supports migration from coarser buckets (30-min → 15-min) on first load
 
 ## Core Algorithm
 
@@ -140,13 +132,13 @@ These values read from HA entities at runtime (adjustable without restart):
 ### Scheduled Tasks
 - **13:15 daily**: Full optimization (after Nord Pool prices publish)
 - **Startup**: Initial optimization
-- **Every 30 min**: Adaptive re-evaluation + schedule change logging
+- **Every 15 min**: Adaptive re-evaluation + schedule change logging
 - **Every 5 min**: Safety checks
 - **Hourly**: Mode execution + battery cost update
 
 ## Development
 
-This is a Python AppDaemon project. Use `uv` for running Python scripts and syntax checks.
+This is a Python AppDaemon project. Use `uv` for running Python scripts and syntax checks. No formatter or linter is enforced.
 
 **Shell note**: Even though the platform is Windows, the shell is bash. Don't use Windows-specific syntax like `cd /d`. The working directory is already set, so run commands directly without `cd`.
 
@@ -167,32 +159,10 @@ uv run pytest tests/test_algorithm.py::TestFindOptimalSchedule::test_basic_charg
 uv run pytest tests/ --cov=appdaemon/apps --cov-report=term-missing
 ```
 
-### Deployment
-```bash
-# Copy app to AppDaemon
-cp appdaemon/apps/battery_optimizer.py /config/appdaemon/apps/
-
-# Copy library package
-cp -r appdaemon/apps/battery_optimizer_lib /config/appdaemon/apps/
-
-# Copy configuration
-cp appdaemon/apps/apps.yaml /config/appdaemon/apps/
-
-# Copy HA package
-cp homeassistant/packages/battery_optimizer.yaml /config/packages/
-```
-
-### Testing
-Manual verification via Home Assistant UI and AppDaemon logs. Set `device_id: ""` in apps.yaml for dry-run mode (simulates without controlling inverter).
-
-### Key Sensor Attributes
-`sensor.battery_optimizer` exposes:
-- `current_mode`, `schedule`, `next_charge`, `next_discharge`
-- `battery_avg_cost` - weighted average cost of energy in battery
-- `discharge_threshold` - current price threshold for discharge decisions
+### Testing Architecture
+- `conftest.py` mocks the entire `appdaemon.plugins.hass.hassapi` module before any imports, so library modules can be tested without AppDaemon installed.
+- Library modules in `battery_optimizer_lib/` are tested directly. The main `battery_optimizer.py` (AppDaemon orchestrator) is not unit-tested — it's validated via dry-run mode (`device_id: ""` in apps.yaml).
+- `apps.yaml` contains a long-lived HA access token — do not commit changes to it carelessly.
 
 ## Key Dependencies
-- AppDaemon 4
-- Home Assistant
-- Nord Pool integration (built-in or HACS)
-- Growatt Modbus integration (for inverter control)
+- AppDaemon 4, Home Assistant, Nord Pool integration, Growatt Modbus integration

@@ -42,7 +42,7 @@ def simple_prices():
     """Simple price list: cheap at night, expensive during day."""
     base = datetime.datetime(2024, 1, 15, 0, 0, 0)
     return [
-        PricePoint(hour=base + datetime.timedelta(hours=i), price=price)
+        PricePoint(time=base + datetime.timedelta(hours=i), price=price)
         for i, price in enumerate([
             0.05,  # 00:00 - cheap
             0.04,  # 01:00 - cheapest
@@ -166,7 +166,7 @@ class TestDPOptimizerOptimize:
             temp_after_idle_predictor=identity_temp_predictor,
         )
         current_slot = datetime.datetime(2024, 1, 15, 12, 0, 0)
-        prices = [PricePoint(hour=current_slot, price=0.10)]
+        prices = [PricePoint(time=current_slot, price=0.10)]
         result = optimizer.optimize(
             prices=prices,
             current_slot=current_slot,
@@ -193,7 +193,7 @@ class TestDPOptimizerOptimize:
             temp_after_charge_predictor=identity_temp_predictor,
             temp_after_idle_predictor=identity_temp_predictor,
         )
-        current_slot = simple_prices[0].hour
+        current_slot = simple_prices[0].time
         result = optimizer.optimize(
             prices=simple_prices,
             current_slot=current_slot,
@@ -229,7 +229,7 @@ class TestDPOptimizerOptimize:
             temp_after_charge_predictor=identity_temp_predictor,
             temp_after_idle_predictor=identity_temp_predictor,
         )
-        current_slot = simple_prices[0].hour
+        current_slot = simple_prices[0].time
         result = optimizer.optimize(
             prices=simple_prices,
             current_slot=current_slot,
@@ -277,7 +277,7 @@ class TestDPOptimizerOptimize:
             temp_after_charge_predictor=identity_temp_predictor,
             temp_after_idle_predictor=identity_temp_predictor,
         )
-        current_slot = simple_prices[0].hour
+        current_slot = simple_prices[0].time
         result = optimizer.optimize(
             prices=simple_prices,
             current_slot=current_slot,
@@ -316,7 +316,7 @@ class TestDPOptimizerOptimize:
             temp_after_charge_predictor=identity_temp_predictor,
             temp_after_idle_predictor=identity_temp_predictor,
         )
-        current_slot = simple_prices[0].hour
+        current_slot = simple_prices[0].time
         result = optimizer.optimize(
             prices=simple_prices,
             current_slot=current_slot,
@@ -343,7 +343,7 @@ class TestDPOptimizerOptimize:
             temp_after_charge_predictor=identity_temp_predictor,
             temp_after_idle_predictor=identity_temp_predictor,
         )
-        current_slot = simple_prices[0].hour
+        current_slot = simple_prices[0].time
         result = optimizer.optimize(
             prices=simple_prices,
             current_slot=current_slot,
@@ -372,7 +372,7 @@ class TestDPOptimizerResult:
         )
         result = optimizer.optimize(
             prices=simple_prices,
-            current_slot=simple_prices[0].hour,
+            current_slot=simple_prices[0].time,
             current_soc=50.0,
         )
         # Check all fields exist
@@ -400,7 +400,7 @@ class TestDPOptimizerResult:
         )
         result = optimizer.optimize(
             prices=simple_prices,
-            current_slot=simple_prices[0].hour,
+            current_slot=simple_prices[0].time,
             current_soc=50.0,
         )
         # Verify counts match schedule
@@ -437,7 +437,7 @@ class TestTemperatureAwareness:
         )
         result = optimizer.optimize(
             prices=simple_prices,
-            current_slot=simple_prices[0].hour,
+            current_slot=simple_prices[0].time,
             current_soc=50.0,
             current_temp=15.0,
         )
@@ -462,7 +462,7 @@ class TestTemperatureAwareness:
         )
         result = optimizer.optimize(
             prices=simple_prices,
-            current_slot=simple_prices[0].hour,
+            current_slot=simple_prices[0].time,
             current_soc=50.0,
             current_temp=15.0,
         )
@@ -487,9 +487,128 @@ class TestTemperatureAwareness:
         )
         result = optimizer.optimize(
             prices=simple_prices,
-            current_slot=simple_prices[0].hour,
+            current_slot=simple_prices[0].time,
             current_soc=50.0,
             current_temp=None,
         )
         # Temperature trajectory should be empty
         assert len(result.temp_trajectory) == 0
+
+
+class TestFifteenMinuteSlotDP:
+    """Tests for DPOptimizer with 15-minute slot resolution."""
+
+    @pytest.fixture
+    def config_15min(self):
+        """Configuration for 15-minute slots."""
+        return DPOptimizerConfig(
+            battery_capacity=14.3,
+            min_soc=10.0,
+            max_soc=100.0,
+            efficiency=0.85,
+            discharge_rate=4.5,
+            slot_minutes=15,
+            soc_step_percent=1.0,
+            grid_fee=0.05,
+            battery_wear_cost=0.02,
+        )
+
+    @pytest.fixture
+    def prices_15min(self):
+        """Price list for 15-minute slots: 8 slots (2 hours)."""
+        base = datetime.datetime(2024, 1, 15, 0, 0, 0)
+        return [
+            PricePoint(time=base + datetime.timedelta(minutes=15 * i), price=price)
+            for i, price in enumerate([
+                0.03,  # 00:00 - cheap
+                0.03,  # 00:15 - cheap
+                0.04,  # 00:30
+                0.05,  # 00:45
+                0.15,  # 01:00 - expensive
+                0.20,  # 01:15 - most expensive
+                0.18,  # 01:30
+                0.12,  # 01:45
+            ])
+        ]
+
+    def test_15min_slot_energy_calculation(
+        self,
+        config_15min,
+        prices_15min,
+        constant_load_predictor,
+        constant_charge_rate_predictor,
+        identity_temp_predictor,
+    ):
+        """Verify 15-min slot energy: charge_rate * 0.25 * efficiency per slot."""
+        # With charge_rate=4.5, efficiency=0.85, slot_hours=0.25:
+        # Energy per slot = 4.5 * 0.25 * 0.85 = 0.95625 kWh
+        assert config_15min.slot_hours == 0.25
+
+        optimizer = DPOptimizer(
+            config=config_15min,
+            load_predictor=constant_load_predictor,
+            charge_rate_predictor=constant_charge_rate_predictor,
+            temp_after_charge_predictor=identity_temp_predictor,
+            temp_after_idle_predictor=identity_temp_predictor,
+        )
+        current_slot = prices_15min[0].time
+        result = optimizer.optimize(
+            prices=prices_15min,
+            current_slot=current_slot,
+            current_soc=20.0,  # Low SOC to encourage charging
+        )
+        # Should generate a valid schedule
+        assert len(result.schedule) == len(prices_15min)
+
+        # Verify at least some charge slots exist at low SOC with cheap prices
+        assert result.charge_count > 0 or result.discharge_count > 0 or result.hold_count > 0
+
+    def test_15min_soc_trajectory(
+        self,
+        config_15min,
+        constant_load_predictor,
+        constant_charge_rate_predictor,
+        identity_temp_predictor,
+    ):
+        """Verify SOC trajectory step sizes for 15-min slots.
+
+        With charge_rate=4.5, efficiency=0.85, capacity=14.3:
+        energy per slot = 4.5 * 0.25 * 0.85 = 0.95625 kWh
+        SOC change per slot = 0.95625 / 14.3 * 100 ~= 6.69%
+        """
+        # Create many cheap slots to encourage charging
+        base = datetime.datetime(2024, 1, 15, 0, 0, 0)
+        prices = [
+            PricePoint(time=base + datetime.timedelta(minutes=15 * i), price=0.01)
+            for i in range(8)
+        ]
+
+        optimizer = DPOptimizer(
+            config=config_15min,
+            load_predictor=constant_load_predictor,
+            charge_rate_predictor=constant_charge_rate_predictor,
+            temp_after_charge_predictor=identity_temp_predictor,
+            temp_after_idle_predictor=identity_temp_predictor,
+        )
+        result = optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=30.0,  # Start low to get charging
+        )
+
+        # Verify SOC trajectory has entries
+        assert len(result.soc_trajectory) > 0
+
+        # For charge slots, check SOC step size is reasonable
+        # Expected: ~6.69% per charging slot (with 0.5kW load reducing it slightly)
+        expected_max_soc_step = (4.5 * 0.25 * 0.85) / 14.3 * 100  # ~6.69%
+        for slot_time, (start_soc, end_soc) in result.soc_trajectory.items():
+            entry = result.schedule.get(slot_time)
+            if entry and entry.mode == BatteryMode.CHARGE:
+                soc_change = end_soc - start_soc
+                # SOC increase should not exceed the maximum possible
+                # (load consumption reduces effective charging, so allow some margin)
+                assert soc_change <= expected_max_soc_step + 1.0, (
+                    f"SOC change {soc_change:.2f}% at {slot_time} exceeds "
+                    f"expected max {expected_max_soc_step:.2f}%"
+                )

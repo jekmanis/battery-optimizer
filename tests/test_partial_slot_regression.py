@@ -142,7 +142,7 @@ def _make_price_points():
         0.0949, 0.0974, 0.1018, 0.1099, 0.1153, 0.1250, 0.1224, 0.1206,
     ]
     return base, [
-        PricePoint(hour=base + datetime.timedelta(hours=i), price=price)
+        PricePoint(time=base + datetime.timedelta(hours=i), price=price)
         for i, price in enumerate(prices)
     ]
 

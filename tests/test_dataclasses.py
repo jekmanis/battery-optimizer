@@ -50,22 +50,22 @@ class TestPricePoint:
     def test_basic_creation(self):
         """Basic creation should work."""
         dt = datetime.datetime(2024, 1, 15, 10, 0, 0)
-        pp = PricePoint(hour=dt, price=0.15)
+        pp = PricePoint(time=dt, price=0.15)
 
-        assert pp.hour == dt
+        assert pp.time == dt
         assert pp.price == 0.15
 
     def test_negative_price(self):
         """Negative prices should be supported."""
         dt = datetime.datetime(2024, 1, 15, 2, 0, 0)
-        pp = PricePoint(hour=dt, price=-0.02)
+        pp = PricePoint(time=dt, price=-0.02)
 
         assert pp.price == -0.02
 
     def test_zero_price(self):
         """Zero price should be supported."""
         dt = datetime.datetime(2024, 1, 15, 2, 0, 0)
-        pp = PricePoint(hour=dt, price=0.0)
+        pp = PricePoint(time=dt, price=0.0)
 
         assert pp.price == 0.0
 
@@ -77,12 +77,12 @@ class TestScheduleEntry:
         """Basic creation should work."""
         dt = datetime.datetime(2024, 1, 15, 10, 0, 0)
         entry = ScheduleEntry(
-            hour=dt,
+            time=dt,
             mode=BatteryMode.CHARGE,
             reason="Cheap electricity"
         )
 
-        assert entry.hour == dt
+        assert entry.time == dt
         assert entry.mode == BatteryMode.CHARGE
         assert entry.reason == "Cheap electricity"
 
@@ -90,9 +90,9 @@ class TestScheduleEntry:
         """Should work with all battery modes."""
         dt = datetime.datetime(2024, 1, 15, 10, 0, 0)
 
-        hold = ScheduleEntry(hour=dt, mode=BatteryMode.HOLD, reason="Hold")
-        charge = ScheduleEntry(hour=dt, mode=BatteryMode.CHARGE, reason="Charge")
-        discharge = ScheduleEntry(hour=dt, mode=BatteryMode.DISCHARGE, reason="Discharge")
+        hold = ScheduleEntry(time=dt, mode=BatteryMode.HOLD, reason="Hold")
+        charge = ScheduleEntry(time=dt, mode=BatteryMode.CHARGE, reason="Charge")
+        discharge = ScheduleEntry(time=dt, mode=BatteryMode.DISCHARGE, reason="Discharge")
 
         assert hold.mode == BatteryMode.HOLD
         assert charge.mode == BatteryMode.CHARGE
@@ -102,7 +102,7 @@ class TestScheduleEntry:
         """Reason can include formatted price info."""
         dt = datetime.datetime(2024, 1, 15, 10, 0, 0)
         entry = ScheduleEntry(
-            hour=dt,
+            time=dt,
             mode=BatteryMode.CHARGE,
             reason=f"Charge @ {0.0523:.4f} EUR/kWh"
         )

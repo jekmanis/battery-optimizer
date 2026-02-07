@@ -105,14 +105,14 @@ battery_optimizer:
   # Leave empty to disable probabilistic load profiling
   load_power_sensor: "sensor.growatt_power_to_load"
 
-  # Schedule resolution in minutes (60 = hourly plan)
-  slot_minutes: 60
+  # Schedule resolution in minutes (15 = quarter-hourly plan)
+  slot_minutes: 15
 
   # Recalculate schedule every N minutes (independent of slot_minutes)
-  adaptive_recalc_minutes: 30
+  adaptive_recalc_minutes: 15
 
   # Load observation interval (minutes)
-  load_observation_minutes: 30
+  load_observation_minutes: 15
 
   # Quantile for load forecast (0.5 = median, 0.8 = conservative)
   load_quantile: 0.75

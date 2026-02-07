@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .models import BatteryMode, PricePoint, ScheduleEntry
-from .timezone_utils import lookup_by_hour
+from .timezone_utils import lookup_by_time
 
 
 @dataclass
@@ -167,12 +167,12 @@ class ScheduleFormatter:
         """Format the SOC/temperature trajectory string for a schedule entry."""
         # Try DP trajectory first (exact values from optimizer)
         dp_soc_data = (
-            lookup_by_hour(dp_soc_trajectory, hour, local_tz)
+            lookup_by_time(dp_soc_trajectory, hour, local_tz)
             if dp_soc_trajectory
             else None
         )
         dp_temp_data = (
-            lookup_by_hour(dp_temp_trajectory, hour, local_tz)
+            lookup_by_time(dp_temp_trajectory, hour, local_tz)
             if dp_temp_trajectory
             else None
         )
@@ -219,9 +219,9 @@ class ScheduleFormatter:
         max_soc: float,
     ) -> str:
         """Format trajectory using recalculated expected values (fallback)."""
-        start_soc = lookup_by_hour(expected_soc, hour, local_tz)
+        start_soc = lookup_by_time(expected_soc, hour, local_tz)
         start_temp = (
-            lookup_by_hour(expected_temp, hour, local_tz) if expected_temp else None
+            lookup_by_time(expected_temp, hour, local_tz) if expected_temp else None
         )
 
         if start_soc is None:
@@ -361,21 +361,21 @@ class ScheduleFormatter:
         charge_slots = []
         discharge_slots = []
         for hour, entry in schedule.items():
-            price_point = next((p for p in prices_sorted if p.hour == hour), None)
+            price_point = next((p for p in prices_sorted if p.time == hour), None)
             price = price_point.price if price_point else 0.0
             if entry.mode == BatteryMode.CHARGE:
                 charge_slots.append({"hour": hour, "price": price})
             elif entry.mode == BatteryMode.DISCHARGE:
                 # Find corresponding load
                 idx = next(
-                    (i for i, p in enumerate(prices_sorted) if p.hour == hour), 0
+                    (i for i, p in enumerate(prices_sorted) if p.time == hour), 0
                 )
                 load = load_kw[idx] if idx < len(load_kw) else 0.0
                 discharge_slots.append({"hour": hour, "price": price, "load": load})
 
         # Sort all prices to rank candidates
         all_prices_sorted = sorted(prices_sorted, key=lambda p: p.price)
-        price_rank = {p.hour: i + 1 for i, p in enumerate(all_prices_sorted)}
+        price_rank = {p.time: i + 1 for i, p in enumerate(all_prices_sorted)}
 
         # Build charge slots list for sensor exposure
         formatted_charge_slots = [
@@ -433,8 +433,8 @@ class ScheduleFormatter:
         # Cheapest charge candidates
         self.log("\nCheapest 5 charge candidates:")
         for i, p in enumerate(all_prices_sorted[:5]):
-            marker = " *" if any(s["hour"] == p.hour for s in charge_slots) else ""
-            self.log(f"  {i+1}. {_fmt_dt(p.hour)} @ {p.price:.4f} EUR/kWh{marker}")
+            marker = " *" if any(s["hour"] == p.time for s in charge_slots) else ""
+            self.log(f"  {i+1}. {_fmt_dt(p.time)} @ {p.price:.4f} EUR/kWh{marker}")
 
         # Selected charge slots with rankings
         if charge_slots:

@@ -142,8 +142,8 @@ class DPOptimizer:
             )
 
         cfg = self._config
-        hours_sorted_by_time = sorted(prices, key=lambda p: p.hour)
-        n_slots = len(hours_sorted_by_time)
+        slots_sorted_by_time = sorted(prices, key=lambda p: p.time)
+        n_slots = len(slots_sorted_by_time)
 
         # Energy bounds in kWh
         min_energy = (cfg.min_soc / 100) * cfg.battery_capacity
@@ -160,29 +160,29 @@ class DPOptimizer:
         slot_fractions = [1.0] * n_slots
         current_slot_index = None
 
-        for i, p in enumerate(hours_sorted_by_time):
-            p_hour = p.hour
+        for i, p in enumerate(slots_sorted_by_time):
+            p_time = p.time
             compare_current = current_slot
-            if p_hour.tzinfo is not None and compare_current.tzinfo is None:
-                p_hour = p_hour.replace(tzinfo=None)
-            elif p_hour.tzinfo is None and compare_current.tzinfo is not None:
+            if p_time.tzinfo is not None and compare_current.tzinfo is None:
+                p_time = p_time.replace(tzinfo=None)
+            elif p_time.tzinfo is None and compare_current.tzinfo is not None:
                 compare_current = compare_current.replace(tzinfo=None)
-            if p_hour == compare_current:
+            if p_time == compare_current:
                 slot_fractions[i] = first_fraction
                 current_slot_index = i
                 break
 
         # Pre-compute temperature-aware charge rates for each slot
         charge_rates_per_slot = self._compute_charge_rates_per_slot(
-            hours_sorted_by_time, slot_fractions, current_soc, current_temp
+            slots_sorted_by_time, slot_fractions, current_soc, current_temp
         )
 
         # Pre-compute load per slot
-        load_kw = [self._predict_load_kw(p.hour) for p in hours_sorted_by_time]
+        load_kw = [self._predict_load_kw(p.time) for p in slots_sorted_by_time]
 
         # Run DP to build schedule
         schedule, idx_trajectory, best_value = self._build_schedule(
-            hours_sorted_by_time=hours_sorted_by_time,
+            slots_sorted_by_time=slots_sorted_by_time,
             load_kw=load_kw,
             charge_rates_per_slot=charge_rates_per_slot,
             slot_fractions=slot_fractions,
@@ -197,12 +197,12 @@ class DPOptimizer:
 
         # Build SOC trajectory
         soc_trajectory = self._build_soc_trajectory(
-            hours_sorted_by_time, idx_trajectory, start_energy, min_energy, step_kwh, n_states
+            slots_sorted_by_time, idx_trajectory, start_energy, min_energy, step_kwh, n_states
         )
 
         # Build temperature trajectory
         temp_trajectory = self._build_temp_trajectory(
-            hours_sorted_by_time, schedule, slot_fractions, current_temp
+            slots_sorted_by_time, schedule, slot_fractions, current_temp
         )
 
         # Count actions
@@ -221,14 +221,14 @@ class DPOptimizer:
 
     def _compute_charge_rates_per_slot(
         self,
-        hours_sorted_by_time: List[PricePoint],
+        slots_sorted_by_time: List[PricePoint],
         slot_fractions: List[float],
         current_soc: float,
         current_temp: Optional[float],
     ) -> List[float]:
         """Pre-compute temperature-aware charge rates for each slot."""
         return compute_charge_rates_per_slot(
-            hours_sorted_by_time=hours_sorted_by_time,
+            slots_sorted_by_time=slots_sorted_by_time,
             slot_fractions=slot_fractions,
             slot_minutes=self._config.slot_minutes,
             current_soc=current_soc,
@@ -239,7 +239,7 @@ class DPOptimizer:
 
     def _build_soc_trajectory(
         self,
-        hours_sorted_by_time: List[PricePoint],
+        slots_sorted_by_time: List[PricePoint],
         idx_trajectory: List[int],
         start_energy: float,
         min_energy: float,
@@ -250,11 +250,11 @@ class DPOptimizer:
         soc_trajectory: Dict[datetime.datetime, Tuple[float, float]] = {}
         cfg = self._config
 
-        if idx_trajectory and len(idx_trajectory) == len(hours_sorted_by_time):
+        if idx_trajectory and len(idx_trajectory) == len(slots_sorted_by_time):
             start_idx = _energy_to_index(start_energy, min_energy, step_kwh, n_states, "round")
 
-            for t, price_point in enumerate(hours_sorted_by_time):
-                hour = price_point.hour
+            for t, price_point in enumerate(slots_sorted_by_time):
+                hour = price_point.time
                 if t == 0:
                     slot_start_idx = start_idx
                 else:
@@ -269,7 +269,7 @@ class DPOptimizer:
 
     def _build_temp_trajectory(
         self,
-        hours_sorted_by_time: List[PricePoint],
+        slots_sorted_by_time: List[PricePoint],
         schedule: Dict[datetime.datetime, ScheduleEntry],
         slot_fractions: List[float],
         current_temp: Optional[float],
@@ -280,8 +280,8 @@ class DPOptimizer:
 
         if current_temp is not None:
             projected_temp = current_temp
-            for t, price_point in enumerate(hours_sorted_by_time):
-                hour = price_point.hour
+            for t, price_point in enumerate(slots_sorted_by_time):
+                hour = price_point.time
                 start_temp = projected_temp
                 slot_duration_minutes = cfg.slot_minutes * slot_fractions[t]
 
@@ -296,7 +296,7 @@ class DPOptimizer:
 
     def _run_dp(
         self,
-        hours_list: List[PricePoint],
+        slots_list: List[PricePoint],
         load_kw_list: List[float],
         charge_rates_list: List[float],
         slot_fractions_list: List[float],
@@ -315,7 +315,7 @@ class DPOptimizer:
             (actions, partial_flags, best_value, idx_trajectory)
         """
         cfg = self._config
-        n_list_slots = len(hours_list)
+        n_list_slots = len(slots_list)
         if n_list_slots == 0:
             return [], [], 0.0, []
 
@@ -360,7 +360,7 @@ class DPOptimizer:
         dp_trace_slots = []
 
         for t in range(n_list_slots):
-            price = hours_list[t].price
+            price = slots_list[t].price
             buy_price = price + cfg.grid_fee
             fraction = slot_fractions_list[t]
             discharge_kwh = min(load_kw_list[t], cfg.discharge_rate) * cfg.slot_hours * fraction
@@ -484,10 +484,10 @@ class DPOptimizer:
                     })
 
             if trace_this_slot and slot_trace:
-                dp_trace_slots.append((hours_list[t].hour, price, slot_trace))
+                dp_trace_slots.append((slots_list[t].time, price, slot_trace))
 
             if deep_trace_this_slot:
-                self._log(f"[DeepTrace] After slot {t} ({hours_list[t].hour.strftime('%H:%M')} @ {price:.4f}):")
+                self._log(f"[DeepTrace] After slot {t} ({slots_list[t].time.strftime('%H:%M')} @ {price:.4f}):")
                 active_states = [
                     (i, next_dp[i], next_prev_action[i])
                     for i in range(n_states)
@@ -540,7 +540,7 @@ class DPOptimizer:
 
             if t < 5 and self._decision_log_level >= 3:
                 soc_at_t = cfg.min_soc + (idx * step_kwh / cfg.battery_capacity) * 100
-                backtrack_trace.append(f"t={t} ({hours_list[t].hour.strftime('%H:%M')}): action={action.name}, idx={idx} ({soc_at_t:.1f}%)->prev_i={prev_i}")
+                backtrack_trace.append(f"t={t} ({slots_list[t].time.strftime('%H:%M')}): action={action.name}, idx={idx} ({soc_at_t:.1f}%)->prev_i={prev_i}")
 
             if prev_i is None:
                 idx = idx
@@ -562,7 +562,7 @@ class DPOptimizer:
             self._log("DP TRACE: Detailed state transitions for discharge-allowed slots")
             self._log("=" * 70)
             for slot_hour, slot_price, traces in dp_trace_slots:
-                slot_idx = next((i for i, h in enumerate(hours_list) if h.hour == slot_hour), -1)
+                slot_idx = next((i for i, h in enumerate(slots_list) if h.time == slot_hour), -1)
                 chosen_action = actions[slot_idx] if 0 <= slot_idx < len(actions) else None
                 self._log(f"\n{slot_hour.strftime('%Y-%m-%d %H:%M')} @ {slot_price:.4f} EUR/kWh -> {chosen_action.name if chosen_action else '?'}")
 
@@ -591,7 +591,7 @@ class DPOptimizer:
 
     def _build_schedule(
         self,
-        hours_sorted_by_time: List[PricePoint],
+        slots_sorted_by_time: List[PricePoint],
         load_kw: List[float],
         charge_rates_per_slot: List[float],
         slot_fractions: List[float],
@@ -621,7 +621,7 @@ class DPOptimizer:
         has_partial = partial_index is not None and partial_fraction < 0.999
 
         if has_partial:
-            price_point = hours_sorted_by_time[partial_index]
+            price_point = slots_sorted_by_time[partial_index]
             price = price_point.price
             buy_price = price + cfg.grid_fee
             fraction = slot_fractions[partial_index]
@@ -633,7 +633,7 @@ class DPOptimizer:
 
             # Remaining slots for DP
             remaining_slice = slice(partial_index + 1, None)
-            hours_remaining = hours_sorted_by_time[remaining_slice]
+            slots_remaining = slots_sorted_by_time[remaining_slice]
             load_remaining = load_kw[remaining_slice]
             charge_rates_remaining = charge_rates_per_slot[remaining_slice]
             slot_fractions_remaining = slot_fractions[remaining_slice]
@@ -703,13 +703,13 @@ class DPOptimizer:
             best_value = neg_inf
 
             if self._decision_log_level >= 3:
-                self._log(f"[GreedyLookahead] Partial slot {price_point.hour.strftime('%H:%M')} @ {price:.4f}")
+                self._log(f"[GreedyLookahead] Partial slot {price_point.time.strftime('%H:%M')} @ {price:.4f}")
                 self._log(f"  Candidates: {[(c[0].name, c[2]) for c in candidates]}")
 
             greedy_results = []
             for action, new_energy, immediate_val, start_idx_override, is_partial in candidates:
                 actions_remaining, partial_flags_remaining, future_val, idx_traj_remaining = self._run_dp(
-                    hours_remaining,
+                    slots_remaining,
                     load_remaining,
                     charge_rates_remaining,
                     slot_fractions_remaining,
@@ -767,7 +767,7 @@ class DPOptimizer:
             idx_trajectory = [best_first_slot_end_idx] + best_idx_trajectory_remaining
         else:
             actions, partial_flags, best_value, idx_trajectory = self._run_dp(
-                hours_sorted_by_time,
+                slots_sorted_by_time,
                 load_kw,
                 charge_rates_per_slot,
                 slot_fractions,
@@ -779,12 +779,12 @@ class DPOptimizer:
                 energy_levels,
             )
 
-        for price_point, action, lk, is_partial in zip(hours_sorted_by_time, actions, load_kw, partial_flags):
-            hour = price_point.hour
+        for price_point, action, lk, is_partial in zip(slots_sorted_by_time, actions, load_kw, partial_flags):
+            hour = price_point.time
             price = price_point.price
             reason = f"{price:.4f} EUR/kWh load~{lk:.2f}kW"
             if is_partial:
                 reason += " (until depleted)"
-            schedule_local[hour] = ScheduleEntry(hour=hour, mode=action, reason=reason)
+            schedule_local[hour] = ScheduleEntry(time=hour, mode=action, reason=reason)
 
         return schedule_local, idx_trajectory, best_value

@@ -11,7 +11,7 @@ from battery_optimizer_lib.timezone_utils import (
     align_to_slot,
     next_slot_time,
     next_interval_time,
-    lookup_by_hour,
+    lookup_by_time,
 )
 
 
@@ -180,29 +180,29 @@ class TestNextIntervalTime:
 
 
 class TestLookupByHour:
-    """Tests for lookup_by_hour function."""
+    """Tests for lookup_by_time function."""
 
     def test_direct_lookup(self):
         dt1 = datetime.datetime(2024, 1, 15, 10, 30)
         dt2 = datetime.datetime(2024, 1, 15, 11, 00)
         data = {dt1: "value1", dt2: "value2"}
-        assert lookup_by_hour(data, dt1) == "value1"
-        assert lookup_by_hour(data, dt2) == "value2"
+        assert lookup_by_time(data, dt1) == "value1"
+        assert lookup_by_time(data, dt2) == "value2"
 
     def test_fallback_matching(self):
         dt_aware = datetime.datetime(2024, 1, 15, 10, 30, tzinfo=TZ_PLUS2)
         dt_naive = datetime.datetime(2024, 1, 15, 10, 30)
         data = {dt_aware: "value1"}
         # Should find via slot matching
-        result = lookup_by_hour(data, dt_naive, TZ_PLUS2)
+        result = lookup_by_time(data, dt_naive, TZ_PLUS2)
         assert result == "value1"
 
     def test_not_found(self):
         dt1 = datetime.datetime(2024, 1, 15, 10, 30)
         dt_missing = datetime.datetime(2024, 1, 15, 12, 30)
         data = {dt1: "value1"}
-        assert lookup_by_hour(data, dt_missing) is None
+        assert lookup_by_time(data, dt_missing) is None
 
     def test_empty_dict(self):
         dt = datetime.datetime(2024, 1, 15, 10, 30)
-        assert lookup_by_hour({}, dt) is None
+        assert lookup_by_time({}, dt) is None

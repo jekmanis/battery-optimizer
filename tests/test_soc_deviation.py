@@ -140,9 +140,9 @@ class TestSocDeviationDuringCharge:
         slot_07 = datetime.datetime(2024, 1, 15, 7, 0, 0)
 
         optimizer.schedule = {
-            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
-            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.CHARGE, reason="cheap"),
-            slot_07: ScheduleEntry(hour=slot_07, mode=BatteryMode.DISCHARGE, reason="expensive"),
+            slot_05: ScheduleEntry(time=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_06: ScheduleEntry(time=slot_06, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_07: ScheduleEntry(time=slot_07, mode=BatteryMode.DISCHARGE, reason="expensive"),
         }
         # Expected SOC at start of each slot
         optimizer.expected_soc_schedule = {
@@ -170,8 +170,8 @@ class TestSocDeviationDuringCharge:
         slot_06 = datetime.datetime(2024, 1, 15, 6, 0, 0)
 
         optimizer.schedule = {
-            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
-            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.HOLD, reason="moderate"),
+            slot_05: ScheduleEntry(time=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_06: ScheduleEntry(time=slot_06, mode=BatteryMode.HOLD, reason="moderate"),
         }
         optimizer.expected_soc_schedule = {
             slot_05: 70.0,  # High starting SOC
@@ -202,8 +202,8 @@ class TestSocDeviationDuringCharge:
         slot_06 = datetime.datetime(2024, 1, 15, 6, 0, 0)
 
         optimizer.schedule = {
-            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
-            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.DISCHARGE, reason="expensive"),
+            slot_05: ScheduleEntry(time=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_06: ScheduleEntry(time=slot_06, mode=BatteryMode.DISCHARGE, reason="expensive"),
         }
         optimizer.expected_soc_schedule = {
             slot_05: 50.0,
@@ -249,8 +249,8 @@ class TestSocDeviationDuringDischarge:
         slot_11 = datetime.datetime(2024, 1, 15, 11, 0, 0)
 
         optimizer.schedule = {
-            slot_10: ScheduleEntry(hour=slot_10, mode=BatteryMode.DISCHARGE, reason="expensive"),
-            slot_11: ScheduleEntry(hour=slot_11, mode=BatteryMode.DISCHARGE, reason="expensive"),
+            slot_10: ScheduleEntry(time=slot_10, mode=BatteryMode.DISCHARGE, reason="expensive"),
+            slot_11: ScheduleEntry(time=slot_11, mode=BatteryMode.DISCHARGE, reason="expensive"),
         }
         optimizer.expected_soc_schedule = {
             slot_10: 80.0,
@@ -278,7 +278,7 @@ class TestSocDeviationDuringDischarge:
         slot_10 = datetime.datetime(2024, 1, 15, 10, 0, 0)
 
         optimizer.schedule = {
-            slot_10: ScheduleEntry(hour=slot_10, mode=BatteryMode.DISCHARGE, reason="expensive"),
+            slot_10: ScheduleEntry(time=slot_10, mode=BatteryMode.DISCHARGE, reason="expensive"),
         }
         optimizer.expected_soc_schedule = {
             slot_10: 80.0,
@@ -305,7 +305,7 @@ class TestSocDeviationDuringDischarge:
         slot_10 = datetime.datetime(2024, 1, 15, 10, 0, 0)
 
         optimizer.schedule = {
-            slot_10: ScheduleEntry(hour=slot_10, mode=BatteryMode.DISCHARGE, reason="expensive"),
+            slot_10: ScheduleEntry(time=slot_10, mode=BatteryMode.DISCHARGE, reason="expensive"),
         }
         optimizer.expected_soc_schedule = {
             slot_10: 80.0,
@@ -335,7 +335,7 @@ class TestSocDeviationEdgeCases:
         slot_10 = datetime.datetime(2024, 1, 15, 10, 0, 0)
 
         optimizer.schedule = {
-            slot_10: ScheduleEntry(hour=slot_10, mode=BatteryMode.HOLD, reason="moderate"),
+            slot_10: ScheduleEntry(time=slot_10, mode=BatteryMode.HOLD, reason="moderate"),
         }
         optimizer.expected_soc_schedule = {
             slot_10: 50.0,
@@ -357,7 +357,7 @@ class TestSocDeviationEdgeCases:
         slot_10 = datetime.datetime(2024, 1, 15, 10, 0, 0)
 
         optimizer.schedule = {
-            slot_10: ScheduleEntry(hour=slot_10, mode=BatteryMode.HOLD, reason="moderate"),
+            slot_10: ScheduleEntry(time=slot_10, mode=BatteryMode.HOLD, reason="moderate"),
         }
         optimizer.expected_soc_schedule = {
             slot_10: 50.0,
@@ -426,9 +426,9 @@ class TestSocDeviationWithLearnedRate:
         slot_07 = datetime.datetime(2024, 1, 15, 7, 0, 0)
 
         opt.schedule = {
-            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
-            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.CHARGE, reason="cheap"),
-            slot_07: ScheduleEntry(hour=slot_07, mode=BatteryMode.DISCHARGE, reason="expensive"),
+            slot_05: ScheduleEntry(time=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_06: ScheduleEntry(time=slot_06, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_07: ScheduleEntry(time=slot_07, mode=BatteryMode.DISCHARGE, reason="expensive"),
         }
         opt.expected_soc_schedule = {
             slot_05: 50.0,
@@ -518,8 +518,8 @@ class TestSocDeviationWithTemperature:
         slot_06 = datetime.datetime(2024, 1, 15, 6, 0, 0)
 
         opt_warm.schedule = {
-            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
-            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.HOLD, reason="moderate"),
+            slot_05: ScheduleEntry(time=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_06: ScheduleEntry(time=slot_06, mode=BatteryMode.HOLD, reason="moderate"),
         }
         opt_warm.expected_soc_schedule = {
             slot_05: 70.0,
@@ -759,8 +759,8 @@ class TestExpectedSocCalculationWithLearnedRate:
         slot_06 = datetime.datetime(2024, 1, 15, 6, 0, 0)
 
         schedule = {
-            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
-            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.HOLD, reason="moderate"),
+            slot_05: ScheduleEntry(time=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_06: ScheduleEntry(time=slot_06, mode=BatteryMode.HOLD, reason="moderate"),
         }
 
         expected_soc, _ = optimizer.calculate_expected_soc_schedule(schedule, starting_soc=60.0)
@@ -841,8 +841,8 @@ class TestLogScheduleUsesLearnedRate:
         slot_05 = datetime.datetime(2024, 1, 15, 5, 0, 0)
 
         schedule = {
-            slot_04: ScheduleEntry(hour=slot_04, mode=BatteryMode.CHARGE, reason="0.1091 EUR/kWh load~0.52kW"),
-            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.HOLD, reason="0.1300 EUR/kWh load~0.52kW"),
+            slot_04: ScheduleEntry(time=slot_04, mode=BatteryMode.CHARGE, reason="0.1091 EUR/kWh load~0.52kW"),
+            slot_05: ScheduleEntry(time=slot_05, mode=BatteryMode.HOLD, reason="0.1300 EUR/kWh load~0.52kW"),
         }
 
         # Calculate expected SOC (uses learned rate via learning engine)
@@ -919,8 +919,8 @@ class TestLogScheduleUsesLearnedRate:
         slot_05 = datetime.datetime(2024, 1, 15, 5, 0, 0)
 
         schedule = {
-            slot_04: ScheduleEntry(hour=slot_04, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
-            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.HOLD, reason="0.13 EUR/kWh"),
+            slot_04: ScheduleEntry(time=slot_04, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
+            slot_05: ScheduleEntry(time=slot_05, mode=BatteryMode.HOLD, reason="0.13 EUR/kWh"),
         }
 
         # Provide expected_soc for fallback path
@@ -1005,9 +1005,9 @@ class TestExtraChargeSlotsWhenBehindSchedule:
         slot_07 = datetime.datetime(2024, 1, 15, 7, 0, 0)  # HOLD slot, potential for extra charge
 
         optimizer.schedule = {
-            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
-            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
-            slot_07: ScheduleEntry(hour=slot_07, mode=BatteryMode.HOLD, reason="0.12 EUR/kWh"),
+            slot_05: ScheduleEntry(time=slot_05, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
+            slot_06: ScheduleEntry(time=slot_06, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
+            slot_07: ScheduleEntry(time=slot_07, mode=BatteryMode.HOLD, reason="0.12 EUR/kWh"),
         }
         optimizer.expected_soc_schedule = {
             slot_05: 50.0,
@@ -1025,9 +1025,9 @@ class TestExtraChargeSlotsWhenBehindSchedule:
 
         # Mock get_prices to return prices for the slots
         optimizer._prices = [
-            type('PricePoint', (), {'hour': slot_05, 'price': 0.10})(),
-            type('PricePoint', (), {'hour': slot_06, 'price': 0.10})(),
-            type('PricePoint', (), {'hour': slot_07, 'price': 0.12})(),
+            type('PricePoint', (), {'time': slot_05, 'price': 0.10})(),
+            type('PricePoint', (), {'time': slot_06, 'price': 0.10})(),
+            type('PricePoint', (), {'time': slot_07, 'price': 0.12})(),
         ]
         optimizer.get_prices = lambda: optimizer._prices
 
@@ -1062,9 +1062,9 @@ class TestExtraChargeSlotsWhenBehindSchedule:
         slot_07 = datetime.datetime(2024, 1, 15, 7, 0, 0)  # HOLD slot, expensive
 
         optimizer.schedule = {
-            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
-            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
-            slot_07: ScheduleEntry(hour=slot_07, mode=BatteryMode.HOLD, reason="0.25 EUR/kWh"),  # Expensive
+            slot_05: ScheduleEntry(time=slot_05, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
+            slot_06: ScheduleEntry(time=slot_06, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
+            slot_07: ScheduleEntry(time=slot_07, mode=BatteryMode.HOLD, reason="0.25 EUR/kWh"),  # Expensive
         }
         optimizer.expected_soc_schedule = {
             slot_05: 50.0,
@@ -1082,9 +1082,9 @@ class TestExtraChargeSlotsWhenBehindSchedule:
 
         # Mock prices with expensive HOLD slot
         optimizer._prices = [
-            type('PricePoint', (), {'hour': slot_05, 'price': 0.10})(),
-            type('PricePoint', (), {'hour': slot_06, 'price': 0.10})(),
-            type('PricePoint', (), {'hour': slot_07, 'price': 0.25})(),  # Expensive
+            type('PricePoint', (), {'time': slot_05, 'price': 0.10})(),
+            type('PricePoint', (), {'time': slot_06, 'price': 0.10})(),
+            type('PricePoint', (), {'time': slot_07, 'price': 0.25})(),  # Expensive
         ]
         optimizer.get_prices = lambda: optimizer._prices
 
@@ -1124,8 +1124,8 @@ class TestExtraChargeSlotsWhenBehindSchedule:
         slot_06 = datetime.datetime(2024, 1, 15, 6, 0, 0)  # DISCHARGE, not HOLD
 
         optimizer.schedule = {
-            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
-            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.DISCHARGE, reason="0.30 EUR/kWh"),  # DISCHARGE
+            slot_05: ScheduleEntry(time=slot_05, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
+            slot_06: ScheduleEntry(time=slot_06, mode=BatteryMode.DISCHARGE, reason="0.30 EUR/kWh"),  # DISCHARGE
         }
         optimizer.expected_soc_schedule = {
             slot_05: 50.0,
@@ -1142,8 +1142,8 @@ class TestExtraChargeSlotsWhenBehindSchedule:
 
         # Mock prices - slot_06 is expensive (DISCHARGE), no HOLD slots
         optimizer._prices = [
-            type('PricePoint', (), {'hour': slot_05, 'price': 0.10})(),
-            type('PricePoint', (), {'hour': slot_06, 'price': 0.30})(),
+            type('PricePoint', (), {'time': slot_05, 'price': 0.10})(),
+            type('PricePoint', (), {'time': slot_06, 'price': 0.30})(),
         ]
         optimizer.get_prices = lambda: optimizer._prices
 
@@ -1175,8 +1175,8 @@ class TestExtraChargeSlotsWhenBehindSchedule:
 
         # HOLD mode with deviation
         optimizer.schedule = {
-            slot_10: ScheduleEntry(hour=slot_10, mode=BatteryMode.HOLD, reason="0.15 EUR/kWh"),
-            slot_11: ScheduleEntry(hour=slot_11, mode=BatteryMode.HOLD, reason="0.15 EUR/kWh"),
+            slot_10: ScheduleEntry(time=slot_10, mode=BatteryMode.HOLD, reason="0.15 EUR/kWh"),
+            slot_11: ScheduleEntry(time=slot_11, mode=BatteryMode.HOLD, reason="0.15 EUR/kWh"),
         }
         optimizer.expected_soc_schedule = {
             slot_10: 70.0,
@@ -1190,8 +1190,8 @@ class TestExtraChargeSlotsWhenBehindSchedule:
 
         # Mock prices
         optimizer._prices = [
-            type('PricePoint', (), {'hour': slot_10, 'price': 0.15})(),
-            type('PricePoint', (), {'hour': slot_11, 'price': 0.15})(),
+            type('PricePoint', (), {'time': slot_10, 'price': 0.15})(),
+            type('PricePoint', (), {'time': slot_11, 'price': 0.15})(),
         ]
         optimizer.get_prices = lambda: optimizer._prices
         optimizer._get_discharge_threshold = lambda: 0.20
@@ -1224,9 +1224,9 @@ class TestExtraChargeSlotsWhenBehindSchedule:
         slot_07_aware = datetime.datetime(2024, 1, 15, 7, 0, 0, tzinfo=tz)
 
         optimizer.schedule = {
-            slot_05_aware: ScheduleEntry(hour=slot_05_aware, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
-            slot_06_aware: ScheduleEntry(hour=slot_06_aware, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
-            slot_07_aware: ScheduleEntry(hour=slot_07_aware, mode=BatteryMode.HOLD, reason="0.12 EUR/kWh"),
+            slot_05_aware: ScheduleEntry(time=slot_05_aware, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
+            slot_06_aware: ScheduleEntry(time=slot_06_aware, mode=BatteryMode.CHARGE, reason="0.10 EUR/kWh"),
+            slot_07_aware: ScheduleEntry(time=slot_07_aware, mode=BatteryMode.HOLD, reason="0.12 EUR/kWh"),
         }
 
         # Use naive datetime for expected_soc_schedule (mixed scenario)
@@ -1252,9 +1252,9 @@ class TestExtraChargeSlotsWhenBehindSchedule:
 
         # Mock prices with aware timestamps
         optimizer._prices = [
-            type('PricePoint', (), {'hour': slot_05_aware, 'price': 0.10})(),
-            type('PricePoint', (), {'hour': slot_06_aware, 'price': 0.10})(),
-            type('PricePoint', (), {'hour': slot_07_aware, 'price': 0.12})(),
+            type('PricePoint', (), {'time': slot_05_aware, 'price': 0.10})(),
+            type('PricePoint', (), {'time': slot_06_aware, 'price': 0.10})(),
+            type('PricePoint', (), {'time': slot_07_aware, 'price': 0.12})(),
         ]
         optimizer.get_prices = lambda: optimizer._prices
 
@@ -1292,17 +1292,17 @@ class TestGetCheapestUpcomingPrices:
         slot_08 = datetime.datetime(2024, 1, 15, 8, 0, 0)
 
         optimizer.schedule = {
-            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
-            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.HOLD, reason="0.15"),  # HOLD
-            slot_07: ScheduleEntry(hour=slot_07, mode=BatteryMode.DISCHARGE, reason="expensive"),
-            slot_08: ScheduleEntry(hour=slot_08, mode=BatteryMode.HOLD, reason="0.12"),  # HOLD, cheaper
+            slot_05: ScheduleEntry(time=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_06: ScheduleEntry(time=slot_06, mode=BatteryMode.HOLD, reason="0.15"),  # HOLD
+            slot_07: ScheduleEntry(time=slot_07, mode=BatteryMode.DISCHARGE, reason="expensive"),
+            slot_08: ScheduleEntry(time=slot_08, mode=BatteryMode.HOLD, reason="0.12"),  # HOLD, cheaper
         }
 
         optimizer._prices = [
-            type('PricePoint', (), {'hour': slot_05, 'price': 0.10})(),
-            type('PricePoint', (), {'hour': slot_06, 'price': 0.15})(),
-            type('PricePoint', (), {'hour': slot_07, 'price': 0.25})(),
-            type('PricePoint', (), {'hour': slot_08, 'price': 0.12})(),
+            type('PricePoint', (), {'time': slot_05, 'price': 0.10})(),
+            type('PricePoint', (), {'time': slot_06, 'price': 0.15})(),
+            type('PricePoint', (), {'time': slot_07, 'price': 0.25})(),
+            type('PricePoint', (), {'time': slot_08, 'price': 0.12})(),
         ]
         optimizer.get_prices = lambda: optimizer._prices
 
@@ -1322,13 +1322,13 @@ class TestGetCheapestUpcomingPrices:
         slot_06 = datetime.datetime(2024, 1, 15, 6, 0, 0)
 
         optimizer.schedule = {
-            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
-            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.DISCHARGE, reason="expensive"),
+            slot_05: ScheduleEntry(time=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_06: ScheduleEntry(time=slot_06, mode=BatteryMode.DISCHARGE, reason="expensive"),
         }
 
         optimizer._prices = [
-            type('PricePoint', (), {'hour': slot_05, 'price': 0.10})(),
-            type('PricePoint', (), {'hour': slot_06, 'price': 0.25})(),
+            type('PricePoint', (), {'time': slot_05, 'price': 0.10})(),
+            type('PricePoint', (), {'time': slot_06, 'price': 0.25})(),
         ]
         optimizer.get_prices = lambda: optimizer._prices
 
@@ -1345,13 +1345,13 @@ class TestGetCheapestUpcomingPrices:
         slot_06 = datetime.datetime(2024, 1, 15, 6, 0, 0)
 
         optimizer.schedule = {
-            slot_05: ScheduleEntry(hour=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
-            slot_06: ScheduleEntry(hour=slot_06, mode=BatteryMode.HOLD, reason="moderate"),  # Only 1 HOLD
+            slot_05: ScheduleEntry(time=slot_05, mode=BatteryMode.CHARGE, reason="cheap"),
+            slot_06: ScheduleEntry(time=slot_06, mode=BatteryMode.HOLD, reason="moderate"),  # Only 1 HOLD
         }
 
         optimizer._prices = [
-            type('PricePoint', (), {'hour': slot_05, 'price': 0.10})(),
-            type('PricePoint', (), {'hour': slot_06, 'price': 0.15})(),
+            type('PricePoint', (), {'time': slot_05, 'price': 0.10})(),
+            type('PricePoint', (), {'time': slot_06, 'price': 0.15})(),
         ]
         optimizer.get_prices = lambda: optimizer._prices
 
@@ -1399,8 +1399,8 @@ class TestRecalculateRemainingScheduleWithExtraSlots:
 
             def get_prices(self):
                 return [
-                    type('PricePoint', (), {'hour': datetime.datetime(2024, 1, 15, 6, 0, 0), 'price': 0.10})(),
-                    type('PricePoint', (), {'hour': datetime.datetime(2024, 1, 15, 7, 0, 0), 'price': 0.15})(),
+                    type('PricePoint', (), {'time': datetime.datetime(2024, 1, 15, 6, 0, 0), 'price': 0.10})(),
+                    type('PricePoint', (), {'time': datetime.datetime(2024, 1, 15, 7, 0, 0), 'price': 0.15})(),
                 ]
 
             def calculate_min_charge_slots_for_horizon(self, soc, prices):
@@ -1461,3 +1461,88 @@ class TestRecalculateRemainingScheduleWithExtraSlots:
 
         # Verify the min_charge_slots used in optimization was boosted
         assert opt._min_charge_slots_used == 3  # 1 base + 2 extra
+
+
+class TestFifteenMinSocDeviation:
+    """Test SOC deviation detection with 15-minute slots."""
+
+    def test_15min_config_slot_hours(self):
+        """SocDeviationConfig with slot_minutes=15 should have slot_hours=0.25."""
+        from battery_optimizer_lib import SocDeviationConfig
+
+        config = SocDeviationConfig(
+            slot_minutes=15,
+            charge_rate=4.5,
+            discharge_rate=4.5,
+            efficiency=0.85,
+            battery_capacity=14.3,
+            min_soc=10.0,
+            max_soc=100.0,
+            soc_deviation_threshold=4.0,
+            grid_fee=0.05,
+        )
+        assert config.slot_hours == 0.25
+
+    def test_15min_expected_soc_interpolation(self):
+        """Expected SOC should interpolate correctly within a 15-min charge slot.
+
+        At 7 minutes into a 15-min charge slot:
+        - fraction = 7 / 15 = 0.4667
+        - energy_added = charge_rate * efficiency * slot_hours * fraction
+                       = 4.5 * 0.85 * 0.25 * 0.4667
+                       = 0.4463 kWh
+        - soc_gain = energy_added / capacity * 100
+                   = 0.4463 / 14.3 * 100
+                   = 3.12%
+        - expected_soc = start_soc + soc_gain
+        """
+        from battery_optimizer_lib import SocDeviationDetector, SocDeviationConfig
+
+        config = SocDeviationConfig(
+            slot_minutes=15,
+            charge_rate=4.5,
+            discharge_rate=4.5,
+            efficiency=0.85,
+            battery_capacity=14.3,
+            min_soc=10.0,
+            max_soc=100.0,
+            soc_deviation_threshold=4.0,
+            grid_fee=0.05,
+        )
+        detector = SocDeviationDetector(config=config)
+
+        # Create a schedule with a single CHARGE slot at 10:00
+        slot_start = datetime.datetime(2024, 1, 15, 10, 0, 0)
+        schedule = {
+            slot_start: ScheduleEntry(
+                time=slot_start, mode=BatteryMode.CHARGE, reason="Charge"
+            )
+        }
+        expected_soc_schedule = {slot_start: 50.0}  # SOC at start of slot
+
+        # Check at 7 minutes into the slot (10:07)
+        now = datetime.datetime(2024, 1, 15, 10, 7, 0)
+
+        result = detector.check_deviation(
+            current_soc=50.0,  # We want to see what expected_soc_now is
+            schedule=schedule,
+            expected_soc_schedule=expected_soc_schedule,
+            now=now,
+            current_slot=slot_start,
+            local_tz=None,
+        )
+
+        # Calculate expected interpolation
+        fraction = 7.0 / 15.0  # ~0.4667
+        energy_added = 4.5 * 0.85 * 0.25 * fraction
+        expected_soc_gain = (energy_added / 14.3) * 100
+        expected_soc_now = 50.0 + expected_soc_gain  # ~53.12%
+
+        # With current_soc=50.0, deviation = 50.0 - expected_soc_now = -3.12%
+        # This is within the 4% threshold, so should_recalculate is False
+        assert result.should_recalculate is False
+
+        # Verify the deviation is approximately correct
+        assert result.deviation is not None
+        expected_deviation = 50.0 - expected_soc_now  # ~-3.12
+        assert abs(result.deviation - expected_deviation) < 0.1

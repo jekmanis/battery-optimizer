@@ -95,7 +95,13 @@ class TouSyncManager:
         """
         Convert a schedule to TOU periods for inverter programming.
 
-        Consolidates contiguous slots with same mode into single periods.
+        Walks forward from the current time slot, consolidating contiguous
+        same-mode slots into periods, collecting up to MAX_TOU_PERIODS (20).
+        The result is then sorted by clock time for writing to the inverter.
+
+        Since the system re-syncs every 15 minutes, far-future periods that
+        didn't fit will be picked up by later syncs as the window advances.
+
         All modes are written as TOU periods:
         - CHARGE: +100% (or configured power)
         - DISCHARGE: -100% (or configured power)
@@ -108,14 +114,10 @@ class TouSyncManager:
             boundary_minute: Minutes since midnight (0-1439) for rolling day boundary.
 
         Returns:
-            List of TouPeriod objects (max 20 periods)
+            List of TouPeriod objects (max 20 periods), sorted by start time
         """
         if not schedule:
             return []
-
-        periods = []
-        current_period_mode = None
-        current_period_start = None
 
         local_tz = self.get_timezone()
         now = self.datetime()
@@ -177,8 +179,6 @@ class TouSyncManager:
                  f"(today: {sum(1 for _, d in time_of_day_map.values() if d == today)}, "
                  f"tomorrow: {sum(1 for _, d in time_of_day_map.values() if d == tomorrow)})")
 
-        sorted_minutes = sorted(time_of_day_map.keys())
-
         def get_power_for_mode(mode: BatteryMode) -> int:
             """Get TOU power value for mode. HOLD uses +1% (true standby)."""
             if mode == BatteryMode.CHARGE:
@@ -188,44 +188,74 @@ class TouSyncManager:
             else:  # HOLD
                 return 1  # +1% charge = TRUE HOLD (firmware quirk)
 
-        for i, hour_minutes in enumerate(sorted_minutes):
+        # Sort entries in forward order starting from reference_minute
+        reference_minute = boundary_minute if boundary_minute is not None else (now.hour * 60 + now.minute)
+        sorted_minutes = sorted(time_of_day_map.keys(),
+                                key=lambda m: (m - reference_minute) % 1440)
+
+        def close_period(start, end_slot, power, into):
+            """Close a period, splitting across midnight if needed."""
+            period_end = end_slot + self.slot_minutes - 1
+            if period_end > 1439:
+                period_end = 1439
+
+            if start <= period_end:
+                # Normal period (no midnight wrap)
+                into.append(TouPeriod(start=start, end=period_end, power=power))
+            else:
+                # Period wraps around midnight — split into two
+                into.append(TouPeriod(start=start, end=1439, power=power))
+                if len(into) < MAX_TOU_PERIODS:
+                    into.append(TouPeriod(start=0, end=period_end, power=power))
+
+        # Walk forward, consolidating contiguous same-mode slots into periods.
+        # Stop once we've collected MAX_TOU_PERIODS periods.
+        periods = []
+        current_period_mode = None
+        current_period_start = None
+        prev_minutes = None
+
+        for hour_minutes in sorted_minutes:
             entry, _ = time_of_day_map[hour_minutes]
             mode = entry.mode
 
+            # Detect gap: entries are non-contiguous (accounting for day wrap)
+            has_gap = (prev_minutes is not None and
+                       (hour_minutes - prev_minutes) % 1440 > self.slot_minutes)
+
             if current_period_mode is None:
+                # First entry
                 current_period_mode = mode
                 current_period_start = hour_minutes
-            elif current_period_mode == mode:
-                pass  # Continue current period
-            else:
-                # Mode changed - close current period
-                period_end = hour_minutes - 1
-                power = get_power_for_mode(current_period_mode)
-                periods.append(TouPeriod(
-                    start=current_period_start,
-                    end=period_end,
-                    power=power
-                ))
+            elif current_period_mode != mode or has_gap:
+                # Mode changed or gap — close current period
+                close_period(current_period_start, prev_minutes,
+                             get_power_for_mode(current_period_mode), periods)
+                if len(periods) >= MAX_TOU_PERIODS:
+                    break
                 current_period_mode = mode
                 current_period_start = hour_minutes
 
-            # Close any open period at end
-            if i == len(sorted_minutes) - 1 and current_period_mode is not None:
-                period_end = hour_minutes + self.slot_minutes - 1
-                if period_end > 1439:
-                    period_end = 1439
-                power = get_power_for_mode(current_period_mode)
-                periods.append(TouPeriod(
-                    start=current_period_start,
-                    end=period_end,
-                    power=power
-                ))
+            prev_minutes = hour_minutes
 
-        # Limit to 20 periods (inverter maximum)
+        # Close the last open period (if we didn't hit the limit mid-loop)
+        if len(periods) < MAX_TOU_PERIODS and current_period_mode is not None:
+            close_period(current_period_start, prev_minutes,
+                         get_power_for_mode(current_period_mode), periods)
+
+        # Trim to MAX_TOU_PERIODS (close_period may have added a split pair)
         if len(periods) > MAX_TOU_PERIODS:
-            self.log(f"TOU schedule has {len(periods)} periods, truncating to {MAX_TOU_PERIODS}",
-                    level="WARNING")
             periods = periods[:MAX_TOU_PERIODS]
+
+        # Sort by clock time for writing to inverter
+        periods.sort(key=lambda p: p.start)
+
+        # Firmware requires period 1 to start at 00:00 — pad with HOLD if needed
+        if periods and periods[0].start > 0 and len(periods) < MAX_TOU_PERIODS:
+            periods.insert(0, TouPeriod(start=0, end=periods[0].start - 1, power=1))
+
+        self.log(f"TOU periods: {len(periods)} (forward from "
+                 f"{reference_minute//60:02d}:{reference_minute%60:02d})")
 
         return periods
 

@@ -60,9 +60,9 @@ class BatteryOptimizerConfig:
     # =========================================================================
     # Scheduling Resolution
     # =========================================================================
-    slot_minutes: int = 30
-    adaptive_recalc_minutes: int = 30
-    load_observation_minutes: int = 30
+    slot_minutes: int = 15
+    adaptive_recalc_minutes: int = 15
+    load_observation_minutes: int = 15
     soc_step_percent: float = 1.0  # DP resolution for SOC
 
     # =========================================================================
@@ -126,15 +126,15 @@ class BatteryOptimizerConfig:
         """Validate and compute derived values."""
         # Validate slot_minutes
         if self.slot_minutes <= 0 or 1440 % self.slot_minutes != 0:
-            self.slot_minutes = 30
+            self.slot_minutes = 15
 
         # Validate adaptive_recalc_minutes
         if self.adaptive_recalc_minutes <= 0 or 1440 % self.adaptive_recalc_minutes != 0:
-            self.adaptive_recalc_minutes = 30
+            self.adaptive_recalc_minutes = 15
 
         # Validate load_observation_minutes
         if self.load_observation_minutes <= 0 or 1440 % self.load_observation_minutes != 0:
-            self.load_observation_minutes = 30
+            self.load_observation_minutes = 15
 
         # Validate soc_step_percent
         if self.soc_step_percent <= 0:
@@ -167,19 +167,19 @@ class BatteryOptimizerConfig:
         discharge_rate = float(args.get("discharge_rate_kw", charge_rate))
 
         # Extract slot_minutes with validation warning
-        slot_minutes = int(args.get("slot_minutes", 30))
+        slot_minutes = int(args.get("slot_minutes", 15))
         if slot_minutes <= 0 or 1440 % slot_minutes != 0:
-            log_warn(f"Invalid slot_minutes={slot_minutes}, falling back to 30")
+            log_warn(f"Invalid slot_minutes={slot_minutes}, falling back to 15")
 
         # Extract adaptive_recalc_minutes with validation warning
-        adaptive_recalc_minutes = int(args.get("adaptive_recalc_minutes", 30))
+        adaptive_recalc_minutes = int(args.get("adaptive_recalc_minutes", 15))
         if adaptive_recalc_minutes <= 0 or 1440 % adaptive_recalc_minutes != 0:
-            log_warn(f"Invalid adaptive_recalc_minutes={adaptive_recalc_minutes}, falling back to 30")
+            log_warn(f"Invalid adaptive_recalc_minutes={adaptive_recalc_minutes}, falling back to 15")
 
         # Extract load_observation_minutes with validation warning
         load_observation_minutes = int(args.get("load_observation_minutes", adaptive_recalc_minutes))
         if load_observation_minutes <= 0 or 1440 % load_observation_minutes != 0:
-            log_warn(f"Invalid load_observation_minutes={load_observation_minutes}, falling back to 30")
+            log_warn(f"Invalid load_observation_minutes={load_observation_minutes}, falling back to 15")
 
         return cls(
             # Nord Pool

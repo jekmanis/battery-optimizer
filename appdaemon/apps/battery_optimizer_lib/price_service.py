@@ -119,7 +119,7 @@ class NordPoolPriceService:
             cache_age_days = (today - self.cached_prices_date).days
             if cache_age_days <= 1:
                 # Additional check: ensure we have prices for today
-                has_today_prices = any(p.hour.date() == today for p in self.cached_prices)
+                has_today_prices = any(p.time.date() == today for p in self.cached_prices)
                 if has_today_prices:
                     self.log(f"Using cached prices (cached {cache_age_days} day(s) ago)", level="WARNING")
                     return self.cached_prices
@@ -143,10 +143,10 @@ class NordPoolPriceService:
         if not prices:
             return []
 
-        sorted_prices = sorted(prices, key=lambda p: p.hour)
+        sorted_prices = sorted(prices, key=lambda p: p.time)
         deltas = []
         for i in range(1, len(sorted_prices)):
-            delta_min = (sorted_prices[i].hour - sorted_prices[i - 1].hour).total_seconds() / 60
+            delta_min = (sorted_prices[i].time - sorted_prices[i - 1].time).total_seconds() / 60
             if delta_min > 0:
                 deltas.append(delta_min)
         min_delta = min(deltas) if deltas else self.slot_minutes
@@ -159,13 +159,13 @@ class NordPoolPriceService:
         if min_delta < self.slot_minutes:
             buckets: Dict[datetime.datetime, List[float]] = {}
             for p in sorted_prices:
-                bucket = self._align_to_slot(p.hour)
+                bucket = self._align_to_slot(p.time)
                 buckets.setdefault(bucket, []).append(p.price)
             normalized = [
-                PricePoint(hour=dt, price=sum(vals) / len(vals))
+                PricePoint(time=dt, price=sum(vals) / len(vals))
                 for dt, vals in buckets.items()
             ]
-            return sorted(normalized, key=lambda p: p.hour)
+            return sorted(normalized, key=lambda p: p.time)
 
         # Expand coarser data into multiple slots
         factor = int(round(min_delta / self.slot_minutes))
@@ -173,22 +173,22 @@ class NordPoolPriceService:
             # Fallback to bucketing if resolution is irregular
             buckets: Dict[datetime.datetime, List[float]] = {}
             for p in sorted_prices:
-                bucket = self._align_to_slot(p.hour)
+                bucket = self._align_to_slot(p.time)
                 buckets.setdefault(bucket, []).append(p.price)
             normalized = [
-                PricePoint(hour=dt, price=sum(vals) / len(vals))
+                PricePoint(time=dt, price=sum(vals) / len(vals))
                 for dt, vals in buckets.items()
             ]
-            return sorted(normalized, key=lambda p: p.hour)
+            return sorted(normalized, key=lambda p: p.time)
 
         expanded: List[PricePoint] = []
         for p in sorted_prices:
             for i in range(factor):
                 expanded.append(PricePoint(
-                    hour=p.hour + datetime.timedelta(minutes=i * self.slot_minutes),
+                    time=p.time + datetime.timedelta(minutes=i * self.slot_minutes),
                     price=p.price
                 ))
-        return sorted(expanded, key=lambda p: p.hour)
+        return sorted(expanded, key=lambda p: p.time)
 
     def _align_to_slot(self, dt: datetime.datetime) -> datetime.datetime:
         """Floor datetime to the start of the current time slot."""
@@ -209,7 +209,7 @@ class NordPoolPriceService:
     def _get_prices_via_service(self, today, tomorrow, tz) -> List[PricePoint]:
         """
         Fetch prices using the built-in HA Nord Pool integration service.
-        Uses nordpool.get_prices_for_date action.
+        Uses nordpool.get_price_indices_for_date action.
         """
         prices = []
 
@@ -270,7 +270,7 @@ class NordPoolPriceService:
 
     def _call_nordpool_service(self, date_str: str) -> Optional[Dict]:
         """
-        Call the nordpool.get_prices_for_date service.
+        Call the nordpool.get_price_indices_for_date service.
         Tries REST API approach first, falls back to AppDaemon call_service.
         """
         # Try REST API approach (more reliable for response actions)
@@ -281,10 +281,11 @@ class NordPoolPriceService:
         # Fallback to AppDaemon call_service (may not return response data)
         try:
             result = self.call_service(
-                "nordpool/get_prices_for_date",
+                "nordpool/get_price_indices_for_date",
                 config_entry=self.nordpool_config_entry,
                 date=date_str,
                 areas=self.nordpool_area,
+                resolution=self.slot_minutes,
                 return_result=True
             )
             self.log(f"Nord Pool service response for {date_str}: {type(result)}")
@@ -309,7 +310,7 @@ class NordPoolPriceService:
                 return None
 
             # Add return_response for HA 2023.7+ response-returning actions
-            url = f"{self.ha_url}/api/services/nordpool/get_prices_for_date?return_response"
+            url = f"{self.ha_url}/api/services/nordpool/get_price_indices_for_date?return_response"
             headers = {
                 "Authorization": f"Bearer {self.ha_token}",
                 "Content-Type": "application/json"
@@ -317,7 +318,8 @@ class NordPoolPriceService:
             payload = {
                 "config_entry": self.nordpool_config_entry,
                 "date": date_str,
-                "areas": self.nordpool_area
+                "areas": self.nordpool_area,
+                "resolution": self.slot_minutes,
             }
 
             self.log(f"Calling Nord Pool API: POST {url}")
@@ -360,7 +362,7 @@ class NordPoolPriceService:
 
     def _parse_service_response(self, data: Dict, tz) -> List[PricePoint]:
         """
-        Parse the response from nordpool.get_prices_for_date service.
+        Parse the response from nordpool.get_price_indices_for_date service.
         Response format: {area: [{start, end, price}, ...]}
         Prices are in EUR/MWh, need to convert to EUR/kWh.
         """
@@ -425,7 +427,7 @@ class NordPoolPriceService:
 
                 # Convert EUR/MWh to EUR/kWh
                 price_kwh = float(price_mwh) / 1000.0
-                prices.append(PricePoint(hour=start_dt, price=price_kwh))
+                prices.append(PricePoint(time=start_dt, price=price_kwh))
 
             except (ValueError, TypeError) as e:
                 self.log(f"Error parsing price entry {entry}: {e}", level="DEBUG")
@@ -486,7 +488,7 @@ class NordPoolPriceService:
                             dt = dt.astimezone(tz)
                         elif tz:
                             dt = dt.replace(tzinfo=tz)
-                        prices.append(PricePoint(hour=dt, price=float(price)))
+                        prices.append(PricePoint(time=dt, price=float(price)))
                     except (ValueError, TypeError):
                         pass
         else:
@@ -503,6 +505,6 @@ class NordPoolPriceService:
                     )
                     if tz:
                         dt = dt.replace(tzinfo=tz)
-                    prices.append(PricePoint(hour=dt, price=float(price)))
+                    prices.append(PricePoint(time=dt, price=float(price)))
 
         return prices

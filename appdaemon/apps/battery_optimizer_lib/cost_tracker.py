@@ -33,7 +33,7 @@ class BatteryCostConfig:
     # Battery parameters
     battery_capacity: float = 14.3  # kWh
     efficiency: float = 0.85
-    slot_minutes: int = 30
+    slot_minutes: int = 15
     charge_rate: float = 4.5  # kW
     discharge_rate: float = 4.5  # kW
 
@@ -715,7 +715,7 @@ class BatteryCostTracker:
 
         local_tz = self._get_timezone()
         for price_point in self._get_cached_prices():
-            if datetimes_match_slot(price_point.hour, slot, local_tz):
+            if datetimes_match_slot(price_point.time, slot, local_tz):
                 return price_point.price
         return None
 

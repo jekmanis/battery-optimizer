@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .models import BatteryMode, ScheduleEntry
-from .timezone_utils import ensure_local_tz, lookup_by_hour
+from .timezone_utils import ensure_local_tz, lookup_by_time
 
 
 @dataclass
@@ -107,12 +107,12 @@ class SocDeviationDetector:
         result = DeviationCheckResult()
 
         # Get expected SOC for current slot (with timezone-aware lookup)
-        expected_soc = lookup_by_hour(expected_soc_schedule, current_slot, local_tz)
+        expected_soc = lookup_by_time(expected_soc_schedule, current_slot, local_tz)
         if expected_soc is None:
             return result  # No expected SOC, can't detect deviation
 
         # Get schedule entry for current slot
-        entry = lookup_by_hour(schedule, current_slot, local_tz)
+        entry = lookup_by_time(schedule, current_slot, local_tz)
 
         # Calculate time fraction into current slot
         minutes_into_slot = max(0.0, (now - current_slot).total_seconds() / 60.0)

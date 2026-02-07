@@ -177,7 +177,7 @@ def sample_prices() -> List[PricePoint]:
 
     return [
         PricePoint(
-            hour=base_time + datetime.timedelta(hours=i),
+            time=base_time + datetime.timedelta(hours=i),
             price=price / 100  # Convert cents to EUR
         )
         for i, price in enumerate(prices_cents)
@@ -199,7 +199,7 @@ def sample_prices_tomorrow() -> List[PricePoint]:
 
     return [
         PricePoint(
-            hour=base_time + datetime.timedelta(hours=i),
+            time=base_time + datetime.timedelta(hours=i),
             price=price / 100
         )
         for i, price in enumerate(prices_cents)
@@ -241,7 +241,7 @@ def extreme_prices() -> List[PricePoint]:
 
     return [
         PricePoint(
-            hour=base_time + datetime.timedelta(hours=i),
+            time=base_time + datetime.timedelta(hours=i),
             price=price / 100
         )
         for i, price in enumerate(prices_cents)
@@ -255,6 +255,6 @@ def flat_prices() -> List[PricePoint]:
     flat_price = 0.10  # 10 cents
 
     return [
-        PricePoint(hour=base_time + datetime.timedelta(hours=i), price=flat_price)
+        PricePoint(time=base_time + datetime.timedelta(hours=i), price=flat_price)
         for i in range(24)
     ]

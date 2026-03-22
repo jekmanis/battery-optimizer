@@ -30,7 +30,23 @@ class ScheduleEntry:
     """Represents a scheduled battery mode for a specific time slot."""
     time: datetime.datetime
     mode: BatteryMode
-    reason: str
+    reason: str = ""
+
+    # --- Direct control fields ---
+    export_rate: Optional[int] = None
+    # None = use mode default, 0 = zero export, 100 = full export
+
+    ac_charge_mode: Optional[str] = None
+    # None = auto-detect, "disabled" / "pv_priority" / "ac_priority"
+
+    power_percent: Optional[int] = None
+    # None = use config default (100%)
+
+    charge_cutoff_soc: Optional[int] = None
+    # None = use config default
+
+    discharge_cutoff_soc: Optional[int] = None
+    # None = use config default
 
 
 @dataclass
@@ -89,3 +105,21 @@ class LoadProfileStats:
     @classmethod
     def from_dict(cls, data: dict) -> 'LoadProfileStats':
         return cls(**data)
+
+
+@dataclass
+class PredictionAccuracyStats:
+    """Tracks predicted vs actual load ratios per time-of-day slot."""
+    ratios_by_slot: Dict[str, List[float]] = field(default_factory=dict)
+    global_ratios: List[float] = field(default_factory=list)
+    total_comparisons: int = 0
+    last_comparison: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'PredictionAccuracyStats':
+        known_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered_data = {k: v for k, v in data.items() if k in known_fields}
+        return cls(**filtered_data)

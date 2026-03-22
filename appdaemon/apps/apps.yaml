@@ -118,7 +118,7 @@ battery_optimizer:
   load_quantile: 0.75
 
   # DP SOC resolution in percent (smaller = more precise, slower)
-  soc_step_percent: 1.0
+  soc_step_percent: 0.25
 
   # Load profile persistence
   # File path preferred (unlimited size). Leave empty to disable file persistence.

@@ -238,9 +238,7 @@ class TestLoadProfile:
         success = profile_30.load_from_json(json_str)
 
         assert success is True
-        # Old slot 10 should be split into new slots 20 and 21
-        assert "20" in profile_30.stats.samples_by_slot
-        assert "21" in profile_30.stats.samples_by_slot
+        # Old slot 10 (10:00-11:00) -> both sub-slots get mean as single sample
         assert profile_30.stats.samples_by_slot["20"] == [500.0]
         assert profile_30.stats.samples_by_slot["21"] == [500.0]
 
@@ -285,6 +283,52 @@ class TestLoadProfile:
         samples = load_profile.stats.samples_by_slot["10"]
         assert 500.0 in samples
         assert 600.0 in samples
+
+
+class TestCorrectionFactor:
+    """Test correction_factor parameter in predict_kw."""
+
+    def test_predict_with_correction_factor(self, load_profile):
+        """Prediction should scale by correction factor."""
+        dt = datetime.datetime(2024, 1, 15, 10, 0, 0)
+
+        # Add enough samples for full confidence
+        for _ in range(6):
+            load_profile.record(dt, 500.0)
+
+        pred_base = load_profile.predict_kw(dt, quantile=0.5)
+        pred_corrected = load_profile.predict_kw(dt, quantile=0.5, correction_factor=2.0)
+
+        assert pred_corrected == pytest.approx(pred_base * 2.0)
+
+    def test_predict_correction_factor_default(self, load_profile):
+        """Default correction_factor=1.0 should not change prediction."""
+        dt = datetime.datetime(2024, 1, 15, 10, 0, 0)
+        for _ in range(6):
+            load_profile.record(dt, 500.0)
+
+        pred_default = load_profile.predict_kw(dt, quantile=0.5)
+        pred_explicit = load_profile.predict_kw(dt, quantile=0.5, correction_factor=1.0)
+
+        assert pred_default == pred_explicit
+
+    def test_predict_no_data_with_correction(self, load_profile):
+        """No-data prediction should also be scaled by correction factor."""
+        dt = datetime.datetime(2024, 1, 15, 10, 0, 0)
+
+        pred_base = load_profile.predict_kw(dt)  # default = 500W = 0.5kW
+        pred_3x = load_profile.predict_kw(dt, correction_factor=3.0)
+
+        assert pred_base == 0.5
+        assert pred_3x == pytest.approx(1.5)
+
+    def test_predict_correction_never_negative(self, load_profile):
+        """Even with weird data, correction should not produce negative."""
+        dt = datetime.datetime(2024, 1, 15, 10, 0, 0)
+        load_profile.stats.samples_by_slot["10"] = [-100.0, -200.0]
+
+        pred = load_profile.predict_kw(dt, correction_factor=2.0)
+        assert pred >= 0
 
 
 class TestFifteenMinuteSlotLoadProfile:
@@ -367,15 +411,11 @@ class TestFifteenMinuteSlotLoadProfile:
         success = profile.load_from_json(json_data)
         assert success is True
 
-        # Old slot "0" (00:00-00:30) -> new slots "0" (00:00-00:15) and "1" (00:15-00:30)
-        assert "0" in profile.stats.samples_by_slot
-        assert "1" in profile.stats.samples_by_slot
-        assert profile.stats.samples_by_slot["0"] == [300.0, 350.0]
-        assert profile.stats.samples_by_slot["1"] == [300.0, 350.0]
+        # Old slot "0" (00:00-00:30) -> both sub-slots get mean as single sample
+        assert profile.stats.samples_by_slot["0"] == [325.0]
+        assert profile.stats.samples_by_slot["1"] == [325.0]
 
-        # Old slot "1" (00:30-01:00) -> new slots "2" (00:30-00:45) and "3" (00:45-01:00)
-        assert "2" in profile.stats.samples_by_slot
-        assert "3" in profile.stats.samples_by_slot
+        # Old slot "1" (00:30-01:00) -> both sub-slots get mean as single sample
         assert profile.stats.samples_by_slot["2"] == [400.0]
         assert profile.stats.samples_by_slot["3"] == [400.0]
 
@@ -399,19 +439,17 @@ class TestFifteenMinuteSlotLoadProfile:
         success = profile.load_from_json(json_data)
         assert success is True
 
-        # Old slot "0" (hour 0) -> new slots "0", "1", "2", "3" (factor=4)
-        for new_slot in ["0", "1", "2", "3"]:
-            assert new_slot in profile.stats.samples_by_slot, (
-                f"Slot {new_slot} should exist after migration"
-            )
-            assert profile.stats.samples_by_slot[new_slot] == [250.0, 275.0]
+        # Old slot "0" (hour 0) -> all 4 sub-slots get mean as single sample
+        assert profile.stats.samples_by_slot["0"] == [262.5]
+        assert profile.stats.samples_by_slot["1"] == [262.5]
+        assert profile.stats.samples_by_slot["2"] == [262.5]
+        assert profile.stats.samples_by_slot["3"] == [262.5]
 
-        # Old slot "12" (hour 12) -> new slots "48", "49", "50", "51"
-        for new_slot in ["48", "49", "50", "51"]:
-            assert new_slot in profile.stats.samples_by_slot, (
-                f"Slot {new_slot} should exist after migration"
-            )
-            assert profile.stats.samples_by_slot[new_slot] == [900.0, 950.0]
+        # Old slot "12" (hour 12) -> all 4 sub-slots get mean as single sample
+        assert profile.stats.samples_by_slot["48"] == [925.0]
+        assert profile.stats.samples_by_slot["49"] == [925.0]
+        assert profile.stats.samples_by_slot["50"] == [925.0]
+        assert profile.stats.samples_by_slot["51"] == [925.0]
 
     def test_migrate_incompatible_rejected(self):
         """Migrating from 20-min to 15-min slots should fail (20 % 15 != 0)."""

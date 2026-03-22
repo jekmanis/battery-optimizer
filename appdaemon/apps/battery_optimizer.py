@@ -28,7 +28,7 @@ from battery_optimizer_lib import (
     BatteryLearningEngine,
     LoadProfile,
     NordPoolPriceService,
-    TouSyncManager,
+    DirectControl,
     # DP Optimizer
     DPOptimizer,
     DPOptimizerConfig,
@@ -53,13 +53,11 @@ from battery_optimizer_lib import (
     # Schedule formatting
     ScheduleFormatter,
     ScheduleFormatterConfig,
+    # Prediction tracker
+    LoadPredictionTracker,
 )
 
 
-# Note: Data models (BatteryMode, PricePoint, ScheduleEntry, TouPeriod, LearningStats,
-# LoadProfileStats) and helper classes (BatteryLearningEngine, LoadProfile, NordPoolPriceService,
-# TouSyncManager) have been moved to the battery_optimizer/ package for better organization.
-# See battery_optimizer/__init__.py for the full list of exports.
 
 
 
@@ -97,8 +95,9 @@ class BatteryOptimizer(hass.Hass):
         self._previous_schedule_from_sensor: Optional[Dict[datetime.datetime, BatteryMode]] = None
 
         # Decision context tracking (for transparency logging and sensor exposure)
-        self._last_recalc_trigger: str = "startup"  # "startup", "daily_13:15", "soc_deviation", "manual"
+        self._last_recalc_trigger: str = "startup"  # "startup", "daily_13:15", "soc_deviation", "manual", "battery_depleted"
         self._last_recalc_time: Optional[datetime.datetime] = None
+        self._last_depletion_recalc_time: Optional[datetime.datetime] = None
         self._last_soc_deviation: Optional[float] = None  # Deviation that triggered recalculation
         self._last_min_charge_slots: int = 0  # Min charge slots from last calculation
         self._last_charge_slots: List[Dict] = []  # Selected charge slots with prices
@@ -127,20 +126,15 @@ class BatteryOptimizer(hass.Hass):
         )
         self._init_load_profile()
 
-        # TOU sync manager for inverter schedule sync
-        self._tou_sync_manager = TouSyncManager(
-            device_id=self.config.device_id,
+        # Prediction accuracy tracker
+        self.prediction_tracker = LoadPredictionTracker(
             slot_minutes=self.config.slot_minutes,
-            ha_url=self.config.ha_url,
-            ha_token=self.config.ha_token,
-            call_service_func=self.call_service,
-            get_datetime_func=self.datetime,
-            get_timezone_func=self._get_local_timezone,
-            sleep_func=self.sleep,
-            create_task_func=self.create_task,
             log_func=self.log,
-            get_schedule_func=lambda: self.schedule,  # Fresh schedule at execution time
         )
+        self._init_prediction_tracker()
+
+        # Direct inverter control via set_wit_mode service
+        self._direct_control = DirectControl(self, self.config)
 
         # Nord Pool price service for fetching electricity prices
         self._price_service = NordPoolPriceService(
@@ -234,6 +228,10 @@ class BatteryOptimizer(hass.Hass):
             self._next_interval_time(self.config.load_observation_minutes),
             self.config.load_observation_minutes * 60
         )
+
+        # Listen for optimizer enable/disable
+        if self.config.enabled_entity:
+            self.listen_state(self._on_enabled_change, self.config.enabled_entity)
 
         # Listen for manual override changes
         if self.config.override_entity:
@@ -398,6 +396,8 @@ class BatteryOptimizer(hass.Hass):
                 soc_step_percent=self.config.soc_step_percent,
                 grid_fee=self.config.grid_fee,
                 battery_wear_cost=self.config.battery_wear_cost,
+                export_rate_multiplier=self.config.export_rate_multiplier,
+                export_profit_threshold=self.config.export_profit_threshold,
             ),
             load_predictor=self._predict_load_kw,
             charge_rate_predictor=self.learning_engine.get_charge_rate_for_soc,
@@ -771,11 +771,7 @@ class BatteryOptimizer(hass.Hass):
 
         self.last_optimization = self.datetime()
 
-        # Sync schedule to inverter TOU registers (if configured)
-        if self.config.tou_sync_enabled and self.config.device_id:
-            self._schedule_tou_sync(reason="full_optimize")
-
-        # Apply current hour's mode
+        # Apply current slot's mode immediately
         self.execute_scheduled_mode(None)
 
         # Update sensor
@@ -804,10 +800,13 @@ class BatteryOptimizer(hass.Hass):
         # Check for solar override
         if pv_power > self.pv_threshold and self.current_mode == BatteryMode.CHARGE:
             self.log(f"Solar override: PV={pv_power}W, switching from charge to hold")
-            if self.config.tou_sync_enabled and self.config.device_id:
-                self._insert_hold_and_resync("solar_override")
-            else:
-                self.set_mode(BatteryMode.HOLD)
+            entry = ScheduleEntry(
+                time=self._align_to_slot(now),
+                mode=BatteryMode.HOLD,
+                reason="solar_override",
+            )
+            self._handle_mode_transition(BatteryMode.HOLD)
+            self._direct_control.apply_mode(entry)
             return
 
         # Get current slot for schedule change logging
@@ -852,9 +851,6 @@ class BatteryOptimizer(hass.Hass):
                     max_soc=self.max_soc,
                 )
 
-        # Check if TOU needs rolling update (every adaptive cycle)
-        if self.config.tou_sync_enabled and self.config.device_id:
-            self._check_and_sync_rolling_tou()
 
     def _recalculate_remaining_schedule(self, current_soc: float, extra_charge_slots: int = 0):
         """
@@ -926,16 +922,15 @@ class BatteryOptimizer(hass.Hass):
                 max_soc=self.max_soc,
             )
 
-        # Sync updated schedule to inverter TOU registers (if configured)
-        if self.config.tou_sync_enabled and self.config.device_id:
-            self._schedule_tou_sync(reason="recalculate")
+        # Apply updated mode immediately
+        self.execute_scheduled_mode(None)
 
         self._update_schedule_sensor()
 
     def execute_scheduled_mode(self, kwargs, force: bool = False):
         """
         Execute the scheduled mode for the current slot.
-        Called at the start of each slot.
+        Called at the start of each slot. Sends a direct mode command to the inverter.
 
         Args:
             kwargs: AppDaemon callback kwargs
@@ -948,7 +943,7 @@ class BatteryOptimizer(hass.Hass):
             self.log("Manual override active, skipping scheduled execution")
             return
 
-        # Get current hour in local timezone for schedule lookup
+        # Get current slot in local timezone for schedule lookup
         now = self.datetime()
         local_tz = self._get_local_timezone()
         if now.tzinfo is not None and local_tz is not None:
@@ -959,17 +954,15 @@ class BatteryOptimizer(hass.Hass):
 
         entry = self.schedule.get(current_slot)
 
-        # If not found, try matching by hour value with different timezone representations
+        # If not found, try matching by time components with different tz representations
         if entry is None and self.schedule:
             for schedule_hour, schedule_entry in self.schedule.items():
-                # Convert both to local timezone for comparison
                 compare_schedule = schedule_hour
                 if schedule_hour.tzinfo is not None and local_tz is not None:
                     compare_schedule = schedule_hour.astimezone(local_tz)
                 compare_current = current_slot
                 if current_slot.tzinfo is not None and local_tz is not None:
                     compare_current = current_slot.astimezone(local_tz)
-                # Compare the hour components
                 if (compare_schedule.date() == compare_current.date() and
                     compare_schedule.hour == compare_current.hour and
                     compare_schedule.minute == compare_current.minute):
@@ -977,72 +970,23 @@ class BatteryOptimizer(hass.Hass):
                     current_slot = schedule_hour
                     break
 
-        if entry:
-            self.log(f"Executing scheduled mode for {current_slot}: {entry.mode.name} ({entry.reason})")
-
-            # When TOU sync is enabled, avoid hourly set_mode which clears TOU periods (30411=0)
-            if self.config.tou_sync_enabled and self.config.device_id:
-                # Still track mode transitions for learning engine baseline reset
-                self._handle_mode_transition(entry.mode)
-                self.log("TOU sync enabled; skipping hourly set_mode to preserve inverter TOU schedule")
-                return
-            self.set_mode(entry.mode)
-        else:
-            self.log(f"No schedule entry for {current_slot}, defaulting to HOLD")
-            if self.config.tou_sync_enabled and self.config.device_id:
-                self._handle_mode_transition(BatteryMode.HOLD)
-                self.log("TOU sync enabled; skipping hourly set_mode to preserve inverter TOU schedule")
-                return
-            self.set_mode(BatteryMode.HOLD)
-
-    def _insert_hold_and_resync(self, reason: str = "safety"):
-        """
-        Insert HOLD for the current slot and resync TOU schedule.
-
-        This preserves the rest of the schedule while only modifying the current
-        hour to HOLD. Much better than set_mode(HOLD) which destroys the entire
-        TOU schedule and creates a 2-hour HOLD period that can conflict.
-
-        Args:
-            reason: Reason for the HOLD (used in log messages and schedule entry)
-        """
-        now = self.datetime()
-        local_tz = self._get_local_timezone()
-        if now.tzinfo is not None and local_tz is not None:
-            now = now.astimezone(local_tz)
-        current_slot = self._align_to_slot(now)
-
-        # Check if both schedule AND current mode are already HOLD
-        # Only skip if truly nothing needs to change (both aligned to HOLD)
-        if current_slot in self.schedule:
-            old_entry = self.schedule[current_slot]
-            if old_entry.mode == BatteryMode.HOLD and self.current_mode == BatteryMode.HOLD:
-                return  # Both schedule and inverter already HOLD, nothing to do
-            if old_entry.mode != BatteryMode.HOLD:
-                # Schedule needs updating
-                self.schedule[current_slot] = ScheduleEntry(
-                    time=current_slot,
-                    mode=BatteryMode.HOLD,
-                    reason=f"{reason}_hold (was {old_entry.mode.name})"
-                )
-                self.log(f"Inserted HOLD at {current_slot} (was {old_entry.mode.name})")
-            else:
-                # Schedule is HOLD but current_mode isn't - log the enforcement
-                self.log(f"Enforcing HOLD at {current_slot} (schedule was HOLD but mode was {self.current_mode.name})")
-        else:
-            self.schedule[current_slot] = ScheduleEntry(
+        if entry is None:
+            entry = ScheduleEntry(
                 time=current_slot,
                 mode=BatteryMode.HOLD,
-                reason=f"{reason}_hold"
+                reason="no_schedule",
             )
-            self.log(f"Inserted HOLD at {current_slot}")
 
-        self._handle_mode_transition(BatteryMode.HOLD)
-        self._update_schedule_sensor()
+        self.log(f"Executing scheduled mode for {current_slot}: {entry.mode.name} ({entry.reason})")
 
-        # Resync TOU with updated schedule (uses existing async wrapper)
-        if self.config.tou_sync_enabled and self.config.device_id:
-            self._schedule_tou_sync(skip_fit_check=True, reason=f"{reason}_hold_resync")
+        # Track mode transition for cost tracking / learning
+        self._handle_mode_transition(entry.mode)
+
+        # Send command to inverter
+        success = self._direct_control.apply_mode(entry)
+        if not success:
+            self.log("Failed to apply mode — will retry next slot", level="WARNING")
+
 
     def _check_soc_boundaries(self, current_soc: float) -> bool:
         """
@@ -1058,25 +1002,49 @@ class BatteryOptimizer(hass.Hass):
         Returns:
             True if mode was changed due to boundary violation, False otherwise
         """
+        now = self.datetime()
+
         # Stop discharge if SOC too low
         if current_soc <= self.min_soc and self.current_mode == BatteryMode.DISCHARGE:
             self.log(f"Safety: HOLD (battery depleted at {current_soc}%)")
-            if self.config.tou_sync_enabled and self.config.device_id:
-                self._insert_hold_and_resync("battery_depleted")
-            else:
-                self.set_mode(BatteryMode.HOLD)
+            entry = ScheduleEntry(
+                time=self._align_to_slot(now),
+                mode=BatteryMode.HOLD,
+                reason="safety_min_soc",
+            )
+            self._handle_mode_transition(BatteryMode.HOLD)
+            self._direct_control.apply_mode(entry)
+            # Schedule re-optimization to find charging opportunities
+            if (self._last_depletion_recalc_time is None or
+                    (now - self._last_depletion_recalc_time).total_seconds() > 1800):
+                self._last_depletion_recalc_time = now
+                self.log("Scheduling re-optimization in 120s after battery depletion")
+                self.run_in(self._on_depletion_recalc, 120)
             return True
 
         # Stop charge if SOC full
         if current_soc >= self.max_soc and self.current_mode == BatteryMode.CHARGE:
             self.log(f"Safety: Stopping charge, SOC at maximum ({current_soc}%)")
-            if self.config.tou_sync_enabled and self.config.device_id:
-                self._insert_hold_and_resync("safety_max_soc")
-            else:
-                self.set_mode(BatteryMode.HOLD)
+            entry = ScheduleEntry(
+                time=self._align_to_slot(now),
+                mode=BatteryMode.HOLD,
+                reason="safety_max_soc",
+            )
+            self._handle_mode_transition(BatteryMode.HOLD)
+            self._direct_control.apply_mode(entry)
             return True
 
         return False
+
+    def _on_depletion_recalc(self, kwargs=None):
+        """Re-optimize after battery depletion to find charging opportunities."""
+        current_soc = self._get_current_soc()
+        if current_soc is None:
+            return
+        self.log(f"Re-optimizing after battery depletion (SOC={current_soc}%)")
+        self._last_recalc_trigger = "battery_depleted"
+        self._last_recalc_time = self.datetime()
+        self._recalculate_remaining_schedule(current_soc)
 
     def _get_cheapest_upcoming_prices(self, remaining_hours: List[datetime.datetime], count: int) -> List[float]:
         """
@@ -1258,58 +1226,19 @@ class BatteryOptimizer(hass.Hass):
         self.current_mode = new_mode
         self._update_schedule_sensor()
 
-    def set_mode(self, mode: BatteryMode, power_percent: int = 100):
-        """
-        Set the battery mode via VPP protocol registers.
-
-        Delegates to TouSyncManager for the actual register writes.
-        Updates mode tracking on success or in dry-run mode.
-
-        Mode Mapping:
-        - CHARGE: Remote control with positive power
-        - DISCHARGE: Remote control with negative power
-        - HOLD: TOU with +1% charge (firmware quirk for true standby)
-
-        Dry-run mode: When device_id is empty, no register writes are performed
-        but internal state is still updated for testing/simulation purposes.
-        """
-        # Delegate to TouSyncManager for register writes
-        success = self._tou_sync_manager.set_mode(mode, power_percent)
-
-        # Update mode tracking on success, or always in dry-run mode (no device_id)
-        # for state consistency during testing/simulation
-        if success or not self.config.device_id:
-            self._handle_mode_transition(mode)
 
     # =========================================================================
-    # TOU Schedule Sync (delegates to TouSyncManager)
+    # Enable/Disable and Manual Override Handling
     # =========================================================================
 
-    def schedule_to_tou_periods(self, boundary_minute: int = None) -> List[TouPeriod]:
-        """Convert current schedule to TOU periods for inverter programming."""
-        return self._tou_sync_manager.schedule_to_tou_periods(self.schedule, boundary_minute)
-
-    def _schedule_tou_sync(self, boundary_minute: int = None, skip_fit_check: bool = False,
-                           allow_queue: bool = True, reason: str = ""):
-        """Schedule a TOU sync, avoiding overlapping register writes."""
-        self._tou_sync_manager.schedule_tou_sync(
-            boundary_minute, skip_fit_check, allow_queue, reason
-        )
-
-    def _check_and_sync_rolling_tou(self):
-        """Check if TOU schedule needs rolling update and sync if needed."""
-        self._tou_sync_manager.check_and_sync_rolling_tou()
-
-    async def sync_schedule_to_inverter(self, boundary_minute: int = None,
-                                        skip_fit_check: bool = False) -> bool:
-        """Sync the current schedule to the inverter's TOU registers."""
-        return await self._tou_sync_manager.sync_schedule_to_inverter(
-            self.schedule, boundary_minute, skip_fit_check
-        )
-
-    # =========================================================================
-    # Manual Override Handling
-    # =========================================================================
+    def _on_enabled_change(self, entity, attribute, old, new, kwargs):
+        """Handle optimizer enable/disable toggle."""
+        if new == "off":
+            self.log("Optimizer disabled — releasing inverter overrides")
+            self._direct_control.release_control()
+        elif new == "on" and old == "off":
+            self.log("Optimizer re-enabled — resuming scheduled operation")
+            self.execute_scheduled_mode(None)
 
     def on_override_change(self, entity, attribute, old, new, kwargs):
         """Handle manual override toggle"""
@@ -1339,10 +1268,16 @@ class BatteryOptimizer(hass.Hass):
         mode = mode_map.get(mode_str)
         if mode is not None:
             self.log(f"Applying manual mode: {mode.name}")
-            self.set_mode(mode)
+            now = self.datetime()
+            entry = ScheduleEntry(
+                time=self._align_to_slot(now),
+                mode=mode,
+                reason=f"manual_{mode.name.lower()}",
+            )
+            self._handle_mode_transition(mode)
+            self._direct_control.apply_mode(entry)
         elif mode_str == "Auto":
             # Turn off override to fully resume automatic scheduling
-            # This ensures subsequent hourly executions work correctly
             self.log("Manual mode set to Auto, turning off override and resuming schedule")
             try:
                 self.call_service("input_boolean/turn_off",
@@ -1477,6 +1412,25 @@ class BatteryOptimizer(hass.Hass):
                 self.log(f"Could not load load profile data: {e}", level="WARNING")
 
         self.log("Starting with fresh load profile")
+
+    def _init_prediction_tracker(self):
+        """Initialize prediction tracker from persistent storage."""
+        if self.config.prediction_tracker_file:
+            try:
+                with open(self.config.prediction_tracker_file, "r", encoding="utf-8") as fh:
+                    data = fh.read()
+                if data and self.prediction_tracker.load_from_json(data):
+                    self.log(
+                        f"Loaded prediction tracker: "
+                        f"{self.prediction_tracker.stats.total_comparisons} comparisons"
+                    )
+                    return
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                self.log(f"Could not load prediction tracker file: {e}", level="WARNING")
+
+        self.log("Starting with fresh prediction tracker")
 
     def _restore_previous_schedule_from_sensor(self):
         """
@@ -1634,6 +1588,44 @@ class BatteryOptimizer(hass.Hass):
         except Exception as e:
             self.log(f"Could not update load profile sensors: {e}", level="DEBUG")
 
+    def _save_prediction_tracker(self):
+        """Persist prediction tracker to file."""
+        if not self.config.prediction_tracker_file:
+            return
+        try:
+            json_data = self.prediction_tracker.to_json()
+            with open(self.config.prediction_tracker_file, "w", encoding="utf-8") as fh:
+                fh.write(json_data)
+        except Exception as e:
+            self.log(f"Could not save prediction tracker file: {e}", level="DEBUG")
+        self._update_prediction_accuracy_sensor()
+
+    def _update_prediction_accuracy_sensor(self):
+        """Update prediction accuracy sensor in Home Assistant."""
+        try:
+            metrics = self.prediction_tracker.get_risk_metrics()
+            bias = metrics["overall_bias"]
+            state_str = f"{bias:.2f}x" if bias != 1.0 else "1.00x"
+            attrs = {
+                "friendly_name": "Battery Prediction Accuracy",
+                "icon": "mdi:chart-bell-curve",
+                "overall_bias": metrics["overall_bias"],
+                "underestimate_pct": metrics["underestimate_pct"],
+                "p90_ratio": metrics["p90_ratio"],
+                "worst_slot": metrics["worst_slot"],
+                "worst_slot_ratio": metrics["worst_slot_ratio"],
+                "confidence": metrics["confidence"],
+                "total_comparisons": self.prediction_tracker.stats.total_comparisons,
+            }
+            # Add schedule risk if we have a current schedule
+            if self.schedule:
+                risk = self.prediction_tracker.get_schedule_risk_assessment(self.schedule)
+                attrs["discharge_risk"] = risk["overall_risk"]
+                attrs["discharge_slot_risks"] = risk["discharge_slot_risks"]
+            self.set_state("sensor.battery_prediction_accuracy", state=state_str, attributes=attrs)
+        except Exception as e:
+            self.log(f"Could not update prediction accuracy sensor: {e}", level="DEBUG")
+
     def record_load_observation(self, kwargs=None):
         """Record current house load into the statistical load profile."""
         if not self.config.load_power_sensor:
@@ -1642,8 +1634,20 @@ class BatteryOptimizer(hass.Hass):
         if load_w is None:
             return
         now = self._align_to_slot(self.datetime())
+
+        # Record actual for just-completed slot comparison
+        self.prediction_tracker.record_actual(now, load_w / 1000.0)
+
+        # Record in load profile
         self.load_profile.record(now, load_w)
+
+        # Record prediction for the next slot (to compare at next observation)
+        next_slot = now + datetime.timedelta(minutes=self.config.slot_minutes)
+        predicted_kw = self._predict_load_kw(next_slot)
+        self.prediction_tracker.record_prediction(next_slot, predicted_kw)
+
         self._save_load_profile()
+        self._save_prediction_tracker()
 
     def _save_learning_data(self):
         """Persist learning data to file"""
@@ -1727,13 +1731,11 @@ class BatteryOptimizer(hass.Hass):
         return load_w
 
     def _predict_load_kw(self, dt: datetime.datetime) -> float:
-        """Predict expected load (kW) for a slot using load profile."""
+        """Predict expected load (kW) for a slot using load profile with correction."""
+        correction = self.prediction_tracker.get_correction_factor(dt)
         if self.load_profile:
-            predicted = self.load_profile.predict_kw(dt, self.config.load_quantile)
-        else:
-            predicted = self.config.base_consumption / 1000.0
-
-        return predicted
+            return self.load_profile.predict_kw(dt, self.config.load_quantile, correction)
+        return (self.config.base_consumption / 1000.0) * correction
 
     def _align_to_slot(self, dt: datetime.datetime) -> datetime.datetime:
         """Floor datetime to the start of the current time slot."""

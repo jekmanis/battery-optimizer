@@ -1378,7 +1378,6 @@ class TestRecalculateRemainingScheduleWithExtraSlots:
             def __init__(self):
                 self.config = BatteryOptimizerConfig(
                     slot_minutes=60,
-                    tou_sync_enabled=False,
                     device_id="",
                     decision_log_level=1,
                 )
@@ -1416,7 +1415,7 @@ class TestRecalculateRemainingScheduleWithExtraSlots:
             def calculate_expected_soc_schedule(self, schedule, starting_soc, starting_temp=None):
                 return {}, {}
 
-            def _schedule_tou_sync(self, reason):
+            def execute_scheduled_mode(self, kwargs, force=False):
                 pass
 
             def _update_schedule_sensor(self):

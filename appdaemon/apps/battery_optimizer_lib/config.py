@@ -46,7 +46,21 @@ class BatteryOptimizerConfig:
     # Device Control
     # =========================================================================
     device_id: str = ""  # Empty = dry-run mode (no inverter control)
-    tou_sync_enabled: bool = True
+
+    # =========================================================================
+    # Direct Control Settings
+    # =========================================================================
+    direct_control_buffer_minutes: int = 5
+    # Buffer added to slot_minutes for override duration.
+    # slot=15 + buffer=5 = 20 min override. If optimizer misses a refresh,
+    # inverter reverts to safe base mode after 20 min.
+
+    default_power_percent: int = 100
+    # Default charge/discharge power when not specified per-slot.
+
+    export_profit_threshold: float = 1.05
+    # Export when sell_price > buy_price * threshold.
+    # 1.05 = export only when 5% more profitable than self-consuming.
 
     # =========================================================================
     # Battery Parameters
@@ -63,7 +77,7 @@ class BatteryOptimizerConfig:
     slot_minutes: int = 15
     adaptive_recalc_minutes: int = 15
     load_observation_minutes: int = 15
-    soc_step_percent: float = 1.0  # DP resolution for SOC
+    soc_step_percent: float = 0.25  # DP resolution for SOC (must be < load/slot in kWh)
 
     # =========================================================================
     # Load Profile
@@ -74,6 +88,7 @@ class BatteryOptimizerConfig:
     load_profile_min_samples: int = 6
     load_zero_floor_w: float = 450.0
     load_profile_file: str = "/config/load_profile.json"
+    prediction_tracker_file: str = "/config/prediction_tracker.json"
     load_profile_last_obs_entity: str = "sensor.load_profile_last_observation"
     load_profile_count_entity: str = "sensor.load_profile_observation_count"
 
@@ -203,7 +218,11 @@ class BatteryOptimizerConfig:
 
             # Device Control
             device_id=args.get("device_id", ""),
-            tou_sync_enabled=args.get("tou_sync_enabled", True),
+
+            # Direct Control
+            direct_control_buffer_minutes=int(args.get("direct_control_buffer_minutes", 5)),
+            default_power_percent=int(args.get("default_power_percent", 100)),
+            export_profit_threshold=float(args.get("export_profit_threshold", 1.05)),
 
             # Battery Parameters
             battery_capacity=float(args.get("battery_capacity_kwh", 14.3)),
@@ -225,6 +244,7 @@ class BatteryOptimizerConfig:
             load_profile_min_samples=int(args.get("load_profile_min_samples", 6)),
             load_zero_floor_w=float(args.get("load_zero_floor_w", 450)),
             load_profile_file=args.get("load_profile_file", "/config/load_profile.json"),
+            prediction_tracker_file=args.get("prediction_tracker_file", "/config/prediction_tracker.json"),
             load_profile_last_obs_entity=args.get(
                 "load_profile_last_observation_entity",
                 "sensor.load_profile_last_observation"
@@ -273,8 +293,8 @@ class BatteryOptimizerConfig:
             f"HA connection: ha_url='{self.ha_url or 'NOT SET'}', "
             f"ha_token={'SET' if self.ha_token else 'NOT SET'}"
         )
-        if self.tou_sync_enabled and self.device_id:
-            log_func(f"TOU sync enabled via growatt_modbus (device: {self.device_id})")
+        if self.device_id:
+            log_func(f"Direct control enabled via growatt_modbus/set_wit_mode (device: {self.device_id})")
         log_func(f"Loaded grid_fee: {self.grid_fee} EUR/kWh")
         log_func(
             f"Config loaded: capacity={self.battery_capacity}kWh, "

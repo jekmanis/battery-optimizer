@@ -7,7 +7,7 @@ This package contains helper modules for the main BatteryOptimizer AppDaemon app
 - learning_engine: Self-learning battery performance tracking
 - load_profile: Statistical load forecasting by time-of-day
 - price_service: Nord Pool electricity price fetching
-- tou_sync: TOU schedule sync and inverter control via Modbus
+- direct_control: Direct inverter control via set_wit_mode service
 - timezone_utils: Timezone-aware datetime comparison and slot alignment
 - ha_helpers: Home Assistant state reading helpers
 - cost_tracker: Battery cost tracking with weighted average calculations
@@ -23,11 +23,13 @@ from .models import (
     TouPeriod,
     LearningStats,
     LoadProfileStats,
+    PredictionAccuracyStats,
 )
 from .learning_engine import BatteryLearningEngine
 from .load_profile import LoadProfile, _quantile
 from .price_service import NordPoolPriceService
-from .tou_sync import TouSyncManager
+from .direct_control import DirectControl
+from .tou_sync import TouSyncManager  # Retained for test compatibility; not used in production
 from .dp_optimizer import DPOptimizer, DPOptimizerConfig, DPOptimizerResult
 from .timezone_utils import (
     normalize_tz_pair,
@@ -44,6 +46,7 @@ from .cost_tracker import BatteryCostTracker, BatteryCostConfig
 from .charge_rate_utils import compute_charge_rates_per_slot
 from .soc_deviation import SocDeviationDetector, SocDeviationConfig, DeviationCheckResult
 from .schedule_formatter import ScheduleFormatter, ScheduleFormatterConfig
+from .load_prediction_tracker import LoadPredictionTracker
 
 __all__ = [
     # Config
@@ -55,10 +58,12 @@ __all__ = [
     "TouPeriod",
     "LearningStats",
     "LoadProfileStats",
+    "PredictionAccuracyStats",
     # Classes
     "BatteryLearningEngine",
     "LoadProfile",
     "NordPoolPriceService",
+    "DirectControl",
     "TouSyncManager",
     "SensorReader",
     # DP Optimizer
@@ -88,4 +93,6 @@ __all__ = [
     # Schedule formatting
     "ScheduleFormatter",
     "ScheduleFormatterConfig",
+    # Prediction tracker
+    "LoadPredictionTracker",
 ]

@@ -676,10 +676,25 @@ class TouSyncManager:
         self.log(f"Set battery mode to DISCHARGE at {power_percent}%")
         return True
 
+    _MAX_READ_COUNT = 50  # growatt_modbus service limit
+
     def _read_modbus_registers(self, address: int, count: int = 1) -> Optional[List[int]]:
         """Read holding registers via growatt_modbus service."""
         if not self.device_id:
             return None
+
+        # Chunk reads that exceed the service limit
+        if count > self._MAX_READ_COUNT:
+            all_values = []
+            offset = 0
+            while offset < count:
+                chunk = min(self._MAX_READ_COUNT, count - offset)
+                result = self._read_modbus_registers(address + offset, chunk)
+                if result is None:
+                    return None
+                all_values.extend(result)
+                offset += chunk
+            return all_values
 
         # Prefer REST API
         rest_values = self._read_modbus_registers_rest(address, count)

@@ -70,20 +70,22 @@ class LoadProfile:
         self.stats.observation_count += 1
         self.stats.last_observation = dt.isoformat()
 
-    def predict_kw(self, dt: datetime.datetime, quantile: float = 0.75) -> float:
+    def predict_kw(self, dt: datetime.datetime, quantile: float = 0.75,
+                    correction_factor: float = 1.0) -> float:
         """
         Predict expected load (kW) for a slot using stored samples.
 
-        Uses quantile-based forecast blended with default based on confidence.
+        Uses quantile-based forecast blended with default based on confidence,
+        then scaled by correction_factor from prediction accuracy tracking.
         """
         slot = str(self._slot_index(dt))
         samples = self.stats.samples_by_slot.get(slot, [])
         if not samples:
-            return self.default_load_w / 1000.0
+            return max(0.0, self.default_load_w * correction_factor) / 1000.0
         q_value = _quantile(samples, quantile)
         confidence = min(1.0, len(samples) / self.min_samples)
         blended = (self.default_load_w * (1 - confidence)) + (q_value * confidence)
-        return max(0.0, blended) / 1000.0
+        return max(0.0, blended * correction_factor) / 1000.0
 
     def to_json(self) -> str:
         """Serialize load profile for persistence."""
@@ -115,9 +117,13 @@ class LoadProfile:
                         new_samples = {}
                         for old_slot_str, samples in old_samples.items():
                             old_slot = int(old_slot_str)
+                            # Spread a condensed prior (mean) to all sub-slots
+                            # so they have a useful starting estimate, but with
+                            # low confidence (1 sample) that real data will replace
+                            mean_val = sum(samples) / len(samples)
                             for i in range(factor):
                                 new_slot = old_slot * factor + i
-                                new_samples[str(new_slot)] = list(samples)
+                                new_samples[str(new_slot)] = [mean_val]
                         self.stats = LoadProfileStats(
                             samples_by_slot=new_samples,
                             observation_count=old_stats.get("observation_count", 0),

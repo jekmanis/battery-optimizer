@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from .config import BatteryOptimizerConfig
     from .models import BatteryMode, PricePoint, ScheduleEntry
     from .learning_engine import BatteryLearningEngine
 
@@ -36,13 +37,37 @@ class BatteryCostConfig:
     slot_minutes: int = 15
     charge_rate: float = 4.5  # kW
     discharge_rate: float = 4.5  # kW
+    export_discharge_rate: float = 0.0  # kW — discharge rate during grid export (0 = use discharge_rate)
 
     # Pricing
-    grid_fee: float = 0.05  # EUR/kWh
+    grid_fee: float = 0.052  # EUR/kWh — trading margin + distribution on purchases
     battery_wear_cost: float = 0.0  # EUR/kWh
 
     # Default fallback cost when HA entity unavailable
     default_cost: float = 0.10  # EUR/kWh
+
+    @property
+    def effective_export_discharge_rate(self) -> float:
+        """Discharge rate during grid export (kW). Falls back to discharge_rate if not set."""
+        return self.export_discharge_rate if self.export_discharge_rate > 0 else self.discharge_rate
+
+    @classmethod
+    def from_main_config(cls, cfg: "BatteryOptimizerConfig") -> "BatteryCostConfig":
+        """Create from the central BatteryOptimizerConfig."""
+        return cls(
+            battery_cost_entity=cfg.battery_cost_entity,
+            battery_charge_sensor=cfg.battery_charge_sensor,
+            battery_discharge_sensor=cfg.battery_discharge_sensor,
+            use_inverter_energy_sensors=cfg.use_inverter_energy_sensors,
+            battery_capacity=cfg.battery_capacity,
+            efficiency=cfg.efficiency,
+            slot_minutes=cfg.slot_minutes,
+            charge_rate=cfg.charge_rate,
+            discharge_rate=cfg.discharge_rate,
+            export_discharge_rate=cfg.export_discharge_rate,
+            grid_fee=cfg.grid_fee,
+            battery_wear_cost=cfg.battery_wear_cost,
+        )
 
 
 class BatteryCostTracker:
@@ -732,6 +757,7 @@ class BatteryCostTracker:
         predict_load_func: Callable[[datetime.datetime], float],
         charge_rates_by_slot: Optional[Dict[datetime.datetime, float]] = None,
         slot_fractions_by_slot: Optional[Dict[datetime.datetime, float]] = None,
+        predict_pv_func: Optional[Callable[[datetime.datetime], float]] = None,
     ) -> Tuple[Dict[datetime.datetime, float], float]:
         """
         Project battery avg cost evolution through a schedule.
@@ -784,13 +810,37 @@ class BatteryCostTracker:
                 current_soc = min(self._get_max_soc(), current_soc + (energy_added / self._config.battery_capacity) * 100)
 
             elif entry.mode == BatteryMode.DISCHARGE:
-                load_kw = predict_load_func(hour)
                 fraction = (
                     slot_fractions_by_slot.get(hour, 1.0)
                     if slot_fractions_by_slot is not None
                     else 1.0
                 )
-                energy_removed = min(load_kw, self._config.discharge_rate) * slot_hours * fraction
+                if entry.export_rate is not None and entry.export_rate > 0:
+                    # Export: drain at full export discharge rate
+                    edr = self._config.effective_export_discharge_rate
+                    energy_removed = edr * slot_hours * fraction
+                else:
+                    # Self-consumption: drain at load rate
+                    load_kw = predict_load_func(hour)
+                    energy_removed = min(load_kw, self._config.discharge_rate) * slot_hours * fraction
                 current_soc = max(self._get_min_soc(), current_soc - (energy_removed / self._config.battery_capacity) * 100)
+
+            elif entry.mode == BatteryMode.SELF_CONSUMPTION:
+                fraction = (
+                    slot_fractions_by_slot.get(hour, 1.0)
+                    if slot_fractions_by_slot is not None
+                    else 1.0
+                )
+                pv_kw = predict_pv_func(hour) if predict_pv_func else 0.0
+                load_kw = predict_load_func(hour)
+                pv_surplus = max(0.0, pv_kw - load_kw)
+                pv_charge_kw = min(pv_surplus, self._config.charge_rate)
+                pv_charge_kwh = pv_charge_kw * self._config.efficiency * slot_hours * fraction
+                load_deficit = max(0.0, load_kw - pv_kw)
+                battery_discharge_kwh = min(load_deficit, self._config.discharge_rate) * slot_hours * fraction
+                net_energy = pv_charge_kwh - battery_discharge_kwh
+                soc_change = (net_energy / self._config.battery_capacity) * 100
+                current_soc = max(self._get_min_soc(), min(self._get_max_soc(), current_soc + soc_change))
+                # PV charging is free — no cost update needed for the charge portion
 
         return projected_costs, current_cost

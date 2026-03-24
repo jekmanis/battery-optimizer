@@ -77,6 +77,9 @@ class MockSocDeviationOptimizer:
     def _predict_load_kw(self, hour: datetime.datetime) -> float:
         return 0.5  # Default load prediction
 
+    def _predict_pv_kw(self, dt: datetime.datetime) -> float:
+        return 0.0  # Default PV prediction
+
     def _get_battery_temp(self) -> Optional[float]:
         """Return mock battery temperature (None by default, can be set in tests)."""
         return getattr(self, '_battery_temp', None)
@@ -829,6 +832,7 @@ class TestLogScheduleUsesLearnedRate:
                 battery_capacity=14.3,
                 charge_rate=4.5,  # Configured (lower)
                 discharge_rate=4.5,
+                export_discharge_rate=0.0,
                 efficiency=0.95,
                 battery_wear_cost=0.0,
                 decision_log_level=1,
@@ -907,6 +911,7 @@ class TestLogScheduleUsesLearnedRate:
                 battery_capacity=14.3,
                 charge_rate=4.5,
                 discharge_rate=4.5,
+                export_discharge_rate=0.0,
                 efficiency=0.95,
                 battery_wear_cost=0.0,
                 decision_log_level=1,
@@ -1444,6 +1449,7 @@ class TestRecalculateRemainingScheduleWithExtraSlots:
                 battery_capacity=14.3,
                 charge_rate=4.5,
                 discharge_rate=4.5,
+                export_discharge_rate=0.0,
                 efficiency=0.85,
                 battery_wear_cost=0.0,
                 decision_log_level=1,

@@ -58,16 +58,13 @@ class BatteryOptimizerConfig:
     default_power_percent: int = 100
     # Default charge/discharge power when not specified per-slot.
 
-    export_profit_threshold: float = 1.05
-    # Export when sell_price > buy_price * threshold.
-    # 1.05 = export only when 5% more profitable than self-consuming.
-
     # =========================================================================
     # Battery Parameters
     # =========================================================================
     battery_capacity: float = 14.3  # kWh
     charge_rate: float = 4.5  # kW
-    discharge_rate: float = 4.5  # kW (defaults to charge_rate if not specified)
+    discharge_rate: float = 4.5  # kW (from_args defaults to charge_rate if not specified)
+    export_discharge_rate: float = 0.0  # kW — discharge rate during grid export (0 = use discharge_rate)
     efficiency: float = 0.85
     base_consumption: float = 500.0  # W (fallback when no load profile)
 
@@ -93,6 +90,18 @@ class BatteryOptimizerConfig:
     load_profile_count_entity: str = "sensor.load_profile_observation_count"
 
     # =========================================================================
+    # PV Profile
+    # =========================================================================
+    pv_profile_file: str = "/config/pv_profile.json"
+    pv_profile_max_samples: int = 60
+    pv_profile_min_samples: int = 6
+    pv_quantile: float = 0.5
+    pv_forecast_sensor: str = ""  # Optional external PV forecast sensor (e.g., Solcast)
+    pv_forecast_unit: str = "W"  # Unit of pv_forecast_sensor: "W" or "kW"
+    enable_self_consumption: bool = True  # Enable SELF_CONSUMPTION DP action
+    inverter_mode_sensor: str = ""  # Inverter mode sensor for monitoring (e.g., sensor.growatt_wit_inverter_mode)
+
+    # =========================================================================
     # SOC Limits (defaults - can be overridden by HA entities at runtime)
     # =========================================================================
     default_min_soc: float = 10.0
@@ -103,9 +112,10 @@ class BatteryOptimizerConfig:
     # =========================================================================
     # Pricing
     # =========================================================================
-    grid_fee: float = 0.05  # EUR/kWh
+    grid_fee: float = 0.052  # EUR/kWh — trading margin + distribution fee on purchases
+    grid_export_fee: float = 0.02  # EUR/kWh — fixed deduction from spot price when selling
     battery_wear_cost: float = 0.0  # EUR/kWh
-    export_rate_multiplier: float = 1.0
+    export_rate_multiplier: float = 1.0  # 1.0 = no percentage reduction (deduction is fixed)
 
     # =========================================================================
     # HA Entities for Dynamic Config
@@ -161,6 +171,11 @@ class BatteryOptimizerConfig:
         # Compute derived values
         self.slot_hours = self.slot_minutes / 60.0
 
+    @property
+    def effective_export_discharge_rate(self) -> float:
+        """Discharge rate during grid export (kW). Falls back to discharge_rate if not set."""
+        return self.export_discharge_rate if self.export_discharge_rate > 0 else self.discharge_rate
+
     @classmethod
     def from_args(cls, args: dict, log_func=None) -> "BatteryOptimizerConfig":
         """
@@ -180,6 +195,7 @@ class BatteryOptimizerConfig:
         # Extract discharge_rate with fallback to charge_rate
         charge_rate = float(args.get("charge_rate_kw", 4.5))
         discharge_rate = float(args.get("discharge_rate_kw", charge_rate))
+        export_discharge_rate = float(args.get("export_discharge_rate_kw", 0))
 
         # Extract slot_minutes with validation warning
         slot_minutes = int(args.get("slot_minutes", 15))
@@ -222,12 +238,12 @@ class BatteryOptimizerConfig:
             # Direct Control
             direct_control_buffer_minutes=int(args.get("direct_control_buffer_minutes", 5)),
             default_power_percent=int(args.get("default_power_percent", 100)),
-            export_profit_threshold=float(args.get("export_profit_threshold", 1.05)),
 
             # Battery Parameters
             battery_capacity=float(args.get("battery_capacity_kwh", 14.3)),
             charge_rate=charge_rate,
             discharge_rate=discharge_rate,
+            export_discharge_rate=export_discharge_rate,
             efficiency=float(args.get("efficiency", 0.85)),
             base_consumption=float(args.get("base_consumption_w", 500)),
 
@@ -254,6 +270,16 @@ class BatteryOptimizerConfig:
                 "sensor.load_profile_observation_count"
             ),
 
+            # PV Profile
+            pv_profile_file=args.get("pv_profile_file", "/config/pv_profile.json"),
+            pv_profile_max_samples=int(args.get("pv_profile_max_samples", 60)),
+            pv_profile_min_samples=int(args.get("pv_profile_min_samples", 6)),
+            pv_quantile=float(args.get("pv_quantile", 0.5)),
+            pv_forecast_sensor=args.get("pv_forecast_sensor", ""),
+            pv_forecast_unit=args.get("pv_forecast_unit", "W"),
+            enable_self_consumption=args.get("enable_self_consumption", True),
+            inverter_mode_sensor=args.get("inverter_mode_sensor", ""),
+
             # SOC Limits
             default_min_soc=float(args.get("min_soc", 10)),
             default_max_soc=float(args.get("max_soc", 100)),
@@ -261,7 +287,8 @@ class BatteryOptimizerConfig:
             soc_deviation_threshold=float(args.get("soc_deviation_threshold", 10)),
 
             # Pricing
-            grid_fee=float(args.get("grid_fee_eur_kwh", 0.05)),
+            grid_fee=float(args.get("grid_fee_eur_kwh", 0.052)),
+            grid_export_fee=float(args.get("grid_export_fee_eur_kwh", 0.02)),
             battery_wear_cost=float(args.get("battery_wear_cost_eur_kwh", 0.0)),
             export_rate_multiplier=float(args.get("export_rate_multiplier", 1.0)),
 
@@ -299,5 +326,6 @@ class BatteryOptimizerConfig:
         log_func(
             f"Config loaded: capacity={self.battery_capacity}kWh, "
             f"charge_rate={self.charge_rate}kW, discharge_rate={self.discharge_rate}kW, "
+            f"export_discharge_rate={self.effective_export_discharge_rate}kW, "
             f"efficiency={self.efficiency}, slot={self.slot_minutes}min"
         )

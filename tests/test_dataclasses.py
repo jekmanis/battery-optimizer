@@ -38,10 +38,11 @@ class TestBatteryMode:
     def test_enum_iteration(self):
         """Should be able to iterate over all modes."""
         modes = list(BatteryMode)
-        assert len(modes) == 3
+        assert len(modes) == 4
         assert BatteryMode.HOLD in modes
         assert BatteryMode.CHARGE in modes
         assert BatteryMode.DISCHARGE in modes
+        assert BatteryMode.SELF_CONSUMPTION in modes
 
 
 class TestPricePoint:

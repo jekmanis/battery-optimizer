@@ -85,7 +85,7 @@ battery_optimizer:
   charge_rate_kw: 4.5
 
   # Discharge rate in kW
-  discharge_rate_kw: 4.5
+  discharge_rate_kw: 5.9
 
   # Minimum state of charge (emergency reserve)
   min_soc: 10
@@ -142,16 +142,19 @@ battery_optimizer:
   # Pricing Parameters
   # ==========================================================================
 
-  # Fixed grid fees per kWh (distribution, taxes, etc.)
-  # These fees apply regardless of spot price
-  grid_fee_eur_kwh: 0.00
+  # Fixed grid fees per kWh added to spot price when buying
+  # Trading margin (0.01238) + distribution fee (0.03962) = 0.052
+  grid_fee_eur_kwh: 0.052
+
+  # Fixed fee subtracted from spot price when selling (net metering deduction)
+  # Sell price = max(0, nordpool - 0.02)
+  grid_export_fee_eur_kwh: 0.02
+
+  # Export rate multiplier (1.0 = no percentage reduction, deduction is fixed via grid_export_fee)
+  export_rate_multiplier: 1.0
 
   # Optional battery wear cost per kWh (discourages cycling at marginal prices)
   battery_wear_cost_eur_kwh: 0.00
-
-  # Export rate multiplier (what percentage of spot you get for export)
-  # 0.8 = 80% of spot price for exported energy
-  export_rate_multiplier: 0.95
 
   # ==========================================================================
   # Optimization Thresholds

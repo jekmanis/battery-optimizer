@@ -83,6 +83,7 @@ class SocDeviationDetector:
         local_tz,
         current_temp: Optional[float] = None,
         predict_load_kw: Optional[Callable[[datetime.datetime], float]] = None,
+        predict_pv_kw: Optional[Callable[[datetime.datetime], float]] = None,
         get_cheapest_upcoming_prices: Optional[Callable[[List[datetime.datetime], int], List[float]]] = None,
         get_discharge_threshold: Optional[Callable[[], float]] = None,
     ) -> DeviationCheckResult:
@@ -120,7 +121,8 @@ class SocDeviationDetector:
 
         # Interpolate expected SOC based on elapsed time in slot
         expected_soc_now = self._interpolate_expected_soc(
-            expected_soc, entry, fraction, current_soc, current_slot, current_temp, predict_load_kw
+            expected_soc, entry, fraction, current_soc, current_slot, current_temp,
+            predict_load_kw, predict_pv_kw,
         )
 
         soc_delta = current_soc - expected_soc_now
@@ -201,6 +203,7 @@ class SocDeviationDetector:
         current_slot: datetime.datetime,
         current_temp: Optional[float],
         predict_load_kw: Optional[Callable[[datetime.datetime], float]],
+        predict_pv_kw: Optional[Callable[[datetime.datetime], float]] = None,
     ) -> float:
         """
         Interpolate expected SOC based on elapsed time within the slot.
@@ -213,6 +216,7 @@ class SocDeviationDetector:
             current_slot: Current slot datetime
             current_temp: Current battery temperature
             predict_load_kw: Load prediction function
+            predict_pv_kw: PV prediction function
 
         Returns:
             Interpolated expected SOC for current time within slot
@@ -243,6 +247,21 @@ class SocDeviationDetector:
             return max(
                 self.config.min_soc,
                 expected_soc_start - (energy_removed / self.config.battery_capacity) * 100
+            )
+
+        elif entry.mode == BatteryMode.SELF_CONSUMPTION:
+            # PV surplus charges, load deficit discharges
+            pv_kw = predict_pv_kw(current_slot) if predict_pv_kw else 0.0
+            load_kw = predict_load_kw(current_slot) if predict_load_kw else 0.0
+            pv_surplus = max(0.0, pv_kw - load_kw)
+            load_deficit = max(0.0, load_kw - pv_kw)
+            charge_kwh = min(pv_surplus, self.config.charge_rate) * self.config.efficiency * self.config.slot_hours * fraction
+            discharge_kwh = min(load_deficit, self.config.discharge_rate) * self.config.slot_hours * fraction
+            net_energy = charge_kwh - discharge_kwh
+            soc_change = (net_energy / self.config.battery_capacity) * 100
+            return max(
+                self.config.min_soc,
+                min(self.config.max_soc, expected_soc_start + soc_change)
             )
 
         # HOLD mode - no change

@@ -101,6 +101,7 @@ class MockOptimizer:
                 battery_capacity=self.config.battery_capacity,
                 charge_rate=self.config.charge_rate,
                 discharge_rate=self.config.discharge_rate,
+                export_discharge_rate=self.config.export_discharge_rate,
                 efficiency=self.config.efficiency,
                 battery_wear_cost=self.config.battery_wear_cost,
                 decision_log_level=self.config.decision_log_level,
@@ -170,6 +171,10 @@ class MockOptimizer:
     def _predict_load_kw(self, dt: datetime.datetime) -> float:
         """Predict load for given time."""
         return self.load_profile.predict_kw(dt, self.config.load_quantile)
+
+    def _predict_pv_kw(self, dt: datetime.datetime) -> float:
+        """Predict PV production for given time (no PV data in tests)."""
+        return 0.0
 
     def _get_prices_for_date(self, date, tz):
         """Return empty list (no yesterday prices in tests)."""

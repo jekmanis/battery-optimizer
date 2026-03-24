@@ -164,6 +164,9 @@ class MockOptimizer:
         """Predict load for given time."""
         return self.load_profile.predict_kw(dt, self.config.load_quantile)
 
+    def _predict_pv_kw(self, dt: datetime.datetime) -> float:
+        return 0.0
+
     def _get_prices_for_date(self, date, tz):
         """Return empty list (no yesterday prices in tests)."""
         return []
@@ -512,6 +515,7 @@ class TestLogScheduleTemperatureDisplay:
                 battery_capacity=14.3,
                 charge_rate=4.5,
                 discharge_rate=4.5,
+                export_discharge_rate=0.0,
                 efficiency=0.85,
                 battery_wear_cost=0.0,
                 decision_log_level=1,
@@ -554,6 +558,7 @@ class TestLogScheduleTemperatureDisplay:
                 battery_capacity=14.3,
                 charge_rate=4.5,
                 discharge_rate=4.5,
+                export_discharge_rate=0.0,
                 efficiency=0.85,
                 battery_wear_cost=0.0,
                 decision_log_level=1,

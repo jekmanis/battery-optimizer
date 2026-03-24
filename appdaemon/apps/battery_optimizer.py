@@ -56,6 +56,8 @@ from battery_optimizer_lib import (
     # Prediction tracker
     LoadPredictionTracker,
 )
+from battery_optimizer_lib.pv_profile import PvProfile
+from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
 
 
 
@@ -133,6 +135,22 @@ class BatteryOptimizer(hass.Hass):
         )
         self._init_prediction_tracker()
 
+        # PV production profile for self-consumption planning
+        self.pv_profile = PvProfile(
+            slot_minutes=self.config.slot_minutes,
+            default_pv_w=0.0,
+            max_samples=self.config.pv_profile_max_samples,
+            min_samples=self.config.pv_profile_min_samples,
+            log_func=self.log,
+        )
+        self._init_pv_profile()
+
+        # Slot outcome tracker for prediction monitoring
+        self._outcome_tracker = SlotOutcomeTracker(
+            slot_minutes=self.config.slot_minutes,
+            log_func=self.log,
+        )
+
         # Direct inverter control via set_wit_mode service
         self._direct_control = DirectControl(self, self.config)
 
@@ -161,6 +179,7 @@ class BatteryOptimizer(hass.Hass):
                 battery_capacity=self.config.battery_capacity,
                 charge_rate=self.config.charge_rate,
                 discharge_rate=self.config.discharge_rate,
+                export_discharge_rate=self.config.export_discharge_rate,
                 efficiency=self.config.efficiency,
                 battery_wear_cost=self.config.battery_wear_cost,
                 decision_log_level=self.config.decision_log_level,
@@ -171,19 +190,7 @@ class BatteryOptimizer(hass.Hass):
 
         # Battery cost tracker (must be after learning engine and price service)
         self._cost_tracker = BatteryCostTracker(
-            config=BatteryCostConfig(
-                battery_cost_entity=self.config.battery_cost_entity,
-                battery_charge_sensor=self.config.battery_charge_sensor,
-                battery_discharge_sensor=self.config.battery_discharge_sensor,
-                use_inverter_energy_sensors=self.config.use_inverter_energy_sensors,
-                battery_capacity=self.config.battery_capacity,
-                efficiency=self.config.efficiency,
-                slot_minutes=self.config.slot_minutes,
-                charge_rate=self.config.charge_rate,
-                discharge_rate=self.config.discharge_rate,
-                grid_fee=self.config.grid_fee,
-                battery_wear_cost=self.config.battery_wear_cost,
-            ),
+            config=BatteryCostConfig.from_main_config(self.config),
             get_state_func=self.get_state,
             call_service_func=self.call_service,
             get_datetime_func=self.datetime,
@@ -356,7 +363,6 @@ class BatteryOptimizer(hass.Hass):
         - Optimizes expected profit via dynamic programming
         - Ensures SOC constraints across the full horizon
         """
-        _ = charge_hours_needed  # kept for compatibility with previous interface
         if not prices:
             return {}
 
@@ -386,18 +392,8 @@ class BatteryOptimizer(hass.Hass):
 
         # Create optimizer with fresh config (min_soc/max_soc are dynamic properties)
         optimizer = DPOptimizer(
-            config=DPOptimizerConfig(
-                battery_capacity=self.config.battery_capacity,
-                min_soc=self.min_soc,
-                max_soc=self.max_soc,
-                efficiency=self.config.efficiency,
-                discharge_rate=self.config.discharge_rate,
-                slot_minutes=self.config.slot_minutes,
-                soc_step_percent=self.config.soc_step_percent,
-                grid_fee=self.config.grid_fee,
-                battery_wear_cost=self.config.battery_wear_cost,
-                export_rate_multiplier=self.config.export_rate_multiplier,
-                export_profit_threshold=self.config.export_profit_threshold,
+            config=DPOptimizerConfig.from_main_config(
+                self.config, min_soc=self.min_soc, max_soc=self.max_soc,
             ),
             load_predictor=self._predict_load_kw,
             charge_rate_predictor=self.learning_engine.get_charge_rate_for_soc,
@@ -405,6 +401,7 @@ class BatteryOptimizer(hass.Hass):
             temp_after_idle_predictor=self.learning_engine.predict_temp_after_idle,
             log_fn=self.log,
             decision_log_level=self.config.decision_log_level,
+            pv_predictor=self._predict_pv_kw if self.config.enable_self_consumption else None,
         )
 
         # Run optimization
@@ -442,14 +439,23 @@ class BatteryOptimizer(hass.Hass):
                 predict_load_func=self._predict_load_kw,
                 charge_rates_by_slot=slot_charge_rates_by_slot,
                 slot_fractions_by_slot=slot_fractions_by_slot,
+                predict_pv_func=self._predict_pv_kw,
             )
             self._last_projected_costs = projected_costs
         else:
             self._last_projected_costs = {}
 
-        self.log(f"Schedule generated: {result.charge_count} charge, {result.discharge_count} discharge, "
-                 f"{result.hold_count} hold slots (slot={self.config.slot_minutes}min, load_quantile={self.config.load_quantile:.2f}, "
-                 f"min_charge_slots={min_charge_slots})")
+        parts = [f"{result.charge_count} charge"]
+        if result.self_consume_slot_count:
+            parts.append(f"{result.self_consume_slot_count} discharge(self)")
+        if result.export_slot_count:
+            parts.append(f"{result.export_slot_count} discharge(export)")
+        if result.self_consumption_count:
+            parts.append(f"{result.self_consumption_count} self_consumption")
+        parts.append(f"{result.hold_count} hold")
+        self.log(f"Schedule generated: {', '.join(parts)} slots "
+                 f"(slot={self.config.slot_minutes}min, "
+                 f"load_quantile={self.config.load_quantile:.2f}, min_charge_slots={min_charge_slots})")
 
         # Store min_charge_slots for sensor exposure
         self._last_min_charge_slots = min_charge_slots
@@ -670,9 +676,12 @@ class BatteryOptimizer(hass.Hass):
                     current_soc = min(self.max_soc, current_soc + soc_increase)
 
             elif entry.mode == BatteryMode.DISCHARGE:
-                # Discharging: battery drains at predicted load rate (limited by discharge rate)
-                load_kw = self._predict_load_kw(hour)
-                energy_removed = min(load_kw, self.config.discharge_rate) * self.config.slot_hours
+                # Discharging: export drains at full rate, self-consumption at load rate
+                if entry.export_rate is not None and entry.export_rate > 0:
+                    energy_removed = self.config.effective_export_discharge_rate * self.config.slot_hours
+                else:
+                    load_kw = self._predict_load_kw(hour)
+                    energy_removed = min(load_kw, self.config.discharge_rate) * self.config.slot_hours
                 soc_decrease = (energy_removed / self.config.battery_capacity) * 100
                 current_soc = max(self.min_soc, current_soc - soc_decrease)
                 # Temperature cools toward ambient during discharge (no active warming)
@@ -680,6 +689,28 @@ class BatteryOptimizer(hass.Hass):
                     current_temp = self.learning_engine.predict_temp_after_idle(
                         current_temp, self.config.slot_minutes
                     )
+
+            elif entry.mode == BatteryMode.SELF_CONSUMPTION:
+                # PV-aware: battery can charge from PV surplus or discharge to cover load deficit
+                pv_kw = self._predict_pv_kw(hour)
+                load_kw = self._predict_load_kw(hour)
+                pv_surplus = max(0.0, pv_kw - load_kw)
+                pv_charge_kw = min(pv_surplus, self.config.charge_rate)
+                pv_charge_kwh = pv_charge_kw * self.config.efficiency * self.config.slot_hours
+                load_deficit = max(0.0, load_kw - pv_kw)
+                battery_discharge_kwh = min(load_deficit, self.config.discharge_rate) * self.config.slot_hours
+                net_energy = pv_charge_kwh - battery_discharge_kwh
+                soc_change = (net_energy / self.config.battery_capacity) * 100
+                current_soc = max(self.min_soc, min(self.max_soc, current_soc + soc_change))
+                if current_temp is not None and self.learning_engine:
+                    if pv_surplus > load_deficit:
+                        current_temp = self.learning_engine.predict_temp_after_duration(
+                            current_temp, self.config.slot_minutes
+                        )
+                    else:
+                        current_temp = self.learning_engine.predict_temp_after_idle(
+                            current_temp, self.config.slot_minutes
+                        )
 
             else:  # HOLD
                 # In hold mode, grid covers base load
@@ -765,6 +796,7 @@ class BatteryOptimizer(hass.Hass):
             projected_costs=self._last_projected_costs,
             local_tz=self._get_local_timezone(),
             predict_load_kw=self._predict_load_kw,
+            predict_pv_kw=self._predict_pv_kw,
             min_soc=self.min_soc,
             max_soc=self.max_soc,
         )
@@ -795,17 +827,19 @@ class BatteryOptimizer(hass.Hass):
         # Snapshot schedule for change detection
         schedule_snapshot = {h: e.mode for h, e in self.schedule.items()} if self.schedule else {}
 
+        # Safety: if significant PV is producing during a grid-charge slot and
+        # the DP didn't anticipate it (e.g. fresh PV profile), pause charging to
+        # let the inverter use solar instead of paying for grid.
         pv_power = self._get_pv_power()
-
-        # Check for solar override
         if pv_power > self.pv_threshold and self.current_mode == BatteryMode.CHARGE:
-            self.log(f"Solar override: PV={pv_power}W, switching from charge to hold")
+            self.log(f"Solar override: PV={pv_power}W > threshold={self.pv_threshold}W, "
+                     f"switching from charge to self_consumption")
             entry = ScheduleEntry(
-                time=self._align_to_slot(now),
-                mode=BatteryMode.HOLD,
+                time=self._align_to_slot(self.datetime()),
+                mode=BatteryMode.SELF_CONSUMPTION,
                 reason="solar_override",
             )
-            self._handle_mode_transition(BatteryMode.HOLD)
+            self._handle_mode_transition(BatteryMode.SELF_CONSUMPTION)
             self._direct_control.apply_mode(entry)
             return
 
@@ -979,6 +1013,24 @@ class BatteryOptimizer(hass.Hass):
 
         self.log(f"Executing scheduled mode for {current_slot}: {entry.mode.name} ({entry.reason})")
 
+        # Finalize previous slot outcome and record predictions for this slot
+        current_soc = self._get_current_soc()
+        self._outcome_tracker.record_slot_end(
+            actual_soc=current_soc,
+            actual_pv_w=self._get_pv_power(),
+            actual_mode=self._get_inverter_mode(),
+        )
+        next_slot = current_slot + datetime.timedelta(minutes=self.config.slot_minutes)
+        predicted_soc_end = self.expected_soc_schedule.get(next_slot,
+                            self.expected_soc_schedule.get(current_slot, current_soc or 50.0))
+        self._outcome_tracker.record_slot_start(
+            slot_time=current_slot,
+            mode=entry.mode.name,
+            predicted_soc_end=predicted_soc_end,
+            predicted_load_kw=self._predict_load_kw(current_slot),
+            predicted_pv_kw=self._predict_pv_kw(current_slot),
+        )
+
         # Track mode transition for cost tracking / learning
         self._handle_mode_transition(entry.mode)
 
@@ -1005,7 +1057,7 @@ class BatteryOptimizer(hass.Hass):
         now = self.datetime()
 
         # Stop discharge if SOC too low
-        if current_soc <= self.min_soc and self.current_mode == BatteryMode.DISCHARGE:
+        if current_soc <= self.min_soc and self.current_mode in (BatteryMode.DISCHARGE, BatteryMode.SELF_CONSUMPTION):
             self.log(f"Safety: HOLD (battery depleted at {current_soc}%)")
             entry = ScheduleEntry(
                 time=self._align_to_slot(now),
@@ -1167,6 +1219,7 @@ class BatteryOptimizer(hass.Hass):
             local_tz=local_tz,
             current_temp=current_temp,
             predict_load_kw=self._predict_load_kw,
+            predict_pv_kw=self._predict_pv_kw,
             get_cheapest_upcoming_prices=self._get_cheapest_upcoming_prices,
             get_discharge_threshold=self._get_discharge_threshold,
         )
@@ -1432,6 +1485,34 @@ class BatteryOptimizer(hass.Hass):
 
         self.log("Starting with fresh prediction tracker")
 
+    def _init_pv_profile(self):
+        """Initialize PV profile from persistent storage."""
+        if self.config.pv_profile_file:
+            try:
+                with open(self.config.pv_profile_file, "r", encoding="utf-8") as fh:
+                    data = fh.read()
+                if data and self.pv_profile.load_from_json(data):
+                    self.log(
+                        f"Loaded PV profile: "
+                        f"{self.pv_profile.stats.observation_count} observations"
+                    )
+                    return
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                self.log(f"Could not load PV profile file: {e}", level="WARNING")
+
+        self.log("Starting with fresh PV profile")
+
+    def _save_pv_profile(self):
+        """Save PV profile to persistent storage."""
+        if self.config.pv_profile_file:
+            try:
+                with open(self.config.pv_profile_file, "w", encoding="utf-8") as fh:
+                    fh.write(self.pv_profile.to_json())
+            except Exception as e:
+                self.log(f"Could not save PV profile: {e}", level="WARNING")
+
     def _restore_previous_schedule_from_sensor(self):
         """
         Restore the previous schedule from sensor.battery_optimizer on startup.
@@ -1649,6 +1730,14 @@ class BatteryOptimizer(hass.Hass):
         self._save_load_profile()
         self._save_prediction_tracker()
 
+        # Record PV observation (including 0 during daytime for cloudy day accuracy)
+        pv_w = self._get_pv_power()
+        hour = now.hour
+        is_daytime = 6 <= hour <= 21
+        if pv_w > 0 or is_daytime:
+            self.pv_profile.record(now, pv_w)
+            self._save_pv_profile()
+
     def _save_learning_data(self):
         """Persist learning data to file"""
         if not self.config.learning_data_file:
@@ -1711,6 +1800,18 @@ class BatteryOptimizer(hass.Hass):
         """Get current PV power production."""
         return self._sensors.get_power(self.config.pv_power_sensor, default=0.0)
 
+    def _get_inverter_mode(self) -> Optional[str]:
+        """Get current inverter mode from mode sensor."""
+        if not self.config.inverter_mode_sensor:
+            return None
+        try:
+            state = self.get_state(self.config.inverter_mode_sensor)
+            if state and state not in ("unknown", "unavailable"):
+                return str(state)
+        except Exception:
+            pass
+        return None
+
     def _get_battery_temp(self) -> Optional[float]:
         """Get current battery temperature in Celsius."""
         return self._sensors.get_temperature(self.config.battery_temp_sensor)
@@ -1736,6 +1837,31 @@ class BatteryOptimizer(hass.Hass):
         if self.load_profile:
             return self.load_profile.predict_kw(dt, self.config.load_quantile, correction)
         return (self.config.base_consumption / 1000.0) * correction
+
+    def _predict_pv_kw(self, dt: datetime.datetime) -> float:
+        """Predict PV production (kW) for a slot.
+
+        Tries external forecast sensor first, falls back to PV profile history.
+        Configure pv_forecast_unit ("W" or "kW") to match your sensor.
+        """
+        if self.config.pv_forecast_sensor:
+            # External forecast sensor reports a single instantaneous value —
+            # only trust it for the current slot.  For future slots the
+            # historical PV profile gives a proper per-slot shape.
+            current_slot = self._align_to_slot(self.datetime())
+            slot_dt = self._align_to_slot(dt)
+            if slot_dt == current_slot:
+                try:
+                    state = self.get_state(self.config.pv_forecast_sensor)
+                    if state and state not in ("unknown", "unavailable"):
+                        val = float(state)
+                        if val >= 0:
+                            if self.config.pv_forecast_unit.lower() == "kw":
+                                return val
+                            return val / 1000.0  # Default: sensor reports Watts
+                except (ValueError, TypeError):
+                    pass
+        return self.pv_profile.predict_kw(dt, self.config.pv_quantile)
 
     def _align_to_slot(self, dt: datetime.datetime) -> datetime.datetime:
         """Floor datetime to the start of the current time slot."""
@@ -1919,6 +2045,15 @@ class BatteryOptimizer(hass.Hass):
             learning_summary = self.learning_engine.get_learning_summary()
             temp_aware_rates = learning_summary.get("temp_aware_rates", {})
 
+            # Generate markdown schedule for dashboard display
+            schedule_md = self._schedule_formatter.format_schedule_markdown(
+                schedule=self.schedule,
+                now=now,
+                local_tz=local_tz,
+                align_to_slot_func=self._align_to_slot,
+                dp_soc_trajectory=self._last_dp_soc_trajectory,
+            )
+
             # Set sensor state
             self.set_state("sensor.battery_optimizer",
                 state=self.current_mode.name,
@@ -1946,8 +2081,21 @@ class BatteryOptimizer(hass.Hass):
                     # Load profile statistics for visualization
                     "load_profile_stats": self._get_load_profile_stats(),
                     "load_profile_observations": self.load_profile.stats.observation_count,
+                    "pv_profile_observations": self.pv_profile.stats.observation_count,
                     "slot_minutes": self.config.slot_minutes,
+                    # Slot outcome monitoring
+                    "slot_outcomes_recent": self._outcome_tracker.get_recent_outcomes(10),
+                    "prediction_accuracy": self._outcome_tracker.get_accuracy_stats(),
                     "friendly_name": "Battery Optimizer"
+                }
+            )
+
+            # Separate markdown sensor — lightweight, used by dashboard template
+            self.set_state("sensor.battery_optimizer_schedule_markdown",
+                state=self.current_mode.name,
+                attributes={
+                    "md": schedule_md,
+                    "friendly_name": "Battery Schedule",
                 }
             )
         except Exception as e:

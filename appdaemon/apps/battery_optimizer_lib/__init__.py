@@ -23,13 +23,14 @@ from .models import (
     TouPeriod,
     LearningStats,
     LoadProfileStats,
+    PvProfileStats,
     PredictionAccuracyStats,
 )
+from .pv_profile import PvProfile
 from .learning_engine import BatteryLearningEngine
 from .load_profile import LoadProfile, _quantile
 from .price_service import NordPoolPriceService
 from .direct_control import DirectControl
-from .tou_sync import TouSyncManager  # Retained for test compatibility; not used in production
 from .dp_optimizer import DPOptimizer, DPOptimizerConfig, DPOptimizerResult
 from .timezone_utils import (
     normalize_tz_pair,
@@ -45,7 +46,7 @@ from .ha_helpers import SensorReader
 from .cost_tracker import BatteryCostTracker, BatteryCostConfig
 from .charge_rate_utils import compute_charge_rates_per_slot
 from .soc_deviation import SocDeviationDetector, SocDeviationConfig, DeviationCheckResult
-from .schedule_formatter import ScheduleFormatter, ScheduleFormatterConfig
+from .schedule_formatter import ScheduleFormatter, ScheduleFormatterConfig, resolve_wit_mode
 from .load_prediction_tracker import LoadPredictionTracker
 
 __all__ = [
@@ -58,13 +59,14 @@ __all__ = [
     "TouPeriod",
     "LearningStats",
     "LoadProfileStats",
+    "PvProfileStats",
     "PredictionAccuracyStats",
+    "PvProfile",
     # Classes
     "BatteryLearningEngine",
     "LoadProfile",
     "NordPoolPriceService",
     "DirectControl",
-    "TouSyncManager",
     "SensorReader",
     # DP Optimizer
     "DPOptimizer",
@@ -93,6 +95,7 @@ __all__ = [
     # Schedule formatting
     "ScheduleFormatter",
     "ScheduleFormatterConfig",
+    "resolve_wit_mode",
     # Prediction tracker
     "LoadPredictionTracker",
 ]

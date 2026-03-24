@@ -16,6 +16,7 @@ class BatteryMode(Enum):
     HOLD = 0
     CHARGE = 1
     DISCHARGE = 2
+    SELF_CONSUMPTION = 3
 
 
 @dataclass
@@ -86,7 +87,7 @@ class LearningStats:
 
     @classmethod
     def from_dict(cls, data: dict) -> 'LearningStats':
-        # Handle backward compatibility for older versions without charge_rates_by_soc_temp
+        # Ignore unknown fields when loading from JSON
         known_fields = {f.name for f in cls.__dataclass_fields__.values()}
         filtered_data = {k: v for k, v in data.items() if k in known_fields}
         return cls(**filtered_data)
@@ -104,6 +105,21 @@ class LoadProfileStats:
 
     @classmethod
     def from_dict(cls, data: dict) -> 'LoadProfileStats':
+        return cls(**data)
+
+
+@dataclass
+class PvProfileStats:
+    """Aggregated PV production observations per time slot."""
+    samples_by_slot: Dict[str, List[float]] = field(default_factory=dict)  # slot -> W samples
+    observation_count: int = 0
+    last_observation: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'PvProfileStats':
         return cls(**data)
 
 

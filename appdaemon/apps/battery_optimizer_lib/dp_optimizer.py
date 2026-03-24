@@ -8,7 +8,10 @@ dynamic programming with temperature-aware charge rate predictions.
 import datetime
 import math
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .config import BatteryOptimizerConfig
 
 from .models import BatteryMode, PricePoint, ScheduleEntry
 from .charge_rate_utils import compute_charge_rates_per_slot
@@ -53,16 +56,42 @@ class DPOptimizerConfig:
     max_soc: float               # % (e.g., 100.0)
     efficiency: float            # 0-1 (e.g., 0.85)
     discharge_rate: float        # kW
-    slot_minutes: int            # e.g., 60
-    soc_step_percent: float      # DP resolution (e.g., 1.0)
-    grid_fee: float              # EUR/kWh
-    battery_wear_cost: float     # EUR/kWh
-    export_rate_multiplier: float = 1.0   # Sell price = price * multiplier
-    export_profit_threshold: float = 1.05  # Export when sell > buy * threshold
+    export_discharge_rate: float = 0.0  # kW — discharge rate during grid export (0 = use discharge_rate)
+    slot_minutes: int = 15       # e.g., 60
+    soc_step_percent: float = 1.0  # DP resolution (e.g., 1.0)
+    grid_fee: float = 0.052     # EUR/kWh — trading margin + distribution on purchases
+    battery_wear_cost: float = 0.0  # EUR/kWh
+    grid_export_fee: float = 0.02  # EUR/kWh — fixed deduction from spot when selling
+    export_rate_multiplier: float = 1.0   # Sell price = price * multiplier - export_fee
 
     @property
     def slot_hours(self) -> float:
         return self.slot_minutes / 60.0
+
+    @property
+    def effective_export_discharge_rate(self) -> float:
+        """Discharge rate during grid export (kW). Falls back to discharge_rate if not set."""
+        return self.export_discharge_rate if self.export_discharge_rate > 0 else self.discharge_rate
+
+    @classmethod
+    def from_main_config(
+        cls, cfg: "BatteryOptimizerConfig", *, min_soc: float, max_soc: float
+    ) -> "DPOptimizerConfig":
+        """Create from the central BatteryOptimizerConfig plus dynamic SOC limits."""
+        return cls(
+            battery_capacity=cfg.battery_capacity,
+            min_soc=min_soc,
+            max_soc=max_soc,
+            efficiency=cfg.efficiency,
+            discharge_rate=cfg.discharge_rate,
+            export_discharge_rate=cfg.export_discharge_rate,
+            slot_minutes=cfg.slot_minutes,
+            soc_step_percent=cfg.soc_step_percent,
+            grid_fee=cfg.grid_fee,
+            grid_export_fee=cfg.grid_export_fee,
+            battery_wear_cost=cfg.battery_wear_cost,
+            export_rate_multiplier=cfg.export_rate_multiplier,
+        )
 
 
 @dataclass
@@ -76,6 +105,7 @@ class DPOptimizerResult:
     hold_count: int
     export_slot_count: int = 0
     self_consume_slot_count: int = 0
+    self_consumption_count: int = 0
 
 
 class DPOptimizer:
@@ -87,6 +117,7 @@ class DPOptimizer:
     - charge_rate_predictor: predicts charge rate (kW) for SOC and temperature
     - temp_after_charge_predictor: predicts temperature after charging
     - temp_after_idle_predictor: predicts temperature after idle period
+    - pv_predictor: predicts PV production (kW) for a given datetime (optional)
     """
 
     def __init__(
@@ -98,6 +129,7 @@ class DPOptimizer:
         temp_after_idle_predictor: Callable[[float, float], float],
         log_fn: Optional[Callable] = None,
         decision_log_level: int = 0,
+        pv_predictor: Optional[Callable[[datetime.datetime], float]] = None,
     ):
         self._config = config
         self._predict_load_kw = load_predictor
@@ -106,6 +138,7 @@ class DPOptimizer:
         self._predict_temp_after_idle = temp_after_idle_predictor
         self._log_fn = log_fn
         self._decision_log_level = decision_log_level
+        self._predict_pv_kw = pv_predictor
 
     def _log(self, message: str, level: str = "INFO"):
         """Log a message using the provided log function."""
@@ -181,8 +214,12 @@ class DPOptimizer:
             slots_sorted_by_time, slot_fractions, current_soc, current_temp
         )
 
-        # Pre-compute load per slot
+        # Pre-compute load and PV per slot
         load_kw = [self._predict_load_kw(p.time) for p in slots_sorted_by_time]
+        pv_kw = (
+            [self._predict_pv_kw(p.time) for p in slots_sorted_by_time]
+            if self._predict_pv_kw else None
+        )
 
         # Run DP to build schedule
         schedule, idx_trajectory, best_value = self._build_schedule(
@@ -197,6 +234,7 @@ class DPOptimizer:
             step_kwh=step_kwh,
             n_states=n_states,
             energy_levels=energy_levels,
+            pv_kw=pv_kw,
         )
 
         # Build SOC trajectory
@@ -209,14 +247,11 @@ class DPOptimizer:
             slots_sorted_by_time, schedule, slot_fractions, current_temp
         )
 
-        # Post-process: assign export_rate to DISCHARGE slots
-        prices_by_slot = {p.time: p.price for p in slots_sorted_by_time}
-        self._assign_export_rates(schedule, prices_by_slot)
-
         # Count actions
         charge_count = sum(1 for e in schedule.values() if e.mode == BatteryMode.CHARGE)
         discharge_count = sum(1 for e in schedule.values() if e.mode == BatteryMode.DISCHARGE)
         hold_count = sum(1 for e in schedule.values() if e.mode == BatteryMode.HOLD)
+        self_consumption_count = sum(1 for e in schedule.values() if e.mode == BatteryMode.SELF_CONSUMPTION)
         export_slot_count = sum(
             1 for e in schedule.values()
             if e.mode == BatteryMode.DISCHARGE and e.export_rate is not None and e.export_rate > 0
@@ -232,6 +267,7 @@ class DPOptimizer:
             hold_count=hold_count,
             export_slot_count=export_slot_count,
             self_consume_slot_count=self_consume_slot_count,
+            self_consumption_count=self_consumption_count,
         )
 
     def _compute_charge_rates_per_slot(
@@ -251,54 +287,6 @@ class DPOptimizer:
             get_charge_rate_for_soc=self._get_charge_rate_for_soc,
             predict_temp_after_duration=self._predict_temp_after_duration,
         )
-
-    def _assign_export_rates(
-        self,
-        schedule: Dict[datetime.datetime, ScheduleEntry],
-        prices_by_slot: Dict[datetime.datetime, float],
-    ) -> None:
-        """Post-process: assign export_rate to each DISCHARGE slot.
-
-        If sell_price > buy_price * threshold, enable export (selling to grid).
-        Otherwise, discharge to load only (self-consumption).
-        """
-        cfg = self._config
-        for slot_time, entry in schedule.items():
-            if entry.mode != BatteryMode.DISCHARGE:
-                continue
-
-            price = self._lookup_price(slot_time, prices_by_slot)
-            if price is None:
-                entry.export_rate = 0  # safe default: no accidental export
-                continue
-
-            sell_price = price * cfg.export_rate_multiplier
-            buy_price = price + cfg.grid_fee
-
-            if sell_price > buy_price * cfg.export_profit_threshold:
-                entry.export_rate = 100
-            else:
-                entry.export_rate = 0
-
-    @staticmethod
-    def _lookup_price(
-        slot_time: datetime.datetime,
-        prices_by_slot: Dict[datetime.datetime, float],
-    ) -> Optional[float]:
-        """Look up price for a slot, handling timezone mismatches."""
-        price = prices_by_slot.get(slot_time)
-        if price is not None:
-            return price
-
-        # Fallback: match by date/hour/minute after stripping tz
-        slot_naive = slot_time.replace(tzinfo=None) if slot_time.tzinfo else slot_time
-        for k, v in prices_by_slot.items():
-            k_naive = k.replace(tzinfo=None) if k.tzinfo else k
-            if (k_naive.date() == slot_naive.date()
-                    and k_naive.hour == slot_naive.hour
-                    and k_naive.minute == slot_naive.minute):
-                return v
-        return None
 
     def _build_soc_trajectory(
         self,
@@ -370,17 +358,18 @@ class DPOptimizer:
         n_states: int,
         energy_levels: List[float],
         start_idx_override: Optional[int] = None,
-    ) -> Tuple[List[BatteryMode], List[bool], float, List[int]]:
+        pv_kw_list: Optional[List[float]] = None,
+    ) -> Tuple[List[BatteryMode], List[bool], List[bool], float, List[int]]:
         """
         Core DP algorithm.
 
         Returns:
-            (actions, partial_flags, best_value, idx_trajectory)
+            (actions, partial_flags, export_flags, best_value, idx_trajectory)
         """
         cfg = self._config
         n_list_slots = len(slots_list)
         if n_list_slots == 0:
-            return [], [], 0.0, []
+            return [], [], [], 0.0, []
 
         neg_inf = -1e18
         tie_val_eps = 1e-6
@@ -412,6 +401,7 @@ class DPOptimizer:
         prev_idx = [None] * n_list_slots
         prev_action = [None] * n_list_slots
         prev_partial = [None] * n_list_slots
+        prev_export = [None] * n_list_slots
 
         def _should_update(curr_val: float, curr_tie: float, cand_val: float, cand_tie: float) -> bool:
             if cand_val > curr_val + tie_val_eps:
@@ -431,12 +421,19 @@ class DPOptimizer:
             charge_energy_kwh = slot_charge_rate * cfg.efficiency * cfg.slot_hours * fraction
             charge_cost_kwh = slot_charge_rate * cfg.slot_hours * fraction
 
+            # Export variables
+            sell_price = price * cfg.export_rate_multiplier - cfg.grid_export_fee
+            export_discharge_kwh = cfg.effective_export_discharge_rate * cfg.slot_hours * fraction
+            load_kwh = load_kw_list[t] * cfg.slot_hours * fraction
+            exported_kwh_full = max(0.0, export_discharge_kwh - load_kwh)
+
             # Reset next_dp buffers using slice assignment (faster than nested loop)
             next_dp[:] = _neg_inf_row
             next_dp_tie[:] = _neg_inf_row
             next_prev_idx = [None] * n_states
             next_prev_action = [None] * n_states
             next_prev_partial = [False] * n_states
+            next_prev_export = [False] * n_states
 
             slot_trace = []
             trace_this_slot = self._decision_log_level >= 3 and fraction > 0.5
@@ -528,6 +525,75 @@ class DPOptimizer:
                                 f"existing_val={next_dp[next_idx]:.4f} >= discharge_val={next_val:.4f}"
                             )
 
+                # DISCHARGE_EXPORT (full rate discharge with grid export)
+                if sell_price > 0 and exported_kwh_full > 0:
+                    new_energy = energy_levels[idx] - export_discharge_kwh
+                    is_partial_export = False
+                    actual_export_kwh = export_discharge_kwh
+
+                    if new_energy >= min_energy - 1e-6:
+                        next_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "round")
+                        next_val = val + sell_price * exported_kwh_full - (discharge_cost_per_kwh * actual_export_kwh)
+                    elif energy_levels[idx] > min_energy + export_discharge_kwh * 0.3:
+                        is_partial_export = True
+                        actual_export_kwh = energy_levels[idx] - min_energy
+                        remaining_load = load_kwh - actual_export_kwh
+                        actual_exported = max(0.0, actual_export_kwh - load_kwh)
+                        if remaining_load > 0:
+                            # Battery can't even cover load — grid covers rest
+                            next_val = val - (buy_price * remaining_load) - (discharge_cost_per_kwh * actual_export_kwh)
+                        else:
+                            next_val = val + sell_price * actual_exported - (discharge_cost_per_kwh * actual_export_kwh)
+                        next_idx = 0
+                        new_energy = min_energy
+                    else:
+                        next_val = None
+                        next_idx = None
+
+                    if next_val is not None:
+                        if _should_update(next_dp[next_idx], next_dp_tie[next_idx], next_val, curr_tie):
+                            next_dp[next_idx] = next_val
+                            next_dp_tie[next_idx] = curr_tie
+                            next_prev_idx[next_idx] = idx
+                            next_prev_action[next_idx] = BatteryMode.DISCHARGE
+                            next_prev_partial[next_idx] = is_partial_export
+                            next_prev_export[next_idx] = True
+
+                # SELF_CONSUMPTION (PV-aware autonomous mode)
+                if pv_kw_list is not None and pv_kw_list[t] > 0:
+                    pv = pv_kw_list[t]
+                    load = load_kw_list[t]
+
+                    # PV serves load first, surplus charges battery (free)
+                    pv_surplus = max(0.0, pv - load)
+                    pv_charge_kw = min(pv_surplus, slot_charge_rate)
+                    pv_charge_kwh = pv_charge_kw * cfg.efficiency * cfg.slot_hours * fraction
+
+                    # Load deficit served by battery
+                    load_deficit = max(0.0, load - pv)
+                    battery_discharge_kw = min(load_deficit, cfg.discharge_rate)
+                    battery_discharge_kwh = battery_discharge_kw * cfg.slot_hours * fraction
+
+                    # Net battery energy change
+                    net_delta = pv_charge_kwh - battery_discharge_kwh
+                    new_energy = energy_levels[idx] + net_delta
+                    new_energy = max(min_energy, min(max_energy, new_energy))
+
+                    # Grid import for uncovered load
+                    remaining_load_kw = max(0.0, load - pv - battery_discharge_kw)
+                    grid_import_kwh = remaining_load_kw * cfg.slot_hours * fraction
+
+                    # Cost: grid import + wear on battery discharge portion
+                    sc_cost = buy_price * grid_import_kwh + discharge_cost_per_kwh * battery_discharge_kwh
+                    sc_val = val - sc_cost
+
+                    next_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "round")
+                    if _should_update(next_dp[next_idx], next_dp_tie[next_idx], sc_val, curr_tie):
+                        next_dp[next_idx] = sc_val
+                        next_dp_tie[next_idx] = curr_tie
+                        next_prev_idx[next_idx] = idx
+                        next_prev_action[next_idx] = BatteryMode.SELF_CONSUMPTION
+
                 # Trace collection for logging
                 if trace_this_slot and discharge_attempted:
                     next_soc_discharge = cfg.min_soc + (discharge_next_idx * step_kwh / cfg.battery_capacity) * 100 if discharge_next_idx is not None else 0
@@ -570,6 +636,7 @@ class DPOptimizer:
             prev_idx[t] = next_prev_idx
             prev_action[t] = next_prev_action
             prev_partial[t] = next_prev_partial
+            prev_export[t] = next_prev_export
 
         # Find best final state
         best_val = neg_inf
@@ -586,6 +653,7 @@ class DPOptimizer:
         # Backtrack to extract actions
         actions: List[BatteryMode] = []
         partial_flags: List[bool] = []
+        export_flags: List[bool] = []
         idx_trajectory: List[int] = []
         idx = best_idx if best_idx is not None else start_idx_local
 
@@ -596,8 +664,10 @@ class DPOptimizer:
         for t in range(n_list_slots - 1, -1, -1):
             action = prev_action[t][idx] or BatteryMode.HOLD
             is_partial = prev_partial[t][idx] if action == BatteryMode.DISCHARGE else False
+            is_export = prev_export[t][idx] if action == BatteryMode.DISCHARGE else False
             actions.append(action)
             partial_flags.append(is_partial)
+            export_flags.append(is_export)
             idx_trajectory.append(idx)
             prev_i = prev_idx[t][idx]
 
@@ -612,6 +682,7 @@ class DPOptimizer:
 
         actions.reverse()
         partial_flags.reverse()
+        export_flags.reverse()
         idx_trajectory.reverse()
 
         if backtrack_trace and self._decision_log_level >= 3:
@@ -650,7 +721,7 @@ class DPOptimizer:
                         )
             self._log("=" * 70)
 
-        return actions, partial_flags, best_val, idx_trajectory
+        return actions, partial_flags, export_flags, best_val, idx_trajectory
 
     def _build_schedule(
         self,
@@ -665,6 +736,7 @@ class DPOptimizer:
         step_kwh: float,
         n_states: int,
         energy_levels: List[float],
+        pv_kw: Optional[List[float]] = None,
     ) -> Tuple[Dict[datetime.datetime, ScheduleEntry], List[int], float]:
         """
         Build schedule using DP with greedy lookahead for partial first slot.
@@ -700,13 +772,14 @@ class DPOptimizer:
             load_remaining = load_kw[remaining_slice]
             charge_rates_remaining = charge_rates_per_slot[remaining_slice]
             slot_fractions_remaining = slot_fractions[remaining_slice]
+            pv_kw_remaining = pv_kw[remaining_slice] if pv_kw is not None else None
 
-            # Candidates: (action, new_energy, immediate_val, start_idx_override, is_partial)
+            # Candidates: (action, new_energy, immediate_val, start_idx_override, is_partial, is_export)
             candidates = []
 
             # HOLD
             hold_cost = buy_price * discharge_kwh
-            candidates.append((BatteryMode.HOLD, start_energy, -hold_cost, None, False))
+            candidates.append((BatteryMode.HOLD, start_energy, -hold_cost, None, False, False))
 
             # CHARGE
             if charge_energy_kwh > 0:
@@ -730,9 +803,10 @@ class DPOptimizer:
                         charge_immediate_cost,
                         start_idx_override,
                         False,
+                        False,
                     ))
 
-            # DISCHARGE
+            # DISCHARGE (self-consumption)
             if discharge_kwh > 0:
                 new_energy = start_energy - discharge_kwh
                 if new_energy >= min_energy - 1e-6:
@@ -743,6 +817,7 @@ class DPOptimizer:
                         new_energy,
                         discharge_cost,
                         start_idx_override,
+                        False,
                         False,
                     ))
                 elif start_energy > min_energy + discharge_kwh * 0.5:
@@ -755,23 +830,86 @@ class DPOptimizer:
                         partial_value,
                         0,
                         True,
+                        False,
                     ))
+
+            # DISCHARGE_EXPORT (full rate with grid selling)
+            sell_price = price * cfg.export_rate_multiplier - cfg.grid_export_fee
+            export_discharge_kwh = cfg.effective_export_discharge_rate * cfg.slot_hours * fraction
+            load_kwh_slot = slot_load_kw * cfg.slot_hours * fraction
+            exported_kwh = max(0.0, export_discharge_kwh - load_kwh_slot)
+
+            if sell_price > 0 and exported_kwh > 0:
+                new_energy = start_energy - export_discharge_kwh
+                if new_energy >= min_energy - 1e-6:
+                    start_idx_override = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "round")
+                    export_value = sell_price * exported_kwh - discharge_cost_per_kwh * export_discharge_kwh
+                    candidates.append((
+                        BatteryMode.DISCHARGE,
+                        new_energy,
+                        export_value,
+                        start_idx_override,
+                        False,
+                        True,
+                    ))
+                elif start_energy > min_energy + export_discharge_kwh * 0.3:
+                    actual_export_kwh = start_energy - min_energy
+                    remaining_load = load_kwh_slot - actual_export_kwh
+                    actual_exported = max(0.0, actual_export_kwh - load_kwh_slot)
+                    if remaining_load > 0:
+                        export_value = -buy_price * remaining_load - discharge_cost_per_kwh * actual_export_kwh
+                    else:
+                        export_value = sell_price * actual_exported - discharge_cost_per_kwh * actual_export_kwh
+                    candidates.append((
+                        BatteryMode.DISCHARGE,
+                        min_energy,
+                        export_value,
+                        0,
+                        True,
+                        True,
+                    ))
+
+            # SELF_CONSUMPTION (PV-aware: free PV charging + autonomous load serving)
+            slot_pv_kw = pv_kw[partial_index] if pv_kw is not None else 0.0
+            if slot_pv_kw > 0:
+                pv_surplus = max(0.0, slot_pv_kw - slot_load_kw)
+                pv_charge_kw = min(pv_surplus, charge_rates_per_slot[partial_index])
+                pv_charge_kwh = pv_charge_kw * cfg.efficiency * cfg.slot_hours * fraction
+                load_deficit = max(0.0, slot_load_kw - slot_pv_kw)
+                battery_discharge_kw = min(load_deficit, cfg.discharge_rate)
+                battery_discharge_kwh_sc = battery_discharge_kw * cfg.slot_hours * fraction
+                net_delta = pv_charge_kwh - battery_discharge_kwh_sc
+                new_energy = max(min_energy, min(max_energy, start_energy + net_delta))
+                remaining_load_kw = max(0.0, slot_load_kw - slot_pv_kw - battery_discharge_kw)
+                grid_import_kwh = remaining_load_kw * cfg.slot_hours * fraction
+                sc_cost = buy_price * grid_import_kwh + discharge_cost_per_kwh * battery_discharge_kwh_sc
+                start_idx_override = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "round")
+                candidates.append((
+                    BatteryMode.SELF_CONSUMPTION,
+                    new_energy,
+                    -sc_cost,
+                    start_idx_override,
+                    False,
+                    False,
+                ))
 
             best_action = BatteryMode.HOLD
             best_is_partial = False
+            best_is_export = False
             best_actions_remaining: List[BatteryMode] = []
             best_partial_flags_remaining: List[bool] = []
+            best_export_flags_remaining: List[bool] = []
             best_idx_trajectory_remaining: List[int] = []
             best_first_slot_end_idx: int = _energy_to_index(start_energy, min_energy, step_kwh, n_states, "round")
             best_value = neg_inf
 
             if self._decision_log_level >= 3:
                 self._log(f"[GreedyLookahead] Partial slot {price_point.time.strftime('%H:%M')} @ {price:.4f}")
-                self._log(f"  Candidates: {[(c[0].name, c[2]) for c in candidates]}")
+                self._log(f"  Candidates: {[(c[0].name + ('[EXP]' if c[5] else ''), c[2]) for c in candidates]}")
 
             greedy_results = []
-            for action, new_energy, immediate_val, start_idx_override, is_partial in candidates:
-                actions_remaining, partial_flags_remaining, future_val, idx_traj_remaining = self._run_dp(
+            for action, new_energy, immediate_val, start_idx_override, is_partial, is_export in candidates:
+                actions_remaining, partial_flags_remaining, export_flags_remaining, future_val, idx_traj_remaining = self._run_dp(
                     slots_remaining,
                     load_remaining,
                     charge_rates_remaining,
@@ -783,9 +921,11 @@ class DPOptimizer:
                     n_states,
                     energy_levels,
                     start_idx_override=start_idx_override,
+                    pv_kw_list=pv_kw_remaining,
                 )
                 total_val = immediate_val + future_val
-                greedy_results.append((action.name, immediate_val, future_val, total_val))
+                label = action.name + ("[EXP]" if is_export else "")
+                greedy_results.append((label, immediate_val, future_val, total_val))
                 if action == BatteryMode.CHARGE:
                     first_slot_end_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "floor")
                 elif action == BatteryMode.DISCHARGE:
@@ -796,15 +936,17 @@ class DPOptimizer:
                     best_value = total_val
                     best_action = action
                     best_is_partial = is_partial
+                    best_is_export = is_export
                     best_actions_remaining = actions_remaining
                     best_partial_flags_remaining = partial_flags_remaining
+                    best_export_flags_remaining = export_flags_remaining
                     best_idx_trajectory_remaining = idx_traj_remaining
                     best_first_slot_end_idx = first_slot_end_idx
 
             if self._decision_log_level >= 3:
                 for name, imm, fut, tot in greedy_results:
                     self._log(f"  {name}: immediate={imm:.4f}, future={fut:.4f}, total={tot:.4f}")
-                self._log(f"  -> Best: {best_action.name} (val={best_value:.4f})")
+                self._log(f"  -> Best: {best_action.name}{'[EXP]' if best_is_export else ''} (val={best_value:.4f})")
 
                 hold_result = next((r for r in greedy_results if r[0] == "HOLD"), None)
                 discharge_result = next((r for r in greedy_results if r[0] == "DISCHARGE"), None)
@@ -827,9 +969,10 @@ class DPOptimizer:
 
             actions = [best_action] + best_actions_remaining
             partial_flags = [best_is_partial] + best_partial_flags_remaining
+            export_flags = [best_is_export] + best_export_flags_remaining
             idx_trajectory = [best_first_slot_end_idx] + best_idx_trajectory_remaining
         else:
-            actions, partial_flags, best_value, idx_trajectory = self._run_dp(
+            actions, partial_flags, export_flags, best_value, idx_trajectory = self._run_dp(
                 slots_sorted_by_time,
                 load_kw,
                 charge_rates_per_slot,
@@ -840,14 +983,28 @@ class DPOptimizer:
                 step_kwh,
                 n_states,
                 energy_levels,
+                pv_kw_list=pv_kw,
             )
 
-        for price_point, action, lk, is_partial in zip(slots_sorted_by_time, actions, load_kw, partial_flags):
+        for t, (price_point, action, lk, is_partial, is_export) in enumerate(zip(
+            slots_sorted_by_time, actions, load_kw, partial_flags, export_flags
+        )):
             hour = price_point.time
             price = price_point.price
+            pv = pv_kw[t] if pv_kw is not None else 0.0
             reason = f"{price:.4f} EUR/kWh load~{lk:.2f}kW"
+            if pv > 0:
+                reason += f" pv~{pv:.2f}kW"
             if is_partial:
                 reason += " (until depleted)"
-            schedule_local[hour] = ScheduleEntry(time=hour, mode=action, reason=reason)
+            if is_export:
+                reason += " [EXPORT]"
+            entry = ScheduleEntry(time=hour, mode=action, reason=reason)
+            if action == BatteryMode.DISCHARGE:
+                entry.export_rate = 100 if is_export else 0
+            elif action == BatteryMode.SELF_CONSUMPTION:
+                entry.export_rate = 0
+                entry.ac_charge_mode = "disabled"
+            schedule_local[hour] = entry
 
         return schedule_local, idx_trajectory, best_value

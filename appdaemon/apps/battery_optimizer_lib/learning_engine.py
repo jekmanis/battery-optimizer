@@ -151,7 +151,7 @@ class BatteryLearningEngine:
                 )
                 self.stats.efficiency_history.append(observed_efficiency)
 
-        # Update SOC-range specific charge rates (legacy, SOC-only)
+        # Update SOC-range specific charge rates (fallback when temperature unavailable)
         soc_range = self._get_soc_range((soc_start + soc_end) / 2)
         if soc_range not in self.stats.charge_rates_by_soc:
             self.stats.charge_rates_by_soc[soc_range] = []
@@ -383,7 +383,7 @@ class BatteryLearningEngine:
         Uses learned data with fallback chain:
         1. Exact SOC+temp match (>=3 observations) -> median of last 10
         2. SOC match, aggregate all temps
-        3. SOC-only legacy data
+        3. SOC-only data (when temperature unavailable)
         4. Nominal rate
 
         Args:
@@ -412,7 +412,7 @@ class BatteryLearningEngine:
                 if len(all_rates) >= 3:
                     return statistics.median(all_rates)
 
-        # Fallback 3: Use SOC-only legacy data
+        # Fallback 3: Use SOC-only data (when temperature unavailable)
         if soc_range in self.stats.charge_rates_by_soc:
             observations = self.stats.charge_rates_by_soc[soc_range]
             if len(observations) >= 3:

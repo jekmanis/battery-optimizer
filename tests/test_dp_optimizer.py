@@ -612,3 +612,362 @@ class TestFifteenMinuteSlotDP:
                     f"SOC change {soc_change:.2f}% at {slot_time} exceeds "
                     f"expected max {expected_max_soc_step:.2f}%"
                 )
+
+
+# === Export / Arbitrage Tests ===
+
+class TestDPOptimizerExport:
+    """Tests for DISCHARGE_EXPORT (grid selling) DP action."""
+
+    @pytest.fixture
+    def export_config(self):
+        """Config with export enabled (multiplier=1.0) and realistic fees."""
+        return DPOptimizerConfig(
+            battery_capacity=14.3,
+            min_soc=10.0,
+            max_soc=100.0,
+            efficiency=0.85,
+            discharge_rate=4.5,
+            slot_minutes=15,
+            soc_step_percent=1.0,
+            grid_fee=0.05,
+            battery_wear_cost=0.01,
+            export_rate_multiplier=1.0,
+            grid_export_fee=0.0,
+        )
+
+    @pytest.fixture
+    def no_export_config(self):
+        """Config with export disabled."""
+        return DPOptimizerConfig(
+            battery_capacity=14.3,
+            min_soc=10.0,
+            max_soc=100.0,
+            efficiency=0.85,
+            discharge_rate=4.5,
+            slot_minutes=15,
+            soc_step_percent=1.0,
+            grid_fee=0.05,
+            battery_wear_cost=0.01,
+            export_rate_multiplier=0.0,
+        )
+
+    def _make_optimizer(self, config, load_kw=0.5):
+        return DPOptimizer(
+            config=config,
+            load_predictor=lambda dt: load_kw,
+            charge_rate_predictor=lambda soc, temp: 4.5,
+            temp_after_charge_predictor=lambda temp, dur: temp,
+            temp_after_idle_predictor=lambda temp, dur: temp,
+        )
+
+    def _make_prices(self, prices_list, slot_minutes=15):
+        base = datetime.datetime(2024, 1, 15, 0, 0, 0)
+        return [
+            PricePoint(
+                time=base + datetime.timedelta(minutes=slot_minutes * i),
+                price=price,
+            )
+            for i, price in enumerate(prices_list)
+        ]
+
+    def test_export_chosen_when_profitable(self, export_config):
+        """High price slots should trigger export (export_rate=100)."""
+        # 4 cheap slots then 4 expensive slots
+        prices = self._make_prices([0.01, 0.01, 0.01, 0.01, 0.25, 0.25, 0.25, 0.25])
+        optimizer = self._make_optimizer(export_config)
+        result = optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=80.0,
+        )
+        # Should have some export slots at the expensive prices
+        export_entries = [
+            e for e in result.schedule.values()
+            if e.mode == BatteryMode.DISCHARGE and e.export_rate == 100
+        ]
+        assert len(export_entries) > 0, "Should export during expensive slots"
+        assert result.export_slot_count > 0
+
+    def test_export_not_chosen_at_negative_sell_price(self, export_config):
+        """When sell_price <= 0, no export should happen."""
+        # All negative prices — sell_price = price * 1.0 - 0.0 < 0
+        prices = self._make_prices([-0.05, -0.03, -0.04, -0.02])
+        optimizer = self._make_optimizer(export_config)
+        result = optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=80.0,
+        )
+        export_entries = [
+            e for e in result.schedule.values()
+            if e.mode == BatteryMode.DISCHARGE and e.export_rate is not None and e.export_rate > 0
+        ]
+        assert len(export_entries) == 0, "Should not export at negative prices"
+
+    def test_no_export_when_multiplier_zero(self, no_export_config):
+        """With export_rate_multiplier=0, never export."""
+        prices = self._make_prices([0.01, 0.01, 0.25, 0.25, 0.25, 0.25])
+        optimizer = self._make_optimizer(no_export_config)
+        result = optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=80.0,
+        )
+        export_entries = [
+            e for e in result.schedule.values()
+            if e.mode == BatteryMode.DISCHARGE and e.export_rate is not None and e.export_rate > 0
+        ]
+        assert len(export_entries) == 0, "No export when multiplier=0"
+
+    def test_export_drains_more_than_self_consumption(self, export_config):
+        """Export slots should drain at full discharge_rate, not just load."""
+        prices = self._make_prices([0.30])  # Single expensive slot
+        optimizer = self._make_optimizer(export_config, load_kw=0.5)
+        result = optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=80.0,
+        )
+        # Check SOC trajectory: export should drain more than self-consumption
+        if result.soc_trajectory:
+            slot_time = prices[0].time
+            start_soc, end_soc = result.soc_trajectory[slot_time]
+            soc_drop = start_soc - end_soc
+            # Full discharge: 4.5 kW * 0.25 h / 14.3 kWh * 100 = ~7.87%
+            # Self-consume: 0.5 kW * 0.25 h / 14.3 kWh * 100 = ~0.87%
+            if result.export_slot_count > 0:
+                assert soc_drop > 3.0, (
+                    f"Export should drain significantly (got {soc_drop:.1f}%)"
+                )
+
+    def test_no_export_when_load_exceeds_rate(self, export_config):
+        """When load >= discharge_rate, no surplus to export."""
+        prices = self._make_prices([0.30, 0.30])
+        # Load=5.0 kW exceeds discharge_rate=4.5 kW — no surplus possible
+        optimizer = self._make_optimizer(export_config, load_kw=5.0)
+        result = optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=80.0,
+        )
+        export_entries = [
+            e for e in result.schedule.values()
+            if e.mode == BatteryMode.DISCHARGE and e.export_rate is not None and e.export_rate > 0
+        ]
+        assert len(export_entries) == 0, "No export when load >= discharge_rate"
+
+    def test_grid_export_fee_reduces_attractiveness(self):
+        """Higher grid_export_fee should make export less attractive."""
+        prices = self._make_prices([0.01, 0.01, 0.10, 0.10])
+
+        # Without export fee
+        config_no_fee = DPOptimizerConfig(
+            battery_capacity=14.3, min_soc=10.0, max_soc=100.0,
+            efficiency=0.85, discharge_rate=4.5, slot_minutes=15,
+            soc_step_percent=1.0, grid_fee=0.05, battery_wear_cost=0.01,
+            export_rate_multiplier=1.0, grid_export_fee=0.0,
+        )
+        opt_no_fee = self._make_optimizer(config_no_fee)
+        res_no_fee = opt_no_fee.optimize(
+            prices=prices, current_slot=prices[0].time, current_soc=80.0,
+        )
+
+        # With high export fee that makes export unprofitable
+        config_high_fee = DPOptimizerConfig(
+            battery_capacity=14.3, min_soc=10.0, max_soc=100.0,
+            efficiency=0.85, discharge_rate=4.5, slot_minutes=15,
+            soc_step_percent=1.0, grid_fee=0.05, battery_wear_cost=0.01,
+            export_rate_multiplier=1.0, grid_export_fee=0.15,
+        )
+        opt_high_fee = self._make_optimizer(config_high_fee)
+        res_high_fee = opt_high_fee.optimize(
+            prices=prices, current_slot=prices[0].time, current_soc=80.0,
+        )
+
+        assert res_high_fee.export_slot_count <= res_no_fee.export_slot_count, (
+            "Higher export fee should result in fewer or equal export slots"
+        )
+
+    def test_export_flag_on_schedule_entry(self, export_config):
+        """Verify export_rate is set correctly on ScheduleEntry objects."""
+        prices = self._make_prices([0.01, 0.25, 0.25, 0.01])
+        optimizer = self._make_optimizer(export_config)
+        result = optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=80.0,
+        )
+        for entry in result.schedule.values():
+            if entry.mode == BatteryMode.DISCHARGE:
+                assert entry.export_rate is not None, (
+                    "All DISCHARGE entries should have export_rate set"
+                )
+                assert entry.export_rate in (0, 100), (
+                    f"export_rate should be 0 or 100, got {entry.export_rate}"
+                )
+
+    def test_charge_then_export_arbitrage(self, export_config):
+        """Classic arbitrage: charge cheap, export expensive."""
+        # Very cheap then very expensive — start low SOC so charging is needed
+        prices = self._make_prices([
+            0.01, 0.01, 0.01, 0.01,  # Cheap: charge here
+            0.30, 0.30, 0.30, 0.30,  # Expensive: export here
+        ])
+        optimizer = self._make_optimizer(export_config)
+        result = optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=15.0,  # Low SOC forces charging before export
+        )
+        # Should have both charge and export slots
+        assert result.charge_count > 0, "Should charge during cheap period"
+        assert result.export_slot_count > 0, "Should export during expensive period"
+
+    def test_export_reason_contains_export_tag(self, export_config):
+        """Export slots should have [EXPORT] in their reason string."""
+        prices = self._make_prices([0.30])
+        optimizer = self._make_optimizer(export_config)
+        result = optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=80.0,
+        )
+        for entry in result.schedule.values():
+            if entry.export_rate is not None and entry.export_rate > 0:
+                assert "[EXPORT]" in entry.reason, (
+                    f"Export entry reason should contain [EXPORT], got: {entry.reason}"
+                )
+
+
+# === Self-Consumption Tests ===
+
+class TestDPOptimizerSelfConsumption:
+    """Tests for SELF_CONSUMPTION (PV-aware autonomous) DP action."""
+
+    def _make_optimizer(self, config, load_kw=0.5, pv_kw_fn=None):
+        return DPOptimizer(
+            config=config,
+            load_predictor=lambda dt: load_kw,
+            charge_rate_predictor=lambda soc, temp: 4.5,
+            temp_after_charge_predictor=lambda temp, dur: temp,
+            temp_after_idle_predictor=lambda temp, dur: temp,
+            pv_predictor=pv_kw_fn,
+        )
+
+    def _make_prices(self, prices_list, slot_minutes=15):
+        base = datetime.datetime(2024, 7, 15, 10, 0, 0)  # Summer daytime
+        return [
+            PricePoint(
+                time=base + datetime.timedelta(minutes=slot_minutes * i),
+                price=price,
+            )
+            for i, price in enumerate(prices_list)
+        ]
+
+    def _sc_config(self):
+        return DPOptimizerConfig(
+            battery_capacity=14.3,
+            min_soc=10.0,
+            max_soc=100.0,
+            efficiency=0.85,
+            discharge_rate=4.5,
+            slot_minutes=15,
+            soc_step_percent=1.0,
+            grid_fee=0.05,
+            battery_wear_cost=0.01,
+            export_rate_multiplier=0.0,  # Disable export to isolate SC
+        )
+
+    def test_self_consumption_chosen_when_pv_exceeds_load(self):
+        """With PV > load, self_consumption captures free PV charging."""
+        config = self._sc_config()
+        prices = self._make_prices([0.10, 0.10, 0.10, 0.10])
+        # PV=3kW >> load=0.5kW — lots of free charging
+        optimizer = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 3.0)
+        result = optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=50.0,
+        )
+        sc_entries = [e for e in result.schedule.values() if e.mode == BatteryMode.SELF_CONSUMPTION]
+        assert len(sc_entries) > 0, "Should choose SELF_CONSUMPTION when PV > load"
+        assert result.self_consumption_count > 0
+
+    def test_self_consumption_not_chosen_at_night(self):
+        """With PV=0, self_consumption should not be evaluated."""
+        config = self._sc_config()
+        prices = self._make_prices([0.10, 0.10])
+        optimizer = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 0.0)
+        result = optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=50.0,
+        )
+        sc_entries = [e for e in result.schedule.values() if e.mode == BatteryMode.SELF_CONSUMPTION]
+        assert len(sc_entries) == 0, "No SELF_CONSUMPTION when PV=0"
+
+    def test_self_consumption_not_chosen_without_pv_predictor(self):
+        """Without pv_predictor, SELF_CONSUMPTION is never evaluated."""
+        config = self._sc_config()
+        prices = self._make_prices([0.10, 0.10])
+        optimizer = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=None)
+        result = optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=50.0,
+        )
+        sc_entries = [e for e in result.schedule.values() if e.mode == BatteryMode.SELF_CONSUMPTION]
+        assert len(sc_entries) == 0, "No SELF_CONSUMPTION without pv_predictor"
+
+    def test_self_consumption_beats_hold_during_pv(self):
+        """Self_consumption is strictly better than HOLD when PV is producing."""
+        config = self._sc_config()
+        # Moderate price — HOLD would pay grid for load
+        prices = self._make_prices([0.15])
+        # PV=2kW > load=0.5kW — SC saves grid cost AND charges battery
+        optimizer = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 2.0)
+        result = optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=50.0,
+        )
+        # Should prefer SC over HOLD
+        entry = list(result.schedule.values())[0]
+        assert entry.mode == BatteryMode.SELF_CONSUMPTION, (
+            f"Expected SELF_CONSUMPTION, got {entry.mode.name}"
+        )
+
+    def test_self_consumption_soc_increases_with_pv_surplus(self):
+        """Battery SOC should increase during self_consumption with PV surplus."""
+        config = self._sc_config()
+        prices = self._make_prices([0.10])
+        # PV=4kW >> load=0.5kW → big surplus charges battery
+        optimizer = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 4.0)
+        result = optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=50.0,
+        )
+        if result.soc_trajectory:
+            slot_time = prices[0].time
+            start_soc, end_soc = result.soc_trajectory[slot_time]
+            if list(result.schedule.values())[0].mode == BatteryMode.SELF_CONSUMPTION:
+                assert end_soc > start_soc, (
+                    f"SOC should increase with PV surplus, got {start_soc}→{end_soc}"
+                )
+
+    def test_self_consumption_ac_charge_mode_disabled(self):
+        """Self_consumption entries should have ac_charge_mode=disabled."""
+        config = self._sc_config()
+        prices = self._make_prices([0.10])
+        optimizer = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 3.0)
+        result = optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=50.0,
+        )
+        for entry in result.schedule.values():
+            if entry.mode == BatteryMode.SELF_CONSUMPTION:
+                assert entry.ac_charge_mode == "disabled"
+                assert entry.export_rate == 0

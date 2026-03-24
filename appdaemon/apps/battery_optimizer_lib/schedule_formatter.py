@@ -18,6 +18,40 @@ from .models import BatteryMode, PricePoint, ScheduleEntry
 from .timezone_utils import lookup_by_time
 
 
+# WIT mode display names and icons for markdown rendering
+_WIT_MODE_DISPLAY = {
+    "grid_charge":        ("Grid Charge",        "🔋", "Yes"),
+    "discharge_to_load":  ("Discharge to Load",  "🏠", "No"),
+    "discharge_to_grid":  ("Discharge to Grid",  "💰", "Yes"),
+    "max_export":         ("Max Export",          "⚡", "Yes"),
+    "hold":               ("Hold",               "⏸️", "—"),
+    "self_consumption":   ("Self-Consumption",    "☀️", "Auto"),
+}
+
+
+def resolve_wit_mode(entry: ScheduleEntry, default_power_percent: int = 100) -> str:
+    """Map a ScheduleEntry to the WIT mode string that DirectControl would send.
+
+    Mirrors DirectControl._resolve_charge_mode / _resolve_discharge_mode logic
+    so the display layer can show the same mode without importing DirectControl.
+    """
+    mode = entry.mode
+    if mode == BatteryMode.CHARGE:
+        return "grid_charge"
+    elif mode == BatteryMode.DISCHARGE:
+        export_rate = entry.export_rate
+        if export_rate is not None and export_rate > 0:
+            power = entry.power_percent if entry.power_percent is not None else default_power_percent
+            if export_rate >= 100 and power >= 100:
+                return "max_export"
+            return "discharge_to_grid"
+        return "discharge_to_load"
+    elif mode == BatteryMode.SELF_CONSUMPTION:
+        return "self_consumption"
+    else:
+        return "hold"
+
+
 @dataclass
 class ScheduleFormatterConfig:
     """Configuration for schedule formatting."""
@@ -27,6 +61,7 @@ class ScheduleFormatterConfig:
     battery_capacity: float
     charge_rate: float
     discharge_rate: float
+    export_discharge_rate: float  # kW — discharge rate during grid export (0 = use discharge_rate)
     efficiency: float
     battery_wear_cost: float
     decision_log_level: int
@@ -73,6 +108,7 @@ class ScheduleFormatter:
         projected_costs: Optional[Dict[datetime.datetime, float]] = None,
         local_tz=None,
         predict_load_kw: Optional[Callable[[datetime.datetime], float]] = None,
+        predict_pv_kw: Optional[Callable[[datetime.datetime], float]] = None,
         min_soc: float = 10.0,
         max_soc: float = 100.0,
     ):
@@ -81,7 +117,7 @@ class ScheduleFormatter:
 
         Prefers the DP optimizer's actual SOC trajectory (dp_soc_trajectory) when available,
         as this reflects the exact values the optimizer computed. Falls back to expected_soc
-        (from calculate_expected_soc_schedule) for backwards compatibility.
+        (from calculate_expected_soc_schedule) when DP trajectory is not available.
 
         Args:
             schedule: Schedule entries keyed by slot datetime
@@ -124,6 +160,7 @@ class ScheduleFormatter:
                 expected_temp=expected_temp,
                 local_tz=local_tz,
                 predict_load_kw=predict_load_kw,
+                predict_pv_kw=predict_pv_kw,
                 min_soc=min_soc,
                 max_soc=max_soc,
             )
@@ -141,13 +178,25 @@ class ScheduleFormatter:
         charge_count = len(
             [e for e in schedule.values() if e.mode == BatteryMode.CHARGE]
         )
-        discharge_count = len(
-            [e for e in schedule.values() if e.mode == BatteryMode.DISCHARGE]
+        export_count = len(
+            [e for e in schedule.values()
+             if e.mode == BatteryMode.DISCHARGE and e.export_rate is not None and e.export_rate > 0]
+        )
+        self_consume_count = len(
+            [e for e in schedule.values()
+             if e.mode == BatteryMode.DISCHARGE and (e.export_rate is None or e.export_rate == 0)]
         )
         hold_count = len([e for e in schedule.values() if e.mode == BatteryMode.HOLD])
-        self.log(
-            f"Total: {charge_count} charge, {discharge_count} discharge, {hold_count} hold slots"
-        )
+        sc_count = len([e for e in schedule.values() if e.mode == BatteryMode.SELF_CONSUMPTION])
+        parts = [f"{charge_count} charge"]
+        if self_consume_count:
+            parts.append(f"{self_consume_count} discharge(self)")
+        if export_count:
+            parts.append(f"{export_count} discharge(export)")
+        if sc_count:
+            parts.append(f"{sc_count} self_consumption")
+        parts.append(f"{hold_count} hold")
+        self.log(f"Total: {', '.join(parts)} slots")
 
     def _format_soc_trajectory(
         self,
@@ -161,8 +210,9 @@ class ScheduleFormatter:
         expected_temp: Optional[Dict[datetime.datetime, float]],
         local_tz,
         predict_load_kw: Optional[Callable[[datetime.datetime], float]],
-        min_soc: float,
-        max_soc: float,
+        predict_pv_kw: Optional[Callable[[datetime.datetime], float]] = None,
+        min_soc: float = 10.0,
+        max_soc: float = 100.0,
     ) -> str:
         """Format the SOC/temperature trajectory string for a schedule entry."""
         # Try DP trajectory first (exact values from optimizer)
@@ -188,6 +238,7 @@ class ScheduleFormatter:
                 expected_temp=expected_temp,
                 local_tz=local_tz,
                 predict_load_kw=predict_load_kw,
+                predict_pv_kw=predict_pv_kw,
                 min_soc=min_soc,
                 max_soc=max_soc,
             )
@@ -215,8 +266,9 @@ class ScheduleFormatter:
         expected_temp: Optional[Dict[datetime.datetime, float]],
         local_tz,
         predict_load_kw: Optional[Callable[[datetime.datetime], float]],
-        min_soc: float,
-        max_soc: float,
+        predict_pv_kw: Optional[Callable[[datetime.datetime], float]] = None,
+        min_soc: float = 10.0,
+        max_soc: float = 100.0,
     ) -> str:
         """Format trajectory using recalculated expected values (fallback)."""
         start_soc = lookup_by_time(expected_soc, hour, local_tz)
@@ -231,8 +283,20 @@ class ScheduleFormatter:
             return self._format_charge_trajectory(start_soc, start_temp, max_soc)
         elif entry.mode == BatteryMode.DISCHARGE:
             return self._format_discharge_trajectory(
-                hour, start_soc, start_temp, min_soc, predict_load_kw
+                hour, start_soc, start_temp, min_soc, predict_load_kw, entry=entry
             )
+        elif entry.mode == BatteryMode.SELF_CONSUMPTION:
+            pv_kw = predict_pv_kw(hour) if predict_pv_kw else 0.0
+            load_kw = predict_load_kw(hour) if predict_load_kw else 0.5
+            pv_surplus = max(0.0, pv_kw - load_kw)
+            pv_charge_kw = min(pv_surplus, self.config.charge_rate)
+            pv_charge_kwh = pv_charge_kw * self.config.slot_hours * self.config.efficiency
+            load_deficit = max(0.0, load_kw - pv_kw)
+            battery_discharge_kwh = min(load_deficit, self.config.discharge_rate) * self.config.slot_hours
+            net_energy = pv_charge_kwh - battery_discharge_kwh
+            soc_change = (net_energy / self.config.battery_capacity) * 100
+            end_soc = max(min_soc, min(max_soc, start_soc + soc_change))
+            return f" {start_soc:5.1f}%->{end_soc:5.1f}%"
         else:  # HOLD
             return self._format_hold_trajectory(start_soc, start_temp)
 
@@ -277,12 +341,17 @@ class ScheduleFormatter:
         start_temp: Optional[float],
         min_soc: float,
         predict_load_kw: Optional[Callable[[datetime.datetime], float]],
+        entry: Optional[ScheduleEntry] = None,
     ) -> str:
         """Format trajectory for a DISCHARGE slot."""
-        load_kw = predict_load_kw(hour) if predict_load_kw else 0.5
-        energy_removed = (
-            min(load_kw, self.config.discharge_rate) * self.config.slot_hours
-        )
+        if entry is not None and entry.export_rate is not None and entry.export_rate > 0:
+            edr = self.config.export_discharge_rate if self.config.export_discharge_rate > 0 else self.config.discharge_rate
+            energy_removed = edr * self.config.slot_hours
+        else:
+            load_kw = predict_load_kw(hour) if predict_load_kw else 0.5
+            energy_removed = (
+                min(load_kw, self.config.discharge_rate) * self.config.slot_hours
+            )
         end_soc = max(
             min_soc, start_soc - (energy_removed / self.config.battery_capacity) * 100
         )
@@ -482,15 +551,134 @@ class ScheduleFormatter:
             schedule: Schedule entries keyed by slot datetime
 
         Returns:
-            List of {time, mode, reason} dicts sorted by time
+            List of {time, mode, wit_mode, reason, export} dicts sorted by time
         """
         schedule_data = []
         for hour in sorted(schedule.keys()):
             entry = schedule[hour]
-            schedule_data.append(
-                {"time": hour.isoformat(), "mode": entry.mode.name, "reason": entry.reason}
-            )
+            wit_mode = resolve_wit_mode(entry)
+            display = _WIT_MODE_DISPLAY.get(wit_mode, (wit_mode, "", "—"))
+            schedule_data.append({
+                "time": hour.isoformat(),
+                "mode": entry.mode.name,
+                "wit_mode": wit_mode,
+                "wit_mode_name": display[0],
+                "export": display[2],
+                "reason": entry.reason,
+            })
         return schedule_data
+
+    def format_schedule_markdown(
+        self,
+        schedule: Dict[datetime.datetime, ScheduleEntry],
+        now: datetime.datetime,
+        local_tz,
+        align_to_slot_func: Callable[[datetime.datetime], datetime.datetime],
+        dp_soc_trajectory: Optional[Dict[datetime.datetime, Tuple[float, float]]] = None,
+    ) -> str:
+        """Generate a markdown table of the schedule for HA dashboard display.
+
+        Shows the actual WIT mode that will be sent to the inverter, export
+        status, SOC trajectory, and price — giving full visibility into what
+        the optimizer is doing.
+
+        Args:
+            schedule: Schedule entries keyed by slot datetime
+            now: Current datetime
+            local_tz: Local timezone for display
+            align_to_slot_func: Function to align datetime to slot boundary
+            dp_soc_trajectory: DP optimizer's SOC trajectory (start, end) per slot
+        """
+        if not schedule:
+            return "No schedule available"
+
+        # Determine the current slot for highlighting
+        if now.tzinfo is not None and local_tz is not None:
+            now = now.astimezone(local_tz)
+        now_slot = align_to_slot_func(now)
+
+        lines: List[str] = []
+        lines.append("| Time | Mode | Export | SOC | Price |")
+        lines.append("|------|------|--------|-----|-------|")
+
+        for hour in sorted(schedule.keys()):
+            entry = schedule[hour]
+
+            # Display time in local tz
+            display_hour = hour
+            if hour.tzinfo is not None and local_tz is not None:
+                display_hour = hour.astimezone(local_tz)
+            time_str = display_hour.strftime("%H:%M")
+
+            # Current-slot marker
+            is_current = self._is_same_slot(hour, now_slot, local_tz)
+            if is_current:
+                time_str = f"**{time_str}**"
+
+            # WIT mode
+            wit_mode = resolve_wit_mode(entry)
+            display = _WIT_MODE_DISPLAY.get(wit_mode, (wit_mode, "", "—"))
+            icon = display[1]
+            mode_name = display[0]
+            export_str = display[2]
+
+            # SOC trajectory
+            soc_str = ""
+            if dp_soc_trajectory:
+                soc_data = lookup_by_time(dp_soc_trajectory, hour, local_tz)
+                if soc_data is not None:
+                    start_soc, end_soc = soc_data
+                    soc_str = f"{start_soc:.0f}→{end_soc:.0f}%"
+
+            # Price from reason (format: "X.XXXX EUR/kWh ...")
+            price_str = self._extract_price_from_reason(entry.reason)
+
+            lines.append(
+                f"| {time_str} | {icon} {mode_name} | {export_str} | {soc_str} | {price_str} |"
+            )
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _is_same_slot(
+        hour: datetime.datetime,
+        now_slot: datetime.datetime,
+        local_tz,
+    ) -> bool:
+        """Check if hour refers to the same slot as now_slot."""
+        compare_hour = hour
+        compare_now = now_slot
+        if local_tz is not None:
+            if hour.tzinfo is not None:
+                compare_hour = hour.astimezone(local_tz)
+            if now_slot.tzinfo is not None:
+                compare_now = now_slot.astimezone(local_tz)
+        if compare_hour.tzinfo is not None and compare_now.tzinfo is None:
+            compare_hour = compare_hour.replace(tzinfo=None)
+        elif compare_hour.tzinfo is None and compare_now.tzinfo is not None:
+            compare_now = compare_now.replace(tzinfo=None)
+        return compare_hour == compare_now
+
+    @staticmethod
+    def _extract_price_from_reason(reason: str) -> str:
+        """Pull the price out of a reason string like '0.1234 EUR/kWh load~0.5kW'."""
+        if not reason:
+            return ""
+        parts = reason.split(" EUR/kWh")
+        if len(parts) >= 2:
+            try:
+                price_val = float(parts[0])
+                return f"{price_val:.4f}"
+            except ValueError:
+                pass
+        # Try just taking leading numeric
+        for token in reason.split():
+            try:
+                val = float(token)
+                return f"{val:.4f}"
+            except ValueError:
+                break
+        return ""
 
     def find_next_events(
         self,

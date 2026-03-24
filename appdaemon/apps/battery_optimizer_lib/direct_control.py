@@ -60,6 +60,7 @@ class DirectControl:
             BatteryMode.CHARGE: self._resolve_charge_mode(entry),
             BatteryMode.DISCHARGE: self._resolve_discharge_mode(entry),
             BatteryMode.HOLD: "hold",
+            BatteryMode.SELF_CONSUMPTION: "self_consumption",
         }.get(mode, "hold")
 
         params = {
@@ -85,12 +86,12 @@ class DirectControl:
         # SOC limits
         if entry.charge_cutoff_soc is not None:
             params["charge_cutoff_soc"] = entry.charge_cutoff_soc
-        elif mode == BatteryMode.CHARGE:
+        elif mode in (BatteryMode.CHARGE, BatteryMode.SELF_CONSUMPTION):
             params["charge_cutoff_soc"] = self._get_max_soc()
 
         if entry.discharge_cutoff_soc is not None:
             params["discharge_cutoff_soc"] = entry.discharge_cutoff_soc
-        elif mode == BatteryMode.DISCHARGE:
+        elif mode in (BatteryMode.DISCHARGE, BatteryMode.SELF_CONSUMPTION):
             params["discharge_cutoff_soc"] = self._get_min_soc()
 
         # Duplicate detection

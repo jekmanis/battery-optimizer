@@ -34,6 +34,7 @@ class PartialSlotOptimizer:
             default_max_soc=100.0,
             decision_log_level=0,
             battery_wear_cost=0.0,
+            export_rate_multiplier=0.0,  # Disable export to test partial slot logic only
         )
 
         # Legacy attributes for tests
@@ -106,6 +107,9 @@ class PartialSlotOptimizer:
 
     def _predict_load_kw(self, dt: datetime.datetime) -> float:
         return self.load_profile.predict_kw(dt, self.config.load_quantile)
+
+    def _predict_pv_kw(self, dt: datetime.datetime) -> float:
+        return 0.0
 
     def _get_prices_for_date(self, date, tz):
         return []

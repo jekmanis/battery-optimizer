@@ -839,6 +839,89 @@ class TestDPOptimizerExport:
                     f"Export entry reason should contain [EXPORT], got: {entry.reason}"
                 )
 
+    def test_no_export_when_sell_price_below_wear_cost(self):
+        """Export should not be chosen when sell revenue < battery wear cost.
+
+        Auditor scenario: NP=0.03, grid_export_fee=0.02 → sell_price=0.01,
+        but battery_wear_cost=0.017 → net loss of 0.007/kWh on export.
+        Self-consumption saves 0.03+0.052=0.082/kWh, so DISCHARGE(self) is
+        strictly better than DISCHARGE(export).
+        """
+        config = DPOptimizerConfig(
+            battery_capacity=14.3,
+            min_soc=10.0,
+            max_soc=100.0,
+            efficiency=0.95,
+            discharge_rate=4.5,
+            slot_minutes=15,
+            soc_step_percent=1.0,
+            grid_fee=0.052,
+            battery_wear_cost=0.017,
+            export_rate_multiplier=1.0,
+            grid_export_fee=0.02,
+        )
+        # All slots at NP=0.03 — sell_price=0.01, wear=0.017
+        prices = self._make_prices([0.03, 0.03, 0.03, 0.03])
+        optimizer = self._make_optimizer(config, load_kw=0.5)
+        result = optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=80.0,
+        )
+        export_entries = [
+            e for e in result.schedule.values()
+            if e.mode == BatteryMode.DISCHARGE and e.export_rate is not None and e.export_rate > 0
+        ]
+        assert len(export_entries) == 0, (
+            "Should not export when sell_price (0.01) < wear_cost (0.017)"
+        )
+
+    def test_wear_cost_favours_hold_over_discharge_at_low_prices(self):
+        """With wear cost and scarce battery energy, DP should prioritise
+        discharge during expensive slots over cheap ones.
+
+        Scenario: SOC=25% with 3 kW load means only ~2.1 kWh usable but
+        6 kWh total load across 8 slots. The DP must ration and should
+        prefer expensive slots (net saving 0.135/kWh) over cheap ones
+        (net saving 0.036/kWh).
+        """
+        config = DPOptimizerConfig(
+            battery_capacity=14.3,
+            min_soc=10.0,
+            max_soc=100.0,
+            efficiency=0.95,
+            discharge_rate=4.5,
+            slot_minutes=15,
+            soc_step_percent=1.0,
+            grid_fee=0.052,
+            battery_wear_cost=0.017,
+            export_rate_multiplier=1.0,
+            grid_export_fee=0.02,
+        )
+        prices = self._make_prices([
+            0.001, 0.001, 0.001, 0.001,  # Cheap: grid costs 0.053/kWh
+            0.10, 0.10, 0.10, 0.10,      # Expensive: grid costs 0.152/kWh
+        ])
+        optimizer = self._make_optimizer(config, load_kw=3.0)
+        result = optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=25.0,  # Only ~2.1 kWh usable → must ration
+        )
+        # Count discharge in expensive vs cheap slots
+        expensive_discharge = sum(
+            1 for i in range(4, 8)
+            if (e := result.schedule.get(prices[i].time)) and e.mode == BatteryMode.DISCHARGE
+        )
+        cheap_discharge = sum(
+            1 for i in range(0, 4)
+            if (e := result.schedule.get(prices[i].time)) and e.mode == BatteryMode.DISCHARGE
+        )
+        assert expensive_discharge > cheap_discharge, (
+            f"Should discharge more in expensive slots ({expensive_discharge}) "
+            f"than cheap ones ({cheap_discharge})"
+        )
+
 
 # === Self-Consumption Tests ===
 

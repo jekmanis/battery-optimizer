@@ -13,6 +13,7 @@ This package contains helper modules for the main BatteryOptimizer AppDaemon app
 - cost_tracker: Battery cost tracking with weighted average calculations
 - charge_rate_utils: Temperature-aware charge rate computation
 - schedule_formatter: Schedule logging and formatting for display
+- pv_forecast_service: PV forecast fetching (Solcast / Forecast.Solar)
 """
 
 from .config import BatteryOptimizerConfig
@@ -48,6 +49,7 @@ from .charge_rate_utils import compute_charge_rates_per_slot
 from .soc_deviation import SocDeviationDetector, SocDeviationConfig, DeviationCheckResult
 from .schedule_formatter import ScheduleFormatter, ScheduleFormatterConfig, resolve_wit_mode
 from .load_prediction_tracker import LoadPredictionTracker
+from .pv_forecast_service import PvForecastService, PvForecastServiceConfig
 
 __all__ = [
     # Config
@@ -98,4 +100,7 @@ __all__ = [
     "resolve_wit_mode",
     # Prediction tracker
     "LoadPredictionTracker",
+    # PV forecast service
+    "PvForecastService",
+    "PvForecastServiceConfig",
 ]

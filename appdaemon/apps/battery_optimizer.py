@@ -55,6 +55,9 @@ from battery_optimizer_lib import (
     ScheduleFormatterConfig,
     # Prediction tracker
     LoadPredictionTracker,
+    # PV forecast service
+    PvForecastService,
+    PvForecastServiceConfig,
 )
 from battery_optimizer_lib.pv_profile import PvProfile
 from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
@@ -144,6 +147,15 @@ class BatteryOptimizer(hass.Hass):
             log_func=self.log,
         )
         self._init_pv_profile()
+
+        # PV forecast service (Solcast / Forecast.Solar)
+        self._pv_forecast_service = PvForecastService(
+            config=PvForecastServiceConfig.from_main_config(self.config),
+            get_state_func=self.get_state,
+            get_datetime_func=self.datetime,
+            get_timezone_func=self._get_local_timezone,
+            log_func=self.log,
+        )
 
         # Slot outcome tracker for prediction monitoring
         self._outcome_tracker = SlotOutcomeTracker(
@@ -365,6 +377,9 @@ class BatteryOptimizer(hass.Hass):
         """
         if not prices:
             return {}
+
+        # Refresh PV forecast (no-ops if cache is fresh)
+        self._pv_forecast_service.refresh()
 
         now = self.datetime()
         current_slot = self._align_to_slot(now)
@@ -735,7 +750,8 @@ class BatteryOptimizer(hass.Hass):
 
         # Determine trigger type: startup (no previous recalc) or daily schedule
         now = self.datetime()
-        if self._last_recalc_time is None:
+        is_startup = self._last_recalc_time is None
+        if is_startup:
             self._last_recalc_trigger = "startup"
         else:
             # Check if this is around the scheduled daily time (within 30 min of tomorrow_prices_hour:15)
@@ -808,6 +824,19 @@ class BatteryOptimizer(hass.Hass):
 
         # Update sensor
         self._update_schedule_sensor()
+
+        # If PV forecast was unavailable at startup, HA sensors may not have been
+        # ready yet (Solcast HACS integration loads attributes asynchronously).
+        # Schedule a re-optimization after 30s when sensors are more likely populated.
+        if (is_startup
+                and self.config.enable_self_consumption
+                and not self._pv_forecast_service.has_forecast):
+            self.log(
+                "PV forecast unavailable at startup — scheduling re-optimization "
+                "in 30s to pick up Solcast data",
+                level="WARNING",
+            )
+            self.run_in(self.full_optimize, 30)
 
         self.log("Full optimization complete")
 
@@ -1841,13 +1870,19 @@ class BatteryOptimizer(hass.Hass):
     def _predict_pv_kw(self, dt: datetime.datetime) -> float:
         """Predict PV production (kW) for a slot.
 
-        Tries external forecast sensor first, falls back to PV profile history.
-        Configure pv_forecast_unit ("W" or "kW") to match your sensor.
+        Three-tier fallback:
+        1. PV forecast service (Solcast / Forecast.Solar) — per-slot forecast
+        2. Legacy pv_forecast_sensor — single value, current slot only
+        3. PV profile — statistical history
         """
+        # Tier 1: PV forecast service (Solcast / Forecast.Solar)
+        # If the forecast service has data for this specific slot, trust it
+        # (including 0.0 — "no sun" is an authoritative forecast)
+        if self._pv_forecast_service.has_slot(dt):
+            return self._pv_forecast_service.predict_kw(dt)
+
+        # Tier 2: Legacy single-sensor forecast (current slot only)
         if self.config.pv_forecast_sensor:
-            # External forecast sensor reports a single instantaneous value —
-            # only trust it for the current slot.  For future slots the
-            # historical PV profile gives a proper per-slot shape.
             current_slot = self._align_to_slot(self.datetime())
             slot_dt = self._align_to_slot(dt)
             if slot_dt == current_slot:
@@ -1858,9 +1893,11 @@ class BatteryOptimizer(hass.Hass):
                         if val >= 0:
                             if self.config.pv_forecast_unit.lower() == "kw":
                                 return val
-                            return val / 1000.0  # Default: sensor reports Watts
+                            return val / 1000.0
                 except (ValueError, TypeError):
                     pass
+
+        # Tier 3: Statistical PV profile
         return self.pv_profile.predict_kw(dt, self.config.pv_quantile)
 
     def _align_to_slot(self, dt: datetime.datetime) -> datetime.datetime:

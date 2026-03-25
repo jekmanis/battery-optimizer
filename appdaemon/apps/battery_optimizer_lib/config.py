@@ -102,6 +102,22 @@ class BatteryOptimizerConfig:
     inverter_mode_sensor: str = ""  # Inverter mode sensor for monitoring (e.g., sensor.growatt_wit_inverter_mode)
 
     # =========================================================================
+    # PV Forecast Service (Solcast / Forecast.Solar)
+    # =========================================================================
+    solcast_today_entity: str = ""  # e.g. sensor.solcast_pv_forecast_forecast_today
+    solcast_tomorrow_entity: str = ""  # e.g. sensor.solcast_pv_forecast_forecast_tomorrow
+    solcast_estimate_field: str = "pv_estimate"  # pv_estimate, pv_estimate10, pv_estimate90
+
+    forecast_solar_lat: float = 0.0
+    forecast_solar_lon: float = 0.0
+    forecast_solar_declination: int = 0  # panel tilt degrees
+    forecast_solar_azimuth: int = 0  # 0=north, 90=east, 180=south, 270=west
+    forecast_solar_kwp: float = 0.0  # peak kW (0 = disabled)
+    forecast_solar_api_key: str = ""  # optional paid API key
+
+    pv_forecast_cache_minutes: int = 60  # how often to refresh forecast
+
+    # =========================================================================
     # SOC Limits (defaults - can be overridden by HA entities at runtime)
     # =========================================================================
     default_min_soc: float = 10.0
@@ -280,6 +296,18 @@ class BatteryOptimizerConfig:
             enable_self_consumption=args.get("enable_self_consumption", True),
             inverter_mode_sensor=args.get("inverter_mode_sensor", ""),
 
+            # PV Forecast Service
+            solcast_today_entity=args.get("solcast_today_entity", ""),
+            solcast_tomorrow_entity=args.get("solcast_tomorrow_entity", ""),
+            solcast_estimate_field=args.get("solcast_estimate_field", "pv_estimate"),
+            forecast_solar_lat=float(args.get("forecast_solar_lat", 0.0)),
+            forecast_solar_lon=float(args.get("forecast_solar_lon", 0.0)),
+            forecast_solar_declination=int(args.get("forecast_solar_declination", 0)),
+            forecast_solar_azimuth=int(args.get("forecast_solar_azimuth", 0)),
+            forecast_solar_kwp=float(args.get("forecast_solar_kwp", 0.0)),
+            forecast_solar_api_key=args.get("forecast_solar_api_key", ""),
+            pv_forecast_cache_minutes=int(args.get("pv_forecast_cache_minutes", 60)),
+
             # SOC Limits
             default_min_soc=float(args.get("min_soc", 10)),
             default_max_soc=float(args.get("max_soc", 100)),
@@ -329,3 +357,10 @@ class BatteryOptimizerConfig:
             f"export_discharge_rate={self.effective_export_discharge_rate}kW, "
             f"efficiency={self.efficiency}, slot={self.slot_minutes}min"
         )
+        pv_sources = []
+        if self.solcast_today_entity:
+            pv_sources.append(f"Solcast({self.solcast_estimate_field})")
+        if self.forecast_solar_kwp > 0:
+            pv_sources.append(f"Forecast.Solar({self.forecast_solar_kwp}kWp)")
+        if pv_sources:
+            log_func(f"PV forecast: {' + '.join(pv_sources)}")

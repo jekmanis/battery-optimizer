@@ -23,6 +23,8 @@ from battery_optimizer_lib import (
     BatteryCostTracker,
     BatteryCostConfig,
     BatteryOptimizerConfig,
+    PvForecastService,
+    PvForecastServiceConfig,
     ScheduleFormatter,
     ScheduleFormatterConfig,
 )
@@ -122,6 +124,15 @@ class MockOptimizer:
             get_cached_prices_func=lambda: [],
             save_learning_data_func=lambda: None,
             update_learning_sensor_func=lambda: None,
+            log_func=self.log,
+        )
+
+        # PV forecast service (empty — no forecast data in tests)
+        self._pv_forecast_service = PvForecastService(
+            config=PvForecastServiceConfig(slot_minutes=self.config.slot_minutes),
+            get_state_func=lambda e, **kw: None,
+            get_datetime_func=self.datetime,
+            get_timezone_func=self._get_local_timezone,
             log_func=self.log,
         )
 

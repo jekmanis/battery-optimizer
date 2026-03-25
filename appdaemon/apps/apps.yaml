@@ -154,7 +154,7 @@ battery_optimizer:
   export_rate_multiplier: 1.0
 
   # Optional battery wear cost per kWh (discourages cycling at marginal prices)
-  battery_wear_cost_eur_kwh: 0.00
+  battery_wear_cost_eur_kwh: 0.017
 
   # ==========================================================================
   # Optimization Thresholds
@@ -163,6 +163,10 @@ battery_optimizer:
   # PV power threshold for solar override (Watts)
   # When PV exceeds this, pause grid charging to use solar
   pv_threshold_w: 500
+
+  # PV forecast (Solcast HACS integration)
+  solcast_today_entity: sensor.solcast_pv_forecast_forecast_today
+  solcast_tomorrow_entity: sensor.solcast_pv_forecast_forecast_tomorrow
 
   # SOC deviation threshold for schedule recalculation (%)
   # If actual SOC differs from expected by more than this, recalculate

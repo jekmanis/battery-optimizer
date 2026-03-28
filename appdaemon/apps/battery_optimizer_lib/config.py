@@ -98,7 +98,6 @@ class BatteryOptimizerConfig:
     pv_quantile: float = 0.5
     pv_forecast_sensor: str = ""  # Optional external PV forecast sensor (e.g., Solcast)
     pv_forecast_unit: str = "W"  # Unit of pv_forecast_sensor: "W" or "kW"
-    enable_self_consumption: bool = True  # Enable SELF_CONSUMPTION DP action
     inverter_mode_sensor: str = ""  # Inverter mode sensor for monitoring (e.g., sensor.growatt_wit_inverter_mode)
 
     # =========================================================================
@@ -124,6 +123,7 @@ class BatteryOptimizerConfig:
     default_max_soc: float = 100.0
     default_pv_threshold: float = 500.0  # W
     soc_deviation_threshold: float = 10.0  # % deviation to trigger recalc
+    soc_shortfall_recalc_threshold: float = 3.0  # % SOC shortfall to trigger pre-execution recalc
 
     # =========================================================================
     # Pricing
@@ -293,7 +293,6 @@ class BatteryOptimizerConfig:
             pv_quantile=float(args.get("pv_quantile", 0.5)),
             pv_forecast_sensor=args.get("pv_forecast_sensor", ""),
             pv_forecast_unit=args.get("pv_forecast_unit", "W"),
-            enable_self_consumption=args.get("enable_self_consumption", True),
             inverter_mode_sensor=args.get("inverter_mode_sensor", ""),
 
             # PV Forecast Service
@@ -313,6 +312,7 @@ class BatteryOptimizerConfig:
             default_max_soc=float(args.get("max_soc", 100)),
             default_pv_threshold=float(args.get("pv_threshold_w", 500)),
             soc_deviation_threshold=float(args.get("soc_deviation_threshold", 10)),
+            soc_shortfall_recalc_threshold=float(args.get("soc_shortfall_recalc_threshold", 3.0)),
 
             # Pricing
             grid_fee=float(args.get("grid_fee_eur_kwh", 0.052)),

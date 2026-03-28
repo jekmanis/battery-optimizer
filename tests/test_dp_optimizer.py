@@ -925,8 +925,8 @@ class TestDPOptimizerExport:
 
 # === Self-Consumption Tests ===
 
-class TestDPOptimizerSelfConsumption:
-    """Tests for SELF_CONSUMPTION (PV-aware autonomous) DP action."""
+class TestDPOptimizerPvAwareModes:
+    """Tests for PV-aware mode selection — PV is modeled in all modes (HOLD, CHARGE, DISCHARGE)."""
 
     def _make_optimizer(self, config, load_kw=0.5, pv_kw_fn=None):
         return DPOptimizer(
@@ -948,7 +948,7 @@ class TestDPOptimizerSelfConsumption:
             for i, price in enumerate(prices_list)
         ]
 
-    def _sc_config(self):
+    def _pv_config(self, export_rate_multiplier=0.0):
         return DPOptimizerConfig(
             battery_capacity=14.3,
             min_soc=10.0,
@@ -959,14 +959,13 @@ class TestDPOptimizerSelfConsumption:
             soc_step_percent=1.0,
             grid_fee=0.05,
             battery_wear_cost=0.01,
-            export_rate_multiplier=0.0,  # Disable export to isolate SC
+            export_rate_multiplier=export_rate_multiplier,
         )
 
-    def test_self_consumption_chosen_when_pv_exceeds_load(self):
-        """With PV > load, self_consumption captures free PV charging."""
-        config = self._sc_config()
+    def test_no_self_consumption_mode_produced(self):
+        """SELF_CONSUMPTION is no longer produced by the DP optimizer."""
+        config = self._pv_config()
         prices = self._make_prices([0.10, 0.10, 0.10, 0.10])
-        # PV=3kW >> load=0.5kW — lots of free charging
         optimizer = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 3.0)
         result = optimizer.optimize(
             prices=prices,
@@ -974,75 +973,27 @@ class TestDPOptimizerSelfConsumption:
             current_soc=50.0,
         )
         sc_entries = [e for e in result.schedule.values() if e.mode == BatteryMode.SELF_CONSUMPTION]
-        assert len(sc_entries) > 0, "Should choose SELF_CONSUMPTION when PV > load"
-        assert result.self_consumption_count > 0
+        assert len(sc_entries) == 0, "SELF_CONSUMPTION should never be produced"
+        assert result.self_consumption_count == 0
 
-    def test_self_consumption_not_chosen_at_night(self):
-        """With PV=0, self_consumption should not be evaluated."""
-        config = self._sc_config()
-        prices = self._make_prices([0.10, 0.10])
-        optimizer = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 0.0)
+    def test_charge_chosen_when_pv_exceeds_load(self):
+        """With PV > load and low SOC, CHARGE captures free PV surplus."""
+        config = self._pv_config(export_rate_multiplier=1.0)
+        # Cheap now, expensive later — charging now is valuable
+        prices = self._make_prices([0.05, 0.05, 0.20, 0.20])
+        # PV=3kW >> load=0.5kW — CHARGE with pv_priority stores surplus for free
+        optimizer = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 3.0)
         result = optimizer.optimize(
             prices=prices,
             current_slot=prices[0].time,
-            current_soc=50.0,
+            current_soc=15.0,
         )
-        sc_entries = [e for e in result.schedule.values() if e.mode == BatteryMode.SELF_CONSUMPTION]
-        assert len(sc_entries) == 0, "No SELF_CONSUMPTION when PV=0"
+        charge_entries = [e for e in result.schedule.values() if e.mode == BatteryMode.CHARGE]
+        assert len(charge_entries) > 0, "Should choose CHARGE when PV surplus can charge battery for free"
 
-    def test_self_consumption_not_chosen_without_pv_predictor(self):
-        """Without pv_predictor, SELF_CONSUMPTION is never evaluated."""
-        config = self._sc_config()
-        prices = self._make_prices([0.10, 0.10])
-        optimizer = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=None)
-        result = optimizer.optimize(
-            prices=prices,
-            current_slot=prices[0].time,
-            current_soc=50.0,
-        )
-        sc_entries = [e for e in result.schedule.values() if e.mode == BatteryMode.SELF_CONSUMPTION]
-        assert len(sc_entries) == 0, "No SELF_CONSUMPTION without pv_predictor"
-
-    def test_self_consumption_beats_hold_during_pv(self):
-        """Self_consumption is strictly better than HOLD when PV is producing."""
-        config = self._sc_config()
-        # Moderate price — HOLD would pay grid for load
-        prices = self._make_prices([0.15])
-        # PV=2kW > load=0.5kW — SC saves grid cost AND charges battery
-        optimizer = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 2.0)
-        result = optimizer.optimize(
-            prices=prices,
-            current_slot=prices[0].time,
-            current_soc=50.0,
-        )
-        # Should prefer SC over HOLD
-        entry = list(result.schedule.values())[0]
-        assert entry.mode == BatteryMode.SELF_CONSUMPTION, (
-            f"Expected SELF_CONSUMPTION, got {entry.mode.name}"
-        )
-
-    def test_self_consumption_soc_increases_with_pv_surplus(self):
-        """Battery SOC should increase during self_consumption with PV surplus."""
-        config = self._sc_config()
-        prices = self._make_prices([0.10])
-        # PV=4kW >> load=0.5kW → big surplus charges battery
-        optimizer = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 4.0)
-        result = optimizer.optimize(
-            prices=prices,
-            current_slot=prices[0].time,
-            current_soc=50.0,
-        )
-        if result.soc_trajectory:
-            slot_time = prices[0].time
-            start_soc, end_soc = result.soc_trajectory[slot_time]
-            if list(result.schedule.values())[0].mode == BatteryMode.SELF_CONSUMPTION:
-                assert end_soc > start_soc, (
-                    f"SOC should increase with PV surplus, got {start_soc}→{end_soc}"
-                )
-
-    def test_self_consumption_ac_charge_mode_disabled(self):
-        """Self_consumption entries should have ac_charge_mode=disabled."""
-        config = self._sc_config()
+    def test_charge_with_pv_sets_pv_priority(self):
+        """CHARGE entries during PV production should have ac_charge_mode=pv_priority."""
+        config = self._pv_config()
         prices = self._make_prices([0.10])
         optimizer = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 3.0)
         result = optimizer.optimize(
@@ -1051,6 +1002,121 @@ class TestDPOptimizerSelfConsumption:
             current_soc=50.0,
         )
         for entry in result.schedule.values():
-            if entry.mode == BatteryMode.SELF_CONSUMPTION:
-                assert entry.ac_charge_mode == "disabled"
-                assert entry.export_rate == 0
+            if entry.mode == BatteryMode.CHARGE:
+                assert entry.ac_charge_mode == "pv_priority", (
+                    f"CHARGE during PV should use pv_priority, got {entry.ac_charge_mode}"
+                )
+
+    def test_hold_soc_increases_with_pv_surplus(self):
+        """Battery SOC should increase in HOLD when PV surplus charges battery."""
+        config = self._pv_config(export_rate_multiplier=1.0)
+        prices = self._make_prices([0.05, 0.30])
+        # PV=4kW >> load=0.5kW → big surplus charges battery in HOLD (free, no grid)
+        optimizer = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 4.0)
+        result = optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=15.0,
+        )
+        # HOLD preferred over CHARGE: same PV charging, but HOLD doesn't use grid
+        entry = list(result.schedule.values())[0]
+        assert entry.mode in (BatteryMode.HOLD, BatteryMode.CHARGE), (
+            f"Expected HOLD or CHARGE during PV, got {entry.mode.name}"
+        )
+        if result.soc_trajectory:
+            slot_time = prices[0].time
+            start_soc, end_soc = result.soc_trajectory[slot_time]
+            assert end_soc > start_soc, (
+                f"SOC should increase with PV surplus, got {start_soc}→{end_soc}"
+            )
+
+    def test_hold_cost_reduced_by_pv(self):
+        """HOLD during PV should cost less than HOLD at night (PV covers load)."""
+        config = self._pv_config()
+        # Same price for 2 slots
+        prices = self._make_prices([0.10, 0.10])
+
+        # Night: no PV, grid covers all load
+        optimizer_night = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 0.0)
+        result_night = optimizer_night.optimize(
+            prices=prices, current_slot=prices[0].time, current_soc=50.0,
+        )
+        # Day: PV=3kW >> load, grid cost should be zero
+        optimizer_day = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 3.0)
+        result_day = optimizer_day.optimize(
+            prices=prices, current_slot=prices[0].time, current_soc=50.0,
+        )
+        # With PV, the schedule should be at least as good (less costly) as without
+        # We can't compare DP values directly, but CHARGE should appear with PV
+        # (free charging is better than hold-and-pay-grid)
+        day_charges = sum(1 for e in result_day.schedule.values() if e.mode == BatteryMode.CHARGE)
+        night_charges = sum(1 for e in result_night.schedule.values() if e.mode == BatteryMode.CHARGE)
+        assert day_charges >= night_charges, "PV should make CHARGE more attractive (free surplus)"
+
+    def test_discharge_reduced_by_pv(self):
+        """During PV production, battery discharge should be less (PV covers part of load)."""
+        config = self._pv_config()
+        # High price: optimizer wants to discharge to avoid grid import
+        prices = self._make_prices([0.20])
+
+        # Without PV: battery covers 0.5kW load
+        optimizer_no_pv = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 0.0)
+        result_no_pv = optimizer_no_pv.optimize(
+            prices=prices, current_slot=prices[0].time, current_soc=50.0,
+        )
+        # With PV=0.3kW: battery only needs to cover 0.2kW
+        optimizer_pv = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 0.3)
+        result_pv = optimizer_pv.optimize(
+            prices=prices, current_slot=prices[0].time, current_soc=50.0,
+        )
+        # With PV offset, SOC should drop less during discharge
+        if result_no_pv.soc_trajectory and result_pv.soc_trajectory:
+            slot = prices[0].time
+            _, end_no_pv = result_no_pv.soc_trajectory[slot]
+            _, end_pv = result_pv.soc_trajectory[slot]
+            assert end_pv >= end_no_pv, (
+                f"PV should reduce discharge drain: end_pv={end_pv}% vs end_no_pv={end_no_pv}%"
+            )
+
+    def test_no_pv_predictor_same_as_zero_pv(self):
+        """Without pv_predictor, modes behave as if PV=0 (no offset)."""
+        config = self._pv_config()
+        prices = self._make_prices([0.10, 0.10])
+        optimizer = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=None)
+        result = optimizer.optimize(
+            prices=prices, current_slot=prices[0].time, current_soc=50.0,
+        )
+        # No SELF_CONSUMPTION and schedule should be valid
+        sc_entries = [e for e in result.schedule.values() if e.mode == BatteryMode.SELF_CONSUMPTION]
+        assert len(sc_entries) == 0
+        assert len(result.schedule) == 2
+
+    def test_pv_export_revenue_in_hold(self):
+        """HOLD with PV > load should earn export revenue (not cost full grid price)."""
+        config = self._pv_config(export_rate_multiplier=1.0)
+        # Low price — no incentive to discharge, HOLD is fine
+        prices = self._make_prices([0.02])
+        # PV=2kW > load=0.5kW, battery at min — can't discharge, HOLD exports PV surplus
+        optimizer = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 2.0)
+        result = optimizer.optimize(
+            prices=prices, current_slot=prices[0].time, current_soc=10.0,
+        )
+        # At min SOC with low price, HOLD or CHARGE expected (not discharge)
+        entry = list(result.schedule.values())[0]
+        assert entry.mode in (BatteryMode.HOLD, BatteryMode.CHARGE), (
+            f"At min SOC with low price, expected HOLD/CHARGE, got {entry.mode.name}"
+        )
+
+    def test_pv_adds_to_export_discharge(self):
+        """DISCHARGE_EXPORT with PV should earn more than without PV."""
+        config = self._pv_config(export_rate_multiplier=1.0)
+        # Very high price to make export attractive
+        prices = self._make_prices([0.50])
+        # With PV=2kW, export = battery + PV - load
+        optimizer = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 2.0)
+        result = optimizer.optimize(
+            prices=prices, current_slot=prices[0].time, current_soc=50.0,
+        )
+        export_entries = [e for e in result.schedule.values()
+                         if e.mode == BatteryMode.DISCHARGE and e.export_rate and e.export_rate > 0]
+        assert len(export_entries) > 0, "High price + PV should trigger export discharge"

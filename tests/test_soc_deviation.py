@@ -746,6 +746,9 @@ class TestExpectedSocCalculationWithLearnedRate:
             def _predict_load_kw(self, hour):
                 return 0.5
 
+            def _predict_pv_kw(self, hour):
+                return 0.0
+
         MockCalculateOptimizer.calculate_expected_soc_schedule = BatteryOptimizer.calculate_expected_soc_schedule
 
         optimizer = MockCalculateOptimizer()

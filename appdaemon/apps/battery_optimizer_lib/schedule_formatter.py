@@ -575,12 +575,14 @@ class ScheduleFormatter:
         local_tz,
         align_to_slot_func: Callable[[datetime.datetime], datetime.datetime],
         dp_soc_trajectory: Optional[Dict[datetime.datetime, Tuple[float, float]]] = None,
+        predict_load_kw: Optional[Callable[[datetime.datetime], float]] = None,
+        predict_pv_kw: Optional[Callable[[datetime.datetime], float]] = None,
     ) -> str:
         """Generate a markdown table of the schedule for HA dashboard display.
 
         Shows the actual WIT mode that will be sent to the inverter, export
-        status, SOC trajectory, and price — giving full visibility into what
-        the optimizer is doing.
+        status, SOC trajectory, price, and estimated load/PV — giving full
+        visibility into what the optimizer is doing.
 
         Args:
             schedule: Schedule entries keyed by slot datetime
@@ -588,6 +590,8 @@ class ScheduleFormatter:
             local_tz: Local timezone for display
             align_to_slot_func: Function to align datetime to slot boundary
             dp_soc_trajectory: DP optimizer's SOC trajectory (start, end) per slot
+            predict_load_kw: Load predictor function (kW) per slot
+            predict_pv_kw: PV production predictor function (kW) per slot
         """
         if not schedule:
             return "No schedule available"
@@ -598,8 +602,8 @@ class ScheduleFormatter:
         now_slot = align_to_slot_func(now)
 
         lines: List[str] = []
-        lines.append("| Time | Mode | Export | SOC | Price |")
-        lines.append("|------|------|--------|-----|-------|")
+        lines.append("| Time | Mode | Export | SOC | Load | PV | Price |")
+        lines.append("|------|------|--------|-----|------|-----|-------|")
 
         for hour in sorted(schedule.keys()):
             entry = schedule[hour]
@@ -630,11 +634,24 @@ class ScheduleFormatter:
                     start_soc, end_soc = soc_data
                     soc_str = f"{start_soc:.0f}→{end_soc:.0f}%"
 
+            # Estimated load
+            load_str = ""
+            if predict_load_kw is not None:
+                load_val = predict_load_kw(hour)
+                load_str = f"{load_val:.2f}"
+
+            # Estimated PV
+            pv_str = ""
+            if predict_pv_kw is not None:
+                pv_val = predict_pv_kw(hour)
+                if pv_val > 0:
+                    pv_str = f"{pv_val:.2f}"
+
             # Price from reason (format: "X.XXXX EUR/kWh ...")
             price_str = self._extract_price_from_reason(entry.reason)
 
             lines.append(
-                f"| {time_str} | {icon} {mode_name} | {export_str} | {soc_str} | {price_str} |"
+                f"| {time_str} | {icon} {mode_name} | {export_str} | {soc_str} | {load_str} | {pv_str} | {price_str} |"
             )
 
         return "\n".join(lines)

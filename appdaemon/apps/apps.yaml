@@ -103,7 +103,7 @@ battery_optimizer:
   # Household load power sensor (W) used for statistical load profiling
   # Prefer a sensor representing net house load (consumption minus PV)
   # Leave empty to disable probabilistic load profiling
-  load_power_sensor: "sensor.growatt_power_to_load"
+  load_power_sensor: "sensor.growatt_house_consumption"
 
   # Schedule resolution in minutes (15 = quarter-hourly plan)
   slot_minutes: 15
@@ -153,7 +153,9 @@ battery_optimizer:
   # Export rate multiplier (1.0 = no percentage reduction, deduction is fixed via grid_export_fee)
   export_rate_multiplier: 1.0
 
-  # Optional battery wear cost per kWh (discourages cycling at marginal prices)
+  # Battery wear cost per kWh (discourages cycling at marginal prices)
+  # Growatt HOPE 14.3L-A1: 3811.50 EUR (ar PVN, pēc atlaides) - 2287.47 EUR (valsts atbalsts 38.12%) = 1524.03 EUR
+  # 1524.03 / (8000 cycles × 14.3 kWh × 0.80 DOD) = 0.017
   battery_wear_cost_eur_kwh: 0.017
 
   # ==========================================================================

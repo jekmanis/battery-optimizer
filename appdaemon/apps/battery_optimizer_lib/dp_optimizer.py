@@ -416,16 +416,24 @@ class DPOptimizer:
             price = slots_list[t].price
             buy_price = price + cfg.grid_fee
             fraction = slot_fractions_list[t]
-            discharge_kwh = min(load_kw_list[t], cfg.discharge_rate) * cfg.slot_hours * fraction
+            slot_load_kw = load_kw_list[t]
+            slot_pv_kw = pv_kw_list[t] if pv_kw_list is not None else 0.0
+            net_load_kw = max(0.0, slot_load_kw - slot_pv_kw)
+            pv_surplus_kw = max(0.0, slot_pv_kw - slot_load_kw)
+            discharge_kwh = min(net_load_kw, cfg.discharge_rate) * cfg.slot_hours * fraction
             slot_charge_rate = charge_rates_list[t]
             charge_energy_kwh = slot_charge_rate * cfg.efficiency * cfg.slot_hours * fraction
             charge_cost_kwh = slot_charge_rate * cfg.slot_hours * fraction
+            # PV surplus charges battery for free (pv_priority); grid covers rest
+            pv_free_charge_kwh = min(pv_surplus_kw, slot_charge_rate) * cfg.slot_hours * fraction
+            net_load_kwh = net_load_kw * cfg.slot_hours * fraction
 
             # Export variables
             sell_price = price * cfg.export_rate_multiplier - cfg.grid_export_fee
             export_discharge_kwh = cfg.effective_export_discharge_rate * cfg.slot_hours * fraction
-            load_kwh = load_kw_list[t] * cfg.slot_hours * fraction
-            exported_kwh_full = max(0.0, export_discharge_kwh - load_kwh)
+            load_kwh = slot_load_kw * cfg.slot_hours * fraction
+            pv_kwh = slot_pv_kw * cfg.slot_hours * fraction
+            exported_kwh_full = max(0.0, export_discharge_kwh + pv_kwh - load_kwh)
 
             # Reset next_dp buffers using slice assignment (faster than nested loop)
             next_dp[:] = _neg_inf_row
@@ -434,6 +442,14 @@ class DPOptimizer:
             next_prev_action = [None] * n_states
             next_prev_partial = [False] * n_states
             next_prev_export = [False] * n_states
+
+            # HOLD precomputation (slot-level constants)
+            hold_grid_cost = buy_price * net_load_kwh
+            # PV surplus charges battery for free (up to charge rate), rest exports
+            hold_pv_charge_kw = min(pv_surplus_kw, slot_charge_rate)
+            hold_pv_charge_max = hold_pv_charge_kw * cfg.efficiency * cfg.slot_hours * fraction
+            hold_excess_pv_kwh = max(0.0, pv_surplus_kw - slot_charge_rate) * cfg.slot_hours * fraction
+            hold_sell = max(0.0, sell_price)
 
             slot_trace = []
             trace_this_slot = self._decision_log_level >= 3 and fraction > 0.5
@@ -445,15 +461,27 @@ class DPOptimizer:
                 curr_tie = dp_tie[idx]
                 curr_soc = cfg.min_soc + (idx * step_kwh / cfg.battery_capacity) * 100
 
-                # HOLD - costs grid price for load
+                # HOLD - no grid charge; PV covers load, surplus charges battery for free
                 hold_updated = False
-                hold_cost = buy_price * discharge_kwh
-                hold_val = val - hold_cost
-                if _should_update(next_dp[idx], next_dp_tie[idx], hold_val, curr_tie):
-                    next_dp[idx] = hold_val
-                    next_dp_tie[idx] = curr_tie
-                    next_prev_idx[idx] = idx
-                    next_prev_action[idx] = BatteryMode.HOLD
+                if hold_pv_charge_max > 0:
+                    new_energy = min(max_energy, energy_levels[idx] + hold_pv_charge_max)
+                    actual_stored = new_energy - energy_levels[idx]
+                    # PV that couldn't be stored (battery full) + excess beyond charge rate → export
+                    if actual_stored < hold_pv_charge_max - 1e-9:
+                        unused_kwh = (hold_pv_charge_max - actual_stored) / cfg.efficiency
+                    else:
+                        unused_kwh = 0.0
+                    export_revenue = hold_sell * (hold_excess_pv_kwh + unused_kwh)
+                    hold_next_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "floor")
+                else:
+                    export_revenue = hold_sell * hold_excess_pv_kwh
+                    hold_next_idx = idx
+                hold_val = val - hold_grid_cost + export_revenue
+                if _should_update(next_dp[hold_next_idx], next_dp_tie[hold_next_idx], hold_val, curr_tie):
+                    next_dp[hold_next_idx] = hold_val
+                    next_dp_tie[hold_next_idx] = curr_tie
+                    next_prev_idx[hold_next_idx] = idx
+                    next_prev_action[hold_next_idx] = BatteryMode.HOLD
                     hold_updated = True
 
                 discharge_attempted = False
@@ -462,8 +490,9 @@ class DPOptimizer:
                 discharge_next_idx = None
                 discharge_next_val = None
 
-                # CHARGE
-                if charge_energy_kwh > 0:
+                # CHARGE (grid_charge): only when grid is actually needed to supplement PV
+                # When PV surplus fully covers charge rate, HOLD already handles it
+                if charge_energy_kwh > 0 and pv_free_charge_kwh < charge_cost_kwh - 1e-6:
                     new_energy = energy_levels[idx] + charge_energy_kwh
                     actual_charge_energy = charge_energy_kwh
                     actual_charge_cost = charge_cost_kwh
@@ -479,7 +508,8 @@ class DPOptimizer:
 
                     if actual_charge_energy > 0:
                         next_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "floor")
-                        next_val = val - (buy_price * actual_charge_cost) - (buy_price * discharge_kwh)
+                        grid_charge_cost = max(0.0, actual_charge_cost - pv_free_charge_kwh)
+                        next_val = val - (buy_price * grid_charge_cost) - (buy_price * net_load_kwh)
                         charge_tie_bias = (-price * tie_price_weight) + (t * tie_time_weight)
                         next_tie = curr_tie + charge_tie_bias
                         if _should_update(next_dp[next_idx], next_dp_tie[next_idx], next_val, next_tie):
@@ -537,10 +567,10 @@ class DPOptimizer:
                     elif energy_levels[idx] > min_energy + export_discharge_kwh * 0.3:
                         is_partial_export = True
                         actual_export_kwh = energy_levels[idx] - min_energy
-                        remaining_load = load_kwh - actual_export_kwh
-                        actual_exported = max(0.0, actual_export_kwh - load_kwh)
+                        remaining_load = max(0.0, load_kwh - pv_kwh - actual_export_kwh)
+                        actual_exported = max(0.0, actual_export_kwh + pv_kwh - load_kwh)
                         if remaining_load > 0:
-                            # Battery can't even cover load — grid covers rest
+                            # Battery + PV can't cover load — grid covers rest
                             next_val = val - (buy_price * remaining_load) - (discharge_cost_per_kwh * actual_export_kwh)
                         else:
                             next_val = val + sell_price * actual_exported - (discharge_cost_per_kwh * actual_export_kwh)
@@ -559,41 +589,6 @@ class DPOptimizer:
                             next_prev_partial[next_idx] = is_partial_export
                             next_prev_export[next_idx] = True
 
-                # SELF_CONSUMPTION (PV-aware autonomous mode)
-                if pv_kw_list is not None and pv_kw_list[t] > 0:
-                    pv = pv_kw_list[t]
-                    load = load_kw_list[t]
-
-                    # PV serves load first, surplus charges battery (free)
-                    pv_surplus = max(0.0, pv - load)
-                    pv_charge_kw = min(pv_surplus, slot_charge_rate)
-                    pv_charge_kwh = pv_charge_kw * cfg.efficiency * cfg.slot_hours * fraction
-
-                    # Load deficit served by battery
-                    load_deficit = max(0.0, load - pv)
-                    battery_discharge_kw = min(load_deficit, cfg.discharge_rate)
-                    battery_discharge_kwh = battery_discharge_kw * cfg.slot_hours * fraction
-
-                    # Net battery energy change
-                    net_delta = pv_charge_kwh - battery_discharge_kwh
-                    new_energy = energy_levels[idx] + net_delta
-                    new_energy = max(min_energy, min(max_energy, new_energy))
-
-                    # Grid import for uncovered load
-                    remaining_load_kw = max(0.0, load - pv - battery_discharge_kw)
-                    grid_import_kwh = remaining_load_kw * cfg.slot_hours * fraction
-
-                    # Cost: grid import + wear on battery discharge portion
-                    sc_cost = buy_price * grid_import_kwh + discharge_cost_per_kwh * battery_discharge_kwh
-                    sc_val = val - sc_cost
-
-                    next_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "round")
-                    if _should_update(next_dp[next_idx], next_dp_tie[next_idx], sc_val, curr_tie):
-                        next_dp[next_idx] = sc_val
-                        next_dp_tie[next_idx] = curr_tie
-                        next_prev_idx[next_idx] = idx
-                        next_prev_action[next_idx] = BatteryMode.SELF_CONSUMPTION
-
                 # Trace collection for logging
                 if trace_this_slot and discharge_attempted:
                     next_soc_discharge = cfg.min_soc + (discharge_next_idx * step_kwh / cfg.battery_capacity) * 100 if discharge_next_idx is not None else 0
@@ -602,7 +597,7 @@ class DPOptimizer:
                         "from_idx": idx,
                         "from_val": val,
                         "hold_val": hold_val,
-                        "hold_cost": hold_cost,
+                        "hold_cost": hold_grid_cost,
                         "hold_updated": hold_updated,
                         "discharge_attempted": discharge_attempted,
                         "discharge_updated": discharge_updated,
@@ -761,10 +756,15 @@ class DPOptimizer:
             buy_price = price + cfg.grid_fee
             fraction = slot_fractions[partial_index]
             slot_load_kw = load_kw[partial_index]
-            discharge_kwh = min(slot_load_kw, cfg.discharge_rate) * cfg.slot_hours * fraction
+            slot_pv_kw = pv_kw[partial_index] if pv_kw is not None else 0.0
+            net_load_kw = max(0.0, slot_load_kw - slot_pv_kw)
+            pv_surplus_kw = max(0.0, slot_pv_kw - slot_load_kw)
+            discharge_kwh = min(net_load_kw, cfg.discharge_rate) * cfg.slot_hours * fraction
             slot_charge_rate = charge_rates_per_slot[partial_index]
             charge_energy_kwh = slot_charge_rate * cfg.efficiency * cfg.slot_hours * fraction
             charge_cost_kwh = slot_charge_rate * cfg.slot_hours * fraction
+            pv_free_charge_kwh = min(pv_surplus_kw, slot_charge_rate) * cfg.slot_hours * fraction
+            net_load_kwh = net_load_kw * cfg.slot_hours * fraction
 
             # Remaining slots for DP
             remaining_slice = slice(partial_index + 1, None)
@@ -777,12 +777,22 @@ class DPOptimizer:
             # Candidates: (action, new_energy, immediate_val, start_idx_override, is_partial, is_export)
             candidates = []
 
-            # HOLD
-            hold_cost = buy_price * discharge_kwh
-            candidates.append((BatteryMode.HOLD, start_energy, -hold_cost, None, False, False))
+            # HOLD — no grid charge; PV covers load, surplus charges battery for free
+            sell_price = price * cfg.export_rate_multiplier - cfg.grid_export_fee
+            hold_pv_charge_kw = min(pv_surplus_kw, slot_charge_rate)
+            hold_pv_energy = hold_pv_charge_kw * cfg.efficiency * cfg.slot_hours * fraction
+            hold_new_energy = min(max_energy, start_energy + hold_pv_energy)
+            hold_actual_stored = hold_new_energy - start_energy
+            # PV that couldn't be stored + excess beyond charge rate → export
+            hold_unused_kwh = (hold_pv_energy - hold_actual_stored) / cfg.efficiency if hold_actual_stored < hold_pv_energy - 1e-9 else 0.0
+            hold_excess_pv = max(0.0, pv_surplus_kw - slot_charge_rate) * cfg.slot_hours * fraction
+            hold_export_revenue = max(0.0, sell_price) * (hold_excess_pv + hold_unused_kwh)
+            hold_grid_cost = buy_price * net_load_kwh
+            hold_idx_override = _energy_to_index(hold_new_energy, min_energy, step_kwh, n_states, "floor") if hold_pv_energy > 0 else None
+            candidates.append((BatteryMode.HOLD, hold_new_energy, -hold_grid_cost + hold_export_revenue, hold_idx_override, False, False))
 
-            # CHARGE
-            if charge_energy_kwh > 0:
+            # CHARGE (grid_charge): only when grid is actually needed to supplement PV
+            if charge_energy_kwh > 0 and pv_free_charge_kwh < charge_cost_kwh - 1e-6:
                 new_energy = start_energy + charge_energy_kwh
                 actual_charge_energy = charge_energy_kwh
                 actual_charge_cost = charge_cost_kwh
@@ -796,7 +806,8 @@ class DPOptimizer:
                         actual_charge_energy = 0
                 if actual_charge_energy > 0:
                     start_idx_override = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "floor")
-                    charge_immediate_cost = -buy_price * actual_charge_cost - buy_price * discharge_kwh
+                    grid_charge_cost = max(0.0, actual_charge_cost - pv_free_charge_kwh)
+                    charge_immediate_cost = -buy_price * grid_charge_cost - buy_price * net_load_kwh
                     candidates.append((
                         BatteryMode.CHARGE,
                         new_energy,
@@ -833,11 +844,11 @@ class DPOptimizer:
                         False,
                     ))
 
-            # DISCHARGE_EXPORT (full rate with grid selling)
-            sell_price = price * cfg.export_rate_multiplier - cfg.grid_export_fee
+            # DISCHARGE_EXPORT (full rate with grid selling, PV adds to export)
             export_discharge_kwh = cfg.effective_export_discharge_rate * cfg.slot_hours * fraction
             load_kwh_slot = slot_load_kw * cfg.slot_hours * fraction
-            exported_kwh = max(0.0, export_discharge_kwh - load_kwh_slot)
+            pv_kwh_slot = slot_pv_kw * cfg.slot_hours * fraction
+            exported_kwh = max(0.0, export_discharge_kwh + pv_kwh_slot - load_kwh_slot)
 
             if sell_price > 0 and exported_kwh > 0:
                 new_energy = start_energy - export_discharge_kwh
@@ -854,8 +865,8 @@ class DPOptimizer:
                     ))
                 elif start_energy > min_energy + export_discharge_kwh * 0.3:
                     actual_export_kwh = start_energy - min_energy
-                    remaining_load = load_kwh_slot - actual_export_kwh
-                    actual_exported = max(0.0, actual_export_kwh - load_kwh_slot)
+                    remaining_load = max(0.0, load_kwh_slot - pv_kwh_slot - actual_export_kwh)
+                    actual_exported = max(0.0, actual_export_kwh + pv_kwh_slot - load_kwh_slot)
                     if remaining_load > 0:
                         export_value = -buy_price * remaining_load - discharge_cost_per_kwh * actual_export_kwh
                     else:
@@ -868,30 +879,6 @@ class DPOptimizer:
                         True,
                         True,
                     ))
-
-            # SELF_CONSUMPTION (PV-aware: free PV charging + autonomous load serving)
-            slot_pv_kw = pv_kw[partial_index] if pv_kw is not None else 0.0
-            if slot_pv_kw > 0:
-                pv_surplus = max(0.0, slot_pv_kw - slot_load_kw)
-                pv_charge_kw = min(pv_surplus, charge_rates_per_slot[partial_index])
-                pv_charge_kwh = pv_charge_kw * cfg.efficiency * cfg.slot_hours * fraction
-                load_deficit = max(0.0, slot_load_kw - slot_pv_kw)
-                battery_discharge_kw = min(load_deficit, cfg.discharge_rate)
-                battery_discharge_kwh_sc = battery_discharge_kw * cfg.slot_hours * fraction
-                net_delta = pv_charge_kwh - battery_discharge_kwh_sc
-                new_energy = max(min_energy, min(max_energy, start_energy + net_delta))
-                remaining_load_kw = max(0.0, slot_load_kw - slot_pv_kw - battery_discharge_kw)
-                grid_import_kwh = remaining_load_kw * cfg.slot_hours * fraction
-                sc_cost = buy_price * grid_import_kwh + discharge_cost_per_kwh * battery_discharge_kwh_sc
-                start_idx_override = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "round")
-                candidates.append((
-                    BatteryMode.SELF_CONSUMPTION,
-                    new_energy,
-                    -sc_cost,
-                    start_idx_override,
-                    False,
-                    False,
-                ))
 
             best_action = BatteryMode.HOLD
             best_is_partial = False
@@ -1002,9 +989,8 @@ class DPOptimizer:
             entry = ScheduleEntry(time=hour, mode=action, reason=reason)
             if action == BatteryMode.DISCHARGE:
                 entry.export_rate = 100 if is_export else 0
-            elif action == BatteryMode.SELF_CONSUMPTION:
-                entry.export_rate = 0
-                entry.ac_charge_mode = "disabled"
+            elif action == BatteryMode.CHARGE and pv > 0:
+                entry.ac_charge_mode = "pv_priority"
             schedule_local[hour] = entry
 
         return schedule_local, idx_trajectory, best_value

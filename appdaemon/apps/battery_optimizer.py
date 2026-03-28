@@ -416,7 +416,7 @@ class BatteryOptimizer(hass.Hass):
             temp_after_idle_predictor=self.learning_engine.predict_temp_after_idle,
             log_fn=self.log,
             decision_log_level=self.config.decision_log_level,
-            pv_predictor=self._predict_pv_kw if self.config.enable_self_consumption else None,
+            pv_predictor=self._predict_pv_kw,
         )
 
         # Run optimization
@@ -465,8 +465,6 @@ class BatteryOptimizer(hass.Hass):
             parts.append(f"{result.self_consume_slot_count} discharge(self)")
         if result.export_slot_count:
             parts.append(f"{result.export_slot_count} discharge(export)")
-        if result.self_consumption_count:
-            parts.append(f"{result.self_consumption_count} self_consumption")
         parts.append(f"{result.hold_count} hold")
         self.log(f"Schedule generated: {', '.join(parts)} slots "
                  f"(slot={self.config.slot_minutes}min, "
@@ -691,12 +689,14 @@ class BatteryOptimizer(hass.Hass):
                     current_soc = min(self.max_soc, current_soc + soc_increase)
 
             elif entry.mode == BatteryMode.DISCHARGE:
-                # Discharging: export drains at full rate, self-consumption at load rate
+                # Discharging: export drains at full rate, self-consumption at net load after PV
                 if entry.export_rate is not None and entry.export_rate > 0:
                     energy_removed = self.config.effective_export_discharge_rate * self.config.slot_hours
                 else:
                     load_kw = self._predict_load_kw(hour)
-                    energy_removed = min(load_kw, self.config.discharge_rate) * self.config.slot_hours
+                    pv_kw = self._predict_pv_kw(hour)
+                    net_load_kw = max(0.0, load_kw - pv_kw)
+                    energy_removed = min(net_load_kw, self.config.discharge_rate) * self.config.slot_hours
                 soc_decrease = (energy_removed / self.config.battery_capacity) * 100
                 current_soc = max(self.min_soc, current_soc - soc_decrease)
                 # Temperature cools toward ambient during discharge (no active warming)
@@ -705,32 +705,17 @@ class BatteryOptimizer(hass.Hass):
                         current_temp, self.config.slot_minutes
                     )
 
-            elif entry.mode == BatteryMode.SELF_CONSUMPTION:
-                # PV-aware: battery can charge from PV surplus or discharge to cover load deficit
+            else:  # HOLD
+                # Hold: no grid charge, but PV surplus charges battery for free
                 pv_kw = self._predict_pv_kw(hour)
                 load_kw = self._predict_load_kw(hour)
                 pv_surplus = max(0.0, pv_kw - load_kw)
-                pv_charge_kw = min(pv_surplus, self.config.charge_rate)
-                pv_charge_kwh = pv_charge_kw * self.config.efficiency * self.config.slot_hours
-                load_deficit = max(0.0, load_kw - pv_kw)
-                battery_discharge_kwh = min(load_deficit, self.config.discharge_rate) * self.config.slot_hours
-                net_energy = pv_charge_kwh - battery_discharge_kwh
-                soc_change = (net_energy / self.config.battery_capacity) * 100
-                current_soc = max(self.min_soc, min(self.max_soc, current_soc + soc_change))
-                if current_temp is not None and self.learning_engine:
-                    if pv_surplus > load_deficit:
-                        current_temp = self.learning_engine.predict_temp_after_duration(
-                            current_temp, self.config.slot_minutes
-                        )
-                    else:
-                        current_temp = self.learning_engine.predict_temp_after_idle(
-                            current_temp, self.config.slot_minutes
-                        )
-
-            else:  # HOLD
-                # In hold mode, grid covers base load
-                # Battery has minimal standby drain, negligible for hourly planning
-                # Temperature cools toward ambient during idle
+                if pv_surplus > 0:
+                    pv_charge_kw = min(pv_surplus, self.config.charge_rate)
+                    energy_added = pv_charge_kw * self.config.efficiency * self.config.slot_hours
+                    soc_increase = (energy_added / self.config.battery_capacity) * 100
+                    current_soc = min(self.max_soc, current_soc + soc_increase)
+                # Temperature cools toward ambient during idle (PV charge doesn't warm battery significantly)
                 if current_temp is not None and self.learning_engine:
                     current_temp = self.learning_engine.predict_temp_after_idle(
                         current_temp, self.config.slot_minutes
@@ -829,7 +814,6 @@ class BatteryOptimizer(hass.Hass):
         # ready yet (Solcast HACS integration loads attributes asynchronously).
         # Schedule a re-optimization after 30s when sensors are more likely populated.
         if (is_startup
-                and self.config.enable_self_consumption
                 and not self._pv_forecast_service.has_forecast):
             self.log(
                 "PV forecast unavailable at startup — scheduling re-optimization "
@@ -862,13 +846,13 @@ class BatteryOptimizer(hass.Hass):
         pv_power = self._get_pv_power()
         if pv_power > self.pv_threshold and self.current_mode == BatteryMode.CHARGE:
             self.log(f"Solar override: PV={pv_power}W > threshold={self.pv_threshold}W, "
-                     f"switching from charge to self_consumption")
+                     f"switching from charge to hold (PV covers load, surplus exports)")
             entry = ScheduleEntry(
                 time=self._align_to_slot(self.datetime()),
-                mode=BatteryMode.SELF_CONSUMPTION,
+                mode=BatteryMode.HOLD,
                 reason="solar_override",
             )
-            self._handle_mode_transition(BatteryMode.SELF_CONSUMPTION)
+            self._handle_mode_transition(BatteryMode.HOLD)
             self._direct_control.apply_mode(entry)
             return
 
@@ -1015,6 +999,23 @@ class BatteryOptimizer(hass.Hass):
             now = now.replace(tzinfo=local_tz)
         current_slot = self._align_to_slot(now)
 
+        # Pre-execution SOC check: if actual SOC is significantly behind plan,
+        # recalculate the schedule before blindly applying the planned mode.
+        # This prevents e.g. starting Max Export when the preceding charge slot
+        # didn't reach its target SOC.
+        current_soc = self._get_current_soc()
+        if current_soc is not None and self.expected_soc_schedule:
+            expected_soc = self.expected_soc_schedule.get(current_slot)
+            if expected_soc is not None:
+                soc_shortfall = expected_soc - current_soc
+                if soc_shortfall > self.config.soc_shortfall_recalc_threshold:
+                    self.log(f"SOC behind plan: {current_soc:.1f}% vs expected {expected_soc:.1f}% "
+                             f"(shortfall: {soc_shortfall:.1f}%), recalculating before executing slot")
+                    self._recalculate_remaining_schedule(current_soc)
+                    # _recalculate_remaining_schedule calls execute_scheduled_mode
+                    # internally with the updated schedule, so we return here.
+                    return
+
         entry = self.schedule.get(current_slot)
 
         # If not found, try matching by time components with different tz representations
@@ -1086,7 +1087,7 @@ class BatteryOptimizer(hass.Hass):
         now = self.datetime()
 
         # Stop discharge if SOC too low
-        if current_soc <= self.min_soc and self.current_mode in (BatteryMode.DISCHARGE, BatteryMode.SELF_CONSUMPTION):
+        if current_soc <= self.min_soc and self.current_mode == BatteryMode.DISCHARGE:
             self.log(f"Safety: HOLD (battery depleted at {current_soc}%)")
             entry = ScheduleEntry(
                 time=self._align_to_slot(now),
@@ -2089,6 +2090,8 @@ class BatteryOptimizer(hass.Hass):
                 local_tz=local_tz,
                 align_to_slot_func=self._align_to_slot,
                 dp_soc_trajectory=self._last_dp_soc_trajectory,
+                predict_load_kw=self._predict_load_kw,
+                predict_pv_kw=self._predict_pv_kw,
             )
 
             # Set sensor state

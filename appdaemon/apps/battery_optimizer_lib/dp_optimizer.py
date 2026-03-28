@@ -509,6 +509,11 @@ class DPOptimizer:
                     if actual_charge_energy > 0:
                         next_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "floor")
                         grid_charge_cost = max(0.0, actual_charge_cost - pv_free_charge_kwh)
+                        # Skip CHARGE when PV fully covers it — HOLD already handles PV charging
+                        if grid_charge_cost < 1e-6:
+                            actual_charge_energy = 0
+
+                    if actual_charge_energy > 0:
                         next_val = val - (buy_price * grid_charge_cost) - (buy_price * net_load_kwh)
                         charge_tie_bias = (-price * tie_price_weight) + (t * tie_time_weight)
                         next_tie = curr_tie + charge_tie_bias

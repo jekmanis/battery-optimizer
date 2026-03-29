@@ -431,6 +431,27 @@ class BatteryOptimizer(hass.Hass):
 
         schedule = result.schedule
 
+        # Cloud-safe conversion: HOLD → DISCHARGE(to load) during PV hours.
+        # Since discharge_to_load charges from PV surplus (confirmed on Growatt WIT),
+        # it behaves identically to HOLD when PV is available. But when clouds kill
+        # PV, battery covers load instead of grid — cheaper when buy_price > wear.
+        cloud_safe_count = 0
+        prices_by_slot_map = {p.time: p.price for p in slots_sorted_by_time}
+        for slot_time, entry in schedule.items():
+            if entry.mode == BatteryMode.HOLD:
+                pv_kw = self._predict_pv_kw(slot_time)
+                if pv_kw > 0:
+                    price = prices_by_slot_map.get(slot_time, 0.0)
+                    buy_price = price + self.config.grid_fee
+                    if buy_price > self.config.battery_wear_cost:
+                        entry.mode = BatteryMode.DISCHARGE
+                        entry.export_rate = 0
+                        entry.reason += " [cloud-safe]"
+                        cloud_safe_count += 1
+        if cloud_safe_count > 0:
+            self.log(f"Cloud-safe: converted {cloud_safe_count} HOLD→DISCHARGE(to load) "
+                     f"slots during PV hours (buy_price > wear_cost)")
+
         # Project costs for sensor exposure
         has_charge_slots = any(e.mode == BatteryMode.CHARGE for e in schedule.values())
         if has_charge_slots:
@@ -624,6 +645,9 @@ class BatteryOptimizer(hass.Hass):
             current_temp=current_temp if self.learning_engine else None,
             get_charge_rate_for_soc=get_charge_rate,
             predict_temp_after_duration=predict_temp,
+            battery_capacity=self.config.battery_capacity,
+            efficiency=self.config.efficiency,
+            max_soc=self.max_soc,
         )
 
     def calculate_expected_soc_schedule(
@@ -697,6 +721,13 @@ class BatteryOptimizer(hass.Hass):
                     pv_kw = self._predict_pv_kw(hour)
                     net_load_kw = max(0.0, load_kw - pv_kw)
                     energy_removed = min(net_load_kw, self.config.discharge_rate) * self.config.slot_hours
+                    # PV surplus charges battery (confirmed: discharge_to_load charges from PV)
+                    pv_surplus = max(0.0, pv_kw - load_kw)
+                    if pv_surplus > 0:
+                        pv_charge_kw = min(pv_surplus, self.config.charge_rate)
+                        energy_added = pv_charge_kw * self.config.efficiency * self.config.slot_hours
+                        soc_increase = (energy_added / self.config.battery_capacity) * 100
+                        current_soc = min(self.max_soc, current_soc + soc_increase)
                 soc_decrease = (energy_removed / self.config.battery_capacity) * 100
                 current_soc = max(self.min_soc, current_soc - soc_decrease)
                 # Temperature cools toward ambient during discharge (no active warming)
@@ -855,6 +886,22 @@ class BatteryOptimizer(hass.Hass):
             self._handle_mode_transition(BatteryMode.HOLD)
             self._direct_control.apply_mode(entry)
             return
+
+        # Reactive PV check: if actual PV is significantly below forecast,
+        # recalculate — the DP will adjust using actual SOC (which may be lower
+        # if battery was covering load during cloud cover).
+        forecast_pv_kw = self._predict_pv_kw(self._align_to_slot(self.datetime()))
+        forecast_pv_w = forecast_pv_kw * 1000
+        if forecast_pv_w > self.config.pv_reactive_min_forecast_w:
+            actual_pv_w = pv_power  # already read above
+            if actual_pv_w < forecast_pv_w * self.config.pv_reactive_threshold:
+                self.log(
+                    f"PV below forecast: actual={actual_pv_w:.0f}W vs "
+                    f"forecast={forecast_pv_w:.0f}W "
+                    f"({actual_pv_w/forecast_pv_w*100:.0f}%), recalculating"
+                )
+                self._recalculate_remaining_schedule(current_soc)
+                return
 
         # Get current slot for schedule change logging
         now = self.datetime()
@@ -1061,6 +1108,23 @@ class BatteryOptimizer(hass.Hass):
             predicted_pv_kw=self._predict_pv_kw(current_slot),
         )
 
+        # At max SOC with PV surplus, DISCHARGE remote-control clips PV
+        # export — use HOLD instead so surplus PV exports to grid.
+        # When PV < load, keep DISCHARGE so battery covers the deficit.
+        if (entry.mode == BatteryMode.DISCHARGE
+                and current_soc is not None
+                and current_soc >= self.max_soc):
+            pv_w = self._get_pv_power()
+            load_w = self._get_load_power() or 0.0
+            if pv_w > load_w:
+                self.log(f"Overriding DISCHARGE→HOLD at max SOC ({current_soc}%) "
+                         f"— PV {pv_w:.0f}W > load {load_w:.0f}W, allowing export")
+                entry = ScheduleEntry(
+                    time=entry.time,
+                    mode=BatteryMode.HOLD,
+                    reason="safety_max_soc_pv_export",
+                )
+
         # Track mode transition for cost tracking / learning
         self._handle_mode_transition(entry.mode)
 
@@ -1115,6 +1179,24 @@ class BatteryOptimizer(hass.Hass):
             self._handle_mode_transition(BatteryMode.HOLD)
             self._direct_control.apply_mode(entry)
             return True
+
+        # Switch DISCHARGE → HOLD at max SOC when PV covers load, so surplus
+        # PV exports to grid. When PV < load, keep DISCHARGE so battery
+        # covers the deficit (as the schedule intended).
+        if current_soc >= self.max_soc and self.current_mode == BatteryMode.DISCHARGE:
+            pv_w = self._get_pv_power()
+            load_w = self._get_load_power() or 0.0
+            if pv_w > load_w:
+                self.log(f"Safety: HOLD at max SOC ({current_soc}%) — "
+                         f"PV {pv_w:.0f}W > load {load_w:.0f}W, allowing export")
+                entry = ScheduleEntry(
+                    time=self._align_to_slot(now),
+                    mode=BatteryMode.HOLD,
+                    reason="safety_max_soc_pv_export",
+                )
+                self._handle_mode_transition(BatteryMode.HOLD)
+                self._direct_control.apply_mode(entry)
+                return True
 
         return False
 

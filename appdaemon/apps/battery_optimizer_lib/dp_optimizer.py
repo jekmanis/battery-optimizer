@@ -277,7 +277,7 @@ class DPOptimizer:
         current_soc: float,
         current_temp: Optional[float],
     ) -> List[float]:
-        """Pre-compute temperature-aware charge rates for each slot."""
+        """Pre-compute temperature and SOC-aware charge rates for each slot."""
         return compute_charge_rates_per_slot(
             slots_sorted_by_time=slots_sorted_by_time,
             slot_fractions=slot_fractions,
@@ -286,6 +286,9 @@ class DPOptimizer:
             current_temp=current_temp,
             get_charge_rate_for_soc=self._get_charge_rate_for_soc,
             predict_temp_after_duration=self._predict_temp_after_duration,
+            battery_capacity=self._config.battery_capacity,
+            efficiency=self._config.efficiency,
+            max_soc=self._config.max_soc,
         )
 
     def _build_soc_trajectory(

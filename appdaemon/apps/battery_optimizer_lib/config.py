@@ -98,6 +98,8 @@ class BatteryOptimizerConfig:
     pv_quantile: float = 0.5
     pv_forecast_sensor: str = ""  # Optional external PV forecast sensor (e.g., Solcast)
     pv_forecast_unit: str = "W"  # Unit of pv_forecast_sensor: "W" or "kW"
+    pv_reactive_threshold: float = 0.5  # Recalc if actual PV < this fraction of forecast
+    pv_reactive_min_forecast_w: float = 200.0  # Only check PV shortfall when forecast > this (W)
     inverter_mode_sensor: str = ""  # Inverter mode sensor for monitoring (e.g., sensor.growatt_wit_inverter_mode)
 
     # =========================================================================
@@ -293,6 +295,8 @@ class BatteryOptimizerConfig:
             pv_quantile=float(args.get("pv_quantile", 0.5)),
             pv_forecast_sensor=args.get("pv_forecast_sensor", ""),
             pv_forecast_unit=args.get("pv_forecast_unit", "W"),
+            pv_reactive_threshold=float(args.get("pv_reactive_threshold", 0.5)),
+            pv_reactive_min_forecast_w=float(args.get("pv_reactive_min_forecast_w", 200.0)),
             inverter_mode_sensor=args.get("inverter_mode_sensor", ""),
 
             # PV Forecast Service

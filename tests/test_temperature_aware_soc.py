@@ -594,3 +594,101 @@ class TestLogScheduleTemperatureDisplay:
         # Check that temperature info is NOT in the log
         log_text = " ".join(log_messages)
         assert "C->" not in log_text
+
+
+class TestChargeRateSOCProjection:
+    """Tests that charge rates decline as projected SOC increases."""
+
+    def test_rates_decline_with_soc_projection(self):
+        """With SOC-dependent charge rate, later slots should see lower rates."""
+        from battery_optimizer_lib.charge_rate_utils import compute_charge_rates_per_slot
+
+        base = datetime.datetime(2024, 6, 15, 12, 0)
+        slots = [PricePoint(time=base + datetime.timedelta(minutes=15 * i), price=0.05) for i in range(8)]
+        fractions = [1.0] * 8
+
+        # Simulate BMS behaviour: charge rate drops with SOC
+        def charge_rate_by_soc(soc, temp):
+            if soc < 50:
+                return 7.4
+            elif soc < 80:
+                return 5.0
+            else:
+                return 2.5
+
+        rates = compute_charge_rates_per_slot(
+            slots_sorted_by_time=slots,
+            slot_fractions=fractions,
+            slot_minutes=15,
+            current_soc=20.0,
+            current_temp=25.0,
+            get_charge_rate_for_soc=charge_rate_by_soc,
+            predict_temp_after_duration=lambda t, d: t,  # constant temp
+            battery_capacity=14.3,
+            efficiency=0.85,
+            max_soc=100.0,
+        )
+
+        # First slots should have high rate (low SOC)
+        assert rates[0] == 7.4
+        # Later slots should have lower rates as SOC climbs
+        assert rates[-1] < rates[0], f"Last rate {rates[-1]} should be < first rate {rates[0]}"
+        # Rates should be monotonically non-increasing
+        for i in range(1, len(rates)):
+            assert rates[i] <= rates[i - 1], f"Rate at slot {i} ({rates[i]}) > slot {i-1} ({rates[i-1]})"
+
+    def test_rates_constant_without_capacity(self):
+        """Without battery_capacity (legacy), rates stay at initial SOC."""
+        from battery_optimizer_lib.charge_rate_utils import compute_charge_rates_per_slot
+
+        base = datetime.datetime(2024, 6, 15, 12, 0)
+        slots = [PricePoint(time=base + datetime.timedelta(minutes=15 * i), price=0.05) for i in range(4)]
+        fractions = [1.0] * 4
+
+        def charge_rate_by_soc(soc, temp):
+            return 7.4 if soc < 50 else 2.5
+
+        rates = compute_charge_rates_per_slot(
+            slots_sorted_by_time=slots,
+            slot_fractions=fractions,
+            slot_minutes=15,
+            current_soc=20.0,
+            current_temp=None,
+            get_charge_rate_for_soc=charge_rate_by_soc,
+            predict_temp_after_duration=lambda t, d: t,
+            # battery_capacity=0 (default) → no SOC projection
+        )
+
+        # All rates should be at the low-SOC rate
+        assert all(r == 7.4 for r in rates)
+
+    def test_soc_capped_at_max(self):
+        """SOC projection should not exceed max_soc."""
+        from battery_optimizer_lib.charge_rate_utils import compute_charge_rates_per_slot
+
+        base = datetime.datetime(2024, 6, 15, 12, 0)
+        slots = [PricePoint(time=base + datetime.timedelta(minutes=15 * i), price=0.05) for i in range(20)]
+        fractions = [1.0] * 20
+
+        soc_values_seen = []
+
+        def charge_rate_tracker(soc, temp):
+            soc_values_seen.append(soc)
+            return 4.5
+
+        compute_charge_rates_per_slot(
+            slots_sorted_by_time=slots,
+            slot_fractions=fractions,
+            slot_minutes=15,
+            current_soc=80.0,
+            current_temp=25.0,
+            get_charge_rate_for_soc=charge_rate_tracker,
+            predict_temp_after_duration=lambda t, d: t,
+            battery_capacity=14.3,
+            efficiency=0.85,
+            max_soc=100.0,
+        )
+
+        # SOC should never exceed max_soc
+        assert all(s <= 100.0 + 0.01 for s in soc_values_seen), \
+            f"SOC exceeded max: {max(soc_values_seen):.1f}%"

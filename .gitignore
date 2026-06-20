@@ -25,3 +25,9 @@ secrets.yaml
 .coverage
 .pytest_cache/
 .uv-cache/
+
+# AppDaemon real config (copy from apps.yaml.example, holds your HA token)
+appdaemon/apps/apps.yaml
+
+# git-filter-repo working dir
+.git-rewrite/

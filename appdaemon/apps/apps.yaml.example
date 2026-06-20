@@ -14,7 +14,7 @@ battery_optimizer:
 
   # Long-lived access token from HA
   # Create at: Profile (bottom left) > Security > Long-Lived Access Tokens > Create Token
-  ha_token: "REPLACE_WITH_YOUR_HA_LONG_LIVED_TOKEN
+  ha_token: "REPLACE_WITH_YOUR_HA_LONG_LIVED_TOKEN"
 
   # ==========================================================================
   # Nord Pool Configuration
@@ -22,7 +22,7 @@ battery_optimizer:
 
   # Config entry ID from diagnostics file
   # Find it in: Settings > Devices > Nord Pool > 3-dot menu > Download diagnostics
-  nordpool_config_entry: "01KB8MP9Q5PD24QG015ABXBQTS"
+  nordpool_config_entry: "YOUR_NORDPOOL_CONFIG_ENTRY_ID"
   nordpool_area: LV
 
   # Hour when tomorrow's prices become available (in YOUR local timezone)
@@ -62,7 +62,7 @@ battery_optimizer:
 
   # Growatt WIT device ID for Modbus control
   # Find this in Home Assistant Developer Tools > States > growatt entities
-  device_id: "05005d2cc8b5b7acce146af1698e9fb3"  # <-- Set your device_id here
+  device_id: "YOUR_GROWATT_WIT_DEVICE_ID"  # <-- Set your device_id here
 
   # ==========================================================================
   # TOU Schedule Sync (Optional)

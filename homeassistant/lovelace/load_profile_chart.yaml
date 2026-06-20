@@ -1,0 +1,186 @@
+# ApexCharts Card - Household Load Profile
+# Visually stunning consumption pattern visualization
+
+type: custom:apexcharts-card
+header:
+  show: true
+  title: ⚡ Household Consumption Pattern
+  show_states: true
+  colorize_states: true
+graph_span: 24h
+span:
+  start: day
+now:
+  show: true
+  color: '#ffa726'
+  label: Now
+yaxis:
+  - id: power
+    min: 0
+    apex_config:
+      forceNiceScale: true
+      tickAmount: 5
+      labels:
+        formatter: |
+          EVAL:function(val) {
+            if (val >= 1000) return (val/1000).toFixed(1) + ' kW';
+            return Math.round(val) + ' W';
+          }
+        style:
+          colors: '#78909c'
+          fontSize: '11px'
+apex_config:
+  chart:
+    height: 320
+    background: transparent
+    dropShadow:
+      enabled: true
+      top: 4
+      left: 0
+      blur: 8
+      color: '#7c4dff'
+      opacity: 0.15
+    animations:
+      enabled: true
+      speed: 500
+  stroke:
+    width:
+      - 0
+      - 3
+    curve: smooth
+  fill:
+    type:
+      - solid
+      - gradient
+    opacity:
+      - 0.25
+      - 1
+    gradient:
+      shade: dark
+      type: vertical
+      shadeIntensity: 0.3
+      opacityFrom: 0.5
+      opacityTo: 0.05
+      stops:
+        - 0
+        - 95
+        - 100
+  grid:
+    show: true
+    borderColor: 'rgba(255, 255, 255, 0.06)'
+    strokeDashArray: 4
+    position: back
+    xaxis:
+      lines:
+        show: false
+    yaxis:
+      lines:
+        show: true
+  tooltip:
+    enabled: true
+    shared: true
+    intersect: false
+    theme: dark
+    style:
+      fontSize: '12px'
+    y:
+      formatter: |
+        EVAL:function(val) {
+          if (val == null) return 'N/A';
+          if (val >= 1000) return (val/1000).toFixed(2) + ' kW';
+          return Math.round(val) + ' W';
+        }
+    marker:
+      show: true
+  legend:
+    show: true
+    position: bottom
+    horizontalAlign: center
+    fontSize: '12px'
+    labels:
+      colors: '#90a4ae'
+    markers:
+      width: 10
+      height: 10
+      radius: 5
+    itemMargin:
+      horizontal: 12
+  xaxis:
+    min: |
+      EVAL:new Date(new Date().setHours(0,0,0,0)).getTime()
+    max: |
+      EVAL:new Date(new Date().setHours(23,59,59,999)).getTime()
+    tickAmount: 12
+    labels:
+      datetimeFormatter:
+        hour: HH:mm
+      style:
+        colors: '#78909c'
+        fontSize: '11px'
+    axisBorder:
+      show: false
+    axisTicks:
+      show: false
+    crosshairs:
+      show: true
+      stroke:
+        color: '#7c4dff'
+        width: 1
+        dashArray: 3
+series:
+  # P75 area (typical range)
+  - entity: sensor.battery_optimizer
+    name: Typical (P75)
+    type: area
+    yaxis_id: power
+    color: '#26a69a'
+    opacity: 0.25
+    extend_to: end
+    show:
+      legend_value: true
+      in_header: true
+    data_generator: |
+      const stats = entity.attributes.load_profile_stats;
+      if (!stats || !Array.isArray(stats)) return [];
+      const now = new Date();
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const data = [];
+      for (let i = 0; i < stats.length; i++) {
+        const s = stats[i];
+        const hour = s.hour !== undefined ? s.hour : i;
+        const ts = today.getTime() + hour * 3600000;
+        data.push([ts, s.p75 != null ? s.p75 : s.avg]);
+      }
+      if (data.length > 0) {
+        const lastVal = data[data.length - 1][1];
+        data.push([today.getTime() + 24 * 3600000 - 1000, lastVal]);
+      }
+      return data;
+
+  # Average line (main focus)
+  - entity: sensor.battery_optimizer
+    name: Average
+    type: area
+    yaxis_id: power
+    color: '#7c4dff'
+    extend_to: end
+    show:
+      legend_value: true
+      in_header: true
+    data_generator: |
+      const stats = entity.attributes.load_profile_stats;
+      if (!stats || !Array.isArray(stats)) return [];
+      const now = new Date();
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const data = [];
+      for (let i = 0; i < stats.length; i++) {
+        const s = stats[i];
+        const hour = s.hour !== undefined ? s.hour : i;
+        const ts = today.getTime() + hour * 3600000;
+        data.push([ts, s.avg]);
+      }
+      if (data.length > 0) {
+        const lastVal = data[data.length - 1][1];
+        data.push([today.getTime() + 24 * 3600000 - 1000, lastVal]);
+      }
+      return data;

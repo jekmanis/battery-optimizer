@@ -134,6 +134,7 @@ class BatteryOptimizerConfig:
     grid_export_fee: float = 0.02  # EUR/kWh — fixed deduction from spot price when selling
     battery_wear_cost: float = 0.0  # EUR/kWh
     export_rate_multiplier: float = 1.0  # 1.0 = no percentage reduction (deduction is fixed)
+    inverter_efficiency: float = 1.0  # AC↔DC conversion efficiency (e.g., 0.97 for 97%)
 
     # =========================================================================
     # HA Entities for Dynamic Config
@@ -323,6 +324,7 @@ class BatteryOptimizerConfig:
             grid_export_fee=float(args.get("grid_export_fee_eur_kwh", 0.02)),
             battery_wear_cost=float(args.get("battery_wear_cost_eur_kwh", 0.0)),
             export_rate_multiplier=float(args.get("export_rate_multiplier", 1.0)),
+            inverter_efficiency=float(args.get("inverter_efficiency", 1.0)),
 
             # HA Entities
             min_soc_entity=args.get("min_soc_entity", "input_number.battery_min_soc"),

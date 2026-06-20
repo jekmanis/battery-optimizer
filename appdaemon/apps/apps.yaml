@@ -36,22 +36,24 @@ battery_optimizer:
   # nordpool_sensor: sensor.nordpool_kwh_lv_eur_3_10
 
   # Growatt battery state of charge sensor
-  soc_sensor: sensor.growatt_battery_soc
+  soc_sensor: sensor.growatt_battery_battery_soc
 
   # Growatt PV power production sensor (for solar-aware adjustments)
-  pv_power_sensor: sensor.growatt_pv_power
+  # NOTE: total PV power; renamed by integration v0.6.7 device-prefix migration
+  # (previously the non-existent sensor.growatt_pv_power)
+  pv_power_sensor: sensor.growatt_solar_solar_total_power
 
   # Growatt battery temperature sensor (for temperature-aware charge rate prediction)
   # When configured, the optimizer learns and predicts charge rates based on temperature
   # This improves scheduling accuracy for batteries that charge slower when cold
   # Leave empty to disable temperature-aware learning
-  battery_temp_sensor: "sensor.growatt_battery_temperature"
+  battery_temp_sensor: "sensor.growatt_battery_battery_temperature"
 
   # Inverter energy sensors for precise energy measurement (0.1 kWh precision)
   # These cumulative daily sensors provide more accurate tracking than SOC-based calculation
   # Set use_inverter_energy_sensors to false to fall back to SOC-based calculation
-  battery_charge_sensor: "sensor.growatt_battery_charge_today"
-  battery_discharge_sensor: "sensor.growatt_battery_discharge_today"
+  battery_charge_sensor: "sensor.growatt_battery_battery_charge_today"
+  battery_discharge_sensor: "sensor.growatt_battery_battery_discharge_today"
   use_inverter_energy_sensors: true
 
   # ==========================================================================
@@ -103,7 +105,7 @@ battery_optimizer:
   # Household load power sensor (W) used for statistical load profiling
   # Prefer a sensor representing net house load (consumption minus PV)
   # Leave empty to disable probabilistic load profiling
-  load_power_sensor: "sensor.growatt_house_consumption"
+  load_power_sensor: "sensor.growatt_load_house_consumption"
 
   # Schedule resolution in minutes (15 = quarter-hourly plan)
   slot_minutes: 15
@@ -152,6 +154,10 @@ battery_optimizer:
 
   # Export rate multiplier (1.0 = no percentage reduction, deduction is fixed via grid_export_fee)
   export_rate_multiplier: 1.0
+
+  # Inverter AC↔DC conversion efficiency (Growatt WIT European weighted: 97%)
+  # Applied to grid charge cost (AC→DC) and battery discharge value (DC→AC)
+  inverter_efficiency: 0.97
 
   # Battery wear cost per kWh (discourages cycling at marginal prices)
   # Growatt HOPE 14.3L-A1: 3811.50 EUR (ar PVN, pēc atlaides) - 2287.47 EUR (valsts atbalsts 38.12%) = 1524.03 EUR

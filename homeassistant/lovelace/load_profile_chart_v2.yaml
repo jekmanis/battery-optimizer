@@ -1,0 +1,169 @@
+# ApexCharts Card - Household Load Profile (Gradient Style)
+# A visually stunning chart with gradient fills and glow effects
+#
+# Features:
+# - Smooth gradient area for typical consumption range
+# - Glowing average line
+# - Interactive tooltips with detailed stats
+# - Dark theme optimized
+#
+# Add this card to your dashboard via:
+# 1. Edit dashboard → Add Card → Manual
+# 2. Paste this YAML configuration
+
+type: custom:apexcharts-card
+header:
+  show: true
+  title: ⚡ Household Consumption Pattern
+  show_states: true
+  colorize_states: true
+graph_span: 24h
+span:
+  start: day
+now:
+  show: true
+  color: '#ff9800'
+  label: Now
+yaxis:
+  - id: power
+    min: 0
+    apex_config:
+      tickAmount: 5
+      labels:
+        formatter: |
+          EVAL:function(val) {
+            if (val >= 1000) return (val/1000).toFixed(1) + ' kW';
+            return Math.round(val) + ' W';
+          }
+        style:
+          colors: '#9e9e9e'
+apex_config:
+  chart:
+    height: 380
+    animations:
+      enabled: true
+      easing: easeinout
+      speed: 800
+    dropShadow:
+      enabled: true
+      top: 3
+      left: 0
+      blur: 10
+      color: '#00bcd4'
+      opacity: 0.2
+    background: transparent
+  stroke:
+    width:
+      - 0
+      - 0
+      - 3
+    curve: smooth
+  fill:
+    type:
+      - solid
+      - solid
+      - gradient
+    opacity:
+      - 1
+      - 1
+      - 0.5
+    gradient:
+      type: vertical
+      shadeIntensity: 1
+      opacityFrom: 0.5
+      opacityTo: 0.05
+      stops:
+        - 0
+        - 90
+        - 100
+  grid:
+    borderColor: rgba(255, 255, 255, 0.06)
+    strokeDashArray: 4
+    xaxis:
+      lines:
+        show: true
+    yaxis:
+      lines:
+        show: true
+  tooltip:
+    enabled: true
+    shared: true
+    theme: dark
+    x:
+      format: HH:00
+    y:
+      formatter: |
+        EVAL:function(val) {
+          if (val == null) return 'No data';
+          if (Array.isArray(val)) {
+            const fmt = (v) => v >= 1000 ? (v/1000).toFixed(1) + ' kW' : Math.round(v) + ' W';
+            return fmt(val[0]) + ' - ' + fmt(val[1]);
+          }
+          if (val >= 1000) return (val/1000).toFixed(2) + ' kW';
+          return Math.round(val) + ' W';
+        }
+  legend:
+    show: true
+    position: bottom
+    horizontalAlign: center
+    labels:
+      colors: '#9e9e9e'
+    markers:
+      width: 12
+      height: 12
+      radius: 6
+  xaxis:
+    labels:
+      datetimeFormatter:
+        hour: HH:00
+      style:
+        colors: '#9e9e9e'
+        fontSize: 11px
+series:
+  # Min-Max range (outer glow)
+  - entity: sensor.battery_optimizer
+    name: Min-Max Range
+    type: area
+    yaxis_id: power
+    extend_to: false
+    color: rgba(0, 188, 212, 0.08)
+    data_generator: |
+      const stats = entity.attributes.load_profile_stats || [];
+      const now = new Date();
+      const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      return stats.filter(s => s.min != null && s.max != null).map(s => {
+        const time = new Date(startOfDay.getTime() + s.hour * 3600000);
+        return [time.getTime(), [s.min, s.max]];
+      });
+
+  # P25-P75 range (typical consumption band)
+  - entity: sensor.battery_optimizer
+    name: Typical (P25-P75)
+    type: area
+    yaxis_id: power
+    extend_to: false
+    color: rgba(0, 188, 212, 0.25)
+    data_generator: |
+      const stats = entity.attributes.load_profile_stats || [];
+      const now = new Date();
+      const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      return stats.filter(s => s.p25 != null && s.p75 != null).map(s => {
+        const time = new Date(startOfDay.getTime() + s.hour * 3600000);
+        return [time.getTime(), [s.p25, s.p75]];
+      });
+
+  # Average line with gradient fill
+  - entity: sensor.battery_optimizer
+    name: Average
+    type: area
+    yaxis_id: power
+    extend_to: false
+    color: '#00bcd4'
+    data_generator: |
+      const stats = entity.attributes.load_profile_stats || [];
+      const now = new Date();
+      const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      return stats.map(s => {
+        const time = new Date(startOfDay.getTime() + s.hour * 3600000);
+        return [time.getTime(), s.avg];
+      });

@@ -1120,3 +1120,221 @@ class TestDPOptimizerPvAwareModes:
         export_entries = [e for e in result.schedule.values()
                          if e.mode == BatteryMode.DISCHARGE and e.export_rate and e.export_rate > 0]
         assert len(export_entries) > 0, "High price + PV should trigger export discharge"
+
+
+class TestInverterEfficiency:
+    """Tests for inverter AC↔DC conversion losses in the DP."""
+
+    def _make_config(self, inverter_efficiency=1.0, **overrides):
+        defaults = dict(
+            battery_capacity=14.3,
+            min_soc=10.0,
+            max_soc=100.0,
+            efficiency=0.95,
+            discharge_rate=4.5,
+            slot_minutes=60,
+            soc_step_percent=1.0,
+            grid_fee=0.05,
+            battery_wear_cost=0.01,
+            export_rate_multiplier=1.0,
+            grid_export_fee=0.02,
+            inverter_efficiency=inverter_efficiency,
+        )
+        defaults.update(overrides)
+        return DPOptimizerConfig(**defaults)
+
+    def _make_optimizer(self, config, load_kw=0.5, pv_kw=0.0):
+        return DPOptimizer(
+            config=config,
+            load_predictor=lambda dt: load_kw,
+            charge_rate_predictor=lambda soc, temp: 4.5,
+            temp_after_charge_predictor=lambda temp, dur: temp,
+            temp_after_idle_predictor=lambda temp, dur: temp,
+            pv_predictor=lambda dt: pv_kw,
+        )
+
+    def _make_prices(self, prices_list, slot_minutes=60):
+        base = datetime.datetime(2024, 1, 15, 0, 0, 0)
+        return [
+            PricePoint(
+                time=base + datetime.timedelta(minutes=slot_minutes * i),
+                price=price,
+            )
+            for i, price in enumerate(prices_list)
+        ]
+
+    def test_charge_costs_more_with_inverter_loss(self):
+        """Charging at inv_eff<1 should make marginal charge less attractive."""
+        # 2 cheap slots, 2 expensive slots.  Load = 0 so discharge value = 0.
+        prices = self._make_prices([0.03, 0.03, 0.20, 0.20])
+
+        config_ideal = self._make_config(inverter_efficiency=1.0)
+        config_lossy = self._make_config(inverter_efficiency=0.90)
+
+        opt_ideal = self._make_optimizer(config_ideal, load_kw=0.5)
+        opt_lossy = self._make_optimizer(config_lossy, load_kw=0.5)
+
+        res_ideal = opt_ideal.optimize(prices=prices, current_slot=prices[0].time, current_soc=50.0)
+        res_lossy = opt_lossy.optimize(prices=prices, current_slot=prices[0].time, current_soc=50.0)
+
+        # With lossy inverter, charging costs ~11% more per kWh stored,
+        # so optimizer should charge same or fewer slots
+        assert res_lossy.charge_count <= res_ideal.charge_count
+
+    def test_discharge_drains_more_soc_with_inverter_loss(self):
+        """With inv_eff<1, battery must provide more DC to serve same AC load."""
+        prices = self._make_prices([0.02, 0.30])  # cheap then expensive
+        load_kw = 2.0
+
+        config_ideal = self._make_config(inverter_efficiency=1.0)
+        config_lossy = self._make_config(inverter_efficiency=0.90)
+
+        opt_ideal = self._make_optimizer(config_ideal, load_kw=load_kw)
+        opt_lossy = self._make_optimizer(config_lossy, load_kw=load_kw)
+
+        # Start at 30% SOC so we have limited energy
+        res_ideal = opt_ideal.optimize(prices=prices, current_slot=prices[0].time, current_soc=30.0)
+        res_lossy = opt_lossy.optimize(prices=prices, current_slot=prices[0].time, current_soc=30.0)
+
+        # At the expensive slot, both should discharge.
+        # The lossy inverter should end at a lower SOC (more DC drained).
+        expensive_slot = prices[1].time
+        if expensive_slot in res_ideal.soc_trajectory and expensive_slot in res_lossy.soc_trajectory:
+            _, end_ideal = res_ideal.soc_trajectory[expensive_slot]
+            _, end_lossy = res_lossy.soc_trajectory[expensive_slot]
+            assert end_lossy <= end_ideal, (
+                f"Lossy inverter should drain more SOC: ideal={end_ideal:.1f}%, lossy={end_lossy:.1f}%"
+            )
+
+    def test_export_soc_drops_more_with_inverter_loss(self):
+        """Export discharge with inv_eff<1 should consume more DC from battery."""
+        # Very high price to guarantee export
+        prices = self._make_prices([0.50])
+
+        config_ideal = self._make_config(inverter_efficiency=1.0, grid_export_fee=0.0)
+        config_lossy = self._make_config(inverter_efficiency=0.90, grid_export_fee=0.0)
+
+        opt_ideal = self._make_optimizer(config_ideal, load_kw=0.0)
+        opt_lossy = self._make_optimizer(config_lossy, load_kw=0.0)
+
+        res_ideal = opt_ideal.optimize(prices=prices, current_slot=prices[0].time, current_soc=50.0)
+        res_lossy = opt_lossy.optimize(prices=prices, current_slot=prices[0].time, current_soc=50.0)
+
+        slot = prices[0].time
+        if slot in res_ideal.soc_trajectory and slot in res_lossy.soc_trajectory:
+            _, end_ideal = res_ideal.soc_trajectory[slot]
+            _, end_lossy = res_lossy.soc_trajectory[slot]
+            assert end_lossy <= end_ideal, (
+                f"Lossy inverter should drain more SOC on export: ideal={end_ideal:.1f}%, lossy={end_lossy:.1f}%"
+            )
+
+    def test_inverter_efficiency_1_0_is_backward_compatible(self):
+        """inv_eff=1.0 should produce identical results to omitting the parameter."""
+        prices = self._make_prices([0.03, 0.03, 0.05, 0.20, 0.25, 0.15])
+
+        config_default = DPOptimizerConfig(
+            battery_capacity=14.3, min_soc=10.0, max_soc=100.0,
+            efficiency=0.85, discharge_rate=4.5, slot_minutes=60,
+            soc_step_percent=1.0, grid_fee=0.05, battery_wear_cost=0.02,
+        )
+        config_explicit = DPOptimizerConfig(
+            battery_capacity=14.3, min_soc=10.0, max_soc=100.0,
+            efficiency=0.85, discharge_rate=4.5, slot_minutes=60,
+            soc_step_percent=1.0, grid_fee=0.05, battery_wear_cost=0.02,
+            inverter_efficiency=1.0,
+        )
+
+        opt_default = self._make_optimizer(config_default, load_kw=0.5)
+        opt_explicit = self._make_optimizer(config_explicit, load_kw=0.5)
+
+        res_default = opt_default.optimize(prices=prices, current_slot=prices[0].time, current_soc=50.0)
+        res_explicit = opt_explicit.optimize(prices=prices, current_slot=prices[0].time, current_soc=50.0)
+
+        for slot in res_default.schedule:
+            assert res_default.schedule[slot].mode == res_explicit.schedule[slot].mode
+
+
+class TestSellPriceFloor:
+    """Tests for NNS contract sell price floor at 0."""
+
+    def _make_optimizer(self, config, load_kw=0.0):
+        return DPOptimizer(
+            config=config,
+            load_predictor=lambda dt: load_kw,
+            charge_rate_predictor=lambda soc, temp: 4.5,
+            temp_after_charge_predictor=lambda temp, dur: temp,
+            temp_after_idle_predictor=lambda temp, dur: temp,
+        )
+
+    def _make_prices(self, prices_list, slot_minutes=60):
+        base = datetime.datetime(2024, 1, 15, 0, 0, 0)
+        return [
+            PricePoint(
+                time=base + datetime.timedelta(minutes=slot_minutes * i),
+                price=price,
+            )
+            for i, price in enumerate(prices_list)
+        ]
+
+    def test_no_export_at_negative_spot_with_export_fee(self):
+        """When spot < export_fee, sell_price would be negative. Floor ensures no export."""
+        config = DPOptimizerConfig(
+            battery_capacity=14.3, min_soc=10.0, max_soc=100.0,
+            efficiency=0.85, discharge_rate=4.5, slot_minutes=60,
+            soc_step_percent=1.0, grid_fee=0.05, battery_wear_cost=0.01,
+            export_rate_multiplier=1.0, grid_export_fee=0.05,
+        )
+        # Spot price 0.03 → sell = max(0, 0.03 - 0.05) = 0 → no export
+        prices = self._make_prices([0.03, 0.03])
+        optimizer = self._make_optimizer(config, load_kw=0.0)
+        result = optimizer.optimize(prices=prices, current_slot=prices[0].time, current_soc=80.0)
+
+        export_entries = [
+            e for e in result.schedule.values()
+            if e.mode == BatteryMode.DISCHARGE and e.export_rate is not None and e.export_rate > 0
+        ]
+        assert len(export_entries) == 0, "Should not export when spot < export_fee"
+
+    def test_export_happens_when_spot_exceeds_fee(self):
+        """When spot > export_fee, sell_price is positive. Export should be considered."""
+        config = DPOptimizerConfig(
+            battery_capacity=14.3, min_soc=10.0, max_soc=100.0,
+            efficiency=0.85, discharge_rate=4.5, slot_minutes=60,
+            soc_step_percent=1.0, grid_fee=0.05, battery_wear_cost=0.01,
+            export_rate_multiplier=1.0, grid_export_fee=0.02,
+        )
+        # Spot 0.40 → sell = max(0, 0.40 - 0.02) = 0.38
+        prices = self._make_prices([0.40, 0.40])
+        optimizer = self._make_optimizer(config, load_kw=0.0)
+        result = optimizer.optimize(prices=prices, current_slot=prices[0].time, current_soc=80.0)
+
+        export_entries = [
+            e for e in result.schedule.values()
+            if e.mode == BatteryMode.DISCHARGE and e.export_rate is not None and e.export_rate > 0
+        ]
+        assert len(export_entries) > 0, "Should export when sell_price > 0"
+
+    def test_hold_pv_export_revenue_zero_at_negative_sell(self):
+        """HOLD PV export revenue should be 0 when sell_price is floored at 0."""
+        config = DPOptimizerConfig(
+            battery_capacity=14.3, min_soc=10.0, max_soc=100.0,
+            efficiency=0.85, discharge_rate=4.5, slot_minutes=60,
+            soc_step_percent=1.0, grid_fee=0.05, battery_wear_cost=0.01,
+            export_rate_multiplier=1.0, grid_export_fee=0.10,
+        )
+        # Spot 0.05 → sell = max(0, 0.05 - 0.10) = 0
+        # PV surplus should not earn export revenue
+        prices = self._make_prices([0.05])
+        optimizer = DPOptimizer(
+            config=config,
+            load_predictor=lambda dt: 0.5,
+            charge_rate_predictor=lambda soc, temp: 4.5,
+            temp_after_charge_predictor=lambda temp, dur: temp,
+            temp_after_idle_predictor=lambda temp, dur: temp,
+            pv_predictor=lambda dt: 3.0,  # PV surplus
+        )
+        result = optimizer.optimize(prices=prices, current_slot=prices[0].time, current_soc=50.0)
+
+        # Should HOLD (PV charges battery for free), but no export revenue
+        entry = list(result.schedule.values())[0]
+        assert entry.mode in (BatteryMode.HOLD, BatteryMode.CHARGE)

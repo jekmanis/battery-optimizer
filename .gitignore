@@ -20,3 +20,8 @@ nul
 # Local config (may contain secrets)
 *.local.yaml
 secrets.yaml
+
+# Test artifacts
+.coverage
+.pytest_cache/
+.uv-cache/

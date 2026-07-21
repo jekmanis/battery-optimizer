@@ -427,6 +427,35 @@ class BatteryOptimizer(hass.Hass):
 
         schedule = result.schedule
 
+        # Cloud-safe conversion: HOLD → DISCHARGE(to load) during PV hours.
+        # discharge_to_load charges from PV surplus (confirmed on Growatt WIT),
+        # so it behaves identically to HOLD while PV covers the load. But when
+        # clouds kill PV, the battery covers the load instead of the grid —
+        # cheaper whenever the import price exceeds battery wear. The forced
+        # forecast refresh on PV shortfall complements this: the hedge bridges
+        # the gap until re-optimization, without waiting for it.
+        cloud_safe_count = 0
+        prices_by_slot_map = {
+            canonical_slot_key(p.time): p.price for p in slots_sorted_by_time
+        }
+        for slot_time, entry in schedule.items():
+            if entry.mode == BatteryMode.HOLD:
+                pv_kw = self._predict_pv_kw(slot_time)
+                if pv_kw > 0:
+                    price = prices_by_slot_map.get(slot_time, 0.0)
+                    buy_price = (
+                        (price + self.config.grid_fee)
+                        * self.config.import_price_multiplier
+                    )
+                    if buy_price > self.config.battery_wear_cost:
+                        entry.mode = BatteryMode.DISCHARGE
+                        entry.export_rate = 0
+                        entry.reason += " [cloud-safe]"
+                        cloud_safe_count += 1
+        if cloud_safe_count > 0:
+            self.log(f"Cloud-safe: converted {cloud_safe_count} HOLD→DISCHARGE(to load) "
+                     f"slots during PV hours (buy_price > wear_cost)")
+
         # Project landed costs when the plan can add stored energy. Besides
         # explicit CHARGE, HOLD and discharge-to-load can accept PV surplus.
         has_projected_charge = any(

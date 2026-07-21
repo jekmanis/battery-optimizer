@@ -105,9 +105,15 @@ ending near `min_soc`.
 
 Forecast PV participates directly in the DP. PV first serves predicted load;
 surplus can charge the battery within its charge/headroom limits, and remaining
-surplus can earn net export revenue. The generated schedule is not rewritten
-after optimization merely because forecast PV is present; uncertainty should be
-handled by refreshing the forecast and re-running the optimizer.
+surplus can earn net export revenue.
+
+After optimization, HOLD slots with forecast PV are converted to
+DISCHARGE(to load) when the import price exceeds battery wear ("cloud-safe"
+conversion, tagged `[cloud-safe]` in the schedule log). On the Growatt WIT,
+`discharge_to_load` charges from PV surplus exactly like hold while the sun
+covers the load, but the battery — not the grid — picks up the load the moment
+clouds cut PV. The expected SOC trajectory still assumes PV covers the slot, so
+any cloud-induced drain shows up as an SOC deviation and triggers replanning.
 
 During execution, live PV above `pv_threshold_w` can pause a scheduled grid
 charge so solar can charge instead. This real-time safety/operational override

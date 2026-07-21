@@ -129,6 +129,38 @@ class TestNormalizePrices:
             for slot in slots_for_half_hour:
                 assert abs(slot.price - expected_price) < 1e-9
 
+    def test_fall_dst_repeated_hour_is_preserved(self, riga_timezone):
+        """Both physical 03:00 occurrences must survive normalization."""
+        riga = riga_timezone
+        service = _make_price_service(slot_minutes=15)
+        service.get_timezone = lambda: riga
+        utc_start = datetime.datetime(2024, 10, 26, 21, tzinfo=datetime.timezone.utc)
+        hourly = [
+            PricePoint(
+                time=(utc_start + datetime.timedelta(hours=i)).astimezone(riga),
+                price=float(i),
+            )
+            for i in range(25)
+        ]
+
+        result = service._normalize_prices(hourly)
+
+        assert len(result) == 100
+        repeated = [p for p in result if p.time.hour == 3 and p.time.minute == 0]
+        assert len(repeated) == 2
+        assert repeated[0].time.astimezone(datetime.timezone.utc) != repeated[1].time.astimezone(datetime.timezone.utc)
+
+    def test_simple_price_list_supports_25_hour_dst_day(self, riga_timezone):
+        riga = riga_timezone
+        service = _make_price_service(slot_minutes=60)
+        result = service._parse_sensor_prices(
+            list(range(25)), datetime.date(2024, 10, 27), riga
+        )
+        assert len(result) == 25
+        repeated = [p for p in result if p.time.hour == 3]
+        assert len(repeated) == 2
+        assert {p.time.fold for p in repeated} == {0, 1}
+
 
 class TestServiceCallResolution:
     """Tests verifying resolution parameter in service/API calls."""

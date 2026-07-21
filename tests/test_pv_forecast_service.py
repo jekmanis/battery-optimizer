@@ -433,6 +433,129 @@ class TestCaching:
         # Second refresh should no-op (cache is fresh)
         assert svc.refresh() is False
 
+    def test_forced_refresh_bypasses_fresh_cache(self):
+        """A reactive shortfall can refresh before the normal cache TTL."""
+        config = PvForecastServiceConfig(
+            solcast_today_entity="sensor.solcast_today",
+            pv_forecast_cache_minutes=60,
+            slot_minutes=15,
+        )
+        initial_state = {
+            "state": "5.0",
+            "attributes": {
+                "detailedForecast": [_solcast_entry(10, 0, 3.0)],
+            },
+        }
+        svc = _make_service(
+            config=config,
+            states={"sensor.solcast_today": initial_state},
+        )
+        assert svc.refresh() is True
+
+        updated_state = {
+            "state": "2.0",
+            "attributes": {
+                "detailedForecast": [_solcast_entry(10, 0, 1.0)],
+            },
+        }
+        svc.get_state = lambda entity_id, attribute=None: (
+            updated_state if attribute == "all" else updated_state["state"]
+        )
+
+        assert svc.refresh(force=True) is True
+        assert svc.predict_kw(
+            datetime.datetime(2026, 3, 24, 10, 0, tzinfo=TZ_PLUS2)
+        ) == pytest.approx(1.0)
+
+    def test_forced_refresh_is_rate_limited_to_one_per_slot(self):
+        """Repeated safety checks must not repeatedly query the provider."""
+        config = PvForecastServiceConfig(
+            solcast_today_entity="sensor.solcast_today",
+            pv_forecast_cache_minutes=60,
+            slot_minutes=15,
+        )
+        now = datetime.datetime(2026, 3, 24, 12, 0, tzinfo=TZ_PLUS2)
+        state = {
+            "state": "5.0",
+            "attributes": {
+                "detailedForecast": [_solcast_entry(10, 0, 3.0)],
+            },
+        }
+        svc = _make_service(
+            config=config,
+            states={"sensor.solcast_today": state},
+            now=now,
+        )
+        assert svc.refresh() is True
+
+        fetch_count = 0
+
+        def counted_get_state(entity_id, attribute=None):
+            nonlocal fetch_count
+            fetch_count += 1
+            return state if attribute == "all" else state["state"]
+
+        svc.get_state = counted_get_state
+        assert svc.refresh(force=True) is True
+        assert fetch_count == 1
+
+        # Another shortfall callback inside this 15-minute slot is suppressed.
+        svc.datetime = lambda: now + datetime.timedelta(minutes=5)
+        assert svc.refresh(force=True) is False
+        assert fetch_count == 1
+
+        # The next slot can force one new attempt if the shortfall persists.
+        svc.datetime = lambda: now + datetime.timedelta(minutes=15)
+        assert svc.refresh(force=True) is True
+        assert fetch_count == 2
+
+    def test_shortfall_refresh_caps_current_slot_when_provider_is_unchanged(self):
+        """A stale provider response cannot restore the optimistic current slot."""
+        config = PvForecastServiceConfig(
+            solcast_today_entity="sensor.solcast_today",
+            pv_forecast_cache_minutes=60,
+            slot_minutes=15,
+        )
+        state = {
+            "state": "5.0",
+            "attributes": {
+                "detailedForecast": [_solcast_entry(10, 0, 3.0)],
+            },
+        }
+        svc = _make_service(
+            config=config,
+            states={"sensor.solcast_today": state},
+        )
+        assert svc.refresh() is True
+
+        slot = datetime.datetime(2026, 3, 24, 10, 0, tzinfo=TZ_PLUS2)
+        assert svc.refresh_for_shortfall(slot, actual_kw=0.4) is True
+        assert svc.predict_kw(slot) == pytest.approx(0.4)
+
+    def test_shortfall_observation_applies_when_provider_fetch_fails(self):
+        """Provider failure must not leave the current optimistic slot in use."""
+        config = PvForecastServiceConfig(
+            solcast_today_entity="sensor.solcast_today",
+            pv_forecast_cache_minutes=60,
+            slot_minutes=15,
+        )
+        state = {
+            "state": "5.0",
+            "attributes": {
+                "detailedForecast": [_solcast_entry(10, 0, 3.0)],
+            },
+        }
+        svc = _make_service(
+            config=config,
+            states={"sensor.solcast_today": state},
+        )
+        assert svc.refresh() is True
+        svc.get_state = lambda entity_id, attribute=None: None
+
+        slot = datetime.datetime(2026, 3, 24, 10, 0, tzinfo=TZ_PLUS2)
+        assert svc.refresh_for_shortfall(slot, actual_kw=0.2) is False
+        assert svc.predict_kw(slot) == pytest.approx(0.2)
+
     def test_stale_cache_triggers_refetch(self):
         """After cache_minutes elapse, refresh should re-fetch."""
         detailed = [_solcast_entry(10, 0, 3.0)]

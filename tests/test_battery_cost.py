@@ -31,6 +31,7 @@ class MockCostOptimizer:
         min_soc: float = 10.0,
         max_soc: float = 100.0,
         grid_fee: float = 0.05,
+        inverter_efficiency: float = 1.0,
         battery_wear_cost: float = 0.0,
         battery_avg_cost: float = 0.08,
         slot_minutes: int = 60,
@@ -43,6 +44,7 @@ class MockCostOptimizer:
         self.min_soc = min_soc
         self.max_soc = max_soc
         self.grid_fee = grid_fee
+        self.inverter_efficiency = inverter_efficiency
         self.battery_wear_cost = battery_wear_cost
         self._battery_avg_cost = battery_avg_cost
         self.slot_minutes = slot_minutes
@@ -68,6 +70,7 @@ class MockCostOptimizer:
                 charge_rate=charge_rate,
                 discharge_rate=discharge_rate,
                 grid_fee=grid_fee,
+                inverter_efficiency=inverter_efficiency,
                 battery_wear_cost=battery_wear_cost,
                 default_cost=battery_avg_cost,
             ),
@@ -198,8 +201,9 @@ class TestProjectBatteryCosts:
         # Final cost should be weighted average
         expected_old_energy = (50 - 10) / 100 * 14.3
         expected_added = 4.5 * 0.85 * 1.0
+        landed_cost = (0.05 + optimizer.grid_fee) / optimizer.efficiency
         expected_cost = (
-            expected_old_energy * 0.10 + expected_added * 0.05
+            expected_old_energy * 0.10 + expected_added * landed_cost
         ) / (expected_old_energy + expected_added)
         assert abs(final_cost - expected_cost) < 0.001
 
@@ -258,10 +262,9 @@ class TestProjectBatteryCosts:
         # Each slot should have a projected cost
         assert len(projected) == 3
 
-        # Cost should decrease initially (charging at 0.05 with 0.10 avg)
-        # then trend towards the charging prices
+        # Cost should change to reflect fees and charge losses.
         assert projected[hours[0]] == 0.10  # Starting cost
-        assert projected[hours[1]] < 0.10  # Reduced after cheap charge
+        assert projected[hours[1]] != 0.10
         # Final cost influenced by all three charges
 
     def test_charge_then_discharge(self, optimizer, base_time):
@@ -280,9 +283,9 @@ class TestProjectBatteryCosts:
             prices_by_slot=prices_by_slot,
         )
 
-        # After charge, cost should be reduced
+        # After charge, landed cost is reflected.
         cost_after_charge = projected[hours[1]]
-        assert cost_after_charge < 0.10
+        assert cost_after_charge != 0.10
 
         # After discharge, cost should be same as after charge
         assert abs(final_cost - cost_after_charge) < 0.001
@@ -305,7 +308,128 @@ class TestProjectBatteryCosts:
         # Final cost should be close to charge price (0.03)
         # since there's almost no existing energy
         assert final_cost < 0.10
-        assert final_cost > 0.02  # But not exactly 0.03 due to small buffer
+        assert final_cost > 0.02
+
+    def test_hold_pv_charge_uses_foregone_export_value(self, optimizer, base_time):
+        hour = base_time
+        schedule = {hour: make_schedule_entry(hour, BatteryMode.HOLD)}
+
+        projected, final_cost = optimizer._cost_tracker.project_costs(
+            schedule=schedule,
+            starting_soc=optimizer.min_soc,
+            starting_cost=0.20,
+            prices_by_slot={hour: 0.10},
+            predict_load_func=lambda _: 0.5,
+            predict_pv_func=lambda _: 2.0,
+        )
+
+        assert projected[hour] == 0.20
+        # Export would earn 0.10 - 0.02; charge loss is applied per stored kWh.
+        assert final_cost == pytest.approx(0.08 / optimizer.efficiency)
+
+    def test_hybrid_charge_blends_pv_and_grid_cost(self, optimizer, base_time):
+        hour = base_time
+        schedule = {hour: make_schedule_entry(hour, BatteryMode.CHARGE)}
+
+        _, final_cost = optimizer._cost_tracker.project_costs(
+            schedule=schedule,
+            starting_soc=optimizer.min_soc,
+            starting_cost=0.20,
+            prices_by_slot={hour: 0.10},
+            predict_load_func=lambda _: 0.5,
+            predict_pv_func=lambda _: 2.0,
+        )
+
+        # 4.5 DC kWh charge: 1.5 PV surplus + 3.0 grid DC kWh.
+        expected = (1.5 * 0.08 + 3.0 * 0.15) / (4.5 * optimizer.efficiency)
+        assert final_cost == pytest.approx(expected)
+
+    def test_grid_landed_cost_includes_multiplier_and_inverter_loss(self, base_time):
+        optimizer = MockCostOptimizer(inverter_efficiency=0.90)
+        optimizer._cost_tracker._config.import_price_multiplier = 1.21
+        hour = base_time
+
+        _, final_cost = optimizer._project_battery_costs(
+            schedule={hour: make_schedule_entry(hour, BatteryMode.CHARGE)},
+            starting_soc=optimizer.min_soc,
+            starting_cost=0.20,
+            prices_by_slot={hour: 0.10},
+        )
+
+        expected = (0.10 + optimizer.grid_fee) * 1.21 / (
+            optimizer.efficiency * optimizer.inverter_efficiency
+        )
+        assert final_cost == pytest.approx(expected)
+
+    def test_observed_charge_in_discharge_mode_is_pv_opportunity_cost(self, optimizer):
+        """Growatt discharge-to-load can still store surplus PV."""
+        optimizer._cost_tracker._current_mode = BatteryMode.DISCHARGE
+
+        cost, source = optimizer._cost_tracker._observed_charge_cost(0.10)
+
+        assert source == "pv"
+        assert cost == pytest.approx((0.10 - 0.02) / optimizer.efficiency)
+
+    def test_projected_discharge_to_load_can_store_surplus_pv(self, optimizer, base_time):
+        hour = base_time
+        entry = make_schedule_entry(hour, BatteryMode.DISCHARGE)
+        entry.export_rate = 0
+
+        _, final_cost = optimizer._cost_tracker.project_costs(
+            schedule={hour: entry},
+            starting_soc=optimizer.min_soc,
+            starting_cost=0.20,
+            prices_by_slot={hour: 0.10},
+            predict_load_func=lambda _: 0.5,
+            predict_pv_func=lambda _: 2.0,
+        )
+
+        assert final_cost == pytest.approx((0.10 - 0.02) / optimizer.efficiency)
+
+    def test_observed_charge_before_mode_callback_uses_conservative_landed_cost(self):
+        """An unknown source must not inject raw AC spot into the DC average."""
+        optimizer = MockCostOptimizer(efficiency=0.90, inverter_efficiency=0.95)
+        optimizer._cost_tracker._config.import_price_multiplier = 1.21
+
+        cost, source = optimizer._cost_tracker._observed_charge_cost(0.10)
+
+        assert source == "unknown-grid"
+        assert cost == pytest.approx((0.10 + 0.05) * 1.21 / (0.90 * 0.95))
+
+    def test_loading_persisted_cost_does_not_emit_permanent_migration_warning(self, optimizer):
+        messages = []
+        optimizer._cost_tracker._get_state = lambda entity: (
+            "2" if entity.endswith("basis_version") else "0.1234"
+        )
+        optimizer._cost_tracker._log = lambda message, **kwargs: messages.append(
+            (message, kwargs.get("level"))
+        )
+
+        assert optimizer._cost_tracker.load_from_ha() is True
+        assert optimizer.battery_avg_cost == pytest.approx(0.1234)
+        assert not [message for message, level in messages if level == "WARNING"]
+
+    def test_legacy_persisted_cost_is_migrated_once_to_landed_basis(self, optimizer):
+        states = {
+            "input_number.battery_avg_cost": "0.10",
+            "input_number.battery_cost_basis_version": "1",
+        }
+        calls = []
+        optimizer._cost_tracker._get_state = states.get
+        optimizer._cost_tracker._call_service = lambda service, **data: calls.append(
+            (service, data)
+        )
+
+        assert optimizer._cost_tracker.load_from_ha() is True
+        expected = (0.10 + optimizer.grid_fee) / (
+            optimizer.efficiency * optimizer.inverter_efficiency
+        )
+        assert optimizer.battery_avg_cost == pytest.approx(expected)
+        assert any(
+            data.get("entity_id") == "input_number.battery_cost_basis_version"
+            and data.get("value") == 2
+            for _, data in calls
+        )
 
     def test_high_soc_charge_small_impact(self, optimizer, base_time):
         """Starting near max_soc, new charge has small impact on cost."""
@@ -349,7 +473,8 @@ class TestProjectBatteryCosts:
         # Verify cost changed less than with full charge
         old_energy = (starting_soc - optimizer.min_soc) / 100 * optimizer.battery_capacity
         max_added = (optimizer.max_soc - starting_soc) / 100 * optimizer.battery_capacity
-        expected_cost = (old_energy * 0.10 + max_added * 0.05) / (old_energy + max_added)
+        landed_cost = (0.05 + optimizer.grid_fee) / optimizer.efficiency
+        expected_cost = (old_energy * 0.10 + max_added * landed_cost) / (old_energy + max_added)
         assert abs(final_cost - expected_cost) < 0.001
 
     def test_charge_rates_by_slot_used(self, optimizer, base_time):
@@ -370,7 +495,8 @@ class TestProjectBatteryCosts:
         # Calculate expected with custom rate
         old_energy = (50 - 10) / 100 * 14.3
         added_energy = 2.0 * 0.85 * 1.0  # Half rate
-        expected_cost = (old_energy * 0.10 + added_energy * 0.05) / (
+        landed_cost = (0.05 + optimizer.grid_fee) / optimizer.efficiency
+        expected_cost = (old_energy * 0.10 + added_energy * landed_cost) / (
             old_energy + added_energy
         )
         assert abs(final_cost - expected_cost) < 0.001
@@ -393,7 +519,8 @@ class TestProjectBatteryCosts:
         # Calculate expected with half slot
         old_energy = (50 - 10) / 100 * 14.3
         added_energy = 4.5 * 0.85 * 1.0 * 0.5  # Half energy
-        expected_cost = (old_energy * 0.10 + added_energy * 0.05) / (
+        landed_cost = (0.05 + optimizer.grid_fee) / optimizer.efficiency
+        expected_cost = (old_energy * 0.10 + added_energy * landed_cost) / (
             old_energy + added_energy
         )
         assert abs(final_cost - expected_cost) < 0.001
@@ -429,16 +556,17 @@ class TestProjectBatteryCosts:
         # Starting cost
         assert projected[hours[0]] == 0.10
 
-        # After cheap charge, cost should decrease
-        assert projected[hours[1]] < 0.10
+        # After charging, landed acquisition cost changes the average.
+        assert projected[hours[1]] != 0.10
 
         # Discharge and hold don't change cost
         assert projected[hours[2]] == projected[hours[1]]
         assert projected[hours[3]] == projected[hours[2]]
 
         # After second charge, cost changes again
-        # Final cost should be < starting due to cheap charges
-        assert final_cost < 0.10
+        # Fees and charge losses are included, so raw spot below 0.10 does not
+        # necessarily mean stored energy costs less than 0.10.
+        assert final_cost != 0.10
 
 
 class TestGetDischargeThreshold:
@@ -446,8 +574,7 @@ class TestGetDischargeThreshold:
 
     def test_basic_threshold(self):
         """Basic threshold calculation."""
-        # threshold = (avg_cost + grid_fee) / efficiency + wear_cost
-        # = (0.10 + 0.05) / 0.85 + 0.0 = 0.1765
+        # Average cost is already landed per stored DC kWh.
         optimizer = MockCostOptimizer(
             battery_avg_cost=0.10,
             efficiency=0.85,
@@ -456,7 +583,7 @@ class TestGetDischargeThreshold:
         )
 
         threshold = optimizer._get_discharge_threshold()
-        expected = (0.10 + 0.05) / 0.85
+        expected = 0.10
         assert abs(threshold - expected) < 0.001
 
     def test_with_wear_cost(self):
@@ -469,7 +596,7 @@ class TestGetDischargeThreshold:
         )
 
         threshold = optimizer._get_discharge_threshold()
-        expected = (0.10 + 0.05) / 0.85 + 0.02
+        expected = 0.10 + 0.02
         assert abs(threshold - expected) < 0.001
 
         # Should be higher than without wear cost
@@ -491,11 +618,11 @@ class TestGetDischargeThreshold:
         )
 
         threshold = optimizer._get_discharge_threshold()
-        expected = 0.10 / 0.85
+        expected = 0.10
         assert abs(threshold - expected) < 0.001
 
-    def test_high_efficiency_lower_threshold(self):
-        """Higher efficiency should result in lower threshold."""
+    def test_charge_efficiency_does_not_double_count_threshold(self):
+        """Charge efficiency is already represented in landed average cost."""
         opt_high_eff = MockCostOptimizer(
             battery_avg_cost=0.10,
             efficiency=0.95,
@@ -510,8 +637,14 @@ class TestGetDischargeThreshold:
         threshold_high = opt_high_eff._get_discharge_threshold()
         threshold_low = opt_low_eff._get_discharge_threshold()
 
-        # Higher efficiency = lower threshold
-        assert threshold_high < threshold_low
+        assert threshold_high == threshold_low
+
+    def test_inverter_efficiency_raises_threshold(self):
+        optimizer = MockCostOptimizer(
+            battery_avg_cost=0.10,
+            inverter_efficiency=0.90,
+        )
+        assert optimizer._get_discharge_threshold() == pytest.approx(0.10 / 0.90)
 
 
 class TestGetDischargeThresholdForCost:
@@ -544,11 +677,10 @@ class TestGetDischargeThresholdForCost:
         assert threshold_high > threshold_low
 
     def test_zero_cost(self, optimizer):
-        """Zero cost should just include grid_fee/efficiency + wear."""
+        """Zero acquisition cost should include only wear."""
         threshold = optimizer._get_discharge_threshold_for_cost(0.0)
 
-        # threshold = (0 + 0.05) / 0.85 + 0.01
-        expected = (0.0 + 0.05) / 0.85 + 0.01
+        expected = 0.01
         assert abs(threshold - expected) < 0.001
 
     def test_negative_cost(self, optimizer):
@@ -556,18 +688,17 @@ class TestGetDischargeThresholdForCost:
         # This could happen with negative electricity prices
         threshold = optimizer._get_discharge_threshold_for_cost(-0.05)
 
-        # threshold = (-0.05 + 0.05) / 0.85 + 0.01 = 0 + 0.01 = 0.01
-        expected = (-0.05 + 0.05) / 0.85 + 0.01
+        expected = -0.05 + 0.01
         assert abs(threshold - expected) < 0.001
 
     def test_proportional_to_cost(self, optimizer):
-        """Threshold should scale linearly with cost (before efficiency)."""
+        """Threshold should scale linearly with stored-energy cost."""
         threshold_1 = optimizer._get_discharge_threshold_for_cost(0.10)
         threshold_2 = optimizer._get_discharge_threshold_for_cost(0.20)
 
-        # Difference should be proportional to cost difference / efficiency
+        # With unity inverter efficiency, difference equals stored-cost difference.
         cost_diff = 0.20 - 0.10
-        expected_threshold_diff = cost_diff / optimizer.efficiency
+        expected_threshold_diff = cost_diff
         actual_threshold_diff = threshold_2 - threshold_1
 
         assert abs(actual_threshold_diff - expected_threshold_diff) < 0.001
@@ -682,7 +813,8 @@ class TestFifteenMinCostTracking:
         # Calculate expected values with 15-min slot (0.25 hours)
         old_energy = (starting_soc - optimizer.min_soc) / 100 * optimizer.battery_capacity
         energy_added = 4.5 * 0.85 * 0.25  # 0.95625 kWh for 15-min slot
-        expected_cost = (old_energy * starting_cost + energy_added * 0.05) / (
+        landed_cost = (0.05 + optimizer.grid_fee) / optimizer.efficiency
+        expected_cost = (old_energy * starting_cost + energy_added * landed_cost) / (
             old_energy + energy_added
         )
         assert abs(final_cost - expected_cost) < 0.001
@@ -691,10 +823,10 @@ class TestFifteenMinCostTracking:
         energy_30min = 4.5 * 0.85 * 0.5  # would be 1.9125 for 30-min
         energy_60min = 4.5 * 0.85 * 1.0  # would be 3.825 for 60-min
 
-        cost_if_30min = (old_energy * starting_cost + energy_30min * 0.05) / (
+        cost_if_30min = (old_energy * starting_cost + energy_30min * landed_cost) / (
             old_energy + energy_30min
         )
-        cost_if_60min = (old_energy * starting_cost + energy_60min * 0.05) / (
+        cost_if_60min = (old_energy * starting_cost + energy_60min * landed_cost) / (
             old_energy + energy_60min
         )
 

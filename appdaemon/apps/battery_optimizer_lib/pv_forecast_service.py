@@ -12,7 +12,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, TYPE_CHECKING
 
-from .timezone_utils import align_to_slot, ensure_local_tz
+from .timezone_utils import align_to_slot, canonical_slot_key, ensure_local_tz, instant_key
 
 if TYPE_CHECKING:
     from .config import BatteryOptimizerConfig
@@ -98,6 +98,10 @@ class PvForecastService:
         # Cache: slot-aligned naive local datetime -> kW
         self._cache: Dict[datetime.datetime, float] = {}
         self._cache_timestamp: Optional[datetime.datetime] = None
+        # Reactive PV checks may request a refresh before the normal cache TTL.
+        # Keep a separate attempt timestamp so repeated shortfall checks cannot
+        # hammer Forecast.Solar (or repeatedly query HA sensor attributes).
+        self._last_forced_refresh_attempt: Optional[datetime.datetime] = None
 
     @property
     def has_forecast(self) -> bool:
@@ -105,10 +109,10 @@ class PvForecastService:
         return len(self._cache) > 0
 
     def _slot_key(self, dt: datetime.datetime) -> datetime.datetime:
-        """Convert a datetime to a naive local-time cache key."""
+        """Convert a datetime to a DST-safe cache key."""
         tz = self.get_timezone()
         slot_dt = align_to_slot(dt, self._config.slot_minutes, tz)
-        return slot_dt.replace(tzinfo=None)
+        return canonical_slot_key(slot_dt)
 
     def has_slot(self, dt: datetime.datetime) -> bool:
         """Whether the cache contains data for this specific slot."""
@@ -129,16 +133,65 @@ class PvForecastService:
         val = self._cache.get(self._slot_key(dt))
         return val if val is not None else 0.0
 
-    def refresh(self) -> bool:
+    def refresh_for_shortfall(
+        self,
+        dt: datetime.datetime,
+        actual_kw: float,
+    ) -> bool:
+        """Refresh and conservatively correct the current shortfall slot.
+
+        A provider may return the same optimistic forecast even after a forced
+        refresh (notably when a Solcast HA entity has not updated yet).  Cap the
+        affected slot at the observed production so the immediate DP rerun does
+        not reuse that stale value.  Future slots remain provider-driven and
+        will be checked reactively when they become current.
+
+        Returns the result of the provider refresh.  The observation is applied
+        even when the refresh is rate-limited or all providers are unavailable.
         """
-        Fetch fresh forecast data if cache is stale.
+        refreshed = self.refresh(force=True)
+        key = self._slot_key(dt)
+        observed_kw = max(0.0, float(actual_kw))
+        forecast_kw = self._cache.get(key)
+        self._cache[key] = (
+            min(forecast_kw, observed_kw)
+            if forecast_kw is not None
+            else observed_kw
+        )
+        return refreshed
+
+    def refresh(self, force: bool = False) -> bool:
+        """
+        Fetch fresh forecast data if cache is stale or ``force`` is requested.
+
+        Forced refreshes are intended for reactive actual-vs-forecast checks.
+        They bypass the normal cache TTL, but are rate-limited to at most one
+        attempt per scheduling slot.  This allows a detected cloud shortfall to
+        re-read the provider immediately without turning each safety callback
+        into an external API request.
 
         Returns True if cache was updated, False if still using existing cache.
         """
         now = self.datetime()
 
+        if force:
+            forced_cooldown_minutes = max(
+                1,
+                min(
+                    self._config.slot_minutes,
+                    self._config.pv_forecast_cache_minutes,
+                ),
+            )
+            if self._last_forced_refresh_attempt is not None:
+                forced_age_minutes = (
+                    now - self._last_forced_refresh_attempt
+                ).total_seconds() / 60.0
+                if forced_age_minutes < forced_cooldown_minutes:
+                    return False
+            self._last_forced_refresh_attempt = now
+
         # Check cache freshness
-        if self._cache_timestamp is not None:
+        if not force and self._cache_timestamp is not None:
             age_minutes = (now - self._cache_timestamp).total_seconds() / 60.0
             if age_minutes < self._config.pv_forecast_cache_minutes:
                 return False  # Cache is fresh
@@ -370,7 +423,8 @@ class PvForecastService:
         Solcast data with 15-min slots), the same kW value is duplicated to
         each sub-slot within the period.
 
-        Returns dict of naive local datetime -> kW.
+        Returns a dict of fixed-offset local datetime -> kW. Fixed offsets keep
+        both repeated autumn-fold slots distinct.
         """
         slot_min = self._config.slot_minutes
         result: Dict[datetime.datetime, float] = {}
@@ -384,7 +438,13 @@ class PvForecastService:
         n_slots = max(1, period_minutes // slot_min)
 
         for i in range(n_slots):
-            key = (slot_dt + datetime.timedelta(minutes=i * slot_min)).replace(tzinfo=None)
+            if slot_dt.tzinfo is not None:
+                expanded = (
+                    instant_key(slot_dt) + datetime.timedelta(minutes=i * slot_min)
+                ).astimezone(slot_dt.tzinfo)
+            else:
+                expanded = slot_dt + datetime.timedelta(minutes=i * slot_min)
+            key = canonical_slot_key(expanded)
             result[key] = kw_value
 
         return result

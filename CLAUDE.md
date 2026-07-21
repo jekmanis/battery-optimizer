@@ -74,20 +74,29 @@ tests/
 - Price service requests 15-min resolution from Nord Pool (`resolution` parameter)
 - `_normalize_prices()` handles expansion if source data is coarser (e.g., hourly → 4x15min)
 - Load profile supports migration from coarser buckets (30-min → 15-min) on first load
+- A local day is not always 96 slots: Europe/Riga spring/autumn transitions produce 23/25-hour days. Internally, aware timestamps are keyed, sorted, and compared as UTC instants so the two autumn `03:00` intervals remain distinct; local time is for prediction and presentation.
 
 ## Core Algorithm
 
 ### Scheduling Logic (`DPOptimizer.optimize`)
 Uses **dynamic programming** with SOC state tracking:
-1. Discretize SOC into energy levels (0.1 kWh steps)
+1. Discretize the configured SOC range using `soc_step_percent`
 2. For each time slot, evaluate HOLD/CHARGE/DISCHARGE transitions
-3. Track best value for each (charge_count, energy_level) state
+3. Track the best cumulative economic value for each reachable energy level
 4. Backtrack to extract optimal action sequence
 
 **Value calculations:**
-- CHARGE cost: `(price + grid_fee) * energy / efficiency`
-- DISCHARGE value: `(price + grid_fee) * energy` (avoided import cost)
-- Discharge is modeled as self-consumption: `min(predicted_load, discharge_rate)`
+- Marginal import price: `(spot_price + grid_fee) * import_price_multiplier`
+- Net load: `max(0, predicted_load - predicted_pv)`; PV serves load before battery or grid energy
+- Grid CHARGE cost uses AC imported energy. Stored battery energy includes the configured storage efficiency, while grid AC-to-DC conversion also applies `inverter_efficiency`; simultaneous PV surplus reduces the grid contribution.
+- DISCHARGE serves `min(net_load, discharge_rate)` on the AC side. The SOC transition consumes additional DC energy for inverter loss, and battery wear is charged per discharged DC kWh.
+- PV surplus can charge the battery in HOLD/CHARGE and remaining surplus earns `max(0, spot * export_rate_multiplier - grid_export_fee)`.
+
+`efficiency` is the charge-retention factor, not a complete round-trip figure. `inverter_efficiency` applies on grid AC-to-DC charging and battery DC-to-AC discharge, so the modeled grid-charge round trip is approximately `efficiency * inverter_efficiency^2`.
+
+`min_charge_slots_required` is reporting-only: it estimates the aggregate energy deficit but does not constrain the DP. Feasibility comes from SOC-state transitions and power limits.
+
+At the price-horizon boundary, `terminal_energy_value_eur_kwh` values usable stored DC energy. `auto` derives a conservative value from the median forecast import price, discharge conversion, and wear; `0` restores legacy end-of-horizon depletion behavior. It is a salvage value, not a hard terminal-SOC target.
 
 ### Inverter Control (DirectControl)
 The schedule is executed by sending mode commands to the Growatt WIT inverter
@@ -99,16 +108,23 @@ via the `growatt_modbus/set_wit_mode` HA service (no raw register writes):
 - Dry-run mode: `device_id: ""` in apps.yaml logs commands without sending them
 
 ### Battery Cost Tracking
-- **Weighted average**: `(old_energy * old_cost + new_energy * charge_price) / total_energy`
+- **Units**: `battery_avg_cost` is landed EUR per stored DC kWh, not raw spot price
+- **Weighted average**: `(old_stored_energy * old_landed_cost + added_stored_energy * added_landed_cost) / total_stored_energy`
+- **Grid charging**: landed cost includes `(spot + grid_fee) * import_price_multiplier` and AC-to-stored-DC conversion losses
+- **PV charging**: landed cost is the foregone net export revenue per stored DC kWh; PV is not booked at the grid purchase price
 - **SOC-based tracking**: Measures actual SOC changes, not theoretical charging
+- **Discharging**: Reduces stored energy without changing its per-kWh average
 - **Persistence**: Stored in `input_number.battery_avg_cost` (survives restarts)
+
+The tracker is an operational estimate because aggregate inverter counters may not identify every mixed PV/grid contribution. Projected tracking must use the same load and PV predictors as the schedule. The DP itself optimizes forecast cash flows and does not use `battery_avg_cost` as a charge-count constraint or primary objective.
 
 ### Dynamic Configuration
 These values read from HA entities at runtime (adjustable without restart):
 - `input_number.battery_min_soc` -> min_soc
 - `input_number.battery_max_soc` -> max_soc
 - `input_number.battery_pv_threshold` -> pv_threshold
-- `input_number.battery_avg_cost` -> battery cost persistence
+- `input_number.battery_avg_cost` -> landed battery-cost persistence
+- `input_number.battery_cost_basis_version` -> one-time legacy raw-cost migration marker
 
 ### Scheduled Tasks
 - **13:15 daily**: Full optimization (after Nord Pool prices publish)

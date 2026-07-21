@@ -29,6 +29,9 @@ from battery_optimizer_lib import (
     DPOptimizerConfig,
     # Timezone utilities
     normalize_tz_pair,
+    datetimes_match_slot,
+    instant_key,
+    canonical_slot_key,
     dt_ge,
     ensure_local_tz,
     align_to_slot,
@@ -388,7 +391,7 @@ class BatteryOptimizer(hass.Hass):
         future_prices = self._ensure_current_slot_price(prices, future_prices, current_slot)
 
         # Calculate min_charge_slots for informational purposes
-        slots_sorted_by_time = sorted(future_prices, key=lambda p: p.time)
+        slots_sorted_by_time = sorted(future_prices, key=lambda p: instant_key(p.time))
         n_slots = len(slots_sorted_by_time)
         min_charge_slots = max(0, int(charge_hours_needed))
         if min_charge_slots > n_slots:
@@ -424,41 +427,39 @@ class BatteryOptimizer(hass.Hass):
 
         schedule = result.schedule
 
-        # Cloud-safe conversion: HOLD → DISCHARGE(to load) during PV hours.
-        # Since discharge_to_load charges from PV surplus (confirmed on Growatt WIT),
-        # it behaves identically to HOLD when PV is available. But when clouds kill
-        # PV, battery covers load instead of grid — cheaper when buy_price > wear.
-        cloud_safe_count = 0
-        prices_by_slot_map = {p.time: p.price for p in slots_sorted_by_time}
-        for slot_time, entry in schedule.items():
-            if entry.mode == BatteryMode.HOLD:
-                pv_kw = self._predict_pv_kw(slot_time)
-                if pv_kw > 0:
-                    price = prices_by_slot_map.get(slot_time, 0.0)
-                    buy_price = price + self.config.grid_fee
-                    if buy_price > self.config.battery_wear_cost:
-                        entry.mode = BatteryMode.DISCHARGE
-                        entry.export_rate = 0
-                        entry.reason += " [cloud-safe]"
-                        cloud_safe_count += 1
-        if cloud_safe_count > 0:
-            self.log(f"Cloud-safe: converted {cloud_safe_count} HOLD→DISCHARGE(to load) "
-                     f"slots during PV hours (buy_price > wear_cost)")
-
-        # Project costs for sensor exposure
-        has_charge_slots = any(e.mode == BatteryMode.CHARGE for e in schedule.values())
-        if has_charge_slots:
-            prices_by_slot = {p.time: p.price for p in slots_sorted_by_time}
+        # Project landed costs when the plan can add stored energy. Besides
+        # explicit CHARGE, HOLD and discharge-to-load can accept PV surplus.
+        has_projected_charge = any(
+            entry.mode == BatteryMode.CHARGE for entry in schedule.values()
+        )
+        has_projected_pv_gain = any(
+            entry.mode in (BatteryMode.HOLD, BatteryMode.DISCHARGE)
+            and not (entry.export_rate is not None and entry.export_rate > 0)
+            and self._predict_pv_kw(slot_time) > self._predict_load_kw(slot_time)
+            for slot_time, entry in schedule.items()
+        )
+        if schedule and (has_projected_charge or has_projected_pv_gain):
+            local_tz = self._get_local_timezone()
+            prices_by_slot = {
+                canonical_slot_key(p.time): p.price for p in slots_sorted_by_time
+            }
             # Re-compute charge rates per slot for cost projection
-            slot_fractions = self._compute_slot_fractions(slots_sorted_by_time, current_slot, minutes_into_slot)
+            slot_fractions = self._compute_slot_fractions(
+                slots_sorted_by_time,
+                current_slot,
+                minutes_into_slot,
+                local_tz=local_tz,
+            )
             charge_rates_per_slot = self._compute_charge_rates_per_slot(
                 slots_sorted_by_time, slot_fractions, current_soc_for_calc, current_temp
             )
             slot_charge_rates_by_slot = {
-                p.time: charge_rates_per_slot[i] for i, p in enumerate(slots_sorted_by_time)
+                canonical_slot_key(p.time): charge_rates_per_slot[i]
+                for i, p in enumerate(slots_sorted_by_time)
             }
             slot_fractions_by_slot = {
-                p.time: slot_fractions[i] for i, p in enumerate(slots_sorted_by_time)
+                canonical_slot_key(p.time): slot_fractions[i]
+                for i, p in enumerate(slots_sorted_by_time)
             }
             projected_costs, _ = self._cost_tracker.project_costs(
                 schedule,
@@ -466,6 +467,7 @@ class BatteryOptimizer(hass.Hass):
                 self.battery_avg_cost,
                 prices_by_slot,
                 predict_load_func=self._predict_load_kw,
+                predict_pv_func=self._predict_pv_kw,
                 charge_rates_by_slot=slot_charge_rates_by_slot,
                 slot_fractions_by_slot=slot_fractions_by_slot,
             )
@@ -517,31 +519,37 @@ class BatteryOptimizer(hass.Hass):
         Nord Pool may exclude current hour as "past", so we try to
         synthesize the price from yesterday's data or previous prices.
         """
+        local_tz = self._get_local_timezone()
+
         def prices_contains_slot(prices_list, slot):
-            slot_naive = slot.replace(tzinfo=None) if slot.tzinfo else slot
-            for p in prices_list:
-                p_naive = p.time.replace(tzinfo=None) if p.time.tzinfo else p.time
-                if p_naive == slot_naive:
-                    return True
-            return False
+            return any(datetimes_match_slot(p.time, slot, local_tz)
+                       for p in prices_list)
 
         if prices_contains_slot(future_prices, current_slot):
             return future_prices
 
         # Current slot missing - try yesterday's Nord Pool data (timezone shift around midnight)
-        tz = self._get_local_timezone()
+        tz = local_tz
         yesterday = current_slot.date() - datetime.timedelta(days=1)
         yesterday_prices = self._price_service.get_prices_for_date(yesterday, tz)
 
-        def find_slot_price(prices_list, slot):
-            slot_naive = slot.replace(tzinfo=None) if slot.tzinfo else slot
-            for p in prices_list:
-                p_naive = p.time.replace(tzinfo=None) if p.time.tzinfo else p.time
-                if p_naive == slot_naive:
-                    return p
-            return None
+        def find_same_clock_price(prices_list, slot):
+            """Find yesterday's equivalent local clock slot, ignoring its date."""
+            local_slot = ensure_local_tz(slot, tz)
+            candidates = []
+            for point in prices_list:
+                local_point = ensure_local_tz(point.time, tz)
+                if (local_point.hour, local_point.minute) == (local_slot.hour, local_slot.minute):
+                    candidates.append((local_point, point))
+            if not candidates:
+                return None
+            # On an autumn-fold day prefer the corresponding occurrence.
+            for local_point, point in candidates:
+                if local_point.fold == local_slot.fold:
+                    return point
+            return candidates[0][1]
 
-        slot_price_point = find_slot_price(yesterday_prices, current_slot)
+        slot_price_point = find_same_clock_price(yesterday_prices, current_slot)
         if slot_price_point is not None:
             synth_price = slot_price_point.price
             self.log(
@@ -550,18 +558,12 @@ class BatteryOptimizer(hass.Hass):
             )
         else:
             # If still missing, synthesize using most recent past price if available
-            current_slot_naive = current_slot.replace(tzinfo=None) if current_slot.tzinfo else current_slot
             prev_price_point = None
             for p in all_prices:
-                p_hour = p.time
-                p_naive = p_hour.replace(tzinfo=None) if p_hour.tzinfo else p_hour
-                if p_naive <= current_slot_naive:
-                    if prev_price_point is None:
+                if dt_ge(current_slot, p.time, tz):
+                    if (prev_price_point is None or
+                            dt_ge(p.time, prev_price_point.time, tz)):
                         prev_price_point = p
-                    else:
-                        prev_naive = prev_price_point.time.replace(tzinfo=None) if prev_price_point.time.tzinfo else prev_price_point.time
-                        if p_naive > prev_naive:
-                            prev_price_point = p
 
             if prev_price_point is not None:
                 synth_price = prev_price_point.price
@@ -571,7 +573,7 @@ class BatteryOptimizer(hass.Hass):
                 )
             else:
                 # Fallback: use first available future price
-                synth_price = min(future_prices, key=lambda p: p.time).price
+                synth_price = min(future_prices, key=lambda p: instant_key(p.time)).price
                 self.log(f"Added missing current slot {current_slot} using next price {synth_price:.4f} EUR/kWh")
 
         # Normalize timezone to match existing prices (avoid mixing aware/naive)
@@ -593,20 +595,17 @@ class BatteryOptimizer(hass.Hass):
         slots_sorted_by_time: List[PricePoint],
         current_slot: datetime.datetime,
         minutes_into_slot: float,
+        local_tz=None,
     ) -> List[float]:
         """Compute fraction of each slot that is usable (partial first slot)."""
         n_slots = len(slots_sorted_by_time)
         first_fraction = min(1.0, max(0.0, (self.config.slot_minutes - minutes_into_slot) / max(1, self.config.slot_minutes)))
         slot_fractions = [1.0] * n_slots
+        if local_tz is None:
+            local_tz = self._get_local_timezone()
 
         for i, p in enumerate(slots_sorted_by_time):
-            p_hour = p.time
-            compare_current = current_slot
-            if p_hour.tzinfo is not None and compare_current.tzinfo is None:
-                p_hour = p_hour.replace(tzinfo=None)
-            elif p_hour.tzinfo is None and compare_current.tzinfo is not None:
-                compare_current = compare_current.replace(tzinfo=None)
-            if p_hour == compare_current:
+            if datetimes_match_slot(p.time, current_slot, local_tz):
                 slot_fractions[i] = first_fraction
                 break
 
@@ -877,6 +876,14 @@ class BatteryOptimizer(hass.Hass):
                     f"PV below forecast: actual={actual_pv_w:.0f}W vs "
                     f"forecast={forecast_pv_w:.0f}W "
                     f"({actual_pv_w/forecast_pv_w*100:.0f}%), recalculating"
+                )
+                # Bypass the normal forecast cache and cap the current slot at
+                # observed production. The forced provider read is separately
+                # rate-limited, so persistent clouds cannot hammer the API or
+                # immediately reintroduce the same optimistic cached value.
+                self._pv_forecast_service.refresh_for_shortfall(
+                    self._align_to_slot(self.datetime()),
+                    actual_pv_w / 1000.0,
                 )
                 self._recalculate_remaining_schedule(current_soc)
                 return
@@ -1249,6 +1256,8 @@ class BatteryOptimizer(hass.Hass):
             max_soc=self.max_soc,
             soc_deviation_threshold=self.config.soc_deviation_threshold,
             grid_fee=self.config.grid_fee,
+            import_price_multiplier=self.config.import_price_multiplier,
+            inverter_efficiency=self.config.inverter_efficiency,
             decision_log_level=self.config.decision_log_level,
         )
         detector = SocDeviationDetector(

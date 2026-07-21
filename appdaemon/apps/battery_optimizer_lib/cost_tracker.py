@@ -25,6 +25,7 @@ class BatteryCostConfig:
 
     # HA entity for persisting battery cost
     battery_cost_entity: str = "input_number.battery_avg_cost"
+    battery_cost_basis_version_entity: str = "input_number.battery_cost_basis_version"
 
     # Inverter energy sensors
     battery_charge_sensor: str = "sensor.growatt_battery_charge_today"
@@ -41,9 +42,13 @@ class BatteryCostConfig:
 
     # Pricing
     grid_fee: float = 0.052  # EUR/kWh — trading margin + distribution on purchases
+    grid_export_fee: float = 0.02  # EUR/kWh deducted from exported PV value
+    export_rate_multiplier: float = 1.0
+    inverter_efficiency: float = 1.0  # AC-to-DC conversion efficiency
+    import_price_multiplier: float = 1.0  # e.g. VAT applied to spot + variable fees
     battery_wear_cost: float = 0.0  # EUR/kWh
 
-    # Default fallback cost when HA entity unavailable
+    # Default fallback landed cost per stored DC kWh when HA entity unavailable
     default_cost: float = 0.10  # EUR/kWh
 
     @property
@@ -56,6 +61,7 @@ class BatteryCostConfig:
         """Create from the central BatteryOptimizerConfig."""
         return cls(
             battery_cost_entity=cfg.battery_cost_entity,
+            battery_cost_basis_version_entity=cfg.battery_cost_basis_version_entity,
             battery_charge_sensor=cfg.battery_charge_sensor,
             battery_discharge_sensor=cfg.battery_discharge_sensor,
             use_inverter_energy_sensors=cfg.use_inverter_energy_sensors,
@@ -66,6 +72,10 @@ class BatteryCostConfig:
             discharge_rate=cfg.discharge_rate,
             export_discharge_rate=cfg.export_discharge_rate,
             grid_fee=cfg.grid_fee,
+            grid_export_fee=cfg.grid_export_fee,
+            export_rate_multiplier=cfg.export_rate_multiplier,
+            inverter_efficiency=cfg.inverter_efficiency,
+            import_price_multiplier=getattr(cfg, "import_price_multiplier", 1.0),
             battery_wear_cost=cfg.battery_wear_cost,
         )
 
@@ -145,6 +155,8 @@ class BatteryCostTracker:
         self._last_discharge_today_kwh: Optional[float] = None
         self._energy_sensor_available: bool = False
         self._stored_energy_kwh: Optional[float] = None
+        self._current_mode: Optional["BatteryMode"] = None
+        self._basis_migrated_this_runtime = False
 
     # =========================================================================
     # Public Properties
@@ -221,6 +233,49 @@ class BatteryCostTracker:
             old_energy, self._avg_cost, added_energy, added_price
         )
 
+    def _grid_landed_cost(self, spot_price: float) -> float:
+        """Cost per kWh stored from the grid, including conversion losses."""
+        charge_efficiency = max(1e-9, self._config.efficiency)
+        inverter_efficiency = max(1e-9, self._config.inverter_efficiency)
+        import_price = (
+            (spot_price + self._config.grid_fee)
+            * self._config.import_price_multiplier
+        )
+        return import_price / (charge_efficiency * inverter_efficiency)
+
+    def _pv_opportunity_cost(self, spot_price: float) -> float:
+        """Foregone export revenue per kWh stored from surplus PV."""
+        sell_price = max(
+            0.0,
+            spot_price * self._config.export_rate_multiplier
+            - self._config.grid_export_fee,
+        )
+        return sell_price / max(1e-9, self._config.efficiency)
+
+    def _observed_charge_cost(self, spot_price: float) -> Tuple[float, str]:
+        """Attribute measured charging only when the active mode establishes it."""
+        from .models import BatteryMode
+
+        if self._current_mode == BatteryMode.CHARGE:
+            # CHARGE is explicitly commanded grid charging. Any simultaneous,
+            # unmetered PV contribution makes this a conservative estimate.
+            return self._grid_landed_cost(spot_price), "grid"
+        if self._current_mode in (BatteryMode.HOLD, BatteryMode.DISCHARGE):
+            # Growatt's discharge-to-load mode still accepts surplus PV into
+            # the battery.  A measured charge while either non-grid-charging
+            # mode is active is therefore valued at foregone export revenue.
+            return self._pv_opportunity_cost(spot_price), "pv"
+        # Before the first mode callback the source is unknowable. Use the
+        # conservative grid attribution so the landed-cost average never mixes
+        # in an AC-side raw spot price.
+        return self._grid_landed_cost(spot_price), "unknown-grid"
+
+    def _charge_cost_for_price(self, spot_price: Optional[float]) -> Tuple[float, str]:
+        """Return a coherent landed cost, preserving the average if price is unavailable."""
+        if spot_price is None:
+            return self._avg_cost, "unknown"
+        return self._observed_charge_cost(spot_price)
+
     # =========================================================================
     # Initialization
     # =========================================================================
@@ -268,8 +323,25 @@ class BatteryCostTracker:
         try:
             state = self._get_state(self._config.battery_cost_entity)
             if state and state not in ("unknown", "unavailable"):
-                self._avg_cost = float(state)
+                loaded_cost = float(state)
                 self._cost_from_fallback = False
+                basis_state = self._get_state(
+                    self._config.battery_cost_basis_version_entity
+                )
+                if basis_state and basis_state not in ("unknown", "unavailable"):
+                    if float(basis_state) < 2.0:
+                        if not self._basis_migrated_this_runtime:
+                            self._avg_cost = self._grid_landed_cost(loaded_cost)
+                            self._basis_migrated_this_runtime = True
+                            self._log(
+                                f"Migrated legacy raw battery cost {loaded_cost:.4f} to "
+                                f"conservative landed cost {self._avg_cost:.4f} EUR/kWh"
+                            )
+                            self.save_to_ha()
+                    else:
+                        self._avg_cost = loaded_cost
+                else:
+                    self._avg_cost = loaded_cost
                 self._log(f"Loaded battery avg cost: {self._avg_cost:.4f} EUR/kWh")
                 return True
         except (ValueError, TypeError) as e:
@@ -293,6 +365,17 @@ class BatteryCostTracker:
                 entity_id=self._config.battery_cost_entity,
                 value=round(self._avg_cost, 4)
             )
+            # Always stamp the basis version: the saved cost is landed-basis,
+            # so once the helper exists it must read 2 or a later restart
+            # would re-apply the legacy migration to an already-landed value.
+            try:
+                self._call_service(
+                    "input_number/set_value",
+                    entity_id=self._config.battery_cost_basis_version_entity,
+                    value=2,
+                )
+            except Exception:
+                pass  # helper not deployed yet — stamped on a later save
             self._log(f"Saved battery avg cost to HA: {self._avg_cost:.4f} EUR/kWh", level="DEBUG")
         except Exception as e:
             self._log(f"Could not save battery cost to {self._config.battery_cost_entity}: {e}", level="WARNING")
@@ -433,19 +516,19 @@ class BatteryCostTracker:
         if is_charge:
             # Get price for charging period
             charge_price = self._get_price_for_slot(self._last_price_slot) if self._last_price_slot else None
-            if charge_price is None:
-                charge_price = self._avg_cost
+            charge_cost, charge_source = self._charge_cost_for_price(charge_price)
 
             # Update weighted average cost
             # Use stored-energy accumulator to keep base in sync with inverter deltas
             old_energy = self._stored_energy_kwh or 0.0
-            self._update_weighted_avg_cost(old_energy, energy_kwh, charge_price)
+            self._update_weighted_avg_cost(old_energy, energy_kwh, charge_cost)
             new_total_energy = old_energy + energy_kwh
             # Cap stored energy at max usable capacity (max_soc - min_soc)
             max_usable_energy = self._soc_to_energy_kwh(self._get_max_soc())
             self._stored_energy_kwh = max(0.0, min(new_total_energy, max_usable_energy))
 
-            self._log(f"Battery charged: +{energy_kwh:.3f} kWh [inverter] at {charge_price:.4f} EUR/kWh, "
+            self._log(f"Battery charged: +{energy_kwh:.3f} kWh [inverter, {charge_source}] "
+                     f"at stored-energy cost {charge_cost:.4f} EUR/kWh, "
                      f"new avg cost: {self._avg_cost:.4f} EUR/kWh")
             self._cost_from_fallback = False  # We computed a real value
             self.save_to_ha()
@@ -456,8 +539,11 @@ class BatteryCostTracker:
                 soc_start=self._last_soc if self._last_soc else current_soc,
                 soc_end=current_soc,
                 duration_minutes=duration_minutes,
-                energy_from_grid_kwh=energy_kwh / self._config.efficiency,  # Estimate grid energy
-                charge_price=charge_price,
+                energy_from_grid_kwh=(
+                    energy_kwh / self._config.efficiency
+                    if charge_source != "pv" else None
+                ),
+                charge_price=charge_cost,
                 battery_temp=battery_temp,
                 battery_temp_start=self._last_sig_temp,
                 battery_temp_end=battery_temp,
@@ -559,16 +645,16 @@ class BatteryCostTracker:
         if soc_change > 0:
             # Battery charged - get price for the charging period
             charge_price = self._get_price_for_slot(self._last_price_slot) if self._last_price_slot else None
-            if charge_price is None:
-                charge_price = self._avg_cost  # Fallback to current avg
+            charge_cost, charge_source = self._charge_cost_for_price(charge_price)
 
             # Calculate energy BEFORE this charge (at old SOC)
             old_energy = max(0, self._soc_to_energy_kwh(self._last_soc))
 
             # Update weighted average cost
-            self._update_weighted_avg_cost(old_energy, energy_change_kwh, charge_price)
+            self._update_weighted_avg_cost(old_energy, energy_change_kwh, charge_cost)
 
-            self._log(f"Battery charged: +{soc_change:.1f}% (+{energy_change_kwh:.2f} kWh) at {charge_price:.4f} EUR/kWh, "
+            self._log(f"Battery charged: +{soc_change:.1f}% (+{energy_change_kwh:.2f} kWh) "
+                     f"[{charge_source}] at stored-energy cost {charge_cost:.4f} EUR/kWh, "
                      f"new avg cost: {self._avg_cost:.4f} EUR/kWh")
 
             self._cost_from_fallback = False  # We computed a real value
@@ -580,7 +666,7 @@ class BatteryCostTracker:
                 soc_start=self._last_soc,
                 soc_end=current_soc,
                 duration_minutes=duration_minutes,
-                charge_price=charge_price,
+                charge_price=charge_cost,
                 battery_temp=battery_temp_end,
                 battery_temp_start=self._last_sig_temp,
                 battery_temp_end=battery_temp_end
@@ -640,6 +726,7 @@ class BatteryCostTracker:
 
         now = self._get_datetime()
         current_temp = self._get_battery_temp()
+        self._current_mode = new_mode
 
         # Record temperature observation for ambient estimation
         if current_temp is not None and self._learning_engine:
@@ -719,16 +806,20 @@ class BatteryCostTracker:
 
     def get_discharge_threshold(self) -> float:
         """
-        Calculate discharge threshold based on actual battery cost.
+        Return the all-in avoided import price needed to justify discharge.
 
-        Threshold = (what we paid + grid fees) / efficiency + wear cost
-        Only discharge if we can "sell" above this price.
+        Average cost is maintained per stored DC kWh.  Discharging one DC kWh
+        delivers ``inverter_efficiency`` AC kWh, so charge-side fees and losses
+        must not be applied again here.
         """
         return self.get_discharge_threshold_for_cost(self._avg_cost)
 
     def get_discharge_threshold_for_cost(self, avg_cost: float) -> float:
         """Calculate discharge threshold for a given battery average cost."""
-        return ((avg_cost + self._config.grid_fee) / self._config.efficiency) + self._config.battery_wear_cost
+        return (
+            (avg_cost + self._config.battery_wear_cost)
+            / max(1e-9, self._config.inverter_efficiency)
+        )
 
     # =========================================================================
     # Price Lookup
@@ -755,6 +846,7 @@ class BatteryCostTracker:
         starting_cost: float,
         prices_by_slot: Dict[datetime.datetime, float],
         predict_load_func: Callable[[datetime.datetime], float],
+        predict_pv_func: Optional[Callable[[datetime.datetime], float]] = None,
         charge_rates_by_slot: Optional[Dict[datetime.datetime, float]] = None,
         slot_fractions_by_slot: Optional[Dict[datetime.datetime, float]] = None,
     ) -> Tuple[Dict[datetime.datetime, float], float]:
@@ -767,6 +859,7 @@ class BatteryCostTracker:
             starting_cost: Initial avg cost (EUR/kWh)
             prices_by_slot: Dict mapping datetime to electricity price
             predict_load_func: Function that takes datetime and returns predicted load in kW
+            predict_pv_func: Optional function returning predicted PV generation in kW
             charge_rates_by_slot: Optional dict mapping datetime to charge rate (kW)
             slot_fractions_by_slot: Optional dict mapping datetime to slot fraction (0-1)
 
@@ -780,48 +873,128 @@ class BatteryCostTracker:
         current_soc = starting_soc
         current_cost = starting_cost
 
+        def apply_pv_surplus(
+            soc: float,
+            avg_cost: float,
+            pv_surplus_kw: float,
+            slot_charge_rate: float,
+            fraction: float,
+            spot_price: Optional[float],
+        ) -> Tuple[float, float]:
+            """Apply surplus-PV charging for HOLD or discharge-to-load mode."""
+            if pv_surplus_kw <= 0:
+                return soc, avg_cost
+            old_energy = max(0.0, self._soc_to_energy_kwh(soc))
+            pv_charge_dc = min(pv_surplus_kw, slot_charge_rate) * slot_hours * fraction
+            energy_added = pv_charge_dc * self._config.efficiency
+            headroom_kwh = max(
+                0.0,
+                self._soc_to_energy_kwh(self._get_max_soc())
+                - self._soc_to_energy_kwh(soc),
+            )
+            energy_added = min(energy_added, headroom_kwh)
+            source_cost = (
+                self._pv_opportunity_cost(spot_price)
+                if spot_price is not None else avg_cost
+            )
+            new_cost = self._compute_weighted_avg_cost(
+                old_energy, avg_cost, energy_added, source_cost
+            )
+            new_soc = min(
+                self._get_max_soc(),
+                soc + (energy_added / self._config.battery_capacity) * 100,
+            )
+            return new_soc, new_cost
+
         for hour in sorted(schedule.keys()):
             projected_costs[hour] = current_cost
             entry = schedule[hour]
+            spot_price = prices_by_slot.get(hour)
+            fraction = (
+                slot_fractions_by_slot.get(hour, 1.0)
+                if slot_fractions_by_slot is not None
+                else 1.0
+            )
+            slot_charge_rate = (
+                charge_rates_by_slot.get(hour, self._config.charge_rate)
+                if charge_rates_by_slot is not None
+                else self._config.charge_rate
+            )
+            load_kw = max(0.0, predict_load_func(hour))
+            pv_kw = max(0.0, predict_pv_func(hour)) if predict_pv_func is not None else 0.0
+            pv_surplus_kw = max(0.0, pv_kw - load_kw)
 
             if entry.mode == BatteryMode.CHARGE:
-                charge_price = prices_by_slot.get(hour, current_cost)
                 old_energy = max(0, self._soc_to_energy_kwh(current_soc))
-                slot_charge_rate = (
-                    charge_rates_by_slot.get(hour, self._config.charge_rate)
-                    if charge_rates_by_slot is not None
-                    else self._config.charge_rate
-                )
-                fraction = (
-                    slot_fractions_by_slot.get(hour, 1.0)
-                    if slot_fractions_by_slot is not None
-                    else 1.0
-                )
-                energy_added = slot_charge_rate * self._config.efficiency * slot_hours * fraction
+                charge_dc = slot_charge_rate * slot_hours * fraction
+                energy_added = charge_dc * self._config.efficiency
                 # Calculate headroom: (max_soc - current_soc) in kWh
                 headroom_kwh = max(0.0, self._soc_to_energy_kwh(self._get_max_soc()) - self._soc_to_energy_kwh(current_soc))
                 energy_added = max(0.0, min(energy_added, headroom_kwh))
 
+                # Attribute the actual stored energy proportionally when the
+                # headroom cap truncates a mixed PV/grid charge.
+                actual_charge_dc = energy_added / max(1e-9, self._config.efficiency)
+                pv_charge_dc = min(pv_surplus_kw * slot_hours * fraction, actual_charge_dc)
+                grid_charge_dc = max(0.0, actual_charge_dc - pv_charge_dc)
+                if spot_price is None:
+                    # The current average already has landed-cost units. Do not
+                    # add fees/losses to it a second time as a price fallback.
+                    landed_cost = current_cost
+                else:
+                    # Both helpers return cost per stored DC kWh. Weight them
+                    # by each source's stored-energy contribution so live and
+                    # projected accounting share one tariff implementation.
+                    grid_stored = grid_charge_dc * self._config.efficiency
+                    pv_stored = pv_charge_dc * self._config.efficiency
+                    acquisition_cost = (
+                        grid_stored * self._grid_landed_cost(spot_price)
+                        + pv_stored * self._pv_opportunity_cost(spot_price)
+                    )
+                    landed_cost = acquisition_cost / energy_added if energy_added > 0 else current_cost
+
                 current_cost = self._compute_weighted_avg_cost(
-                    old_energy, current_cost, energy_added, charge_price
+                    old_energy, current_cost, energy_added, landed_cost
                 )
 
                 current_soc = min(self._get_max_soc(), current_soc + (energy_added / self._config.battery_capacity) * 100)
 
             elif entry.mode == BatteryMode.DISCHARGE:
-                fraction = (
-                    slot_fractions_by_slot.get(hour, 1.0)
-                    if slot_fractions_by_slot is not None
-                    else 1.0
-                )
                 if entry.export_rate is not None and entry.export_rate > 0:
-                    # Export: drain at full export discharge rate
+                    # Export rate is AC output; account for battery-to-AC loss.
                     edr = self._config.effective_export_discharge_rate
-                    energy_removed = edr * slot_hours * fraction
+                    energy_removed = (
+                        edr * slot_hours * fraction
+                        / max(1e-9, self._config.inverter_efficiency)
+                    )
                 else:
-                    # Self-consumption: drain at load rate
-                    load_kw = predict_load_func(hour)
-                    energy_removed = min(load_kw, self._config.discharge_rate) * slot_hours * fraction
+                    # PV serves load first. Remaining AC load requires more DC
+                    # battery energy because of inverter conversion loss.
+                    net_load_kw = max(0.0, load_kw - pv_kw)
+                    energy_removed = (
+                        min(net_load_kw, self._config.discharge_rate)
+                        * slot_hours * fraction
+                        / max(1e-9, self._config.inverter_efficiency)
+                    )
                 current_soc = max(self._get_min_soc(), current_soc - (energy_removed / self._config.battery_capacity) * 100)
+                if entry.export_rate is None or entry.export_rate <= 0:
+                    current_soc, current_cost = apply_pv_surplus(
+                        current_soc,
+                        current_cost,
+                        pv_surplus_kw,
+                        slot_charge_rate,
+                        fraction,
+                        spot_price,
+                    )
+
+            elif entry.mode == BatteryMode.HOLD and pv_surplus_kw > 0:
+                current_soc, current_cost = apply_pv_surplus(
+                    current_soc,
+                    current_cost,
+                    pv_surplus_kw,
+                    slot_charge_rate,
+                    fraction,
+                    spot_price,
+                )
 
         return projected_costs, current_cost

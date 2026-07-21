@@ -29,6 +29,42 @@ sys.modules["appdaemon.plugins.hass"] = type(sys)("appdaemon.plugins.hass")
 sys.modules["appdaemon.plugins.hass.hassapi"] = mock_hass_module
 
 
+class RigaTestTimezone(datetime.tzinfo):
+    """Minimal 2024 Europe/Riga rules for deterministic DST tests."""
+
+    def utcoffset(self, dt):
+        if dt is None:
+            return datetime.timedelta(hours=2)
+        if dt.date() == datetime.date(2024, 3, 31):
+            return datetime.timedelta(hours=2 if dt.hour < 4 else 3)
+        if dt.date() == datetime.date(2024, 10, 27):
+            if dt.hour == 3:
+                return datetime.timedelta(hours=2 if dt.fold else 3)
+            return datetime.timedelta(hours=3 if dt.hour < 3 else 2)
+        if datetime.date(2024, 3, 31) <= dt.date() < datetime.date(2024, 10, 27):
+            return datetime.timedelta(hours=3)
+        return datetime.timedelta(hours=2)
+
+    def dst(self, dt):
+        return self.utcoffset(dt) - datetime.timedelta(hours=2)
+
+    def fromutc(self, dt):
+        utc = dt.replace(tzinfo=datetime.timezone.utc)
+        spring = datetime.datetime(2024, 3, 31, 1, tzinfo=datetime.timezone.utc)
+        autumn = datetime.datetime(2024, 10, 27, 1, tzinfo=datetime.timezone.utc)
+        offset = datetime.timedelta(hours=3 if spring <= utc < autumn else 2)
+        local = (utc + offset).replace(tzinfo=self)
+        if autumn <= utc < autumn + datetime.timedelta(hours=1):
+            local = local.replace(fold=1)
+        return local
+
+
+@pytest.fixture
+def riga_timezone():
+    """Deterministic Europe/Riga-like timezone including both 2024 DST folds."""
+    return RigaTestTimezone()
+
+
 # Now we can import the module components
 from battery_optimizer_lib import (
     BatteryLearningEngine,

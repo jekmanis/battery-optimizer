@@ -26,6 +26,8 @@ class SocDeviationConfig:
     max_soc: float  # %
     soc_deviation_threshold: float  # %
     grid_fee: float  # EUR/kWh
+    import_price_multiplier: float = 1.0
+    inverter_efficiency: float = 1.0
     decision_log_level: int = 1
 
     @property
@@ -384,23 +386,33 @@ class SocDeviationDetector:
             return 0
 
         avg_extra_charge_price = sum(upcoming_prices) / len(upcoming_prices)
-        discharge_threshold = get_discharge_threshold()
+        discharge_threshold_ac = get_discharge_threshold()
 
-        # Economic check: charging cost < what we'd pay from grid during discharge
-        charge_cost = avg_extra_charge_price + self.config.grid_fee
-        if charge_cost < discharge_threshold:
+        # Economic check in landed EUR per stored DC kWh. The persisted battery
+        # cost and its discharge threshold use the same loss-aware basis.
+        charge_cost = (
+            (avg_extra_charge_price + self.config.grid_fee)
+            * self.config.import_price_multiplier
+            / max(1e-9, self.config.efficiency * self.config.inverter_efficiency)
+        )
+        discharge_value_dc = (
+            discharge_threshold_ac * max(1e-9, self.config.inverter_efficiency)
+        )
+        if charge_cost < discharge_value_dc:
             log_messages.append(
                 f"Charging behind schedule: projected {projected_final_soc:.1f}% vs target {self.config.max_soc}%, "
                 f"adding {extra_slots_needed} slot(s) at avg {avg_extra_charge_price:.4f} EUR/kWh "
-                f"(charge cost {charge_cost:.4f} < discharge threshold {discharge_threshold:.4f})"
+                f"(landed DC charge cost {charge_cost:.4f} < "
+                f"stored-DC discharge value {discharge_value_dc:.4f})"
             )
             return extra_slots_needed
         else:
             log_messages.append(
                 f"Charging behind schedule but extra charging not economical: "
                 f"projected {projected_final_soc:.1f}% vs target {self.config.max_soc}%, "
-                f"avg price {avg_extra_charge_price:.4f} + fee {self.config.grid_fee:.4f} = {charge_cost:.4f} "
-                f">= threshold {discharge_threshold:.4f}"
+                f"landed DC charge cost {charge_cost:.4f} >= "
+                f"stored-DC discharge value {discharge_value_dc:.4f} "
+                f"(avg price {avg_extra_charge_price:.4f}, fee {self.config.grid_fee:.4f})"
             )
             return 0
 

@@ -12,6 +12,7 @@ import traceback
 from typing import Callable, Dict, List, Optional
 
 from .models import PricePoint
+from .timezone_utils import instant_key
 
 try:
     import requests
@@ -143,10 +144,30 @@ class NordPoolPriceService:
         if not prices:
             return []
 
-        sorted_prices = sorted(prices, key=lambda p: p.time)
+        def chronological_key(point: PricePoint):
+            return instant_key(point.time)
+
+        def bucket_points(points: List[PricePoint]) -> List[PricePoint]:
+            """Average points by slot without collapsing autumn-fold instants."""
+            buckets: Dict[datetime.datetime, tuple] = {}
+            for point in points:
+                bucket = self._align_to_slot(point.time)
+                identity = instant_key(bucket)
+                if identity not in buckets:
+                    buckets[identity] = (bucket, [])
+                buckets[identity][1].append(point.price)
+            normalized = [
+                PricePoint(time=bucket, price=sum(values) / len(values))
+                for bucket, values in buckets.values()
+            ]
+            return sorted(normalized, key=chronological_key)
+
+        sorted_prices = sorted(prices, key=chronological_key)
         deltas = []
         for i in range(1, len(sorted_prices)):
-            delta_min = (sorted_prices[i].time - sorted_prices[i - 1].time).total_seconds() / 60
+            current = chronological_key(sorted_prices[i])
+            previous = chronological_key(sorted_prices[i - 1])
+            delta_min = (current - previous).total_seconds() / 60
             if delta_min > 0:
                 deltas.append(delta_min)
         min_delta = min(deltas) if deltas else self.slot_minutes
@@ -157,38 +178,29 @@ class NordPoolPriceService:
 
         # Aggregate finer data into slot buckets
         if min_delta < self.slot_minutes:
-            buckets: Dict[datetime.datetime, List[float]] = {}
-            for p in sorted_prices:
-                bucket = self._align_to_slot(p.time)
-                buckets.setdefault(bucket, []).append(p.price)
-            normalized = [
-                PricePoint(time=dt, price=sum(vals) / len(vals))
-                for dt, vals in buckets.items()
-            ]
-            return sorted(normalized, key=lambda p: p.time)
+            return bucket_points(sorted_prices)
 
         # Expand coarser data into multiple slots
         factor = int(round(min_delta / self.slot_minutes))
         if factor <= 1 or abs(min_delta - factor * self.slot_minutes) > 0.1:
             # Fallback to bucketing if resolution is irregular
-            buckets: Dict[datetime.datetime, List[float]] = {}
-            for p in sorted_prices:
-                bucket = self._align_to_slot(p.time)
-                buckets.setdefault(bucket, []).append(p.price)
-            normalized = [
-                PricePoint(time=dt, price=sum(vals) / len(vals))
-                for dt, vals in buckets.items()
-            ]
-            return sorted(normalized, key=lambda p: p.time)
+            return bucket_points(sorted_prices)
 
         expanded: List[PricePoint] = []
         for p in sorted_prices:
             for i in range(factor):
+                if p.time.tzinfo is not None and p.time.utcoffset() is not None:
+                    expanded_time = (
+                        p.time.astimezone(datetime.timezone.utc)
+                        + datetime.timedelta(minutes=i * self.slot_minutes)
+                    ).astimezone(p.time.tzinfo)
+                else:
+                    expanded_time = p.time + datetime.timedelta(minutes=i * self.slot_minutes)
                 expanded.append(PricePoint(
-                    time=p.time + datetime.timedelta(minutes=i * self.slot_minutes),
+                    time=expanded_time,
                     price=p.price
                 ))
-        return sorted(expanded, key=lambda p: p.time)
+        return sorted(expanded, key=chronological_key)
 
     def _align_to_slot(self, dt: datetime.datetime) -> datetime.datetime:
         """Floor datetime to the start of the current time slot."""
@@ -494,17 +506,34 @@ class NordPoolPriceService:
         else:
             # Simple list of prices (infer step size)
             step_minutes = 60
-            if len(price_data) > 0 and 1440 % len(price_data) == 0:
-                step_minutes = int(1440 / len(price_data))
+            day_minutes = 1440
+            local_midnight = datetime.datetime.combine(date_for_simple, datetime.time(), tzinfo=tz)
+            if tz is not None:
+                next_midnight = datetime.datetime.combine(
+                    date_for_simple + datetime.timedelta(days=1), datetime.time(), tzinfo=tz
+                )
+                day_minutes = int((
+                    next_midnight.astimezone(datetime.timezone.utc)
+                    - local_midnight.astimezone(datetime.timezone.utc)
+                ).total_seconds() / 60)
+            if len(price_data) > 0 and day_minutes % len(price_data) == 0:
+                step_minutes = int(day_minutes / len(price_data))
+            elif len(price_data) > 0:
+                self.log(
+                    f"Price list length {len(price_data)} does not divide the "
+                    f"{day_minutes}-minute local day; assuming hourly steps. "
+                    f"Times may be wrong if the source uses a different resolution.",
+                    level="WARNING",
+                )
             for idx, price in enumerate(price_data):
                 if price is not None:
-                    minutes = idx * step_minutes
-                    dt = datetime.datetime.combine(
-                        date_for_simple,
-                        datetime.time(minutes // 60, minutes % 60)
-                    )
                     if tz:
-                        dt = dt.replace(tzinfo=tz)
+                        dt = (
+                            local_midnight.astimezone(datetime.timezone.utc)
+                            + datetime.timedelta(minutes=idx * step_minutes)
+                        ).astimezone(tz)
+                    else:
+                        dt = local_midnight + datetime.timedelta(minutes=idx * step_minutes)
                     prices.append(PricePoint(time=dt, price=float(price)))
 
         return prices

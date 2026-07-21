@@ -9,6 +9,30 @@ import datetime
 from typing import Dict, Optional, Tuple, TypeVar
 
 T = TypeVar("T")
+UTC = datetime.timezone.utc
+
+
+def _is_aware(dt: datetime.datetime) -> bool:
+    """Return whether *dt* identifies an unambiguous instant."""
+    return dt.tzinfo is not None and dt.utcoffset() is not None
+
+
+def instant_key(dt: datetime.datetime) -> datetime.datetime:
+    """Return an aware datetime as UTC, leaving legacy naive values unchanged."""
+    return dt.astimezone(UTC) if _is_aware(dt) else dt
+
+
+def canonical_slot_key(dt: datetime.datetime) -> datetime.datetime:
+    """Return a datetime safe for use as a slot dictionary key.
+
+    Region-zone datetimes in an autumn fold can compare and hash equal even
+    when their ``fold`` values identify different instants.  A fixed-offset
+    representation preserves the local clock fields while keeping both
+    physical intervals distinct.
+    """
+    if not _is_aware(dt):
+        return dt
+    return dt.astimezone(datetime.timezone(dt.utcoffset()))
 
 
 def normalize_tz_pair(
@@ -66,7 +90,14 @@ def datetimes_match_slot(
     Returns:
         True if both datetimes represent the same slot
     """
-    cmp1, cmp2 = normalize_tz_pair(dt1, dt2, local_tz)
+    # Aware values identify physical instants.  Comparing local components loses
+    # that identity during the autumn DST fold (there are two 03:00 slots).
+    if _is_aware(dt1) and _is_aware(dt2):
+        cmp1, cmp2 = dt1.astimezone(UTC), dt2.astimezone(UTC)
+    else:
+        # Preserve compatibility for legacy naive schedule keys: a naive value
+        # is interpreted as local wall time.
+        cmp1, cmp2 = normalize_tz_pair(dt1, dt2, local_tz)
     return (
         cmp1.date() == cmp2.date() and
         cmp1.hour == cmp2.hour and
@@ -90,7 +121,10 @@ def dt_ge(
     Returns:
         True if dt1 >= dt2
     """
-    cmp1, cmp2 = normalize_tz_pair(dt1, dt2, local_tz)
+    if _is_aware(dt1) and _is_aware(dt2):
+        cmp1, cmp2 = dt1.astimezone(UTC), dt2.astimezone(UTC)
+    else:
+        cmp1, cmp2 = normalize_tz_pair(dt1, dt2, local_tz)
     return cmp1 >= cmp2
 
 
@@ -162,18 +196,16 @@ def next_slot_time(
         Datetime of next slot boundary (with 5 seconds offset for safety)
     """
     now = ensure_local_tz(now, local_tz)
-    minutes = now.hour * 60 + now.minute
-    next_slot = ((minutes // slot_minutes) + 1) * slot_minutes
+    current_slot = align_to_slot(now, slot_minutes)
+    if _is_aware(current_slot):
+        # Add elapsed time in UTC so a spring gap is skipped and both autumn
+        # fold slots are scheduled.
+        result = (current_slot.astimezone(UTC) +
+                  datetime.timedelta(minutes=slot_minutes)).astimezone(current_slot.tzinfo)
+        return result.replace(second=5, microsecond=0)
 
-    if next_slot >= 1440:
-        next_slot = 0
-        now = now + datetime.timedelta(days=1)
-
-    return now.replace(
-        hour=int(next_slot // 60),
-        minute=int(next_slot % 60),
-        second=5,
-        microsecond=0
+    return (current_slot + datetime.timedelta(minutes=slot_minutes)).replace(
+        second=5, microsecond=0
     )
 
 
@@ -193,21 +225,7 @@ def next_interval_time(
     Returns:
         Datetime of next interval boundary (with 5 seconds offset for safety)
     """
-    interval_minutes = max(1, int(interval_minutes))
-    now = ensure_local_tz(now, local_tz)
-    minutes = now.hour * 60 + now.minute
-    next_boundary = ((minutes // interval_minutes) + 1) * interval_minutes
-
-    if next_boundary >= 1440:
-        next_boundary = 0
-        now = now + datetime.timedelta(days=1)
-
-    return now.replace(
-        hour=int(next_boundary // 60),
-        minute=int(next_boundary % 60),
-        second=5,
-        microsecond=0
-    )
+    return next_slot_time(now, max(1, int(interval_minutes)), local_tz)
 
 
 def lookup_by_time(
@@ -232,8 +250,12 @@ def lookup_by_time(
     if not data:
         return None
 
-    # Direct lookup first (fast path)
-    if slot_time in data:
+    # Canonical fixed-offset schedule maps have a safe O(1) lookup even during
+    # an autumn fold. Legacy ZoneInfo-keyed maps fall through to instant scan.
+    canonical_key = canonical_slot_key(slot_time)
+    if canonical_key in data:
+        return data[canonical_key]
+    if not _is_aware(slot_time) and slot_time in data:
         return data[slot_time]
 
     # Fallback: match by local time components

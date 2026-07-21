@@ -144,6 +144,30 @@ PartialSlotOptimizer._compute_slot_fractions = BatteryOptimizer._compute_slot_fr
 PartialSlotOptimizer._compute_charge_rates_per_slot = BatteryOptimizer._compute_charge_rates_per_slot
 
 
+class MissingPriceOptimizer:
+    def __init__(self, yesterday_prices):
+        self._yesterday_prices = yesterday_prices
+
+    def _get_local_timezone(self):
+        return None
+
+    @property
+    def _price_service(self):
+        points = self._yesterday_prices
+
+        class Service:
+            def get_prices_for_date(self, date, tz):
+                return points
+
+        return Service()
+
+    def log(self, *args, **kwargs):
+        pass
+
+
+MissingPriceOptimizer._ensure_current_slot_price = BatteryOptimizer._ensure_current_slot_price
+
+
 def _make_price_points():
     base = datetime.datetime(2026, 1, 24, 16, 0, 0)
     prices = [
@@ -172,9 +196,25 @@ def test_partial_slot_discharges_correctly():
     assert schedule[base].mode == BatteryMode.DISCHARGE
 
 
-def test_partial_slot_discharges_with_finer_soc_steps():
+def test_partial_slot_supports_configured_finer_soc_steps():
     base, prices = _make_price_points()
     now = base + datetime.timedelta(minutes=53)
     optimizer = PartialSlotOptimizer(now=now, soc_step_percent=0.5)
     schedule = optimizer.find_optimal_schedule(prices, 4, current_soc=36.0)
+    # The mode decision must not depend on the SOC grid resolution: this
+    # scenario discharges at the default step and must still discharge at a
+    # finer configured step (guards against rounding-direction bias).
+    assert base in schedule
     assert schedule[base].mode == BatteryMode.DISCHARGE
+
+
+def test_missing_current_slot_uses_yesterday_same_clock_price():
+    current = datetime.datetime(2026, 1, 24, 16, 0)
+    yesterday = PricePoint(datetime.datetime(2026, 1, 23, 16, 0), 0.071)
+    future = [PricePoint(datetime.datetime(2026, 1, 24, 17, 0), 0.2)]
+    optimizer = MissingPriceOptimizer([yesterday])
+
+    result = optimizer._ensure_current_slot_price(future, future, current)
+
+    synthetic = next(p for p in result if p.time == current)
+    assert synthetic.price == 0.071

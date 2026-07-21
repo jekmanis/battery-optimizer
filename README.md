@@ -14,7 +14,7 @@ It plans with dynamic programming over SOC, learns your house load and real char
 - **Self‑learning** — learns actual charge rates per SOC band and round‑trip efficiency from observed behaviour; builds a statistical, time‑of‑day **load profile**.
 - **Temperature‑aware charge rates** — predicts slower charging when the battery is cold for more accurate scheduling.
 - **PV‑aware** — uses Solcast forecasts and a live PV sensor to avoid grid‑charging when solar will cover it.
-- **Battery cost tracking** — weighted‑average cost of stored energy, persisted across restarts, used to avoid selling/using energy below what it cost.
+- **Battery cost tracking** — weighted-average landed cost of stored energy, persisted across restarts and exposed for reporting; the DP optimizes forecast cash flows directly.
 - **Direct WIT control** — applies modes in real time through the Growatt integration's `set_wit_mode` service (grid_charge, discharge_to_load, max_export, hold, …).
 - **Dashboard + manual controls** — HA package with enable/override toggles, manual mode select, force scripts, and rich schedule/status sensors.
 
@@ -141,13 +141,33 @@ Common parameters (see `apps.yaml.example` for the full, commented list):
 | `battery_capacity_kwh` | 14.3 | Usable battery capacity |
 | `charge_rate_kw` / `discharge_rate_kw` | 4.5 / 5.9 | Power used for planning |
 | `min_soc` / `max_soc` | 10 / 100 | SOC bounds (%) |
-| `efficiency` / `inverter_efficiency` | 0.95 / 0.97 | Round‑trip / AC‑DC efficiency |
+| `efficiency` / `inverter_efficiency` | 0.95 / 0.97 | Storage charge-retention factor / symmetric AC↔DC conversion factor (about 89.4% implied AC round trip) |
 | `slot_minutes` | 15 | Plan resolution (matches Nord Pool 15‑min) |
 | `grid_fee_eur_kwh` / `grid_export_fee_eur_kwh` | 0.052 / 0.02 | Import fees added / export fee subtracted |
+| `import_price_multiplier` | 1.0 | Multiplier applied to spot plus import fees; use 1.21 only when those inputs exclude 21% VAT |
 | `battery_wear_cost_eur_kwh` | 0.017 | Per‑kWh wear cost discouraging marginal cycling |
+| `terminal_energy_value_eur_kwh` | `auto` | Values stored DC energy at the price horizon; `0` restores legacy depletion behavior |
 | `pv_threshold_w` | 500 | PV above which grid charging pauses |
 | `solcast_today_entity` / `_tomorrow_entity` | `sensor.solcast_*` | Optional PV forecast |
 | `device_id` | `""` | **Empty = dry‑run** (logs decisions, no inverter writes) |
+
+By default, spot prices and import fees are assumed to already use the desired
+VAT basis. `import_price_multiplier` can apply VAT to the combined variable
+import price when all those inputs are VAT-exclusive. Do not use it when the
+source price or configured fees already include VAT. Import margins,
+distribution charges, and export deductions are contract-specific; verify the
+example values against your bill.
+
+> **Upgrade note:** older releases stored a raw spot-price average in
+> `input_number.battery_avg_cost`; the current tracker stores landed cost per
+> battery kWh. The package includes `battery_cost_basis_version`, which is
+> created at version 2 (current basis) — a legacy value is never converted
+> automatically. To convert a raw-spot average from a pre-landed-cost install,
+> set the helper to 1 and restart AppDaemon once: the value is conservatively
+> migrated as grid-charged energy and the helper is stamped back to 2 (look
+> for the "Migrated legacy raw battery cost" log line to confirm it ran).
+> Alternatively, just reset `input_number.battery_avg_cost` to a reasonable
+> landed-cost estimate manually.
 
 ---
 

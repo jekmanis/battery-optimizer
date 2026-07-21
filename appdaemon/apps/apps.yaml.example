@@ -84,7 +84,9 @@ battery_optimizer:
   # Maximum state of charge (full charge allowed)
   max_soc: 100
 
-  # Round-trip efficiency (charge + discharge losses)
+  # Battery/storage charge-retention factor. This is NOT complete round-trip
+  # efficiency: inverter_efficiency is also applied on AC->DC and DC->AC paths.
+  # With 0.95 and inverter_efficiency 0.97, implied grid AC round trip is ~89.4%.
   efficiency: 0.95
 
   # Base house consumption in Watts
@@ -137,6 +139,11 @@ battery_optimizer:
   # Trading margin (0.01238) + distribution fee (0.03962) = 0.052
   grid_fee_eur_kwh: 0.052
 
+  # Applied to (spot + grid_fee). Keep 1.0 when those inputs already include
+  # the desired VAT basis; use 1.21 only when both are VAT-exclusive and 21%
+  # VAT applies. Never apply VAT twice.
+  import_price_multiplier: 1.0
+
   # Fixed fee subtracted from spot price when selling (net metering deduction)
   # Sell price = max(0, nordpool - 0.02)
   grid_export_fee_eur_kwh: 0.02
@@ -152,6 +159,14 @@ battery_optimizer:
   # Growatt HOPE 14.3L-A1: 3811.50 EUR (ar PVN, pēc atlaides) - 2287.47 EUR (valsts atbalsts 38.12%) = 1524.03 EUR
   # 1524.03 / (8000 cycles × 14.3 kWh × 0.80 DOD) = 0.017
   battery_wear_cost_eur_kwh: 0.017
+
+  # Value of one usable DC kWh left at the end of the known price horizon.
+  # "auto" derives a conservative value from horizon prices, discharge conversion,
+  # and wear. Set a numeric EUR/kWh value explicitly, or 0 for legacy behavior.
+  terminal_energy_value_eur_kwh: "auto"
+
+  # IMPORTANT: the import/export values above are examples. Verify trading
+  # margins, distribution charges, deductions, and VAT basis for your contract.
 
   # ==========================================================================
   # Optimization Thresholds

@@ -9,6 +9,7 @@ from battery_optimizer_lib.timezone_utils import (
     dt_ge,
     ensure_local_tz,
     align_to_slot,
+    canonical_slot_key,
     next_slot_time,
     next_interval_time,
     lookup_by_time,
@@ -87,6 +88,13 @@ class TestDatetimesMatchSlot:
         dt2 = datetime.datetime(2024, 1, 15, 10, 30)  # naive
         assert datetimes_match_slot(dt1, dt2) is True
 
+    def test_dst_fold_slots_are_distinct_instants(self, riga_timezone):
+        riga = riga_timezone
+        first = datetime.datetime(2024, 10, 27, 3, 0, tzinfo=riga, fold=0)
+        second = datetime.datetime(2024, 10, 27, 3, 0, tzinfo=riga, fold=1)
+        assert first.utcoffset() != second.utcoffset()
+        assert datetimes_match_slot(first, second, riga) is False
+
 
 class TestDtComparisons:
     """Tests for dt_ge function."""
@@ -163,6 +171,18 @@ class TestNextSlotTime:
         assert next_slot.hour == 0
         assert next_slot.minute == 0
 
+    def test_next_slot_enters_second_dst_fold(self, riga_timezone):
+        riga = riga_timezone
+        now = datetime.datetime(2024, 10, 27, 3, 45, tzinfo=riga, fold=0)
+        next_slot = next_slot_time(now, 15, riga)
+        assert (next_slot.hour, next_slot.minute, next_slot.fold) == (3, 0, 1)
+
+    def test_next_slot_skips_spring_gap(self, riga_timezone):
+        riga = riga_timezone
+        now = datetime.datetime(2024, 3, 31, 2, 45, tzinfo=riga)
+        next_slot = next_slot_time(now, 15, riga)
+        assert (next_slot.hour, next_slot.minute) == (4, 0)
+
 
 class TestNextIntervalTime:
     """Tests for next_interval_time function."""
@@ -206,3 +226,25 @@ class TestLookupByHour:
     def test_empty_dict(self):
         dt = datetime.datetime(2024, 1, 15, 10, 30)
         assert lookup_by_time({}, dt) is None
+
+    def test_lookup_distinguishes_dst_fold_with_utc_keys(self, riga_timezone):
+        riga = riga_timezone
+        first = datetime.datetime(2024, 10, 27, 3, 0, tzinfo=riga, fold=0)
+        second = datetime.datetime(2024, 10, 27, 3, 0, tzinfo=riga, fold=1)
+        data = {
+            first.astimezone(datetime.timezone.utc): "summer",
+            second.astimezone(datetime.timezone.utc): "winter",
+        }
+        assert lookup_by_time(data, first, riga) == "summer"
+        assert lookup_by_time(data, second, riga) == "winter"
+
+    def test_canonical_slot_keys_keep_both_dst_fold_slots(self, riga_timezone):
+        first = datetime.datetime(2024, 10, 27, 3, 0, tzinfo=riga_timezone, fold=0)
+        second = datetime.datetime(2024, 10, 27, 3, 0, tzinfo=riga_timezone, fold=1)
+        data = {
+            canonical_slot_key(first): "summer",
+            canonical_slot_key(second): "winter",
+        }
+        assert len(data) == 2
+        assert lookup_by_time(data, first, riga_timezone) == "summer"
+        assert lookup_by_time(data, second, riga_timezone) == "winter"

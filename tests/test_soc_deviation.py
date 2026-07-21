@@ -1491,6 +1491,46 @@ class TestFifteenMinSocDeviation:
         )
         assert config.slot_hours == 0.25
 
+    def test_catch_up_gate_compares_loss_adjusted_landed_charge_cost(self):
+        """A raw-price bargain can still lose money after AC-to-DC losses."""
+        from battery_optimizer_lib import SocDeviationConfig, SocDeviationDetector
+
+        config = SocDeviationConfig(
+            slot_minutes=60,
+            charge_rate=4.5,
+            discharge_rate=4.5,
+            efficiency=0.90,
+            inverter_efficiency=1.0,
+            battery_capacity=10.0,
+            min_soc=10.0,
+            max_soc=90.0,
+            soc_deviation_threshold=4.0,
+            grid_fee=0.052,
+        )
+        detector = SocDeviationDetector(config)
+        current_slot = datetime.datetime(2024, 1, 1, 12)
+        future_slot = current_slot + datetime.timedelta(hours=1)
+        schedule = {
+            future_slot: ScheduleEntry(future_slot, BatteryMode.HOLD),
+        }
+        messages = []
+
+        slots = detector._calculate_extra_charge_slots(
+            current_soc=50.0,
+            projected_final_soc=80.0,
+            current_temp=None,
+            schedule=schedule,
+            current_slot=current_slot,
+            local_tz=None,
+            get_cheapest_upcoming_prices=lambda *_: [0.11],
+            get_discharge_threshold=lambda: 0.169,
+            log_messages=messages,
+        )
+
+        # Raw import is 0.162, but landed cost is 0.180 per stored kWh.
+        assert slots == 0
+        assert any("0.1800" in message for message in messages)
+
     def test_15min_expected_soc_interpolation(self):
         """Expected SOC should interpolate correctly within a 15-min charge slot.
 

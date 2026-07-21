@@ -33,6 +33,9 @@ from .direct_control import DirectControl
 from .dp_optimizer import DPOptimizer, DPOptimizerConfig, DPOptimizerResult
 from .timezone_utils import (
     normalize_tz_pair,
+    datetimes_match_slot,
+    instant_key,
+    canonical_slot_key,
     dt_ge,
     ensure_local_tz,
     align_to_slot,
@@ -70,6 +73,9 @@ __all__ = [
     "DPOptimizerResult",
     # Timezone utilities
     "normalize_tz_pair",
+    "datetimes_match_slot",
+    "instant_key",
+    "canonical_slot_key",
     "dt_ge",
     "ensure_local_tz",
     "align_to_slot",

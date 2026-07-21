@@ -135,6 +135,10 @@ class BatteryOptimizerConfig:
     battery_wear_cost: float = 0.0  # EUR/kWh
     export_rate_multiplier: float = 1.0  # 1.0 = no percentage reduction (deduction is fixed)
     inverter_efficiency: float = 1.0  # AC↔DC conversion efficiency (e.g., 0.97 for 97%)
+    import_price_multiplier: float = 1.0  # e.g. 1.21 when spot + variable fees exclude Latvian VAT
+    # None derives a terminal value from the median forecast import price. A
+    # numeric value is an explicit EUR/kWh value for energy left in the battery.
+    terminal_energy_value_eur_kwh: Optional[float] = None
 
     # =========================================================================
     # HA Entities for Dynamic Config
@@ -143,6 +147,7 @@ class BatteryOptimizerConfig:
     max_soc_entity: str = "input_number.battery_max_soc"
     pv_threshold_entity: str = "input_number.battery_pv_threshold"
     battery_cost_entity: str = "input_number.battery_avg_cost"
+    battery_cost_basis_version_entity: str = "input_number.battery_cost_basis_version"
 
     # =========================================================================
     # Control Entities
@@ -230,6 +235,12 @@ class BatteryOptimizerConfig:
         load_observation_minutes = int(args.get("load_observation_minutes", adaptive_recalc_minutes))
         if load_observation_minutes <= 0 or 1440 % load_observation_minutes != 0:
             log_warn(f"Invalid load_observation_minutes={load_observation_minutes}, falling back to 15")
+
+        terminal_value_raw = args.get("terminal_energy_value_eur_kwh", "auto")
+        if terminal_value_raw is None or str(terminal_value_raw).strip().lower() == "auto":
+            terminal_energy_value = None
+        else:
+            terminal_energy_value = max(0.0, float(terminal_value_raw))
 
         return cls(
             # Nord Pool
@@ -325,12 +336,18 @@ class BatteryOptimizerConfig:
             battery_wear_cost=float(args.get("battery_wear_cost_eur_kwh", 0.0)),
             export_rate_multiplier=float(args.get("export_rate_multiplier", 1.0)),
             inverter_efficiency=float(args.get("inverter_efficiency", 1.0)),
+            import_price_multiplier=float(args.get("import_price_multiplier", 1.0)),
+            terminal_energy_value_eur_kwh=terminal_energy_value,
 
             # HA Entities
             min_soc_entity=args.get("min_soc_entity", "input_number.battery_min_soc"),
             max_soc_entity=args.get("max_soc_entity", "input_number.battery_max_soc"),
             pv_threshold_entity=args.get("pv_threshold_entity", "input_number.battery_pv_threshold"),
             battery_cost_entity=args.get("battery_cost_entity", "input_number.battery_avg_cost"),
+            battery_cost_basis_version_entity=args.get(
+                "battery_cost_basis_version_entity",
+                "input_number.battery_cost_basis_version",
+            ),
 
             # Control Entities
             enabled_entity=args.get("enabled_entity", "input_boolean.battery_optimizer_enabled"),

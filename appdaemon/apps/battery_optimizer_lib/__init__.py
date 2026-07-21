@@ -21,10 +21,8 @@ from .models import (
     BatteryMode,
     PricePoint,
     ScheduleEntry,
-    TouPeriod,
     LearningStats,
     LoadProfileStats,
-    PvProfileStats,
     PredictionAccuracyStats,
 )
 from .pv_profile import PvProfile
@@ -35,7 +33,6 @@ from .direct_control import DirectControl
 from .dp_optimizer import DPOptimizer, DPOptimizerConfig, DPOptimizerResult
 from .timezone_utils import (
     normalize_tz_pair,
-    datetimes_match_slot,
     dt_ge,
     ensure_local_tz,
     align_to_slot,
@@ -46,8 +43,8 @@ from .timezone_utils import (
 from .ha_helpers import SensorReader
 from .cost_tracker import BatteryCostTracker, BatteryCostConfig
 from .charge_rate_utils import compute_charge_rates_per_slot
-from .soc_deviation import SocDeviationDetector, SocDeviationConfig, DeviationCheckResult
-from .schedule_formatter import ScheduleFormatter, ScheduleFormatterConfig, resolve_wit_mode
+from .soc_deviation import SocDeviationDetector, SocDeviationConfig
+from .schedule_formatter import ScheduleFormatter, ScheduleFormatterConfig
 from .load_prediction_tracker import LoadPredictionTracker
 from .pv_forecast_service import PvForecastService, PvForecastServiceConfig
 
@@ -58,10 +55,8 @@ __all__ = [
     "BatteryMode",
     "PricePoint",
     "ScheduleEntry",
-    "TouPeriod",
     "LearningStats",
     "LoadProfileStats",
-    "PvProfileStats",
     "PredictionAccuracyStats",
     "PvProfile",
     # Classes
@@ -76,7 +71,6 @@ __all__ = [
     "DPOptimizerResult",
     # Timezone utilities
     "normalize_tz_pair",
-    "datetimes_match_slot",
     "dt_ge",
     "ensure_local_tz",
     "align_to_slot",
@@ -93,11 +87,9 @@ __all__ = [
     # SOC deviation detection
     "SocDeviationDetector",
     "SocDeviationConfig",
-    "DeviationCheckResult",
     # Schedule formatting
     "ScheduleFormatter",
     "ScheduleFormatterConfig",
-    "resolve_wit_mode",
     # Prediction tracker
     "LoadPredictionTracker",
     # PV forecast service

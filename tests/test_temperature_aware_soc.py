@@ -210,7 +210,6 @@ from battery_optimizer import BatteryOptimizer
 # Bind the relevant methods to our mock
 MockOptimizer.calculate_expected_soc_schedule = BatteryOptimizer.calculate_expected_soc_schedule
 MockOptimizer.find_optimal_schedule = BatteryOptimizer.find_optimal_schedule
-MockOptimizer._get_discharge_threshold_for_cost = BatteryOptimizer._get_discharge_threshold_for_cost
 MockOptimizer._ensure_current_slot_price = BatteryOptimizer._ensure_current_slot_price
 MockOptimizer._compute_slot_fractions = BatteryOptimizer._compute_slot_fractions
 MockOptimizer._compute_charge_rates_per_slot = BatteryOptimizer._compute_charge_rates_per_slot

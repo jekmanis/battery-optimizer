@@ -39,10 +39,8 @@ The `BatteryOptimizer` class is an AppDaemon application that orchestrates batte
 │  ├── _check_soc_boundaries() - Safety limits enforcement            │
 │  └── _check_soc_deviation() - Deviation detection                   │
 ├─────────────────────────────────────────────────────────────────────┤
-│  VPP & TOU Control (~90 lines)                                      │
-│  ├── set_mode() - VPP register writes via TouSyncManager            │
-│  ├── _schedule_tou_sync() - Schedule sync coordination              │
-│  └── sync_schedule_to_inverter() - Direct inverter programming      │
+│  Inverter Control                                                   │
+│  └── DirectControl.apply_mode() - set_wit_mode service commands     │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Manual Override (~50 lines)                                        │
 │  ├── on_override_change() - Override toggle handler                 │
@@ -66,8 +64,7 @@ The `BatteryOptimizer` class is an AppDaemon application that orchestrates batte
 │  └── Properties: min_soc, max_soc, pv_threshold, battery_avg_cost   │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Sensor Updates (~70 lines)                                         │
-│  ├── _update_schedule_sensor() - Main sensor.battery_optimizer      │
-│  └── get_schedule_summary() - Human-readable summary                │
+│  └── _update_schedule_sensor() - Main sensor.battery_optimizer      │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -77,7 +74,7 @@ The `BatteryOptimizer` class is an AppDaemon application that orchestrates batte
 |-----------|-------|---------|
 | **Scheduling** | `DPOptimizer` | Dynamic programming SOC-aware optimization |
 | **Prices** | `NordPoolPriceService` | Nord Pool API/sensor price fetching |
-| **TOU Sync** | `TouSyncManager` | Inverter TOU register programming |
+| **Inverter Control** | `DirectControl` | Mode commands via `growatt_modbus/set_wit_mode` |
 | **Cost Tracking** | `BatteryCostTracker` | Weighted average cost calculations |
 | **Learning** | `BatteryLearningEngine` | Charge rate and efficiency learning |
 | **Load Profile** | `LoadProfile` | Statistical load forecasting |
@@ -91,7 +88,7 @@ The `BatteryOptimizer` class is an AppDaemon application that orchestrates batte
 |---------|--------|----------|---------|
 | Daily 14:15 | `full_optimize()` | Once | Full schedule recalculation |
 | Startup | `full_optimize()` | Once | Initial optimization |
-| Every 30 min | `adaptive_optimize()` | 30 min | PV override, schedule changes, TOU rolling |
+| Every 30 min | `adaptive_optimize()` | 30 min | PV override, schedule change logging |
 | Every slot | `execute_scheduled_mode()` | 30/60 min | Apply scheduled mode |
 | Configurable | `record_load_observation()` | 30 min | Load profile data collection |
 
@@ -115,7 +112,6 @@ full_optimize()
   → find_optimal_schedule()
       → DPOptimizer.optimize()
   → calculate_expected_soc_schedule()
-  → _schedule_tou_sync() [via TouSyncManager]
   → execute_scheduled_mode()
   → _update_schedule_sensor()
 ```
@@ -134,8 +130,7 @@ _on_soc_change()
 ```
 execute_scheduled_mode()
   → _handle_mode_transition() [learning engine tracking]
-  → set_mode() [or skip if TOU sync enabled]
-      → TouSyncManager.set_mode()
+  → DirectControl.apply_mode()
 ```
 
 ## Configuration Properties
@@ -145,7 +140,7 @@ execute_scheduled_mode()
 - `slot_minutes`, `adaptive_recalc_minutes`, `load_observation_minutes`
 - `grid_fee_eur_kwh`, `battery_wear_cost_eur_kwh`
 - `nordpool_config_entry`, `nordpool_area`, `nordpool_sensor`
-- `device_id`, `tou_sync_enabled`
+- `device_id` (empty = dry-run)
 
 ### Dynamic (HA entities, runtime)
 - `min_soc` ← `input_number.battery_min_soc`

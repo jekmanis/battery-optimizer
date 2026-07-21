@@ -422,50 +422,6 @@ class BatteryLearningEngine:
         multiplier = self.soc_charge_multipliers.get(soc_range, 1.0)
         return self.nominal_charge_rate * multiplier
 
-    def get_confidence_for_soc(self, soc: float, battery_temp: Optional[float] = None) -> float:
-        """
-        Get prediction confidence for a given SOC level and optional temperature.
-
-        Confidence reflects both data source quality and observation count:
-        - SOC+temp exact match: 0.7 base + up to 0.3 based on count (max at 10 obs)
-        - SOC+temp aggregated: 0.5 base + up to 0.2 based on count (max at 15 obs)
-        - SOC-only data: 0.3 base + up to 0.2 based on count (max at 10 obs)
-        - Nominal fallback: 0.0
-
-        Returns:
-            Confidence level 0.0 to 1.0
-        """
-        soc_range = self._get_soc_range(soc)
-
-        # Check temperature-aware data first
-        if battery_temp is not None:
-            temp_range = self._get_temp_range(battery_temp)
-
-            if soc_range in self.stats.charge_rates_by_soc_temp:
-                temp_data = self.stats.charge_rates_by_soc_temp[soc_range]
-
-                # Exact SOC+temp match
-                if temp_range in temp_data and len(temp_data[temp_range]) >= 3:
-                    count = len(temp_data[temp_range])
-                    return 0.7 + min(0.3, (count - 3) / 7 * 0.3)
-
-                # Aggregated temps for this SOC range
-                all_rates = []
-                for rates in temp_data.values():
-                    all_rates.extend(rates)
-                if len(all_rates) >= 3:
-                    return 0.5 + min(0.2, (len(all_rates) - 3) / 12 * 0.2)
-
-        # SOC-only data
-        if soc_range in self.stats.charge_rates_by_soc:
-            observations = self.stats.charge_rates_by_soc[soc_range]
-            if len(observations) >= 3:
-                count = len(observations)
-                return 0.3 + min(0.2, (count - 3) / 7 * 0.2)
-
-        # Nominal fallback - no confidence
-        return 0.0
-
     def get_warming_rate(self, starting_temp: float) -> Optional[float]:
         """
         Get predicted battery warming rate during charging for a given starting temperature.
@@ -641,47 +597,6 @@ class BatteryLearningEngine:
             end_temp = self.predict_temp_after_duration(start_temp, duration_minutes)
 
         return total_energy, end_temp
-
-    def predict_charge_time(
-        self,
-        current_soc: float,
-        target_soc: float,
-        battery_temp: Optional[float] = None
-    ) -> Tuple[float, float, float]:
-        """
-        Predict time to charge from current to target SOC.
-
-        Args:
-            current_soc: Current state of charge (%)
-            target_soc: Target state of charge (%)
-            battery_temp: Current battery temperature in Celsius (optional)
-
-        Returns: (expected_hours, min_hours, max_hours)
-        """
-        if current_soc >= target_soc:
-            return 0.0, 0.0, 0.0
-
-        total_time = 0.0
-        total_confidence = 0.0
-        step_count = 0
-        soc = current_soc
-        step = 5.0
-
-        while soc < target_soc:
-            next_soc = min(soc + step, target_soc)
-            energy_needed = (next_soc - soc) / 100 * self.battery_capacity
-            charge_rate = self.get_charge_rate_for_soc(soc, battery_temp)
-            grid_energy = energy_needed / self.learned_efficiency
-            time_hours = grid_energy / max(0.1, charge_rate)
-            total_time += time_hours
-            total_confidence += self.get_confidence_for_soc(soc, battery_temp)
-            step_count += 1
-            soc = next_soc
-
-        # Confidence interval based on average per-bucket confidence
-        avg_confidence = total_confidence / max(1, step_count)
-        uncertainty = 0.3 * (1 - avg_confidence)
-        return total_time, total_time * (1 - uncertainty), total_time * (1 + uncertainty)
 
     def get_learning_summary(self) -> Dict:
         """Get summary of learned parameters."""

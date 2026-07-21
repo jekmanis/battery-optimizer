@@ -4,7 +4,7 @@ Tests for battery cost tracking functions.
 Tests for:
 - _project_battery_costs() - projects battery cost evolution through a schedule
 - _get_discharge_threshold() - calculates discharge price threshold
-- _get_discharge_threshold_for_cost() - calculates threshold for a given cost
+- BatteryCostTracker.get_discharge_threshold_for_cost() - threshold for a given cost
 """
 
 import datetime
@@ -113,6 +113,10 @@ class MockCostOptimizer:
         """Set specific load for a given hour."""
         self._load_by_hour[dt] = load_kw
 
+    def _get_discharge_threshold_for_cost(self, avg_cost: float) -> float:
+        """Delegate to the cost tracker's threshold-for-cost calculation."""
+        return self._cost_tracker.get_discharge_threshold_for_cost(avg_cost)
+
     def _project_battery_costs(
         self,
         schedule,
@@ -134,11 +138,8 @@ class MockCostOptimizer:
         )
 
 
-# Bind the actual methods to our mock
+# Bind the actual method to our mock
 MockCostOptimizer._get_discharge_threshold = BatteryOptimizer._get_discharge_threshold
-MockCostOptimizer._get_discharge_threshold_for_cost = (
-    BatteryOptimizer._get_discharge_threshold_for_cost
-)
 
 
 def make_schedule_entry(

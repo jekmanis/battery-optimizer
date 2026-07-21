@@ -34,8 +34,7 @@ flowchart TB
 
     subgraph Output
         DP --> SCHEDULE[Optimal Schedule]
-        SCHEDULE --> TOU[TOU Sync to Inverter (optional)]
-        SCHEDULE --> EXEC[Mode Execution]
+        SCHEDULE --> EXEC[Mode Execution via set_wit_mode]
         PV --> EXEC
     end
 ```
@@ -55,9 +54,8 @@ class BatteryMode(Enum):
 
 | Structure | Fields | Purpose |
 |-----------|--------|---------|
-| `PricePoint` | `hour: datetime`, `price: float` | Single time-slot price data |
-| `ScheduleEntry` | `hour: datetime`, `mode: BatteryMode`, `reason: str` | Scheduled action for a slot |
-| `TouPeriod` | `start: int`, `end: int`, `power: int` | Inverter TOU register format |
+| `PricePoint` | `time: datetime`, `price: float` | Single time-slot price data |
+| `ScheduleEntry` | `time: datetime`, `mode: BatteryMode`, `reason: str` + direct-control fields | Scheduled action for a slot |
 
 ## Algorithm Pipeline
 
@@ -550,30 +548,15 @@ How it is used:
 - **Charging gate in DP**: allow extra charging if `price <= battery_avg_cost * 1.05` (raw price, no grid fee).
 - **Discharge cost in DP**: `((battery_avg_cost + grid_fee) / efficiency) + battery_wear_cost` is used as a per-kWh penalty in discharge value (and is also exposed as a sensor attribute).
 
-## TOU Sync to Inverter
+## Schedule Execution (DirectControl)
 
-The generated schedule can be synced to the inverter's Time-of-Use registers.
-
-```mermaid
-flowchart TB
-    SCHEDULE[Schedule dict]
-    CONSOLIDATE[Consolidate contiguous<br/>same-mode slots]
-    PERIODS[Create TOU periods<br/>max 20]
-    WRITE[Write to inverter<br/>via Modbus]
-
-    SCHEDULE --> CONSOLIDATE --> PERIODS --> WRITE
-```
-
-**TOU Period Format:**
-- Start: minutes since midnight
-- End: minutes since midnight (XX:59 format to prevent overlap)
-- Power: -100 to +100
-
-**Important behaviors:**
-- **HOLD mode** is encoded as **+1% charge** (firmware quirk required for true standby).
-- Schedule is built from today + tomorrow **time-of-day** entries; if the same minute appears twice, today's entry wins.
-- Maximum of 20 periods; extra periods are truncated.
-- When TOU sync is enabled, hourly `set_mode` is skipped to avoid clearing TOU periods; the inverter follows the synced schedule.
+The generated schedule is executed by sending the current slot's mode to the
+inverter via the `growatt_modbus/set_wit_mode` HA service (see
+`battery_optimizer_lib/direct_control.py`). Each command carries the mode
+string (`grid_charge`, `discharge_to_load`, `discharge_to_grid`, `max_export`,
+`hold`), power percent, duration, export rate, AC charge mode, and SOC
+cutoffs. Duplicate commands within half a slot are skipped. Dry-run mode
+(`device_id: ""`) logs commands without sending them.
 
 ## Configuration Parameters (apps.yaml defaults)
 
@@ -680,15 +663,14 @@ sequenceDiagram
     end
     DP->>DP: Backtrack for optimal path
     DP-->>Opt: Return schedule
-    Opt->>Inv: Sync TOU periods (optional)
-    Opt->>Opt: Execute current mode
+    Opt->>Inv: Apply current mode (set_wit_mode)
 
     loop Every adaptive_recalc_minutes
         Opt->>Opt: Check SOC deviation
         alt Deviation > threshold
             Opt->>DP: Recalculate remaining schedule
             DP-->>Opt: Updated schedule
-            Opt->>Inv: Re-sync TOU periods
+            Opt->>Inv: Apply updated mode (set_wit_mode)
         end
     end
 ```

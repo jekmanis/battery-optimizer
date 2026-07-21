@@ -65,17 +65,6 @@ battery_optimizer:
   device_id: "YOUR_GROWATT_WIT_DEVICE_ID"  # <-- Set your device_id here
 
   # ==========================================================================
-  # TOU Schedule Sync (Optional)
-  # ==========================================================================
-  # When configured, the optimizer writes the full schedule to inverter TOU
-  # registers via the HA Modbus integration. This enables autonomous operation
-  # even if Home Assistant goes offline.
-  #
-  # Set to the modbus hub name defined in battery_optimizer.yaml
-  # Leave empty to disable TOU sync (uses hourly mode commands only)
-  modbus_hub: "wit_inverter"  # <-- Set to "wit_inverter" to enable TOU sync
-
-  # ==========================================================================
   # Battery Parameters
   # ==========================================================================
 

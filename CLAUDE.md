@@ -19,11 +19,15 @@ appdaemon/apps/
 │   ├── dp_optimizer.py            # Dynamic programming optimizer
 │   ├── learning_engine.py         # Self-learning charge rate tracker
 │   ├── load_profile.py            # Statistical load forecasting
+│   ├── pv_profile.py              # Statistical PV production profile
+│   ├── pv_forecast_service.py     # PV forecast fetching (Solcast / Forecast.Solar)
 │   ├── price_service.py           # Nord Pool price fetching
-│   ├── tou_sync.py                # TOU schedule sync via Modbus
+│   ├── direct_control.py          # Direct inverter control via set_wit_mode
 │   ├── cost_tracker.py            # Battery cost tracking
 │   ├── schedule_formatter.py      # Schedule logging/formatting
 │   ├── soc_deviation.py           # SOC deviation detection
+│   ├── load_prediction_tracker.py # Predicted vs actual load accuracy
+│   ├── slot_outcome_tracker.py    # Per-slot outcome/compliance tracking
 │   ├── timezone_utils.py          # Timezone-aware datetime helpers
 │   ├── ha_helpers.py              # HA state reading helpers
 │   └── charge_rate_utils.py       # Temperature-aware rate computation
@@ -41,15 +45,19 @@ tests/
 | Module | Key Classes | Purpose |
 |--------|-------------|---------|
 | `config.py` | BatteryOptimizerConfig | Typed config dataclass with `from_args()` loader |
-| `models.py` | BatteryMode, PricePoint, ScheduleEntry, TouPeriod | Pure data structures and enums |
+| `models.py` | BatteryMode, PricePoint, ScheduleEntry | Pure data structures and enums |
 | `dp_optimizer.py` | DPOptimizer, DPOptimizerConfig, DPOptimizerResult | Dynamic programming SOC-aware scheduling |
 | `learning_engine.py` | BatteryLearningEngine | Self-learning charge rate and efficiency tracking |
 | `load_profile.py` | LoadProfile | Statistical load forecasting by time-of-day |
+| `pv_profile.py` | PvProfile | Statistical PV production profile by time-of-day |
+| `pv_forecast_service.py` | PvForecastService, PvForecastServiceConfig | PV forecast fetching (Solcast / Forecast.Solar) |
 | `price_service.py` | NordPoolPriceService | Nord Pool price fetching (built-in HA + HACS) |
-| `tou_sync.py` | TouSyncManager | TOU schedule sync and Modbus device control |
+| `direct_control.py` | DirectControl | Direct inverter control via `growatt_modbus/set_wit_mode` |
 | `cost_tracker.py` | BatteryCostTracker, BatteryCostConfig | Battery cost tracking with weighted averages |
 | `schedule_formatter.py` | ScheduleFormatter, ScheduleFormatterConfig | Schedule logging and HA sensor formatting |
 | `soc_deviation.py` | SocDeviationDetector, SocDeviationConfig | Detects unexpected SOC changes for revalidation |
+| `load_prediction_tracker.py` | LoadPredictionTracker | Predicted vs actual load accuracy tracking |
+| `slot_outcome_tracker.py` | SlotOutcomeTracker | Per-slot outcome and mode compliance tracking |
 | `timezone_utils.py` | normalize_tz_pair, align_to_slot, lookup_by_time, dt_ge | Timezone-aware datetime comparison and alignment |
 | `ha_helpers.py` | SensorReader | HA state reading with validation |
 | `charge_rate_utils.py` | compute_charge_rates_per_slot | Temperature-aware charge rate computation |
@@ -57,8 +65,7 @@ tests/
 ### Data Models
 - `BatteryMode` enum: HOLD (0), CHARGE (1), DISCHARGE (2)
 - `PricePoint` dataclass: Time (datetime) + price
-- `ScheduleEntry` dataclass: Time (datetime) + mode + reason
-- `TouPeriod` dataclass: Start/end minutes + power percentage
+- `ScheduleEntry` dataclass: Time (datetime) + mode + reason + direct-control fields (export_rate, ac_charge_mode, power_percent, SOC cutoffs)
 - `LoadProfileStats` dataclass: Min/max/sum/count for load observations
 - `LearningStats` dataclass: Charge rate learning data per SOC range
 
@@ -71,7 +78,7 @@ tests/
 
 ## Core Algorithm
 
-### Scheduling Logic (`DPOptimizer.find_optimal_schedule`)
+### Scheduling Logic (`DPOptimizer.optimize`)
 Uses **dynamic programming** with SOC state tracking:
 1. Discretize SOC into energy levels (0.1 kWh steps)
 2. For each time slot, evaluate HOLD/CHARGE/DISCHARGE transitions
@@ -83,39 +90,14 @@ Uses **dynamic programming** with SOC state tracking:
 - DISCHARGE value: `(price + grid_fee) * energy` (avoided import cost)
 - Discharge is modeled as self-consumption: `min(predicted_load, discharge_rate)`
 
-### TOU Sync to Inverter
-Syncs schedule to inverter's TOU registers for autonomous operation:
-- Consolidates contiguous same-mode slots into periods
-- Includes today AND tomorrow's schedule (time-of-day based)
-- Today's entries take precedence for conflicting time slots
-- Maximum 20 periods supported by inverter
-
-### Growatt Modbus Quirks (VPP Protocol)
-**Critical**: Register write order for TOU sync:
-1. Set `30100=1` (VPP control authority)
-2. Set `30410=1` (AC charging enable - required for charge periods!)
-3. Set `30407=0` (Disable remote control - so TOU takes precedence!)
-4. Set `30411=0` (Clear existing schedule)
-5. Zero out all period registers (30412+ for periods to write) - **stale data causes overlap validation failures!**
-6. Write periods SEQUENTIALLY:
-   - Write period 1 data (30412-30414), set `30411=1`
-   - Write period 2 data (30415-30417), set `30411=2`
-   - ... repeat for each period
-7. Verify final num_periods
-
-**Key insights**:
-- If `30407=1` (remote control enabled), it overrides TOU schedule!
-- Period 1 MUST start at 00:00 (register 30412 must be 0)
-- Zeroed registers [0,0,0] are treated as "empty" and allow writes
-- Non-zero stale data causes firmware overlap validation to reject writes
-
-**Key Registers:**
-- 30100: VPP Control Authority (1=enable)
-- 30407: Remote Power Control (0=disable for TOU, 1=enable for manual control)
-- 30409: Remote Power Percent (-100 to +100) - only used when 30407=1
-- 30410: AC Charging Enable (1=PV first) - REQUIRED for charge periods
-- 30411: Number of TOU periods (0-20) - must be set BEFORE writing period data
-- 30412+: TOU period data (3 registers each: start, end, power)
+### Inverter Control (DirectControl)
+The schedule is executed by sending mode commands to the Growatt WIT inverter
+via the `growatt_modbus/set_wit_mode` HA service (no raw register writes):
+- Modes: `grid_charge`, `discharge_to_load`, `discharge_to_grid`, `max_export`, `hold`, `passthrough`
+- Each command carries power_percent, duration, export_rate, ac_charge_mode, and SOC cutoffs
+- AC charge mode auto-selects `pv_priority` vs `ac_priority` based on current PV power
+- Duplicate commands within half a slot are skipped; `release_control()` reverts to `passthrough`
+- Dry-run mode: `device_id: ""` in apps.yaml logs commands without sending them
 
 ### Battery Cost Tracking
 - **Weighted average**: `(old_energy * old_cost + new_energy * charge_price) / total_energy`

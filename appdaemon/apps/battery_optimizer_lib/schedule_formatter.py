@@ -25,7 +25,6 @@ _WIT_MODE_DISPLAY = {
     "discharge_to_grid":  ("Discharge to Grid",  "💰", "Yes"),
     "max_export":         ("Max Export",          "⚡", "Yes"),
     "hold":               ("Hold",               "⏸️", "—"),
-    "self_consumption":   ("Self-Consumption",    "☀️", "Auto"),
 }
 
 
@@ -46,8 +45,6 @@ def resolve_wit_mode(entry: ScheduleEntry, default_power_percent: int = 100) -> 
                 return "max_export"
             return "discharge_to_grid"
         return "discharge_to_load"
-    elif mode == BatteryMode.SELF_CONSUMPTION:
-        return "self_consumption"
     else:
         return "hold"
 
@@ -187,14 +184,11 @@ class ScheduleFormatter:
              if e.mode == BatteryMode.DISCHARGE and (e.export_rate is None or e.export_rate == 0)]
         )
         hold_count = len([e for e in schedule.values() if e.mode == BatteryMode.HOLD])
-        sc_count = len([e for e in schedule.values() if e.mode == BatteryMode.SELF_CONSUMPTION])
         parts = [f"{charge_count} charge"]
         if self_consume_count:
             parts.append(f"{self_consume_count} discharge(self)")
         if export_count:
             parts.append(f"{export_count} discharge(export)")
-        if sc_count:
-            parts.append(f"{sc_count} self_consumption")
         parts.append(f"{hold_count} hold")
         self.log(f"Total: {', '.join(parts)} slots")
 
@@ -285,18 +279,6 @@ class ScheduleFormatter:
             return self._format_discharge_trajectory(
                 hour, start_soc, start_temp, min_soc, predict_load_kw, entry=entry
             )
-        elif entry.mode == BatteryMode.SELF_CONSUMPTION:
-            pv_kw = predict_pv_kw(hour) if predict_pv_kw else 0.0
-            load_kw = predict_load_kw(hour) if predict_load_kw else 0.5
-            pv_surplus = max(0.0, pv_kw - load_kw)
-            pv_charge_kw = min(pv_surplus, self.config.charge_rate)
-            pv_charge_kwh = pv_charge_kw * self.config.slot_hours * self.config.efficiency
-            load_deficit = max(0.0, load_kw - pv_kw)
-            battery_discharge_kwh = min(load_deficit, self.config.discharge_rate) * self.config.slot_hours
-            net_energy = pv_charge_kwh - battery_discharge_kwh
-            soc_change = (net_energy / self.config.battery_capacity) * 100
-            end_soc = max(min_soc, min(max_soc, start_soc + soc_change))
-            return f" {start_soc:5.1f}%->{end_soc:5.1f}%"
         else:  # HOLD
             return self._format_hold_trajectory(start_soc, start_temp)
 
@@ -741,76 +723,3 @@ class ScheduleFormatter:
                 next_discharge = hour.isoformat()
 
         return next_charge, next_discharge
-
-    def format_summary(
-        self,
-        schedule: Dict[datetime.datetime, ScheduleEntry],
-        now: datetime.datetime,
-        local_tz,
-        align_to_slot_func: Callable[[datetime.datetime], datetime.datetime],
-    ) -> str:
-        """
-        Generate a human-readable schedule summary.
-
-        Args:
-            schedule: Schedule entries
-            now: Current datetime
-            local_tz: Local timezone
-            align_to_slot_func: Function to align datetime to slot boundary
-
-        Returns:
-            Human-readable summary string
-        """
-        if not schedule:
-            return "No schedule available"
-
-        # Convert now to local timezone
-        if now.tzinfo is not None and local_tz is not None:
-            now = now.astimezone(local_tz)
-        now_slot = align_to_slot_func(now)
-
-        def is_future_or_current(k):
-            compare_k = k
-            compare_now = now_slot
-            if local_tz is not None:
-                if k.tzinfo is not None:
-                    compare_k = k.astimezone(local_tz)
-                if compare_now.tzinfo is not None:
-                    compare_now = compare_now.astimezone(local_tz)
-            # Handle mixed timezone-aware/naive
-            if compare_k.tzinfo is not None and compare_now.tzinfo is None:
-                compare_k = compare_k.replace(tzinfo=None)
-            elif compare_k.tzinfo is None and compare_now.tzinfo is not None:
-                compare_now = compare_now.replace(tzinfo=None)
-            return compare_k >= compare_now
-
-        future_schedule = {k: v for k, v in schedule.items() if is_future_or_current(k)}
-
-        charge_hours = [
-            h for h, e in future_schedule.items() if e.mode == BatteryMode.CHARGE
-        ]
-        discharge_hours = [
-            h for h, e in future_schedule.items() if e.mode == BatteryMode.DISCHARGE
-        ]
-        hold_hours = [
-            h for h, e in future_schedule.items() if e.mode == BatteryMode.HOLD
-        ]
-
-        summary = (
-            f"Schedule: {len(charge_hours)} slots charge, "
-            f"{len(discharge_hours)} slots discharge, "
-            f"{len(hold_hours)} slots hold"
-        )
-
-        if charge_hours:
-            next_charge = min(charge_hours)
-            if next_charge.tzinfo is not None and local_tz is not None:
-                next_charge = next_charge.astimezone(local_tz)
-            summary += f"\nNext charge: {next_charge.strftime('%H:%M')}"
-        if discharge_hours:
-            next_discharge = min(discharge_hours)
-            if next_discharge.tzinfo is not None and local_tz is not None:
-                next_discharge = next_discharge.astimezone(local_tz)
-            summary += f"\nNext discharge: {next_discharge.strftime('%H:%M')}"
-
-        return summary

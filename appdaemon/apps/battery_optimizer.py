@@ -22,7 +22,6 @@ from battery_optimizer_lib import (
     BatteryMode,
     PricePoint,
     ScheduleEntry,
-    TouPeriod,
     LearningStats,
     LoadProfileStats,
     BatteryLearningEngine,
@@ -426,7 +425,6 @@ class BatteryOptimizer(hass.Hass):
             current_soc=current_soc_for_calc,
             current_temp=current_temp,
             minutes_into_slot=minutes_into_slot,
-            min_charge_slots_hint=min_charge_slots,
         )
 
         schedule = result.schedule
@@ -858,7 +856,7 @@ class BatteryOptimizer(hass.Hass):
     def adaptive_optimize(self, kwargs=None):
         """
         Adaptive re-evaluation on a configurable interval.
-        Handles PV override, schedule change logging, and TOU sync.
+        Handles PV override and schedule change logging.
         SOC deviation detection is now event-driven via _on_soc_change.
         """
         if not self._is_enabled() or self._is_override_active():
@@ -1896,10 +1894,6 @@ class BatteryOptimizer(hass.Hass):
         """Calculate discharge threshold based on actual battery cost."""
         return self._cost_tracker.get_discharge_threshold()
 
-    def _get_discharge_threshold_for_cost(self, avg_cost: float) -> float:
-        """Calculate discharge threshold for a given battery average cost."""
-        return self._cost_tracker.get_discharge_threshold_for_cost(avg_cost)
-
     # =========================================================================
     # Helper Methods
     # =========================================================================
@@ -2034,12 +2028,6 @@ class BatteryOptimizer(hass.Hass):
             return datetime.datetime.now().astimezone().tzinfo
         except Exception:
             return None
-
-    def _normalize_to_local(self, dt: datetime.datetime, local_tz) -> datetime.datetime:
-        """Normalize a datetime to local timezone for comparison."""
-        if dt is None:
-            return dt
-        return ensure_local_tz(dt, local_tz)
 
     @property
     def min_soc(self) -> float:
@@ -2222,12 +2210,3 @@ class BatteryOptimizer(hass.Hass):
             )
         except Exception as e:
             self.log(f"Error updating schedule sensor: {e}", level="WARNING")
-
-    def get_schedule_summary(self) -> str:
-        """Generate a human-readable schedule summary"""
-        return self._schedule_formatter.format_summary(
-            schedule=self.schedule,
-            now=self.datetime(),
-            local_tz=self._get_local_timezone(),
-            align_to_slot_func=self._align_to_slot,
-        )

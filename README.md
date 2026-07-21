@@ -15,7 +15,6 @@ It plans with dynamic programming over SOC, learns your house load and real char
 - **Temperature‑aware charge rates** — predicts slower charging when the battery is cold for more accurate scheduling.
 - **PV‑aware** — uses Solcast forecasts and a live PV sensor to avoid grid‑charging when solar will cover it.
 - **Battery cost tracking** — weighted‑average cost of stored energy, persisted across restarts, used to avoid selling/using energy below what it cost.
-- **Rolling TOU sync** — writes the schedule into the inverter's TOU registers with a rolling day boundary so it survives an HA outage (see [Rolling TOU Schedule Sync](#rolling-tou-schedule-sync)).
 - **Direct WIT control** — applies modes in real time through the Growatt integration's `set_wit_mode` service (grid_charge, discharge_to_load, max_export, hold, …).
 - **Dashboard + manual controls** — HA package with enable/override toggles, manual mode select, force scripts, and rich schedule/status sensors.
 
@@ -27,8 +26,7 @@ It plans with dynamic programming over SOC, learns your house load and real char
 Nord Pool prices ─┐
 Solcast PV       ─┼─► DP optimizer ─► schedule (96 × 15‑min slots)
 learned load     ─┤        │
-battery SOC/cost ─┘        ├─► real‑time execution  → growatt_modbus/set_wit_mode
-                           └─► autonomous fallback   → inverter TOU registers (rolling sync)
+battery SOC/cost ─┘        └─► real‑time execution  → growatt_modbus/set_wit_mode
 ```
 
 The optimizer re‑plans on a schedule and adapts when reality drifts from the plan (SOC deviation, new prices, load changes).
@@ -40,9 +38,9 @@ The optimizer re‑plans on a schedule and adapts when reality drifts from the p
 - **Home Assistant** with the **AppDaemon 4** add‑on.
 - **Nord Pool** prices — the built‑in HA Nord Pool integration (config entry) or the [HACS Nord Pool](https://github.com/custom-components/nordpool) integration.
 - **Growatt Modbus integration with WIT `set_wit_mode` support.** The stock upstream integration does **not** include `set_wit_mode`; this optimizer depends on the WIT‑enabled fork:
-  **[jekmanis/Growatt_ModbusTCP](https://github.com/jekmanis/Growatt_ModbusTCP)** (branch `main`, v0.9.3+). It must expose the services `growatt_modbus/set_wit_mode`, `write_register`, `write_registers`, and `get_register_data`.
+  **[jekmanis/Growatt_ModbusTCP](https://github.com/jekmanis/Growatt_ModbusTCP)** (branch `main`, v0.9.3+). It must expose the `growatt_modbus/set_wit_mode` service.
 - *(Optional)* **Solcast PV Forecast** (HACS) for PV‑aware planning.
-- A long‑lived HA access token (used by the app to read Nord Pool prices and write registers via the REST API).
+- A long‑lived HA access token (used by the app to read Nord Pool prices via the REST API).
 
 ---
 
@@ -130,28 +128,7 @@ Restart Home Assistant, then restart the AppDaemon add‑on. Watch **Settings �
 **Scripts:** `script.battery_force_charge`, `script.battery_force_discharge`, `script.battery_force_hold`, `script.battery_resume_auto`.
 
 ### Status & schedule sensors
-`sensor.battery_optimizer` carries the live plan as attributes: `current_mode`, `schedule` (per‑slot list), `slot_minutes`, `next_charge`, `next_discharge`, `battery_avg_cost`, plus decision‑transparency fields. Helper template sensors (confidence, learned rate, efficiency, profit, energy totals, schedule hours) are created by the HA package for dashboards.
-
----
-
-## Rolling TOU Schedule Sync
-
-The optimizer syncs its schedule to the inverter's Time‑of‑Use (TOU) registers so the inverter keeps following the plan even if Home Assistant goes offline.
-
-**The problem:** TOU registers store time‑of‑day only (00:00–23:59), not dates. After midnight, "afternoon" TOU entries would still reflect yesterday's plan until the next sync.
-
-**The solution — rolling boundary:** every cycle the schedule is written using the start of the currently active TOU period as a boundary:
-- hours **before** the boundary (already passed today) → use **tomorrow's** schedule
-- hours **from** the boundary onward → use **today's** schedule
-
-```
-Period 00:00-05:59: boundary 00:00 → all hours = today
-Period 06:00-13:59: boundary 06:00 → 00:00-05:59 = tomorrow, rest = today
-Period 14:00-18:59: boundary 14:00 → 00:00-13:59 = tomorrow, rest = today
-Period 19:00-23:59: boundary 19:00 → 00:00-18:59 = tomorrow, rest = today
-```
-
-So if HA dies at 18:00, the inverter already holds a valid plan for the rest of today **and** tomorrow's early hours. Writes are skipped when the proposed TOU is byte‑identical to what's already programmed, avoiding needless 20‑second write cycles.
+`sensor.battery_optimizer` carries the live plan as attributes: `current_mode`, `schedule` (per‑slot list), `slot_minutes`, `next_charge`, `next_discharge`, `battery_avg_cost`, plus decision‑transparency fields. Helper template sensors (confidence, learned rate, profit, energy totals, schedule hours, next charge/discharge times) are created by the HA package for dashboards.
 
 ---
 
@@ -170,7 +147,6 @@ Common parameters (see `apps.yaml.example` for the full, commented list):
 | `battery_wear_cost_eur_kwh` | 0.017 | Per‑kWh wear cost discouraging marginal cycling |
 | `pv_threshold_w` | 500 | PV above which grid charging pauses |
 | `solcast_today_entity` / `_tomorrow_entity` | `sensor.solcast_*` | Optional PV forecast |
-| `modbus_hub` | `wit_inverter` | Enables TOU sync (empty = mode commands only) |
 | `device_id` | `""` | **Empty = dry‑run** (logs decisions, no inverter writes) |
 
 ---
@@ -189,7 +165,6 @@ appdaemon/apps/
     ├── load_profile.py           # Statistical load forecasting
     ├── pv_forecast_service.py    # Solcast PV forecast integration
     ├── price_service.py          # Nord Pool price fetching
-    ├── tou_sync.py               # Inverter TOU register sync (raw Modbus)
     ├── direct_control.py         # Real‑time control via set_wit_mode
     ├── cost_tracker.py           # Stored‑energy cost tracking
     ├── schedule_formatter.py     # Schedule → sensor/dashboard formatting
@@ -228,7 +203,6 @@ uv run pytest tests/ --cov=appdaemon/apps --cov-report=term-missing
 - **Entities `unavailable` / `not found`:** confirm the Growatt sensor names match your install (integration v0.6.7+ device‑prefixes them, e.g. `sensor.growatt_battery_battery_soc`).
 - **`set_wit_mode` not found:** you're on the stock Growatt integration — install the [WIT fork](https://github.com/jekmanis/Growatt_ModbusTCP).
 - **`set_wit_mode` timeouts:** many sequential VPP register writes on a busy Modbus link can exceed AppDaemon's 10 s service window; the command usually still applies. Verify the inverter mode actually changed.
-- **TOU write failures ("Illegal data value" / "overlap"):** the inverter validates all 20 period registers; the optimizer clears them before each write and retries with backoff. Concurrent reads from the HA coordinator can cause transient bus contention.
 
 ---
 

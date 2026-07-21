@@ -8,7 +8,7 @@ factors, and provides risk metrics for discharge scheduling.
 import datetime
 import json
 import math
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from .models import PredictionAccuracyStats, BatteryMode, ScheduleEntry
 

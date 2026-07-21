@@ -75,7 +75,7 @@ class TestSlotOutcomeTracker:
         tracker = SlotOutcomeTracker()
         dt = datetime.datetime(2024, 7, 15, 12, 0, 0)
         tracker.record_slot_start(
-            slot_time=dt, mode="SELF_CONSUMPTION", predicted_soc_end=55.0,
+            slot_time=dt, mode="HOLD", predicted_soc_end=55.0,
             predicted_load_kw=0.5, predicted_pv_kw=3.0,
         )
         tracker.record_slot_end(actual_soc=56.0, actual_pv_w=3600.0)

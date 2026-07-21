@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 - `appdaemon/apps/battery_optimizer.py` holds the main AppDaemon optimizer logic.
-- `appdaemon/apps/battery_optimizer_lib/` houses helper modules (learning, load profile, price service, TOU sync, models).
+- `appdaemon/apps/battery_optimizer_lib/` houses helper modules (learning, load profile, price service, direct inverter control, models).
 - `appdaemon/apps/apps.yaml` contains AppDaemon configuration and entity wiring.
 - `homeassistant/packages/battery_optimizer.yaml` defines Home Assistant entities, automations, and scripts.
 - `docs/` stores design notes (for example, `docs/scheduling-algorithm.md`).
@@ -23,7 +23,7 @@
 - No formatter or linter is enforced in this repo; keep changes tidy and readable.
 
 ## Testing Guidelines
-- Run unit tests via `uv run pytest tests/ -v` when touching scheduling, TOU sync, or learning logic.
+- Run unit tests via `uv run pytest tests/ -v` when touching scheduling, inverter control, or learning logic.
 - Validate changes by running Home Assistant in "dry-run" mode (`device_id: ""` in `apps.yaml`) and reviewing AppDaemon logs.
 - Use the `sensor.battery_optimizer` attributes to confirm schedule outputs and mode transitions.
 
@@ -36,8 +36,8 @@
 - Core dependencies: AppDaemon 4, Home Assistant, Nord Pool integration, Growatt Modbus integration.
 - Runtime cadence: full optimization at 13:15 daily, adaptive refresh every 30 minutes, safety checks every 5 minutes, and hourly mode application.
 - Dynamic config is read from HA `input_number.*` entities; key outputs surface on `sensor.battery_optimizer`.
-- Growatt TOU writes are order-sensitive; follow the register sequence in `appdaemon/apps/battery_optimizer.py` when changing control flow.
+- Inverter control goes through the `growatt_modbus/set_wit_mode` HA service (`battery_optimizer_lib/direct_control.py`); no raw register writes.
 
 ## Configuration & Safety Notes
-- This project writes to Growatt Modbus TOU registers; keep device safety in mind and test in dry-run first.
+- This project controls a real Growatt inverter; keep device safety in mind and test in dry-run first.
 - Document any new config keys in `appdaemon/apps/apps.yaml` and `README.md`.

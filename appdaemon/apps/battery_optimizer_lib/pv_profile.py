@@ -7,7 +7,6 @@ quantile-based forecasts for self-consumption planning.
 
 import datetime
 import json
-from typing import List
 
 from .models import PvProfileStats
 from .load_profile import _quantile

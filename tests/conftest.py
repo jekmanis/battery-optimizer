@@ -39,7 +39,6 @@ from battery_optimizer_lib import (
     LoadProfileStats,
     PricePoint,
     ScheduleEntry,
-    TouPeriod,
     _quantile,
 )
 

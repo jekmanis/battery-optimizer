@@ -126,9 +126,6 @@ class PartialSlotOptimizer:
     def _get_discharge_threshold(self) -> float:
         return (self.battery_avg_cost / self.config.efficiency) + self.config.grid_fee + self.config.battery_wear_cost
 
-    def _get_discharge_threshold_for_cost(self, avg_cost: float) -> float:
-        return (avg_cost / self.config.efficiency) + self.config.grid_fee + self.config.battery_wear_cost
-
     def _log_schedule_decision_context(self, *args, **kwargs):
         pass
 

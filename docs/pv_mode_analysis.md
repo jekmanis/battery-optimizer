@@ -158,5 +158,12 @@ Cloud-safe mode selection is always active. Configurable thresholds:
 - `dp_optimizer.py` — PV modeled in HOLD (free PV charging + SOC change), CHARGE (PV reduces grid cost), DISCHARGE (PV reduces drain), EXPORT (PV adds to revenue); removed SELF_CONSUMPTION blocks
 - `battery_optimizer.py` — HOLD SOC projection includes PV charging; DISCHARGE uses PV offset and PV surplus charging; solar override uses HOLD; cloud-safe HOLD→DISCHARGE conversion; reactive PV recalculation; removed `enable_self_consumption` conditionals
 - `config.py` — removed `enable_self_consumption` and `self_consumption_min_pv_kw` fields; added `pv_reactive_threshold` and `pv_reactive_min_forecast_w`
-- `direct_control.py` — `BatteryMode.SELF_CONSUMPTION` mapping retained (enum still exists for parsing)
-- `models.py` — `BatteryMode.SELF_CONSUMPTION` enum value retained (used by formatters/parsers)
+- `direct_control.py` — `BatteryMode.SELF_CONSUMPTION` mapping initially retained, later removed
+- `models.py` — `BatteryMode.SELF_CONSUMPTION` enum value initially retained, later removed
+
+**Update (2026-07):** the `BatteryMode.SELF_CONSUMPTION` enum member and all
+remaining consumer branches (direct_control, formatters, cost projection, SOC
+deviation, slot outcome matching) were fully removed in the dead-code cleanup.
+Stale `"SELF_CONSUMPTION"` strings in a schedule persisted by a pre-removal
+build are safely ignored on restore (name lookup raises `KeyError`, which is
+caught and the entry skipped).

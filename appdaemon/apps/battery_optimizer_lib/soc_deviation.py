@@ -8,7 +8,7 @@ battery SOC, determining whether schedule recalculation is needed.
 import datetime
 import math
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional
 
 from .models import BatteryMode, ScheduleEntry
 from .timezone_utils import ensure_local_tz, lookup_by_time
@@ -247,21 +247,6 @@ class SocDeviationDetector:
             return max(
                 self.config.min_soc,
                 expected_soc_start - (energy_removed / self.config.battery_capacity) * 100
-            )
-
-        elif entry.mode == BatteryMode.SELF_CONSUMPTION:
-            # PV surplus charges, load deficit discharges
-            pv_kw = predict_pv_kw(current_slot) if predict_pv_kw else 0.0
-            load_kw = predict_load_kw(current_slot) if predict_load_kw else 0.0
-            pv_surplus = max(0.0, pv_kw - load_kw)
-            load_deficit = max(0.0, load_kw - pv_kw)
-            charge_kwh = min(pv_surplus, self.config.charge_rate) * self.config.efficiency * self.config.slot_hours * fraction
-            discharge_kwh = min(load_deficit, self.config.discharge_rate) * self.config.slot_hours * fraction
-            net_energy = charge_kwh - discharge_kwh
-            soc_change = (net_energy / self.config.battery_capacity) * 100
-            return max(
-                self.config.min_soc,
-                min(self.config.max_soc, expected_soc_start + soc_change)
             )
 
         # HOLD mode - no change

@@ -1,7 +1,7 @@
 """Direct inverter control via growatt_modbus/set_wit_mode service.
 
-Replaces tou_sync.py. Sends mode commands to the WIT inverter via HA
-service calls instead of writing TOU registers.
+Sends mode commands to the WIT inverter via HA service calls
+instead of writing TOU registers.
 """
 
 import datetime
@@ -60,7 +60,6 @@ class DirectControl:
             BatteryMode.CHARGE: self._resolve_charge_mode(entry),
             BatteryMode.DISCHARGE: self._resolve_discharge_mode(entry),
             BatteryMode.HOLD: "hold",
-            BatteryMode.SELF_CONSUMPTION: "self_consumption",
         }.get(mode, "hold")
 
         params = {
@@ -71,8 +70,7 @@ class DirectControl:
 
         # Power percent
         power = entry.power_percent if entry.power_percent is not None else self.config.default_power_percent
-        if mode_str not in ("self_consumption", "passthrough"):
-            params["power_percent"] = power
+        params["power_percent"] = power
 
         # Export rate
         if entry.export_rate is not None:
@@ -86,12 +84,12 @@ class DirectControl:
         # SOC limits
         if entry.charge_cutoff_soc is not None:
             params["charge_cutoff_soc"] = entry.charge_cutoff_soc
-        elif mode in (BatteryMode.CHARGE, BatteryMode.SELF_CONSUMPTION):
+        elif mode == BatteryMode.CHARGE:
             params["charge_cutoff_soc"] = self._get_max_soc()
 
         if entry.discharge_cutoff_soc is not None:
             params["discharge_cutoff_soc"] = entry.discharge_cutoff_soc
-        elif mode in (BatteryMode.DISCHARGE, BatteryMode.SELF_CONSUMPTION):
+        elif mode == BatteryMode.DISCHARGE:
             params["discharge_cutoff_soc"] = self._get_min_soc()
 
         # Duplicate detection

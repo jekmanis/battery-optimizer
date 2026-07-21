@@ -265,17 +265,6 @@ When grid export is profitable, the battery discharges at full rate. Load is sub
 
 **Impact:** Higher predicted load → less exportable surplus → lower export revenue per slot.
 
-#### SELF_CONSUMPTION (PV-aware) — `dp_optimizer.py:562-598`
-
-```python
-load_deficit = max(0.0, load - pv)
-battery_discharge_kw = min(load_deficit, discharge_rate)
-remaining_load_kw = max(0.0, load - pv - battery_discharge_kw)
-grid_import_kwh = remaining_load_kw * slot_hours * fraction
-```
-
-PV generation serves load first. Battery covers the deficit. Any remaining deficit is grid-imported. Load prediction determines how much PV surplus goes to battery charging vs. how much load deficit the battery must cover.
-
 #### CHARGE — `dp_optimizer.py:465-489`
 
 ```python
@@ -386,14 +375,13 @@ When the load profile has no data for a slot:
         ├── HOLD cost    = buy_price × min(load, discharge_rate) × slot_hours
         ├── DISCHARGE    = min(load, discharge_rate) × slot_hours  [capped by load]
         ├── EXPORT       = max(0, discharge - load) × slot_hours   [load subtracted]
-        ├── SELF_CONS    = max(0, load - pv) served by battery     [load deficit]
         └── CHARGE cost  = charge_cost + buy_price × load × slot_hours
                 │
                 ▼
         Optimal Schedule (CHARGE / HOLD / DISCHARGE per slot)
                 │
                 ▼
-        Inverter TOU Registers (autonomous execution)
+        growatt_modbus/set_wit_mode (per-slot execution)
 ```
 
 ---

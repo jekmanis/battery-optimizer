@@ -225,51 +225,6 @@ class TestBatteryLearningEngine:
         rate = engine.get_charge_rate_for_soc(40, battery_temp=15.0)
         assert rate > 0
 
-    def test_get_confidence_no_data(self, learning_engine):
-        """No data should return 0 confidence."""
-        conf = learning_engine.get_confidence_for_soc(40)
-        assert conf == 0.0
-
-    def test_get_confidence_with_data(self, learning_engine_with_data):
-        """With data, confidence should be > 0."""
-        conf = learning_engine_with_data.get_confidence_for_soc(40)
-        assert conf > 0
-
-    def test_predict_charge_time_zero_delta(self, learning_engine):
-        """No charging needed should return zero time."""
-        expected, min_t, max_t = learning_engine.predict_charge_time(50, 50)
-        assert expected == 0.0
-        assert min_t == 0.0
-        assert max_t == 0.0
-
-    def test_predict_charge_time_already_above(self, learning_engine):
-        """Already above target should return zero."""
-        expected, min_t, max_t = learning_engine.predict_charge_time(80, 50)
-        assert expected == 0.0
-
-    def test_predict_charge_time_basic(self, learning_engine):
-        """Basic charge time prediction."""
-        expected, min_t, max_t = learning_engine.predict_charge_time(30, 80)
-
-        # Should take some time
-        assert expected > 0
-        # Should have reasonable bounds
-        assert min_t <= expected <= max_t
-        # With no learned data, uncertainty should be ~30%
-        assert min_t >= expected * 0.7
-        assert max_t <= expected * 1.3
-
-    def test_predict_charge_time_with_temperature(self, learning_engine_with_data):
-        """Temperature should affect prediction."""
-        engine = learning_engine_with_data
-
-        expected_warm, _, _ = engine.predict_charge_time(30, 80, battery_temp=20)
-        expected_cold, _, _ = engine.predict_charge_time(30, 80, battery_temp=5)
-
-        # Both should be positive
-        assert expected_warm > 0
-        assert expected_cold > 0
-
     def test_get_learning_summary(self, learning_engine_with_data):
         """Summary should include all expected fields."""
         summary = learning_engine_with_data.get_learning_summary()

@@ -27,8 +27,6 @@ group:
       # Thresholds
       - input_number.battery_min_soc
       - input_number.battery_max_soc
-      - input_number.battery_charge_price_threshold
-      - input_number.battery_discharge_price_threshold
       - input_number.battery_pv_threshold
       - input_number.battery_avg_cost
       # Status Sensors
@@ -105,26 +103,6 @@ input_number:
     initial: 100
     mode: slider
 
-  battery_charge_price_threshold:
-    name: "Max Charge Price"
-    icon: mdi:currency-eur
-    min: 0
-    max: 0.50
-    step: 0.01
-    unit_of_measurement: "EUR/kWh"
-    initial: 0.15
-    mode: box
-
-  battery_discharge_price_threshold:
-    name: "Min Discharge Price"
-    icon: mdi:currency-eur
-    min: 0
-    max: 1.00
-    step: 0.01
-    unit_of_measurement: "EUR/kWh"
-    initial: 0.20
-    mode: box
-
   battery_pv_threshold:
     name: "PV Override Threshold"
     icon: mdi:solar-power
@@ -150,34 +128,6 @@ input_number:
 # =============================================================================
 template:
   - sensor:
-      - name: "Battery Optimizer Status"
-        unique_id: battery_optimizer_status
-        icon: >-
-          {% set mode = state_attr('sensor.battery_optimizer', 'current_mode') %}
-          {% if mode == 'CHARGE' %}
-            mdi:battery-charging
-          {% elif mode == 'DISCHARGE' %}
-            mdi:battery-arrow-down
-          {% else %}
-            mdi:battery-clock
-          {% endif %}
-        state: >-
-          {% set mode = state_attr('sensor.battery_optimizer', 'current_mode') %}
-          {% if mode == 'CHARGE' %}
-            Charging
-          {% elif mode == 'DISCHARGE' %}
-            Discharging
-          {% else %}
-            Holding
-          {% endif %}
-        attributes:
-          current_mode: "{{ state_attr('sensor.battery_optimizer', 'current_mode') }}"
-          next_charge: "{{ state_attr('sensor.battery_optimizer', 'next_charge') }}"
-          next_discharge: "{{ state_attr('sensor.battery_optimizer', 'next_discharge') }}"
-          last_optimization: "{{ state_attr('sensor.battery_optimizer', 'last_optimization') }}"
-          battery_avg_cost: "{{ state_attr('sensor.battery_optimizer', 'battery_avg_cost') }}"
-          discharge_threshold: "{{ state_attr('sensor.battery_optimizer', 'discharge_threshold') }}"
-
       - name: "Battery Next Charge Time"
         unique_id: battery_next_charge_time
         icon: mdi:battery-charging-high
@@ -259,14 +209,6 @@ template:
         state: >-
           {% set rate = state_attr('sensor.battery_learning_stats', 'learned_charge_rate_kw') %}
           {{ rate | default(0, true) | round(2) }}
-
-      - name: "Battery Overall Efficiency"
-        unique_id: battery_overall_efficiency
-        icon: mdi:percent
-        unit_of_measurement: "%"
-        state: >-
-          {% set eff = state_attr('sensor.battery_learning_stats', 'overall_efficiency') %}
-          {{ (eff | default(0, true) * 100) | round(1) }}
 
       - name: "Battery Total Profit"
         unique_id: battery_total_profit
@@ -434,22 +376,3 @@ script:
           entity_id: input_select.battery_manual_mode
         data:
           option: Auto
-
-# =============================================================================
-# Modbus Hub - WIT Inverter TOU Schedule Control
-# =============================================================================
-# NOTE: The modbus hub "wit_inverter" should be defined in configuration.yaml
-# (not here) to avoid duplicate entries. Example configuration:
-#
-#   modbus:
-#     - name: wit_inverter
-#       type: tcp
-#       host: 192.168.33.8  # Your WIT inverter IP
-#       port: 502
-#       sensors:
-#         - name: "WIT Modbus Dummy"
-#           address: 30000
-#           slave: 1
-#
-# Then set modbus_hub: "wit_inverter" in apps.yaml to enable TOU sync.
-# =============================================================================

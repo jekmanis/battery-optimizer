@@ -16,7 +16,6 @@ class BatteryMode(Enum):
     HOLD = 0
     CHARGE = 1
     DISCHARGE = 2
-    SELF_CONSUMPTION = 3
 
 
 @dataclass
@@ -48,14 +47,6 @@ class ScheduleEntry:
 
     discharge_cutoff_soc: Optional[int] = None
     # None = use config default
-
-
-@dataclass
-class TouPeriod:
-    """Represents a TOU period for inverter scheduling."""
-    start: int      # Minutes since midnight
-    end: int        # Minutes since midnight
-    power: int      # -100 to +100 (positive=charge, negative=discharge)
 
 
 @dataclass

@@ -6,7 +6,7 @@ Rolling window of recent outcomes with summary statistics.
 """
 
 import datetime
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional
 
 
@@ -141,7 +141,6 @@ class SlotOutcomeTracker:
             "DISCHARGE": {"discharge to load", "dischargetoload",
                           "discharge to grid", "dischargetogrid",
                           "max export", "maxexport"},
-            "SELF_CONSUMPTION": {"self-consumption", "selfconsumption", "self consumption"},
         }
 
         def _modes_match(scheduled: str, actual: str) -> bool:

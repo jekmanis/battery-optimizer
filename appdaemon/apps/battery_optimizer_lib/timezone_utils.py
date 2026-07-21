@@ -6,7 +6,7 @@ slot alignment, and dictionary lookups with timezone normalization.
 """
 
 import datetime
-from typing import Dict, Optional, Tuple, TypeVar, Any
+from typing import Dict, Optional, Tuple, TypeVar
 
 T = TypeVar("T")
 

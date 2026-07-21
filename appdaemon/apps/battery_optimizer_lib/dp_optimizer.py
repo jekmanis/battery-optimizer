@@ -7,7 +7,7 @@ dynamic programming with temperature-aware charge rate predictions.
 
 import datetime
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -107,7 +107,6 @@ class DPOptimizerResult:
     hold_count: int
     export_slot_count: int = 0
     self_consume_slot_count: int = 0
-    self_consumption_count: int = 0
 
 
 class DPOptimizer:
@@ -154,7 +153,6 @@ class DPOptimizer:
         current_soc: float,
         current_temp: Optional[float] = None,
         minutes_into_slot: float = 0.0,
-        min_charge_slots_hint: int = 0,
     ) -> DPOptimizerResult:
         """
         Run DP optimization to find optimal schedule.
@@ -165,7 +163,6 @@ class DPOptimizer:
             current_soc: Current battery state of charge (%)
             current_temp: Current battery temperature (Celsius, optional)
             minutes_into_slot: Minutes elapsed in current slot
-            min_charge_slots_hint: Informational minimum charge slots (not enforced)
 
         Returns:
             DPOptimizerResult with schedule and trajectories
@@ -253,7 +250,6 @@ class DPOptimizer:
         charge_count = sum(1 for e in schedule.values() if e.mode == BatteryMode.CHARGE)
         discharge_count = sum(1 for e in schedule.values() if e.mode == BatteryMode.DISCHARGE)
         hold_count = sum(1 for e in schedule.values() if e.mode == BatteryMode.HOLD)
-        self_consumption_count = sum(1 for e in schedule.values() if e.mode == BatteryMode.SELF_CONSUMPTION)
         export_slot_count = sum(
             1 for e in schedule.values()
             if e.mode == BatteryMode.DISCHARGE and e.export_rate is not None and e.export_rate > 0
@@ -269,7 +265,6 @@ class DPOptimizer:
             hold_count=hold_count,
             export_slot_count=export_slot_count,
             self_consume_slot_count=self_consume_slot_count,
-            self_consumption_count=self_consumption_count,
         )
 
     def _compute_charge_rates_per_slot(

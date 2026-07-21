@@ -724,7 +724,7 @@ class BatteryCostTracker:
         Threshold = (what we paid + grid fees) / efficiency + wear cost
         Only discharge if we can "sell" above this price.
         """
-        return ((self._avg_cost + self._config.grid_fee) / self._config.efficiency) + self._config.battery_wear_cost
+        return self.get_discharge_threshold_for_cost(self._avg_cost)
 
     def get_discharge_threshold_for_cost(self, avg_cost: float) -> float:
         """Calculate discharge threshold for a given battery average cost."""
@@ -824,23 +824,5 @@ class BatteryCostTracker:
                     load_kw = predict_load_func(hour)
                     energy_removed = min(load_kw, self._config.discharge_rate) * slot_hours * fraction
                 current_soc = max(self._get_min_soc(), current_soc - (energy_removed / self._config.battery_capacity) * 100)
-
-            elif entry.mode == BatteryMode.SELF_CONSUMPTION:
-                fraction = (
-                    slot_fractions_by_slot.get(hour, 1.0)
-                    if slot_fractions_by_slot is not None
-                    else 1.0
-                )
-                pv_kw = predict_pv_func(hour) if predict_pv_func else 0.0
-                load_kw = predict_load_func(hour)
-                pv_surplus = max(0.0, pv_kw - load_kw)
-                pv_charge_kw = min(pv_surplus, self._config.charge_rate)
-                pv_charge_kwh = pv_charge_kw * self._config.efficiency * slot_hours * fraction
-                load_deficit = max(0.0, load_kw - pv_kw)
-                battery_discharge_kwh = min(load_deficit, self._config.discharge_rate) * slot_hours * fraction
-                net_energy = pv_charge_kwh - battery_discharge_kwh
-                soc_change = (net_energy / self._config.battery_capacity) * 100
-                current_soc = max(self._get_min_soc(), min(self._get_max_soc(), current_soc + soc_change))
-                # PV charging is free — no cost update needed for the charge portion
 
         return projected_costs, current_cost

@@ -962,8 +962,8 @@ class TestDPOptimizerPvAwareModes:
             export_rate_multiplier=export_rate_multiplier,
         )
 
-    def test_no_self_consumption_mode_produced(self):
-        """SELF_CONSUMPTION is no longer produced by the DP optimizer."""
+    def test_only_valid_modes_produced(self):
+        """The DP optimizer only emits HOLD/CHARGE/DISCHARGE."""
         config = self._pv_config()
         prices = self._make_prices([0.10, 0.10, 0.10, 0.10])
         optimizer = self._make_optimizer(config, load_kw=0.5, pv_kw_fn=lambda dt: 3.0)
@@ -972,9 +972,8 @@ class TestDPOptimizerPvAwareModes:
             current_slot=prices[0].time,
             current_soc=50.0,
         )
-        sc_entries = [e for e in result.schedule.values() if e.mode == BatteryMode.SELF_CONSUMPTION]
-        assert len(sc_entries) == 0, "SELF_CONSUMPTION should never be produced"
-        assert result.self_consumption_count == 0
+        valid_modes = {BatteryMode.HOLD, BatteryMode.CHARGE, BatteryMode.DISCHARGE}
+        assert all(e.mode in valid_modes for e in result.schedule.values())
 
     def test_charge_chosen_when_pv_exceeds_load(self):
         """With PV > load and low SOC, CHARGE captures free PV surplus."""
@@ -1086,9 +1085,7 @@ class TestDPOptimizerPvAwareModes:
         result = optimizer.optimize(
             prices=prices, current_slot=prices[0].time, current_soc=50.0,
         )
-        # No SELF_CONSUMPTION and schedule should be valid
-        sc_entries = [e for e in result.schedule.values() if e.mode == BatteryMode.SELF_CONSUMPTION]
-        assert len(sc_entries) == 0
+        # Schedule should be valid
         assert len(result.schedule) == 2
 
     def test_pv_export_revenue_in_hold(self):

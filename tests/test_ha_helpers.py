@@ -5,7 +5,6 @@ from battery_optimizer_lib.ha_helpers import (
     is_state_valid,
     get_float_state,
     get_bool_state,
-    get_string_state,
     SensorReader,
 )
 
@@ -118,34 +117,6 @@ class TestGetBoolState:
         assert result is False
 
 
-class TestGetStringState:
-    """Tests for get_string_state function."""
-
-    def test_valid_string(self):
-        def get_state(entity_id):
-            return "Hello"
-        result = get_string_state(get_state, "sensor.test")
-        assert result == "Hello"
-
-    def test_number_converted_to_string(self):
-        def get_state(entity_id):
-            return 42
-        result = get_string_state(get_state, "sensor.test")
-        assert result == "42"
-
-    def test_unavailable_returns_default(self):
-        def get_state(entity_id):
-            return "unavailable"
-        result = get_string_state(get_state, "sensor.test", default="N/A")
-        assert result == "N/A"
-
-    def test_exception_returns_default(self):
-        def get_state(entity_id):
-            raise Exception("Error")
-        result = get_string_state(get_state, "sensor.test", default="error")
-        assert result == "error"
-
-
 class TestSensorReader:
     """Tests for SensorReader class."""
 
@@ -165,12 +136,6 @@ class TestSensorReader:
         reader = SensorReader(get_state)
         assert reader.get_bool("input_boolean.enabled") is True
         assert reader.get_bool("other") is False
-
-    def test_get_string(self):
-        def get_state(entity_id):
-            return "test_value"
-        reader = SensorReader(get_state)
-        assert reader.get_string("sensor.test") == "test_value"
 
     def test_get_soc(self):
         def get_state(entity_id):

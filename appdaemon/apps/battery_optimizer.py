@@ -10,8 +10,6 @@ Author: AppDaemon Battery Optimizer
 import appdaemon.plugins.hass.hassapi as hass
 import datetime
 import math
-import traceback
-import json
 from typing import Dict, List, Optional, Tuple
 
 # Import from the battery_optimizer_lib package
@@ -22,8 +20,6 @@ from battery_optimizer_lib import (
     BatteryMode,
     PricePoint,
     ScheduleEntry,
-    LearningStats,
-    LoadProfileStats,
     BatteryLearningEngine,
     LoadProfile,
     NordPoolPriceService,
@@ -31,7 +27,6 @@ from battery_optimizer_lib import (
     # DP Optimizer
     DPOptimizer,
     DPOptimizerConfig,
-    DPOptimizerResult,
     # Timezone utilities
     normalize_tz_pair,
     dt_ge,
@@ -473,7 +468,6 @@ class BatteryOptimizer(hass.Hass):
                 predict_load_func=self._predict_load_kw,
                 charge_rates_by_slot=slot_charge_rates_by_slot,
                 slot_fractions_by_slot=slot_fractions_by_slot,
-                predict_pv_func=self._predict_pv_kw,
             )
             self._last_projected_costs = projected_costs
         else:
@@ -626,23 +620,14 @@ class BatteryOptimizer(hass.Hass):
         current_temp: Optional[float],
     ) -> List[float]:
         """Pre-compute temperature-aware charge rates for each slot."""
-        # Use learning_engine callbacks if available, otherwise use simple fallback
-        if self.learning_engine:
-            get_charge_rate = self.learning_engine.get_charge_rate_for_soc
-            predict_temp = self.learning_engine.predict_temp_after_duration
-        else:
-            # Fallback when no learning engine is available
-            get_charge_rate = lambda soc, temp: self.config.charge_rate
-            predict_temp = lambda temp, duration: temp if temp is not None else 25.0
-
         return compute_charge_rates_per_slot(
             slots_sorted_by_time=slots_sorted_by_time,
             slot_fractions=slot_fractions,
             slot_minutes=self.config.slot_minutes,
             current_soc=current_soc,
-            current_temp=current_temp if self.learning_engine else None,
-            get_charge_rate_for_soc=get_charge_rate,
-            predict_temp_after_duration=predict_temp,
+            current_temp=current_temp,
+            get_charge_rate_for_soc=self.learning_engine.get_charge_rate_for_soc,
+            predict_temp_after_duration=self.learning_engine.predict_temp_after_duration,
             battery_capacity=self.config.battery_capacity,
             efficiency=self.config.efficiency,
             max_soc=self.max_soc,
@@ -700,10 +685,9 @@ class BatteryOptimizer(hass.Hass):
                 else:
                     # Fallback: Use SOC-only learned charge rate
                     effective_charge_rate = self.config.charge_rate
-                    if self.learning_engine:
-                        learned_rate = self.learning_engine.get_charge_rate_for_soc(current_soc)
-                        if learned_rate is not None and learned_rate > 0:
-                            effective_charge_rate = learned_rate
+                    learned_rate = self.learning_engine.get_charge_rate_for_soc(current_soc)
+                    if learned_rate is not None and learned_rate > 0:
+                        effective_charge_rate = learned_rate
 
                     # Charging: grid energy * efficiency goes into battery
                     energy_added = effective_charge_rate * self.config.efficiency * self.config.slot_hours
@@ -826,7 +810,6 @@ class BatteryOptimizer(hass.Hass):
             projected_costs=self._last_projected_costs,
             local_tz=self._get_local_timezone(),
             predict_load_kw=self._predict_load_kw,
-            predict_pv_kw=self._predict_pv_kw,
             min_soc=self.min_soc,
             max_soc=self.max_soc,
         )
@@ -866,9 +849,6 @@ class BatteryOptimizer(hass.Hass):
         if current_soc is None:
             return
 
-        # Snapshot schedule for change detection
-        schedule_snapshot = {h: e.mode for h, e in self.schedule.items()} if self.schedule else {}
-
         # Safety: if significant PV is producing during a grid-charge slot and
         # the DP didn't anticipate it (e.g. fresh PV profile), pause charging to
         # let the inverter use solar instead of paying for grid.
@@ -900,48 +880,6 @@ class BatteryOptimizer(hass.Hass):
                 )
                 self._recalculate_remaining_schedule(current_soc)
                 return
-
-        # Get current slot for schedule change logging
-        now = self.datetime()
-        local_tz = self._get_local_timezone()
-        if now.tzinfo is not None and local_tz is not None:
-            now = now.astimezone(local_tz)
-        elif local_tz is not None:
-            now = now.replace(tzinfo=local_tz)
-        current_slot = self._align_to_slot(now)
-
-        # Check if schedule changed and log if so
-        current_schedule_snapshot = {h: e.mode for h, e in self.schedule.items()} if self.schedule else {}
-        if current_schedule_snapshot != schedule_snapshot:
-            # Determine what changed
-            new_hours = set(current_schedule_snapshot.keys()) - set(schedule_snapshot.keys())
-            changed_modes = {h for h in current_schedule_snapshot if h in schedule_snapshot
-                           and current_schedule_snapshot[h] != schedule_snapshot[h]}
-
-            if new_hours or changed_modes:
-                changes = []
-                if new_hours:
-                    changes.append(f"{len(new_hours)} new slots")
-                if changed_modes:
-                    changes.append(f"{len(changed_modes)} mode changes")
-                self.log(f"Schedule updated ({', '.join(changes)}), SOC: {current_soc}%")
-                # Log only current and future schedule entries (not past hours)
-                future_schedule = {
-                    h: e for h, e in self.schedule.items()
-                    if dt_ge(h, current_slot, local_tz)
-                }
-                self._schedule_formatter.log_schedule(
-                    schedule=future_schedule,
-                    expected_soc=self.expected_soc_schedule,
-                    expected_temp=self.expected_temp_schedule,
-                    dp_soc_trajectory=self._last_dp_soc_trajectory,
-                    dp_temp_trajectory=self._last_dp_temp_trajectory,
-                    projected_costs=self._last_projected_costs,
-                    local_tz=local_tz,
-                    predict_load_kw=self._predict_load_kw,
-                    min_soc=self.min_soc,
-                    max_soc=self.max_soc,
-                )
 
 
     def _recalculate_remaining_schedule(self, current_soc: float, extra_charge_slots: int = 0):
@@ -1329,7 +1267,6 @@ class BatteryOptimizer(hass.Hass):
             local_tz=local_tz,
             current_temp=current_temp,
             predict_load_kw=self._predict_load_kw,
-            predict_pv_kw=self._predict_pv_kw,
             get_cheapest_upcoming_prices=self._get_cheapest_upcoming_prices,
             get_discharge_threshold=self._get_discharge_threshold,
         )
@@ -1863,6 +1800,25 @@ class BatteryOptimizer(hass.Hass):
         """Update learning stats sensor for dashboard display"""
         try:
             summary = self.learning_engine.get_learning_summary()
+
+            # Learning confidence: scale total observations against the engine's
+            # per-bucket cap of 50 samples, capped at 100%.
+            total_observations = summary["total_observations"]
+            confidence_pct = round(min(100.0, total_observations / 50.0 * 100.0), 1)
+
+            # Currently learned charge rate at present SOC and battery temperature
+            # (same rate-query API the optimizer uses). Fall back to 0 without SOC.
+            current_soc = self._get_current_soc()
+            if current_soc is not None:
+                learned_charge_rate_kw = round(
+                    self.learning_engine.get_charge_rate_for_soc(
+                        current_soc, self._get_battery_temp()
+                    ),
+                    2,
+                )
+            else:
+                learned_charge_rate_kw = 0.0
+
             self.set_state(
                 "sensor.battery_learning_stats",
                 state=str(summary["total_observations"]),
@@ -1875,6 +1831,8 @@ class BatteryOptimizer(hass.Hass):
                     "overall_efficiency": summary["overall_efficiency"],
                     "total_profit_eur": summary["total_profit_eur"],
                     "total_observations": summary["total_observations"],
+                    "confidence_pct": confidence_pct,
+                    "learned_charge_rate_kw": learned_charge_rate_kw,
                     "soc_charge_rates": summary["soc_charge_rates"],
                     "temp_aware_rates": summary.get("temp_aware_rates", {}),
                     "icon": "mdi:brain",

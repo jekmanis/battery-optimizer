@@ -98,17 +98,11 @@ class PvForecastService:
         # Cache: slot-aligned naive local datetime -> kW
         self._cache: Dict[datetime.datetime, float] = {}
         self._cache_timestamp: Optional[datetime.datetime] = None
-        self._last_source: str = ""  # "solcast", "forecast_solar", or ""
 
     @property
     def has_forecast(self) -> bool:
         """Whether the cache contains any forecast data."""
         return len(self._cache) > 0
-
-    @property
-    def last_source(self) -> str:
-        """Name of the last successful forecast source."""
-        return self._last_source
 
     def _slot_key(self, dt: datetime.datetime) -> datetime.datetime:
         """Convert a datetime to a naive local-time cache key."""
@@ -159,7 +153,6 @@ class PvForecastService:
                 if data:
                     self._cache = data
                     self._cache_timestamp = now
-                    self._last_source = "solcast"
                     self.log(
                         f"PV forecast updated from Solcast: {len(data)} slots, "
                         f"peak {max(data.values()):.2f} kW"
@@ -176,7 +169,6 @@ class PvForecastService:
                 if data:
                     self._cache = data
                     self._cache_timestamp = now
-                    self._last_source = "forecast_solar"
                     self.log(
                         f"PV forecast updated from Forecast.Solar: {len(data)} slots, "
                         f"peak {max(data.values()):.2f} kW"
@@ -204,7 +196,6 @@ class PvForecastService:
                 )
                 self._cache.clear()
                 self._cache_timestamp = None
-                self._last_source = ""
 
         return False
 

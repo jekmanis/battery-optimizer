@@ -74,7 +74,6 @@ class LoadPredictionTracker:
             self.stats.global_ratios = self.stats.global_ratios[-MAX_GLOBAL_SAMPLES:]
 
         self.stats.total_comparisons += 1
-        self.stats.last_comparison = dt.isoformat()
 
     def get_correction_factor(self, dt: datetime.datetime) -> float:
         """

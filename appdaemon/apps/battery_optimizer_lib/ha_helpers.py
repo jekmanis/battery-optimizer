@@ -87,31 +87,6 @@ def get_bool_state(
         return default
 
 
-def get_string_state(
-    get_state: GetStateFunc,
-    entity_id: str,
-    default: str = ""
-) -> str:
-    """
-    Safely get a string value from a Home Assistant entity.
-
-    Args:
-        get_state: Function to get entity state
-        entity_id: The entity ID to read
-        default: Default value if state is invalid
-
-    Returns:
-        The state as string, or default if unavailable
-    """
-    try:
-        state = get_state(entity_id)
-        if is_state_valid(state):
-            return str(state)
-    except Exception:
-        pass
-    return default
-
-
 class SensorReader:
     """
     Helper class for reading sensor values with consistent error handling.
@@ -150,10 +125,6 @@ class SensorReader:
     def get_bool(self, entity_id: str, default: bool = False) -> bool:
         """Get a boolean value from an entity (True if "on")."""
         return get_bool_state(self._get_state, entity_id, default)
-
-    def get_string(self, entity_id: str, default: str = "") -> str:
-        """Get a string value from an entity."""
-        return get_string_state(self._get_state, entity_id, default)
 
     def get_soc(self, soc_sensor: str) -> Optional[float]:
         """

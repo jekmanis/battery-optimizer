@@ -5,8 +5,7 @@ Pytest configuration and shared fixtures for battery optimizer tests.
 import datetime
 import sys
 from pathlib import Path
-from typing import Dict, List
-from unittest.mock import MagicMock
+from typing import List
 
 import pytest
 
@@ -33,13 +32,8 @@ sys.modules["appdaemon.plugins.hass.hassapi"] = mock_hass_module
 # Now we can import the module components
 from battery_optimizer_lib import (
     BatteryLearningEngine,
-    BatteryMode,
-    LearningStats,
     LoadProfile,
-    LoadProfileStats,
     PricePoint,
-    ScheduleEntry,
-    _quantile,
 )
 
 
@@ -178,28 +172,6 @@ def sample_prices() -> List[PricePoint]:
         PricePoint(
             time=base_time + datetime.timedelta(hours=i),
             price=price / 100  # Convert cents to EUR
-        )
-        for i, price in enumerate(prices_cents)
-    ]
-
-
-@pytest.fixture
-def sample_prices_tomorrow() -> List[PricePoint]:
-    """Sample prices for tomorrow (for multi-day scheduling tests)."""
-    base_time = datetime.datetime(2024, 1, 16, 0, 0, 0)
-
-    # Different pattern for tomorrow
-    prices_cents = [
-        4.0, 3.5, 3.2, 3.0, 3.5, 6.0,
-        10.0, 15.0, 16.0, 12.0, 9.0, 8.0,
-        7.5, 7.0, 6.5, 7.5, 10.0, 17.0,
-        20.0, 18.0, 14.0, 10.0, 6.0, 4.5,
-    ]
-
-    return [
-        PricePoint(
-            time=base_time + datetime.timedelta(hours=i),
-            price=price / 100
         )
         for i, price in enumerate(prices_cents)
     ]

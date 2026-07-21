@@ -39,30 +39,18 @@ class ScheduleEntry:
     ac_charge_mode: Optional[str] = None
     # None = auto-detect, "disabled" / "pv_priority" / "ac_priority"
 
-    power_percent: Optional[int] = None
-    # None = use config default (100%)
-
-    charge_cutoff_soc: Optional[int] = None
-    # None = use config default
-
-    discharge_cutoff_soc: Optional[int] = None
-    # None = use config default
-
 
 @dataclass
 class LearningStats:
     """Aggregated learning statistics for battery performance."""
     # Charging rates by SOC range (kW observed at different SOC levels)
     charge_rates_by_soc: Dict[str, List[float]] = field(default_factory=dict)
-    # Round-trip efficiency observations
-    efficiency_history: List[float] = field(default_factory=list)
     # Totals
     total_energy_charged_kwh: float = 0.0
     total_energy_discharged_kwh: float = 0.0
     total_charge_cost_eur: float = 0.0
     total_discharge_revenue_eur: float = 0.0
     # Timestamps
-    first_observation: Optional[str] = None
     last_observation: Optional[str] = None
     # Temperature-aware charge rates: {"25-50": {"5-10": [3.1, 3.2], "10-15": [4.2, 4.5]}}
     charge_rates_by_soc_temp: Dict[str, Dict[str, List[float]]] = field(default_factory=dict)
@@ -120,7 +108,6 @@ class PredictionAccuracyStats:
     ratios_by_slot: Dict[str, List[float]] = field(default_factory=dict)
     global_ratios: List[float] = field(default_factory=list)
     total_comparisons: int = 0
-    last_comparison: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)

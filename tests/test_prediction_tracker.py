@@ -39,14 +39,12 @@ class TestPredictionAccuracyStats:
         assert stats.ratios_by_slot == {}
         assert stats.global_ratios == []
         assert stats.total_comparisons == 0
-        assert stats.last_comparison is None
 
     def test_to_dict_roundtrip(self):
         stats = PredictionAccuracyStats(
             ratios_by_slot={"10": [1.5, 2.0]},
             global_ratios=[1.5, 2.0],
             total_comparisons=2,
-            last_comparison="2024-01-15T10:00:00",
         )
         d = stats.to_dict()
         restored = PredictionAccuracyStats.from_dict(d)

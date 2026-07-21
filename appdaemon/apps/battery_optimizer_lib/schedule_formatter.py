@@ -105,7 +105,6 @@ class ScheduleFormatter:
         projected_costs: Optional[Dict[datetime.datetime, float]] = None,
         local_tz=None,
         predict_load_kw: Optional[Callable[[datetime.datetime], float]] = None,
-        predict_pv_kw: Optional[Callable[[datetime.datetime], float]] = None,
         min_soc: float = 10.0,
         max_soc: float = 100.0,
     ):
@@ -157,7 +156,6 @@ class ScheduleFormatter:
                 expected_temp=expected_temp,
                 local_tz=local_tz,
                 predict_load_kw=predict_load_kw,
-                predict_pv_kw=predict_pv_kw,
                 min_soc=min_soc,
                 max_soc=max_soc,
             )
@@ -204,7 +202,6 @@ class ScheduleFormatter:
         expected_temp: Optional[Dict[datetime.datetime, float]],
         local_tz,
         predict_load_kw: Optional[Callable[[datetime.datetime], float]],
-        predict_pv_kw: Optional[Callable[[datetime.datetime], float]] = None,
         min_soc: float = 10.0,
         max_soc: float = 100.0,
     ) -> str:
@@ -232,7 +229,6 @@ class ScheduleFormatter:
                 expected_temp=expected_temp,
                 local_tz=local_tz,
                 predict_load_kw=predict_load_kw,
-                predict_pv_kw=predict_pv_kw,
                 min_soc=min_soc,
                 max_soc=max_soc,
             )
@@ -260,7 +256,6 @@ class ScheduleFormatter:
         expected_temp: Optional[Dict[datetime.datetime, float]],
         local_tz,
         predict_load_kw: Optional[Callable[[datetime.datetime], float]],
-        predict_pv_kw: Optional[Callable[[datetime.datetime], float]] = None,
         min_soc: float = 10.0,
         max_soc: float = 100.0,
     ) -> str:

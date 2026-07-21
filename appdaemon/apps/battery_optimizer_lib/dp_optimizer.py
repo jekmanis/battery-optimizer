@@ -103,7 +103,6 @@ class DPOptimizerResult:
     soc_trajectory: Dict[datetime.datetime, Tuple[float, float]]
     temp_trajectory: Dict[datetime.datetime, Tuple[Optional[float], Optional[float]]]
     charge_count: int
-    discharge_count: int
     hold_count: int
     export_slot_count: int = 0
     self_consume_slot_count: int = 0
@@ -173,7 +172,6 @@ class DPOptimizer:
                 soc_trajectory={},
                 temp_trajectory={},
                 charge_count=0,
-                discharge_count=0,
                 hold_count=0,
             )
 
@@ -261,7 +259,6 @@ class DPOptimizer:
             soc_trajectory=soc_trajectory,
             temp_trajectory=temp_trajectory,
             charge_count=charge_count,
-            discharge_count=discharge_count,
             hold_count=hold_count,
             export_slot_count=export_slot_count,
             self_consume_slot_count=self_consume_slot_count,

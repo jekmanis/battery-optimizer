@@ -83,7 +83,6 @@ class SocDeviationDetector:
         local_tz,
         current_temp: Optional[float] = None,
         predict_load_kw: Optional[Callable[[datetime.datetime], float]] = None,
-        predict_pv_kw: Optional[Callable[[datetime.datetime], float]] = None,
         get_cheapest_upcoming_prices: Optional[Callable[[List[datetime.datetime], int], List[float]]] = None,
         get_discharge_threshold: Optional[Callable[[], float]] = None,
     ) -> DeviationCheckResult:
@@ -122,7 +121,7 @@ class SocDeviationDetector:
         # Interpolate expected SOC based on elapsed time in slot
         expected_soc_now = self._interpolate_expected_soc(
             expected_soc, entry, fraction, current_soc, current_slot, current_temp,
-            predict_load_kw, predict_pv_kw,
+            predict_load_kw,
         )
 
         soc_delta = current_soc - expected_soc_now
@@ -203,7 +202,6 @@ class SocDeviationDetector:
         current_slot: datetime.datetime,
         current_temp: Optional[float],
         predict_load_kw: Optional[Callable[[datetime.datetime], float]],
-        predict_pv_kw: Optional[Callable[[datetime.datetime], float]] = None,
     ) -> float:
         """
         Interpolate expected SOC based on elapsed time within the slot.
@@ -216,7 +214,6 @@ class SocDeviationDetector:
             current_slot: Current slot datetime
             current_temp: Current battery temperature
             predict_load_kw: Load prediction function
-            predict_pv_kw: PV prediction function
 
         Returns:
             Interpolated expected SOC for current time within slot

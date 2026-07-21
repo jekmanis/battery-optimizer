@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from battery_optimizer import BatteryLearningEngine, LearningStats
+from battery_optimizer_lib import BatteryLearningEngine, LearningStats
 
 
 class TestLearningStats:
@@ -16,11 +16,9 @@ class TestLearningStats:
         """Default values should be set correctly."""
         stats = LearningStats()
         assert stats.charge_rates_by_soc == {}
-        assert stats.efficiency_history == []
         assert stats.total_energy_charged_kwh == 0.0
         assert stats.total_energy_discharged_kwh == 0.0
         assert stats.total_charge_cost_eur == 0.0
-        assert stats.first_observation is None
         assert stats.charge_rates_by_soc_temp == {}
 
     def test_to_dict_roundtrip(self):
@@ -123,7 +121,6 @@ class TestBatteryLearningEngine:
 
         # Energy added: (50-30)/100 * 14.3 = 2.86 kWh
         assert learning_engine.stats.total_energy_charged_kwh > 0
-        assert learning_engine.stats.first_observation is not None
         assert "25-50" in learning_engine.stats.charge_rates_by_soc
 
     def test_record_charging_with_temperature(self, learning_engine):

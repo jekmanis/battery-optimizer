@@ -147,7 +147,8 @@ class TestDPOptimizerOptimize:
         )
         assert result.schedule == {}
         assert result.charge_count == 0
-        assert result.discharge_count == 0
+        assert result.self_consume_slot_count == 0
+        assert result.export_slot_count == 0
         assert result.hold_count == 0
 
     def test_single_slot_hold(
@@ -236,7 +237,7 @@ class TestDPOptimizerOptimize:
             current_soc=95.0,  # High SOC, can discharge
         )
         # Should have some discharge slots
-        assert result.discharge_count > 0
+        assert result.self_consume_slot_count + result.export_slot_count > 0
 
         # Check that discharge happens during expensive hours
         discharge_hours = [
@@ -380,7 +381,8 @@ class TestDPOptimizerResult:
         assert hasattr(result, 'soc_trajectory')
         assert hasattr(result, 'temp_trajectory')
         assert hasattr(result, 'charge_count')
-        assert hasattr(result, 'discharge_count')
+        assert hasattr(result, 'self_consume_slot_count')
+        assert hasattr(result, 'export_slot_count')
         assert hasattr(result, 'hold_count')
 
     def test_counts_match_schedule(
@@ -409,7 +411,7 @@ class TestDPOptimizerResult:
         actual_hold = sum(1 for e in result.schedule.values() if e.mode == BatteryMode.HOLD)
 
         assert result.charge_count == actual_charge
-        assert result.discharge_count == actual_discharge
+        assert result.self_consume_slot_count + result.export_slot_count == actual_discharge
         assert result.hold_count == actual_hold
 
 
@@ -561,7 +563,7 @@ class TestFifteenMinuteSlotDP:
         assert len(result.schedule) == len(prices_15min)
 
         # Verify at least some charge slots exist at low SOC with cheap prices
-        assert result.charge_count > 0 or result.discharge_count > 0 or result.hold_count > 0
+        assert result.charge_count > 0 or result.self_consume_slot_count + result.export_slot_count > 0 or result.hold_count > 0
 
     def test_15min_soc_trajectory(
         self,

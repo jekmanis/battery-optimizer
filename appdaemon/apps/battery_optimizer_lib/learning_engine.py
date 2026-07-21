@@ -149,7 +149,6 @@ class BatteryLearningEngine:
                     self.ema_alpha * observed_efficiency +
                     (1 - self.ema_alpha) * self.learned_efficiency
                 )
-                self.stats.efficiency_history.append(observed_efficiency)
 
         # Update SOC-range specific charge rates (fallback when temperature unavailable)
         soc_range = self._get_soc_range((soc_start + soc_end) / 2)
@@ -200,10 +199,7 @@ class BatteryLearningEngine:
         self.stats.total_charge_cost_eur += energy_added * charge_price
 
         # Update timestamps
-        now = datetime.datetime.now().isoformat()
-        if self.stats.first_observation is None:
-            self.stats.first_observation = now
-        self.stats.last_observation = now
+        self.stats.last_observation = datetime.datetime.now().isoformat()
 
         temp_str = f", temp={battery_temp:.1f}C" if battery_temp is not None else ""
         # Get observation count for this bucket

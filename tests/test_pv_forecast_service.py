@@ -93,7 +93,6 @@ class TestSolcastFetch:
         svc.refresh()
 
         assert svc.has_forecast
-        assert svc.last_source == "solcast"
 
         # 08:00 30-min period -> two 15-min slots at 08:00 and 08:15
         assert svc.predict_kw(datetime.datetime(2026, 3, 24, 8, 0, tzinfo=TZ_PLUS2)) == 0.5
@@ -313,7 +312,6 @@ class TestForecastSolarFetch:
         svc.refresh()
 
         assert svc.has_forecast
-        assert svc.last_source == "forecast_solar"
 
         # 500 Wh / 1h / 1000 = 0.5 kW, expanded to 4 x 15-min slots
         assert svc.predict_kw(datetime.datetime(2026, 3, 24, 8, 0, tzinfo=TZ_PLUS2)) == pytest.approx(0.5)
@@ -550,7 +548,7 @@ class TestFallbackChain:
         svc = _make_service(config=config, states=states)
         svc.refresh()
 
-        assert svc.last_source == "solcast"
+        assert svc.has_forecast
         mock_requests.get.assert_not_called()
 
     @patch("battery_optimizer_lib.pv_forecast_service.requests")
@@ -579,7 +577,6 @@ class TestFallbackChain:
         svc = _make_service(config=config, states={})
         svc.refresh()
 
-        assert svc.last_source == "forecast_solar"
         assert svc.has_forecast
 
     def test_empty_when_nothing_configured(self):

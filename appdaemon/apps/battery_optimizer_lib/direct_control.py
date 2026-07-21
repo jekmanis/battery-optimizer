@@ -41,8 +41,8 @@ class DirectControl:
         """Send mode command to inverter via set_wit_mode service.
 
         Args:
-            entry: Schedule entry with mode, and optional export_rate,
-                   ac_charge_mode, power_percent, cutoff SOC values.
+            entry: Schedule entry with mode, and optional export_rate
+                   and ac_charge_mode.
 
         Returns:
             True if service call succeeded (or dry-run), False otherwise.
@@ -69,8 +69,7 @@ class DirectControl:
         }
 
         # Power percent
-        power = entry.power_percent if entry.power_percent is not None else self.config.default_power_percent
-        params["power_percent"] = power
+        params["power_percent"] = self.config.default_power_percent
 
         # Export rate
         if entry.export_rate is not None:
@@ -82,14 +81,10 @@ class DirectControl:
             params["ac_charge_mode"] = ac_mode
 
         # SOC limits
-        if entry.charge_cutoff_soc is not None:
-            params["charge_cutoff_soc"] = entry.charge_cutoff_soc
-        elif mode == BatteryMode.CHARGE:
+        if mode == BatteryMode.CHARGE:
             params["charge_cutoff_soc"] = self._get_max_soc()
 
-        if entry.discharge_cutoff_soc is not None:
-            params["discharge_cutoff_soc"] = entry.discharge_cutoff_soc
-        elif mode == BatteryMode.DISCHARGE:
+        if mode == BatteryMode.DISCHARGE:
             params["discharge_cutoff_soc"] = self._get_min_soc()
 
         # Duplicate detection
@@ -170,7 +165,7 @@ class DirectControl:
         export_rate = entry.export_rate
 
         if export_rate is not None and export_rate > 0:
-            power = entry.power_percent if entry.power_percent is not None else self.config.default_power_percent
+            power = self.config.default_power_percent
             if export_rate >= 100 and power >= 100:
                 return "max_export"
             return "discharge_to_grid"
@@ -229,7 +224,7 @@ class DirectControl:
         if elapsed > half_slot:
             return False  # Time to refresh even if same mode
 
-        for key in ("mode", "power_percent", "export_rate", "ac_charge_mode",
+        for key in ("mode", "export_rate", "ac_charge_mode",
                      "charge_cutoff_soc", "discharge_cutoff_soc"):
             if params.get(key) != self._last_params.get(key):
                 return False

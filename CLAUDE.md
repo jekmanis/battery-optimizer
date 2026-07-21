@@ -36,7 +36,6 @@ homeassistant/packages/
 └── battery_optimizer.yaml         # HA entities, automations, sensors
 tests/
 ├── conftest.py                    # Pytest fixtures + mock AppDaemon setup
-├── fixtures/mock_hass.py          # Mock Home Assistant
 └── test_*.py                      # Test modules
 ```
 

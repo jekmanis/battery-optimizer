@@ -757,7 +757,6 @@ class BatteryCostTracker:
         predict_load_func: Callable[[datetime.datetime], float],
         charge_rates_by_slot: Optional[Dict[datetime.datetime, float]] = None,
         slot_fractions_by_slot: Optional[Dict[datetime.datetime, float]] = None,
-        predict_pv_func: Optional[Callable[[datetime.datetime], float]] = None,
     ) -> Tuple[Dict[datetime.datetime, float], float]:
         """
         Project battery avg cost evolution through a schedule.

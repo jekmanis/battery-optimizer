@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from battery_optimizer import LoadProfile, LoadProfileStats
+from battery_optimizer_lib import LoadProfile, LoadProfileStats
 
 
 class TestLoadProfileStats:

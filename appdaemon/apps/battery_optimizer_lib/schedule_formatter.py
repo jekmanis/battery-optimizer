@@ -40,8 +40,9 @@ def resolve_wit_mode(entry: ScheduleEntry, default_power_percent: int = 100) -> 
     elif mode == BatteryMode.DISCHARGE:
         export_rate = entry.export_rate
         if export_rate is not None and export_rate > 0:
-            power = entry.power_percent if entry.power_percent is not None else default_power_percent
-            if export_rate >= 100 and power >= 100:
+            # DirectControl always sends config.default_power_percent; ScheduleEntry
+            # no longer carries a per-slot power_percent.
+            if export_rate >= 100 and default_power_percent >= 100:
                 return "max_export"
             return "discharge_to_grid"
         return "discharge_to_load"

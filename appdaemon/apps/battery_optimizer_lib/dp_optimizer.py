@@ -138,6 +138,7 @@ class DPOptimizerResult:
     hold_count: int
     export_slot_count: int = 0
     self_consume_slot_count: int = 0
+    terminal_value_eur_kwh: Optional[float] = None
 
 
 class DPOptimizer:
@@ -273,6 +274,18 @@ class DPOptimizer:
             if self._predict_pv_kw else None
         )
 
+        terminal_rate = self._derive_terminal_rate(slots_sorted_by_time)
+        if self._decision_log_level >= 1:
+            source = (
+                "auto: median horizon buy x inv_eff - wear"
+                if cfg.terminal_energy_value_eur_kwh is None
+                else "configured"
+            )
+            self._log(
+                f"Terminal energy value: {terminal_rate:.4f} EUR/kWh ({source}); "
+                f"net-load slots worth less than this are HELD"
+            )
+
         # Run DP to build schedule
         schedule, idx_trajectory, best_value = self._build_schedule(
             slots_sorted_by_time=slots_sorted_by_time,
@@ -317,6 +330,26 @@ class DPOptimizer:
             hold_count=hold_count,
             export_slot_count=export_slot_count,
             self_consume_slot_count=self_consume_slot_count,
+            terminal_value_eur_kwh=terminal_rate,
+        )
+
+    def _derive_terminal_rate(self, slots_list: List[PricePoint]) -> float:
+        """EUR value of one stored DC kWh at the end of the horizon.
+
+        Auto mode (config None) values it at the median avoided-import value
+        over the given slots: any slot whose own discharge value falls below
+        this is deliberately HELD — keeping the energy beats spending it there.
+        """
+        cfg = self._config
+        if cfg.terminal_energy_value_eur_kwh is not None:
+            return cfg.terminal_energy_value_eur_kwh
+        median_buy = statistics.median(
+            (p.price + cfg.grid_fee) * cfg.import_price_multiplier
+            for p in slots_list
+        )
+        return max(
+            0.0,
+            median_buy * cfg.inverter_efficiency - cfg.battery_wear_cost,
         )
 
     def _compute_charge_rates_per_slot(
@@ -708,18 +741,8 @@ class DPOptimizer:
 
         # Find best final state. Without a terminal value a finite-horizon
         # optimizer treats all remaining energy as worthless and drains the
-        # battery at the forecast boundary. Auto mode values stored DC energy
-        # at the median avoided-import value over the known horizon.
-        terminal_value_per_kwh = cfg.terminal_energy_value_eur_kwh
-        if terminal_value_per_kwh is None:
-            median_buy = statistics.median(
-                (p.price + cfg.grid_fee) * cfg.import_price_multiplier
-                for p in slots_list
-            )
-            terminal_value_per_kwh = max(
-                0.0,
-                median_buy * cfg.inverter_efficiency - cfg.battery_wear_cost,
-            )
+        # battery at the forecast boundary.
+        terminal_value_per_kwh = self._derive_terminal_rate(slots_list)
 
         best_val = neg_inf
         best_tie = neg_inf
@@ -1079,6 +1102,7 @@ class DPOptimizer:
                 pv_kw_list=pv_kw,
             )
 
+        terminal_rate = self._derive_terminal_rate(slots_sorted_by_time)
         for t, (price_point, action, lk, is_partial, is_export) in enumerate(zip(
             slots_sorted_by_time, actions, load_kw, partial_flags, export_flags
         )):
@@ -1092,6 +1116,20 @@ class DPOptimizer:
                 reason += " (until depleted)"
             if is_export:
                 reason += " [EXPORT]"
+            if action == BatteryMode.HOLD:
+                # Annotate the two non-obvious HOLD causes so the schedule log
+                # is self-explanatory (net load is what discharge serves).
+                if pv > 0 and pv >= lk:
+                    reason += " [pv>=load]"
+                elif lk - pv > 0:
+                    keep_value = (
+                        (price + cfg.grid_fee) * cfg.import_price_multiplier
+                        * cfg.inverter_efficiency - cfg.battery_wear_cost
+                    )
+                    if keep_value < terminal_rate:
+                        reason += (
+                            f" [keep: {keep_value:.3f}<terminal {terminal_rate:.3f}]"
+                        )
             entry = ScheduleEntry(time=hour, mode=action, reason=reason)
             if action == BatteryMode.DISCHARGE:
                 entry.export_rate = 100 if is_export else 0

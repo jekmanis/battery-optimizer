@@ -222,7 +222,7 @@ uv run pytest tests/ --cov=appdaemon/apps --cov-report=term-missing
 - **Dry‑run:** set `device_id: ""` to log decisions without touching the inverter.
 - **Entities `unavailable` / `not found`:** confirm the Growatt sensor names match your install (integration v0.6.7+ device‑prefixes them, e.g. `sensor.growatt_battery_battery_soc`).
 - **`set_wit_mode` not found:** you're on the stock Growatt integration — install the [WIT fork](https://github.com/jekmanis/Growatt_ModbusTCP).
-- **`set_wit_mode` timeouts:** many sequential VPP register writes on a busy Modbus link can exceed AppDaemon's 10 s service window; the command usually still applies. Verify the inverter mode actually changed.
+- **`set_wit_mode` timeouts:** many sequential VPP register writes on a busy Modbus link can exceed AppDaemon's default 10 s service window. The optimizer now raises that per-call window to 30 s (`hass_timeout`) and inspects the service response. If AppDaemon still times out client-side (returns `None`), the mode is treated as *unconfirmed* (logged at WARNING) rather than silently assumed applied. About 90 s after every mode change (including `passthrough`), DirectControl reads the integration's **Inverter Mode** sensor (`sensor.growatt_inverter_mode` by default, overridable via `inverter_mode_sensor`) and, on a genuine mismatch, resends the command exactly once. A confirmed failure (the service raised) is logged at ERROR and is **not** recorded as sent, so it is retried on the next slot instead of being masked by duplicate suppression.
 
 ---
 

@@ -105,6 +105,8 @@ via the `growatt_modbus/set_wit_mode` HA service (no raw register writes):
 - Each command carries power_percent, duration, export_rate, ac_charge_mode, and SOC cutoffs
 - AC charge mode auto-selects `pv_priority` vs `ac_priority` based on current PV power
 - Duplicate commands within half a slot are skipped; `release_control()` reverts to `passthrough`
+- Reliability: each call passes `hass_timeout=30` and inspects the service response. A raised/`success=False` result is a confirmed failure (ERROR, returns False, last-sent NOT recorded so it retries next slot). A `None` result is an unconfirmed client-side timeout (WARNING, last-sent recorded to avoid schedule spam).
+- Verify-after-set: ~90s after every mode change (incl. `passthrough`), the integration's Inverter Mode sensor (`sensor.growatt_inverter_mode` default, or `inverter_mode_sensor`) is read; on a genuine mismatch the command is resent exactly once (bypassing duplicate suppression, no re-verification loop). A new `apply_mode` supersedes any pending verification timer.
 - Dry-run mode: `device_id: ""` in apps.yaml logs commands without sending them
 
 ### Battery Cost Tracking

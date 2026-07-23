@@ -100,7 +100,9 @@ class BatteryOptimizerConfig:
     pv_forecast_unit: str = "W"  # Unit of pv_forecast_sensor: "W" or "kW"
     pv_reactive_threshold: float = 0.5  # Recalc if actual PV < this fraction of forecast
     pv_reactive_min_forecast_w: float = 200.0  # Only check PV shortfall when forecast > this (W)
-    inverter_mode_sensor: str = ""  # Inverter mode sensor for monitoring (e.g., sensor.growatt_wit_inverter_mode)
+    inverter_mode_sensor: str = ""  # Integration "Inverter Mode" sensor. Used for
+    # monitoring AND set_wit_mode verify-after-set. When empty, DirectControl
+    # falls back to sensor.growatt_inverter_mode (the integration's default id).
 
     # =========================================================================
     # PV Forecast Service (Solcast / Forecast.Solar)

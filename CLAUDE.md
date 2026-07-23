@@ -120,6 +120,8 @@ via the `growatt_modbus/set_wit_mode` HA service (no raw register writes):
 
 The tracker is an operational estimate because aggregate inverter counters may not identify every mixed PV/grid contribution. Projected tracking must use the same load and PV predictors as the schedule. The DP itself optimizes forecast cash flows and does not use `battery_avg_cost` as a charge-count constraint or primary objective.
 
+Exact cost formulas, the mode-based source attribution table, slot pricing of energy deltas, and how to interpret the charge log are documented in `docs/scheduling-algorithm.md` § Battery cost tracking.
+
 ### Dynamic Configuration
 These values read from HA entities at runtime (adjustable without restart):
 - `input_number.battery_min_soc` -> min_soc

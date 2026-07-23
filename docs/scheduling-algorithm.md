@@ -141,6 +141,70 @@ The tracker is an estimate because inverter aggregate charge counters may not
 identify the source of every charged kWh. It is useful for reporting, but the DP
 optimizes the forecast cash flows directly.
 
+### Stored-energy cost formulas
+
+All costs are per stored DC kWh (`BatteryCostTracker` in `cost_tracker.py`):
+
+```text
+grid_landed_cost    = (spot + grid_fee) * import_price_multiplier
+                      / (efficiency * inverter_efficiency)
+
+pv_opportunity_cost = max(0, spot * export_rate_multiplier - grid_export_fee)
+                      / efficiency
+```
+
+The division by `efficiency` converts an acquisition price into a
+per-stored-kWh figure: storing 1 kWh retains only `efficiency` of the input
+energy, so each stored kWh consumed `1/efficiency` kWh of exportable PV (grid
+charging additionally pays the AC-to-DC `inverter_efficiency` loss). The booked
+PV cost per stored kWh is therefore *higher* than the net export price. Example
+with default fees: spot 0.108 gives a net export price of 0.088 EUR/kWh but a
+stored-energy cost of `(0.108 - 0.02) / 0.85 = 0.1036` EUR/kWh.
+
+### Source attribution
+
+Inverter charge counters do not label the source of each kWh, so measured
+charging is attributed by the currently commanded mode
+(`_observed_charge_cost`):
+
+| Active mode | Source | Cost applied |
+|---|---|---|
+| CHARGE | grid | `grid_landed_cost` (conservative if PV also contributed) |
+| HOLD / DISCHARGE | pv | `pv_opportunity_cost` (discharge-to-load still accepts surplus PV into the battery) |
+| unknown (before first mode callback) | grid | `grid_landed_cost` (conservative) |
+| slot price unavailable | — | current average preserved unchanged |
+
+### Pricing of energy deltas
+
+Each measured charge delta is priced at the slot that was active when the
+energy accrued (`_last_price_slot`, recorded at the previous event), not the
+slot containing the log timestamp. Consecutive deltas inside one 15-minute
+price slot therefore log identical stored-energy costs, and a delta logged
+just after a slot boundary still uses the previous slot's price.
+
+### Reading the charge log
+
+A charge event logs the delta, its attributed source, the stored-energy cost
+of the delta, and the resulting weighted average:
+
+```text
+Battery charged: +0.100 kWh [inverter, pv] at stored-energy cost 0.1036 EUR/kWh,
+new avg cost: 0.1128 EUR/kWh
+```
+
+The average is weighted by `_stored_energy_kwh`, an internal accumulator of
+usable energy above `min_soc`. It is synced from SOC at startup and on energy
+sensor recovery, then maintained by adding/subtracting measured deltas. Two
+consequences when reading the log:
+
+- Near `min_soc` the accumulator is close to zero, so each small charge is a
+  large fraction of the total and the average moves quickly toward the cost of
+  the fresh energy. With several kWh stored, the same 0.1 kWh delta barely
+  moves it. Fast swings at low SOC are expected, not a tracking fault.
+- The first charges after a deep discharge can show a `new avg cost` above the
+  logged charge cost: a small expensive remnant still dominates the weighted
+  average until fresh energy washes it out.
+
 ## Tariff and tax assumptions
 
 Spot price and `grid_fee_eur_kwh` must have the same VAT basis. The

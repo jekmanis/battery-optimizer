@@ -101,8 +101,12 @@ class BatteryOptimizerConfig:
     pv_reactive_threshold: float = 0.5  # Recalc if actual PV < this fraction of forecast
     pv_reactive_min_forecast_w: float = 200.0  # Only check PV shortfall when forecast > this (W)
     inverter_mode_sensor: str = ""  # Integration "Inverter Mode" sensor. Used for
-    # monitoring AND set_wit_mode verify-after-set. When empty, DirectControl
-    # falls back to sensor.growatt_inverter_mode (the integration's default id).
+    # monitoring AND set_wit_mode verify-after-set. The entity id depends on the
+    # config entry name (slugified "<entry> Inverter Mode"): e.g.
+    # sensor.growatt_inverter_mode (entry "Growatt") or
+    # sensor.growatt_wit_inverter_mode (entry "Growatt WIT"). When empty,
+    # DirectControl falls back to sensor.growatt_inverter_mode; set this
+    # explicitly if your entry is named differently.
 
     # =========================================================================
     # PV Forecast Service (Solcast / Forecast.Solar)

@@ -111,7 +111,6 @@ def test_timeout_none_is_unconfirmed_but_records_and_schedules():
     assert result is True
     # hass_timeout was passed on the service call
     assert app.service_calls[0][1].get("hass_timeout") == 30
-    assert app.service_calls[0][1].get("return_result") is True
     # last-sent recorded so the schedule isn't spammed
     assert dc._last_mode_sent == "hold"
     assert dc._last_mode_time is not None
@@ -147,6 +146,93 @@ def test_failure_success_false_returns_false_and_does_not_record():
     assert dc._last_mode_sent is None
     assert len(app.run_in_calls) == 0
     assert "ERROR" in app.levels()
+
+
+def test_service_call_kwargs_only_hass_timeout_plus_schema_fields():
+    """No return_result/return_response key; only schema-valid service fields.
+
+    An unknown kwarg would be forwarded to HA's strict voluptuous schema and
+    fail every set_wit_mode call with "extra keys not allowed".
+    """
+    dc, app = make_dc()
+    dc.apply_mode(hold_entry())
+
+    service, kwargs = app.service_calls[0]
+    assert service == "growatt_modbus/set_wit_mode"
+    # The legacy/incorrect kwargs must never be present.
+    assert "return_result" not in kwargs
+    assert "return_response" not in kwargs
+    # hass_timeout is the only non-service-data kwarg (consumed by the plugin).
+    assert kwargs.get("hass_timeout") == 30
+    # Everything else must be a field the set_wit_mode voluptuous schema allows.
+    allowed = {
+        "hass_timeout",  # AppDaemon HASS plugin formal parameter
+        "device_id", "mode", "power_percent", "duration_minutes",
+        "export_rate", "ac_charge_mode", "charge_cutoff_soc",
+        "discharge_cutoff_soc",
+    }
+    assert set(kwargs).issubset(allowed), f"unexpected kwargs: {set(kwargs) - allowed}"
+
+
+def test_first_unverifiable_logs_warning_then_debug():
+    """First cannot-verify occurrence is WARNING; subsequent ones are DEBUG."""
+    dc, app = make_dc()
+    # mode sensor absent -> get_state returns None -> cannot verify
+
+    dc.apply_mode(hold_entry())
+    app.fire_last_timer()  # first verification: sensor unreadable
+
+    cannot_verify_warnings = [
+        m for m, lvl in app.logs
+        if lvl == "WARNING" and "cannot verify" in m
+    ]
+    assert len(cannot_verify_warnings) == 1
+
+    # A second send + verify with the sensor still unreadable stays at DEBUG.
+    logs_before = len(app.logs)
+    dc.apply_mode(charge_entry())  # different mode -> not a duplicate
+    app.fire_last_timer()
+    new_logs = app.logs[logs_before:]
+    assert not any(
+        lvl == "WARNING" and "cannot verify" in m for m, lvl in new_logs
+    )
+    assert any(
+        lvl == "DEBUG" and "cannot verify" in m for m, lvl in new_logs
+    )
+
+
+def test_failed_apply_cancels_pending_verification_timer():
+    """A confirmed-failure send cancels a timer from a previous good send."""
+    dc, app = make_dc()
+
+    # First send succeeds and schedules timer_1.
+    dc.apply_mode(hold_entry())
+    first_handle = app.run_in_calls[0][3]
+    assert len(app.run_in_calls) == 1
+
+    # Second send (different mode) fails -> must cancel the stale timer and
+    # NOT schedule a new one.
+    app.call_service_raise = RuntimeError("boom")
+    result = dc.apply_mode(charge_entry())
+
+    assert result is False
+    assert first_handle in app.cancelled
+    assert len(app.run_in_calls) == 1  # no new verification scheduled
+
+
+def test_failed_release_cancels_pending_verification_timer():
+    """A failed release_control also cancels a previously pending timer."""
+    dc, app = make_dc()
+
+    dc.apply_mode(hold_entry())  # schedules timer_1
+    first_handle = app.run_in_calls[0][3]
+
+    app.call_service_raise = RuntimeError("boom")
+    result = dc.release_control()
+
+    assert result is False
+    assert first_handle in app.cancelled
+    assert len(app.run_in_calls) == 1
 
 
 def test_success_records_and_schedules_verification():
@@ -220,7 +306,9 @@ def test_verify_unavailable_sensor_does_not_resend():
     app.fire_last_timer()
 
     assert len(app.service_calls) == calls_before
-    assert "DEBUG" in app.levels()
+    # First unreadable occurrence surfaces at WARNING (see dedicated test for
+    # the WARNING-then-DEBUG progression).
+    assert "WARNING" in app.levels()
 
 
 def test_verify_missing_sensor_state_none_does_not_crash():

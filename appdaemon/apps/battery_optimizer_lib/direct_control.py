@@ -12,8 +12,15 @@ from .models import BatteryMode, ScheduleEntry
 # Default entity id of the integration's "Inverter Mode" sensor
 # (GrowattWitModeStatusSensor). Its friendly name is "<entry> Inverter Mode"
 # and, because that sensor does NOT use has_entity_name, the entity_id is
-# derived directly from that name — e.g. "Growatt Inverter Mode" ->
-# sensor.growatt_inverter_mode. Overridable via config.inverter_mode_sensor.
+# derived directly from that slugified name. The id therefore depends on the
+# config entry NAME:
+#   entry "Growatt"     -> sensor.growatt_inverter_mode      (this deployment)
+#   entry "Growatt WIT" -> sensor.growatt_wit_inverter_mode
+# This deployment's other entities are prefixed "growatt_" (e.g.
+# sensor.growatt_battery_battery_soc), so the entry is named "Growatt" and the
+# default below matches. If yours differs, set config.inverter_mode_sensor —
+# a mismatch is surfaced by a WARNING the first time verification can't read
+# the sensor.
 DEFAULT_MODE_STATUS_ENTITY = "sensor.growatt_inverter_mode"
 
 # Expected value of the Inverter Mode sensor for each mode string we send.
@@ -57,6 +64,10 @@ class DirectControl:
         # Handle of the pending one-shot verification timer (from run_in), or
         # None. Superseded whenever a new mode is applied.
         self._verify_timer = None
+        # Whether the "cannot verify — mode sensor unreadable" condition has
+        # been logged at WARNING yet. First occurrence per app start is a
+        # WARNING (a wrong entity id must be visible); the rest are DEBUG.
+        self._verify_unreadable_warned = False
 
     @property
     def device_id(self) -> str:
@@ -129,6 +140,12 @@ class DirectControl:
             )
             return True
 
+        # Supersede any verification pending from a previous send BEFORE we send
+        # (regardless of this send's outcome). Otherwise a confirmed failure
+        # here would return without cancelling, and the stale timer could later
+        # resend the now-superseded older mode.
+        self._cancel_verification()
+
         self.app.log(
             f"DirectControl: {mode_str} "
             f"power={params.get('power_percent', '-')}% "
@@ -177,6 +194,11 @@ class DirectControl:
 
         params = {"device_id": self.device_id, "mode": "passthrough"}
 
+        # Cancel any pending verification from a previous send before sending,
+        # so a failed release can't leave a stale timer that resends an older
+        # mode ~90s later.
+        self._cancel_verification()
+
         outcome = self._call_set_wit_mode(params)
 
         if outcome is False:
@@ -213,15 +235,20 @@ class DirectControl:
                     from lost, so we defer to verify-after-set.
         """
         try:
-            # hass_timeout: consumed by the AppDaemon HASS plugin (>= 4.4),
-            #   NOT forwarded as service data. Raises the 10s default to 30s.
-            # return_result: makes AppDaemon wait for and surface the service
-            #   response dict (set_wit_mode is SupportsResponse.OPTIONAL) and
-            #   lets handler exceptions propagate so real failures are caught.
+            # hass_timeout: a formal parameter of the AppDaemon HASS plugin
+            #   (>= 4.4). It is consumed by the plugin, NOT forwarded as
+            #   service data, and raises the 10s default to 30s.
+            # No return_response/return_result kwarg is passed: set_wit_mode is
+            #   registered SupportsResponse.OPTIONAL, and AppDaemon auto-enables
+            #   return_response for such services, so call_service already
+            #   surfaces the handler's response dict (or None on client-side
+            #   timeout) and propagates handler exceptions. Passing an unknown
+            #   kwarg like return_result would be forwarded to HA's strict
+            #   voluptuous schema and fail every call with "extra keys not
+            #   allowed".
             result = self.app.call_service(
                 "growatt_modbus/set_wit_mode",
                 hass_timeout=SET_WIT_MODE_TIMEOUT_SECONDS,
-                return_result=True,
                 **params,
             )
         except Exception as e:
@@ -305,12 +332,25 @@ class DirectControl:
             state = self.app.get_state(entity)
 
             if state is None or state in ("unknown", "unavailable"):
-                # Cannot verify — don't resend blindly.
-                self.app.log(
-                    f"DirectControl: cannot verify {mode_str} — "
-                    f"{entity} is {state}",
-                    level="DEBUG",
-                )
+                # Cannot verify — don't resend blindly. Warn the FIRST time so a
+                # wrong/misconfigured entity id is visible; stay DEBUG after that
+                # to avoid log spam when the sensor is merely briefly offline.
+                if not self._verify_unreadable_warned:
+                    self._verify_unreadable_warned = True
+                    self.app.log(
+                        f"DirectControl: cannot verify {mode_str} — mode sensor "
+                        f"'{entity}' is {state}. If this persists, check that "
+                        "inverter_mode_sensor points at the integration's "
+                        "Inverter Mode sensor (verification is disabled until "
+                        "it reads a value).",
+                        level="WARNING",
+                    )
+                else:
+                    self.app.log(
+                        f"DirectControl: cannot verify {mode_str} — "
+                        f"{entity} is {state}",
+                        level="DEBUG",
+                    )
                 return
 
             if str(state) == expected:

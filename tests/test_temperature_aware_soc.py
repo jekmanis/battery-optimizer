@@ -8,6 +8,7 @@ These tests verify that the optimizer correctly:
 """
 
 import datetime
+import math
 from typing import Dict, List
 
 import pytest
@@ -27,7 +28,41 @@ from battery_optimizer_lib import (
     PvForecastServiceConfig,
     ScheduleFormatter,
     ScheduleFormatterConfig,
+    TemperatureProjector,
 )
+
+
+class FixedAmbient:
+    """Ambient provider returning a constant, for deterministic assertions."""
+
+    def __init__(self, value: float):
+        self.value = value
+
+    def refresh(self, force: bool = False) -> bool:
+        return False
+
+    def predict_c(self, dt=None):
+        return self.value
+
+
+class DiurnalAmbient:
+    """Ambient provider with a real daily swing (peak at 15:00)."""
+
+    def __init__(self, mean: float = 31.0, amplitude: float = 4.0, peak_hour: float = 15.0):
+        self.mean = mean
+        self.amplitude = amplitude
+        self.peak_hour = peak_hour
+
+    def refresh(self, force: bool = False) -> bool:
+        return False
+
+    def predict_c(self, dt=None):
+        if dt is None:
+            return self.mean
+        hour = dt.hour + dt.minute / 60.0
+        return self.mean + self.amplitude * math.cos(
+            2 * math.pi * (hour - self.peak_hour) / 24.0
+        )
 
 
 class MockOptimizer:
@@ -127,6 +162,10 @@ class MockOptimizer:
             log_func=self.log,
         )
 
+        # Shared thermal model. ``_temp_projector`` is a property because
+        # several tests replace ``learning_engine`` after construction.
+        self._ambient_service = None
+
         # PV forecast service (empty — no forecast data in tests)
         self._pv_forecast_service = PvForecastService(
             config=PvForecastServiceConfig(slot_minutes=self.config.slot_minutes),
@@ -134,6 +173,14 @@ class MockOptimizer:
             get_datetime_func=self.datetime,
             get_timezone_func=self._get_local_timezone,
             log_func=self.log,
+        )
+
+    @property
+    def _temp_projector(self):
+        """Shared thermal projector bound to the CURRENT learning engine."""
+        return TemperatureProjector(
+            learning_engine=self.learning_engine,
+            ambient_provider=self._ambient_service,
         )
 
     def datetime(self):
@@ -691,3 +738,310 @@ class TestChargeRateSOCProjection:
         # SOC should never exceed max_soc
         assert all(s <= 100.0 + 0.01 for s in soc_values_seen), \
             f"SOC exceeded max: {max(soc_values_seen):.1f}%"
+
+
+class TestDischargeWarmsTheBattery:
+    """DEFECT 6 regression on the expected-SOC trajectory.
+
+    ``calculate_expected_soc_schedule`` used to route both DISCHARGE and HOLD
+    through ``predict_temp_after_idle`` with the comment "no active warming".
+    A 5.9 kW discharge does not leave the pack thermally idle.
+    """
+
+    @staticmethod
+    def _optimizer(ambient: float, export_discharge_rate: float = 0.0):
+        opt = MockOptimizer(slot_minutes=15, discharge_rate=5.9)
+        opt.config.export_discharge_rate = export_discharge_rate
+        opt._ambient_service = FixedAmbient(ambient)
+        # 4 kW household net load through the whole window
+        opt._predict_load_kw = lambda dt: 4.0
+        return opt
+
+    @staticmethod
+    def _discharge_schedule(n=8, export_rate=None):
+        base = datetime.datetime(2026, 7, 27, 20, 0)
+        return {
+            base + datetime.timedelta(minutes=15 * i): ScheduleEntry(
+                time=base + datetime.timedelta(minutes=15 * i),
+                mode=BatteryMode.DISCHARGE,
+                reason="expensive",
+                export_rate=export_rate,
+            )
+            for i in range(n)
+        }
+
+    def test_discharge_slots_warm_the_battery(self):
+        """Self-consumption discharge at ambient must RAISE the temperature.
+
+        Before the fix the trajectory relaxed toward min(recent battery temps)
+        (default 10C here) and was strictly decreasing.
+        """
+        optimizer = self._optimizer(ambient=27.0)
+        schedule = self._discharge_schedule()
+
+        _, temp_trajectory = optimizer.calculate_expected_soc_schedule(
+            schedule, starting_soc=80.0, starting_temp=27.0
+        )
+
+        temps = [temp_trajectory[h] for h in sorted(temp_trajectory)]
+        assert len(temps) == 8
+        assert temps[0] == 27.0
+        assert temps[-1] > temps[0], f"discharge did not warm the pack: {temps}"
+
+    def test_export_discharge_warms_more_than_self_consumption(self):
+        """Higher |P_bat| must produce more heating over the same slots."""
+        self_consume = self._optimizer(ambient=27.0)
+        exporting = self._optimizer(ambient=27.0, export_discharge_rate=5.9)
+
+        _, self_temps = self_consume.calculate_expected_soc_schedule(
+            self._discharge_schedule(), starting_soc=90.0, starting_temp=27.0
+        )
+        _, export_temps = exporting.calculate_expected_soc_schedule(
+            self._discharge_schedule(export_rate=100), starting_soc=90.0, starting_temp=27.0
+        )
+
+        assert export_temps[max(export_temps)] > self_temps[max(self_temps)]
+
+    def test_hold_without_pv_stays_thermally_idle(self):
+        """HOLD with no PV surplus is genuinely idle — it must still cool."""
+        optimizer = self._optimizer(ambient=27.0)
+        base = datetime.datetime(2026, 7, 27, 20, 0)
+        schedule = {
+            base + datetime.timedelta(minutes=15 * i): ScheduleEntry(
+                time=base + datetime.timedelta(minutes=15 * i),
+                mode=BatteryMode.HOLD,
+                reason="hold",
+            )
+            for i in range(8)
+        }
+
+        _, temps = optimizer.calculate_expected_soc_schedule(
+            schedule, starting_soc=80.0, starting_temp=33.0
+        )
+        values = [temps[h] for h in sorted(temps)]
+        assert values[-1] < values[0]
+        assert values[-1] > 27.0
+
+
+class TestExpectedTemperatureFollowsAmbientOverTime:
+    """DEFECT 7 regression on the expected-SOC trajectory."""
+
+    def test_trajectory_is_not_a_single_repeated_value(self):
+        optimizer = MockOptimizer(slot_minutes=15, discharge_rate=5.9)
+        optimizer._ambient_service = DiurnalAmbient(mean=31.0, amplitude=4.0)
+        optimizer._predict_load_kw = lambda dt: 0.5
+
+        # 33 h horizon starting at 16:00, exactly like the analysed log window.
+        base = datetime.datetime(2026, 7, 28, 16, 0)
+        schedule = {
+            base + datetime.timedelta(minutes=15 * i): ScheduleEntry(
+                time=base + datetime.timedelta(minutes=15 * i),
+                mode=BatteryMode.HOLD,
+                reason="hold",
+            )
+            for i in range(33 * 4)
+        }
+
+        _, temps = optimizer.calculate_expected_soc_schedule(
+            schedule, starting_soc=50.0, starting_temp=34.0
+        )
+
+        values = [round(temps[h], 0) for h in sorted(temps)]
+        # The logged trajectory showed 34C for 1.5 h then 33C for the rest.
+        assert len(set(values)) >= 4, f"still practically constant: {sorted(set(values))}"
+        assert max(values) - min(values) >= 4.0
+
+    def test_tomorrow_morning_is_colder_than_tonight(self):
+        optimizer = MockOptimizer(slot_minutes=60, discharge_rate=5.9)
+        optimizer._ambient_service = DiurnalAmbient(mean=31.0, amplitude=4.0)
+        optimizer._predict_load_kw = lambda dt: 0.5
+
+        base = datetime.datetime(2026, 7, 27, 16, 0)
+        schedule = {
+            base + datetime.timedelta(hours=i): ScheduleEntry(
+                time=base + datetime.timedelta(hours=i),
+                mode=BatteryMode.HOLD,
+                reason="hold",
+            )
+            for i in range(24)
+        }
+
+        _, temps = optimizer.calculate_expected_soc_schedule(
+            schedule, starting_soc=50.0, starting_temp=34.0
+        )
+        tonight = temps[datetime.datetime(2026, 7, 27, 20, 0)]
+        tomorrow_morning = temps[datetime.datetime(2026, 7, 28, 6, 0)]
+        assert tonight - tomorrow_morning > 2.0
+
+
+class TestSharedProjectionAcrossConsumers:
+    """Point (d): one temperature model, whichever code path is taken."""
+
+    def test_dp_and_expected_trajectories_agree(self):
+        optimizer = MockOptimizer(slot_minutes=15, discharge_rate=5.9)
+        optimizer.config.inverter_efficiency = 0.97
+        optimizer._ambient_service = DiurnalAmbient(mean=29.0, amplitude=5.0)
+        optimizer._predict_load_kw = lambda dt: 3.0
+        optimizer.set_battery_temp(33.0)
+        optimizer.set_datetime(datetime.datetime(2026, 7, 27, 16, 0))
+
+        base = datetime.datetime(2026, 7, 27, 16, 0)
+        prices = [
+            PricePoint(time=base + datetime.timedelta(minutes=15 * i), price=0.30)
+            for i in range(24)
+        ]
+
+        schedule = optimizer.find_optimal_schedule(prices, 0, current_soc=90.0)
+        assert schedule
+        dp_temps = optimizer._last_dp_temp_trajectory
+        assert dp_temps
+
+        _, expected_temps = optimizer.calculate_expected_soc_schedule(
+            schedule, starting_soc=90.0, starting_temp=33.0
+        )
+
+        compared = 0
+        for hour in sorted(schedule):
+            if hour not in dp_temps or hour not in expected_temps:
+                continue
+            dp_start = dp_temps[hour][0]
+            assert abs(dp_start - expected_temps[hour]) < 0.1, (
+                f"{hour}: DP {dp_start:.3f}C vs expected {expected_temps[hour]:.3f}C"
+            )
+            compared += 1
+        assert compared >= 20
+
+    def test_formatter_matches_the_shared_model(self, learning_engine):
+        """The log fallback path must use the same model as everything else."""
+        projector = TemperatureProjector(
+            learning_engine=learning_engine, ambient_provider=FixedAmbient(27.0)
+        )
+        log_messages = []
+        formatter = ScheduleFormatter(
+            config=ScheduleFormatterConfig(
+                slot_minutes=15,
+                slot_hours=0.25,
+                battery_capacity=14.3,
+                charge_rate=4.5,
+                discharge_rate=5.9,
+                export_discharge_rate=0.0,
+                efficiency=0.85,
+                battery_wear_cost=0.0,
+                decision_log_level=1,
+            ),
+            log_func=lambda msg, level="INFO": log_messages.append(msg),
+            learning_engine=learning_engine,
+            temp_projector=projector,
+        )
+
+        hour = datetime.datetime(2026, 7, 27, 20, 0)
+        schedule = {
+            hour: ScheduleEntry(time=hour, mode=BatteryMode.DISCHARGE, reason="0.30 EUR/kWh")
+        }
+        formatter.log_schedule(
+            schedule=schedule,
+            expected_soc={hour: 80.0},
+            expected_temp={hour: 27.0},
+            local_tz=None,
+            predict_load_kw=lambda h: 4.0,
+            min_soc=10.0,
+            max_soc=100.0,
+        )
+
+        text = " ".join(log_messages)
+        assert "C->" in text
+        # The formatter now feeds |P_bat| into the shared model, so a discharge
+        # slot at ambient warms instead of staying flat.
+        expected_end = projector.project(27.0, hour, 15.0, 4.0)
+        assert expected_end > 27.0
+        assert f"(27C->{expected_end:.0f}C)" in text
+
+
+class TestChargeRateProjectionIsBounded:
+    """The one place where the temperature forecast changes DP decisions."""
+
+    @staticmethod
+    def _slots(n):
+        base = datetime.datetime(2026, 7, 27, 16, 0)
+        return [
+            PricePoint(time=base + datetime.timedelta(minutes=15 * i), price=0.05)
+            for i in range(n)
+        ]
+
+    def test_legacy_projection_diverges(self):
+        """Documents the defect: unbounded linear warming across 33 h."""
+        from battery_optimizer_lib.charge_rate_utils import compute_charge_rates_per_slot
+
+        seen = []
+
+        def rate(soc, temp):
+            seen.append(temp)
+            return 4.5
+
+        compute_charge_rates_per_slot(
+            slots_sorted_by_time=self._slots(132),
+            slot_fractions=[1.0] * 132,
+            slot_minutes=15,
+            current_soc=30.0,
+            current_temp=33.0,
+            get_charge_rate_for_soc=rate,
+            # The historical default: +0.1 C/min, no ambient, no ceiling.
+            predict_temp_after_duration=lambda t, d: t + 0.1 * d,
+        )
+        assert max(seen) > 200.0
+
+    def test_shared_projector_does_not_diverge(self, learning_engine):
+        from battery_optimizer_lib.charge_rate_utils import compute_charge_rates_per_slot
+
+        projector = TemperatureProjector(
+            learning_engine=learning_engine,
+            ambient_provider=DiurnalAmbient(mean=31.0, amplitude=4.0),
+        )
+        seen = []
+
+        def rate(soc, temp):
+            seen.append(temp)
+            return 4.5
+
+        compute_charge_rates_per_slot(
+            slots_sorted_by_time=self._slots(132),
+            slot_fractions=[1.0] * 132,
+            slot_minutes=15,
+            current_soc=30.0,
+            current_temp=33.0,
+            get_charge_rate_for_soc=rate,
+            project_temp=projector.project,
+            battery_capacity=14.3,
+            efficiency=0.85,
+            max_soc=100.0,
+        )
+
+        assert len(seen) == 132
+        assert max(seen) < 60.0
+        # ...and it tracks the ambient profile instead of climbing forever.
+        assert max(seen) - min(seen) > 1.0
+
+    def test_projector_wins_over_legacy_callback(self, learning_engine):
+        """When both are supplied, the shared model is authoritative."""
+        from battery_optimizer_lib.charge_rate_utils import compute_charge_rates_per_slot
+
+        projector = TemperatureProjector(
+            learning_engine=learning_engine, ambient_provider=FixedAmbient(27.0)
+        )
+        seen = []
+
+        def rate(soc, temp):
+            seen.append(temp)
+            return 4.5
+
+        compute_charge_rates_per_slot(
+            slots_sorted_by_time=self._slots(10),
+            slot_fractions=[1.0] * 10,
+            slot_minutes=15,
+            current_soc=30.0,
+            current_temp=33.0,
+            get_charge_rate_for_soc=rate,
+            predict_temp_after_duration=lambda t, d: 999.0,
+            project_temp=projector.project,
+        )
+        assert max(seen) < 60.0

@@ -14,6 +14,7 @@ This package contains helper modules for the main BatteryOptimizer AppDaemon app
 - charge_rate_utils: Temperature-aware charge rate computation
 - schedule_formatter: Schedule logging and formatting for display
 - pv_forecast_service: PV forecast fetching (Solcast / Forecast.Solar)
+- pv_bias_tracker: Sliding PV forecast bias estimation and slot-energy sampling
 """
 
 from .config import BatteryOptimizerConfig
@@ -45,10 +46,21 @@ from .timezone_utils import (
 from .ha_helpers import SensorReader
 from .cost_tracker import BatteryCostTracker, BatteryCostConfig
 from .charge_rate_utils import compute_charge_rates_per_slot
+from .soc_projection import SocProjectionParams, SocTransition, project_slot_soc
 from .soc_deviation import SocDeviationDetector, SocDeviationConfig
 from .schedule_formatter import ScheduleFormatter, ScheduleFormatterConfig
 from .load_prediction_tracker import LoadPredictionTracker
 from .pv_forecast_service import PvForecastService, PvForecastServiceConfig
+from .pv_bias_tracker import PvBiasTracker, PvBiasConfig, ClosedSlot
+from .thermal_model import (
+    TemperatureProjector,
+    battery_power_for_entry,
+    step_temperature,
+    DEFAULT_COOLING_RATE_PER_MIN,
+    DEFAULT_HEATING_C_PER_KWH,
+    MAX_BATTERY_TEMP_C,
+)
+from .ambient_service import AmbientTemperatureService, AmbientServiceConfig
 
 __all__ = [
     # Config
@@ -88,6 +100,10 @@ __all__ = [
     "BatteryCostConfig",
     # Charge rate utilities
     "compute_charge_rates_per_slot",
+    # SOC projection (shared slot transition model)
+    "SocProjectionParams",
+    "SocTransition",
+    "project_slot_soc",
     # SOC deviation detection
     "SocDeviationDetector",
     "SocDeviationConfig",
@@ -99,4 +115,18 @@ __all__ = [
     # PV forecast service
     "PvForecastService",
     "PvForecastServiceConfig",
+    # PV forecast bias
+    "PvBiasTracker",
+    "PvBiasConfig",
+    "ClosedSlot",
+    # Thermal model (shared temperature projection)
+    "TemperatureProjector",
+    "battery_power_for_entry",
+    "step_temperature",
+    "DEFAULT_COOLING_RATE_PER_MIN",
+    "DEFAULT_HEATING_C_PER_KWH",
+    "MAX_BATTERY_TEMP_C",
+    # Ambient temperature service
+    "AmbientTemperatureService",
+    "AmbientServiceConfig",
 ]

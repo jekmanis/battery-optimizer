@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
 from .models import BatteryMode, ScheduleEntry
+from .soc_projection import SocProjectionParams, project_slot_soc
 from .timezone_utils import ensure_local_tz, lookup_by_time
 
 
@@ -28,11 +29,21 @@ class SocDeviationConfig:
     grid_fee: float  # EUR/kWh
     import_price_multiplier: float = 1.0
     inverter_efficiency: float = 1.0
+    export_discharge_rate: float = 0.0  # kW (0 = use discharge_rate)
     decision_log_level: int = 1
 
     @property
     def slot_hours(self) -> float:
         return self.slot_minutes / 60.0
+
+    @property
+    def effective_export_discharge_rate(self) -> float:
+        """Discharge rate during grid export (kW). Falls back to discharge_rate."""
+        return (
+            self.export_discharge_rate
+            if self.export_discharge_rate > 0
+            else self.discharge_rate
+        )
 
 
 @dataclass
@@ -85,6 +96,8 @@ class SocDeviationDetector:
         local_tz,
         current_temp: Optional[float] = None,
         predict_load_kw: Optional[Callable[[datetime.datetime], float]] = None,
+        predict_pv_kw: Optional[Callable[[datetime.datetime], float]] = None,
+        expected_soc_anchor: Optional[datetime.datetime] = None,
         get_cheapest_upcoming_prices: Optional[Callable[[List[datetime.datetime], int], List[float]]] = None,
         get_discharge_threshold: Optional[Callable[[], float]] = None,
     ) -> DeviationCheckResult:
@@ -100,6 +113,14 @@ class SocDeviationDetector:
             local_tz: Local timezone
             current_temp: Current battery temperature (Celsius), optional
             predict_load_kw: Function to predict load for a slot
+            predict_pv_kw: Function to predict PV production for a slot. Without
+                it PV is assumed to be zero, which makes sunny DISCHARGE/HOLD
+                slots look like the battery is running "ahead" of plan.
+            expected_soc_anchor: Wall-clock instant the expected SOC trajectory
+                was built from. When it falls inside the current slot, the
+                trajectory's first entry describes that instant (not the slot
+                boundary), so interpolation must start there — otherwise the
+                elapsed part of the slot is counted twice.
             get_cheapest_upcoming_prices: Function to get N cheapest prices from remaining HOLD slots
             get_discharge_threshold: Function to get current discharge threshold
 
@@ -116,14 +137,33 @@ class SocDeviationDetector:
         # Get schedule entry for current slot
         entry = lookup_by_time(schedule, current_slot, local_tz)
 
-        # Calculate time fraction into current slot
-        minutes_into_slot = max(0.0, (now - current_slot).total_seconds() / 60.0)
+        # Calculate time fraction into current slot. The expected trajectory may
+        # have been anchored mid-slot (partial first slot); in that case its
+        # first value already describes the anchor instant, so interpolation
+        # must start there instead of at the slot boundary.
+        now_cmp = self._normalize_for_compare(now, local_tz)
+        slot_cmp = self._normalize_for_compare(current_slot, local_tz)
+        start_cmp = slot_cmp
+        if expected_soc_anchor is not None:
+            anchor_cmp = self._normalize_for_compare(expected_soc_anchor, local_tz)
+            slot_end_cmp = slot_cmp + datetime.timedelta(minutes=self.config.slot_minutes)
+            if slot_cmp <= anchor_cmp < slot_end_cmp:
+                start_cmp = anchor_cmp
+
+        minutes_into_slot = max(0.0, (now_cmp - start_cmp).total_seconds() / 60.0)
         fraction = min(1.0, minutes_into_slot / max(1, self.config.slot_minutes))
+        # How much of the slot itself has elapsed — used for "how much charging
+        # time is left" projections, which are independent of the anchor.
+        elapsed_slot_fraction = min(
+            1.0,
+            max(0.0, (now_cmp - slot_cmp).total_seconds() / 60.0)
+            / max(1, self.config.slot_minutes),
+        )
 
         # Interpolate expected SOC based on elapsed time in slot
         expected_soc_now = self._interpolate_expected_soc(
             expected_soc, entry, fraction, current_soc, current_slot, current_temp,
-            predict_load_kw,
+            predict_load_kw, predict_pv_kw,
         )
 
         soc_delta = current_soc - expected_soc_now
@@ -139,7 +179,7 @@ class SocDeviationDetector:
         # During CHARGE with negative deviation: check if we'll still reach max_soc
         if entry and entry.mode == BatteryMode.CHARGE and soc_delta < 0:
             projected_final_soc = self._project_charge_completion(
-                current_soc, schedule, current_slot, fraction, current_temp, local_tz
+                current_soc, schedule, current_slot, elapsed_slot_fraction, current_temp, local_tz
             )
 
             # If we'll still reach max_soc (with 5% tolerance), skip recalculation
@@ -195,6 +235,20 @@ class SocDeviationDetector:
 
         return result
 
+    def _projection_params(self) -> SocProjectionParams:
+        """Build shared slot-SOC projection parameters from the detector config."""
+        return SocProjectionParams(
+            battery_capacity=self.config.battery_capacity,
+            efficiency=self.config.efficiency,
+            charge_rate=self.config.charge_rate,
+            discharge_rate=self.config.discharge_rate,
+            export_discharge_rate=self.config.export_discharge_rate,
+            inverter_efficiency=self.config.inverter_efficiency,
+            min_soc=self.config.min_soc,
+            max_soc=self.config.max_soc,
+            slot_minutes=self.config.slot_minutes,
+        )
+
     def _interpolate_expected_soc(
         self,
         expected_soc_start: float,
@@ -204,18 +258,25 @@ class SocDeviationDetector:
         current_slot: datetime.datetime,
         current_temp: Optional[float],
         predict_load_kw: Optional[Callable[[datetime.datetime], float]],
+        predict_pv_kw: Optional[Callable[[datetime.datetime], float]] = None,
     ) -> float:
         """
         Interpolate expected SOC based on elapsed time within the slot.
 
+        Delegates to the shared ``project_slot_soc`` model so the detector, the
+        expected-SOC trajectory and the DP cannot disagree about the physics
+        (notably: DISCHARGE with ``pv >= load`` *charges* the battery, and
+        export slots drain at the export discharge rate).
+
         Args:
-            expected_soc_start: Expected SOC at start of slot
+            expected_soc_start: Expected SOC at start of the projected interval
             entry: Schedule entry for current slot (may be None)
             fraction: Fraction of slot elapsed (0.0 to 1.0)
-            current_soc: Current actual SOC (used for rate lookups)
+            current_soc: Current actual SOC (used for charge-rate lookups)
             current_slot: Current slot datetime
             current_temp: Current battery temperature
             predict_load_kw: Load prediction function
+            predict_pv_kw: PV prediction function (0 kW when not supplied)
 
         Returns:
             Interpolated expected SOC for current time within slot
@@ -223,33 +284,26 @@ class SocDeviationDetector:
         if not entry or fraction <= 0:
             return expected_soc_start
 
-        if entry.mode == BatteryMode.CHARGE:
-            # Use learned charge rate if available
-            effective_charge_rate = self.config.charge_rate
-            if self.learning_engine:
-                learned_rate = self.learning_engine.get_charge_rate_for_soc(current_soc, current_temp)
-                if learned_rate is not None and learned_rate > 0:
-                    effective_charge_rate = learned_rate
+        if predict_load_kw:
+            load_kw = predict_load_kw(current_slot)
+        else:
+            load_kw = self.config.discharge_rate  # Fallback
+        pv_kw = predict_pv_kw(current_slot) if predict_pv_kw else 0.0
 
-            energy_added = effective_charge_rate * self.config.efficiency * self.config.slot_hours * fraction
-            return min(
-                self.config.max_soc,
-                expected_soc_start + (energy_added / self.config.battery_capacity) * 100
-            )
-
-        elif entry.mode == BatteryMode.DISCHARGE:
-            if predict_load_kw:
-                load_kw = predict_load_kw(current_slot)
-            else:
-                load_kw = self.config.discharge_rate  # Fallback
-            energy_removed = min(load_kw, self.config.discharge_rate) * self.config.slot_hours * fraction
-            return max(
-                self.config.min_soc,
-                expected_soc_start - (energy_removed / self.config.battery_capacity) * 100
-            )
-
-        # HOLD mode - no change
-        return expected_soc_start
+        return project_slot_soc(
+            soc_start=expected_soc_start,
+            mode=entry.mode,
+            params=self._projection_params(),
+            load_kw=load_kw,
+            pv_kw=pv_kw,
+            fraction=fraction,
+            export_rate=entry.export_rate,
+            temp_start=current_temp,
+            learning_engine=self.learning_engine,
+            # The inverter's charge rate depends on the ACTUAL SOC, not the
+            # planned one — keep the historical lookup basis.
+            rate_lookup_soc=current_soc,
+        ).soc_end
 
     def _project_charge_completion(
         self,

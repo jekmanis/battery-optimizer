@@ -35,15 +35,25 @@ MODE_STATUS_MAP = {
     "passthrough": "Passthrough",
 }
 
-# Delay before verifying a sent mode against the inverter's reported status.
-# The status sensor is recomputed on each coordinator poll (~30-60s), so 90s
-# gives at least one poll cycle after the write settles.
+# Default delay before verifying a sent mode against the inverter's reported
+# status. The status sensor is recomputed on each coordinator poll (~30-60s), so
+# 90s gives at least one poll cycle after the write settles. Overridable via
+# config.verify_delay_seconds: a lagging sensor and a lost command look
+# identical at a fixed delay.
 VERIFY_DELAY_SECONDS = 90
 
+# Default delay for the SINGLE re-check performed after a resend. Shorter than
+# the first check — the resend goes out immediately, only one poll cycle is
+# needed to see it.
+VERIFY_RECHECK_SECONDS = 60
+
 # Per-call websocket timeout for set_wit_mode (AppDaemon >= 4.4 HASS kwarg).
-# The handler performs 6-9 sequential Modbus writes behind a shared lock and
-# can legitimately exceed AppDaemon's 10s default before HA finishes.
-SET_WIT_MODE_TIMEOUT_SECONDS = 30
+# The handler performs 6-9 sequential Modbus writes behind a shared lock and can
+# exceed AppDaemon's 10s default. This call is SYNCHRONOUS on the callback
+# thread, so every second here blocks every other callback of this app; the
+# unconfirmed (None) path is safe because verify-after-set covers it. Overridable
+# via config.set_wit_mode_timeout_seconds.
+SET_WIT_MODE_TIMEOUT_SECONDS = 15
 
 
 class DirectControl:
@@ -68,6 +78,31 @@ class DirectControl:
         # been logged at WARNING yet. First occurrence per app start is a
         # WARNING (a wrong entity id must be visible); the rest are DEBUG.
         self._verify_unreadable_warned = False
+
+        # Timing (configurable — a lagging modbus sensor must be compensable
+        # from apps.yaml, not by editing this module).
+        self._verify_delay = int(
+            getattr(config, "verify_delay_seconds", VERIFY_DELAY_SECONDS)
+        )
+        self._verify_recheck_delay = int(
+            getattr(config, "verify_recheck_seconds", VERIFY_RECHECK_SECONDS)
+        )
+        self._set_mode_timeout = int(
+            getattr(config, "set_wit_mode_timeout_seconds",
+                    SET_WIT_MODE_TIMEOUT_SECONDS)
+        )
+
+        # Diagnostics counters. They exist to separate "the HA sensor lags"
+        # (mismatch_count high, resend_recovered_count high, persistent 0) from
+        # "the inverter really falls back to Passthrough" (persistent grows).
+        self._mismatch_count = 0
+        self._resend_count = 0
+        self._resend_recovered_count = 0
+        self._resend_failed_count = 0
+        self._persistent_mismatch_count = 0
+        self._unverifiable_count = 0
+        self._verified_count = 0
+        self._last_mismatch: Optional[dict] = None
 
     @property
     def device_id(self) -> str:
@@ -230,9 +265,12 @@ class DirectControl:
             False - confirmed failure (handler raised -> exception here, or an
                     explicit success=False in the response)
             None  - unconfirmed. AppDaemon returns None on a client-side
-                    websocket timeout even at hass_timeout=30; the command
-                    usually still executes on the inverter. We can't tell slow
-                    from lost, so we defer to verify-after-set.
+                    websocket timeout regardless of how high hass_timeout is;
+                    the command usually still executes on the inverter. We can't
+                    tell slow from lost, so we defer to verify-after-set. This is
+                    why a SHORT timeout is safe: the failure mode of a too-short
+                    timeout is one extra verification, while a long one blocks
+                    the whole app's callback thread.
         """
         try:
             # hass_timeout: a formal parameter of the AppDaemon HASS plugin
@@ -248,7 +286,7 @@ class DirectControl:
             #   allowed".
             result = self.app.call_service(
                 "growatt_modbus/set_wit_mode",
-                hass_timeout=SET_WIT_MODE_TIMEOUT_SECONDS,
+                hass_timeout=self._set_mode_timeout,
                 **params,
             )
         except Exception as e:
@@ -290,19 +328,29 @@ class DirectControl:
                 pass
             self._verify_timer = None
 
-    def _schedule_verification(self, mode_str: str, params: dict) -> None:
-        """Schedule a one-shot verification ~90s after a mode was sent.
+    def _schedule_verification(
+        self, mode_str: str, params: dict, attempt: int = 1
+    ) -> None:
+        """Schedule a one-shot verification after a mode was sent.
 
         Supersedes any previously pending verification, so a mode applied
         between send and verify cancels the stale check.
+
+        Args:
+            attempt: 1 for the check after the original send (delayed by
+                verify_delay_seconds), 2 for the single re-check after a resend
+                (delayed by verify_recheck_seconds). Attempt is capped at 2 in
+                _verify_mode, so this can never become a resend loop.
         """
         self._cancel_verification()
+        delay = self._verify_delay if attempt <= 1 else self._verify_recheck_delay
         try:
             self._verify_timer = self.app.run_in(
                 self._verify_mode,
-                VERIFY_DELAY_SECONDS,
+                delay,
                 mode_str=mode_str,
                 params=params.copy(),
+                attempt=attempt,
             )
         except Exception as e:
             self.app.log(
@@ -314,14 +362,23 @@ class DirectControl:
     def _verify_mode(self, kwargs=None) -> None:
         """Verify the inverter reached the last-sent mode; resend once if not.
 
-        AppDaemon scheduler callback: receives a single kwargs dict. Max one
-        resend per apply_mode invocation (no re-verification of the resend),
-        so a persistent mismatch can't loop.
+        AppDaemon scheduler callback: receives a single kwargs dict.
+
+        Attempt ladder (bounded — never a loop):
+          attempt 1: mismatch -> WARNING, resend once, schedule attempt 2
+          attempt 2: match    -> INFO "recovered after resend"
+                     mismatch -> ERROR, NO further resend, NO further timer
+
+        The second check is what makes the diagnostics meaningful: without it we
+        never learned whether the resend helped, so a lagging HA modbus sensor
+        was indistinguishable from an inverter that genuinely drops back to
+        Passthrough.
         """
         self._verify_timer = None
         kwargs = kwargs or {}
         mode_str = kwargs.get("mode_str")
         params = kwargs.get("params", {})
+        attempt = int(kwargs.get("attempt", 1) or 1)
 
         try:
             expected = MODE_STATUS_MAP.get(mode_str)
@@ -335,6 +392,7 @@ class DirectControl:
                 # Cannot verify — don't resend blindly. Warn the FIRST time so a
                 # wrong/misconfigured entity id is visible; stay DEBUG after that
                 # to avoid log spam when the sensor is merely briefly offline.
+                self._unverifiable_count += 1
                 if not self._verify_unreadable_warned:
                     self._verify_unreadable_warned = True
                     self.app.log(
@@ -354,10 +412,41 @@ class DirectControl:
                 return
 
             if str(state) == expected:
+                self._verified_count += 1
+                if attempt > 1:
+                    self._resend_recovered_count += 1
+                    self.app.log(
+                        f"DirectControl: {mode_str} recovered after resend — "
+                        f"inverter now reports '{state}'"
+                    )
+                else:
+                    self.app.log(
+                        f"DirectControl: verified {mode_str} — "
+                        f"inverter reports '{state}'",
+                        level="DEBUG",
+                    )
+                return
+
+            self._mismatch_count += 1
+            self._last_mismatch = {
+                "time": datetime.datetime.now().isoformat(timespec="seconds"),
+                "mode": mode_str,
+                "expected": expected,
+                "actual": str(state),
+                "attempt": attempt,
+            }
+
+            if attempt >= 2:
+                # Already resent once and the inverter still disagrees. This is
+                # no longer sensor lag — escalate and STOP (no third send, no
+                # third timer).
+                self._persistent_mismatch_count += 1
                 self.app.log(
-                    f"DirectControl: verified {mode_str} — "
-                    f"inverter reports '{state}'",
-                    level="DEBUG",
+                    f"DirectControl: persistent mode mismatch after resend — "
+                    f"expected '{expected}' for {mode_str}, inverter still "
+                    f"reports '{state}'. The inverter is not honouring the "
+                    f"command; not resending again (retry happens next slot).",
+                    level="ERROR",
                 )
                 return
 
@@ -369,26 +458,56 @@ class DirectControl:
                 level="WARNING",
             )
             self._last_mode_time = None  # bypass _is_duplicate
+            self._resend_count += 1
             outcome = self._call_set_wit_mode(params)
 
             if outcome is False:
+                self._resend_failed_count += 1
                 self.app.log(
                     f"DirectControl: resend of {mode_str} failed",
                     level="ERROR",
                 )
                 return
 
-            # Record last-sent again. Deliberately do NOT schedule another
-            # verification — one resend per apply_mode invocation.
+            # Record last-sent again, then re-check exactly ONCE so we learn
+            # whether the resend actually took effect.
             self._last_mode_sent = mode_str
             self._last_mode_time = datetime.datetime.now()
             self._last_params = params.copy()
+            self._schedule_verification(mode_str, params, attempt=2)
 
         except Exception as e:
             self.app.log(
                 f"DirectControl: verification error for {mode_str}: {e}",
                 level="ERROR",
             )
+
+    def get_diagnostics(self) -> dict:
+        """Counters that make inverter-control health observable in HA.
+
+        Interpretation:
+          * mismatch_count high, resend_recovered_count ~= resend_count,
+            persistent_mismatch_count == 0  -> the HA mode sensor merely LAGS.
+            Raise verify_delay_seconds.
+          * persistent_mismatch_count growing -> the inverter genuinely drops
+            the override (e.g. back to Passthrough). A configuration/firmware
+            problem, not a timing one.
+          * resend_failed_count growing -> the set_wit_mode service itself is
+            failing; check the Modbus connection.
+        """
+        return {
+            "mismatch_count": self._mismatch_count,
+            "resend_count": self._resend_count,
+            "resend_recovered_count": self._resend_recovered_count,
+            "resend_failed_count": self._resend_failed_count,
+            "persistent_mismatch_count": self._persistent_mismatch_count,
+            "unverifiable_count": self._unverifiable_count,
+            "verified_count": self._verified_count,
+            "last_mismatch": self._last_mismatch,
+            "verify_delay_seconds": self._verify_delay,
+            "verify_recheck_seconds": self._verify_recheck_delay,
+            "set_wit_mode_timeout_seconds": self._set_mode_timeout,
+        }
 
     def _ac_charge_mode_for_entry(self, entry: ScheduleEntry) -> str:
         """Determine AC charge mode based on entry and PV conditions."""

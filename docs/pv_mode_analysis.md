@@ -131,9 +131,41 @@ This gives free cloud insurance — identical behavior when PV is available, but
 
 ### Reactive PV Re-evaluation
 
-During adaptive re-evaluation (every 15 min), actual PV is compared to forecast:
-- If `actual_pv < forecast_pv * 0.5` (and forecast > 200W): trigger schedule recalculation
-- The recalculation starts from actual SOC (which may be lower if battery was covering load), so the DP naturally adjusts the remaining schedule
+During adaptive re-evaluation (every 15 min), the **just-completed** slot is
+compared to the forecast snapshot taken for that slot:
+
+- PV power is sampled every `pv_sample_seconds` (60s default). A slot's measured
+  value is the **mean of its samples** — i.e. its energy — not a single
+  instantaneous reading taken at the boundary. A boundary read cannot represent
+  a slot average during morning/evening ramps or passing clouds; the previous
+  implementation produced 43 recalculations in 33 hours of production logs.
+- A slot counts as a shortfall when `measured/forecast < pv_reactive_threshold`
+  (0.5), the forecast exceeds `pv_reactive_min_forecast_w` (200W) and at least
+  `pv_reactive_min_samples` (3) samples were collected.
+- A full recalculation requires `pv_reactive_consecutive_slots` (2) consecutive
+  shortfall slots. Recalculation starts from actual SOC, so the DP adjusts the
+  remaining schedule.
+- An unavailable PV sensor yields *no* sample rather than a 0 W reading, so a
+  dead sensor can no longer masquerade as "0% of forecast".
+
+### Sliding PV Forecast Bias
+
+The shortfall correction used to be applied to the current slot only
+(`PvForecastService.refresh_for_shortfall`), so every rerun re-planned the rest
+of the horizon on the same optimistic provider forecast.
+
+`pv_bias_tracker.PvBiasTracker` now maintains a **sliding bias factor**: the
+median `measured/forecast` ratio over `pv_bias_window_minutes` (120), clamped to
+`[pv_bias_min_factor, pv_bias_max_factor]` (0.2..1.5) and relaxing back to 1.0
+over `pv_bias_decay_slots` (8) once observations go stale. `_predict_pv_kw`
+multiplies **the current and every remaining slot** by that factor, so the DP,
+the expected-SOC trajectory, the projected costs and the min-charge estimate all
+see the corrected forecast. `_predict_pv_kw_raw` returns the un-corrected
+provider value and is what feeds the ratio, preventing a bias-on-bias loop.
+
+The factor is logged on every material change and exposed on
+`sensor.battery_optimizer_schedule` as `pv_bias_factor` / `pv_bias_samples` /
+`pv_bias_enabled`. Set `pv_bias_enabled: false` to disable it entirely.
 
 ### Cost Comparison
 
@@ -150,8 +182,16 @@ Battery backup is typically 3-4x cheaper than grid during most hours, making DIS
 The `enable_self_consumption` and `self_consumption_min_pv_kw` config fields have been removed. PV-aware cost modeling is always active — the PV predictor is unconditionally passed to the DP optimizer.
 
 Cloud-safe mode selection is always active. Configurable thresholds:
-- `pv_reactive_threshold`: Fraction below which actual PV triggers recalc (default: 0.5 = 50%)
+- `pv_reactive_threshold`: Fraction below which measured PV triggers recalc (default: 0.5 = 50%)
 - `pv_reactive_min_forecast_w`: Minimum forecast (W) to check PV shortfall (default: 200W)
+- `pv_reactive_consecutive_slots`: Consecutive shortfall slots before a full recalc (default: 2)
+- `pv_reactive_min_samples`: Minimum samples in a slot before its mean is trusted (default: 3)
+- `pv_sample_seconds`: PV power sampling interval (default: 60, clamped to one slot)
+- `pv_bias_enabled`: Master switch for the sliding forecast bias (default: true)
+- `pv_bias_window_minutes`: Ratio window used for the median (default: 120)
+- `pv_bias_min_slots`: Minimum in-window observations before the factor leaves 1.0 (default: 2)
+- `pv_bias_min_factor` / `pv_bias_max_factor`: Clamp for the factor (default: 0.2 / 1.5)
+- `pv_bias_decay_slots`: Slots without fresh data to relax back to 1.0 (default: 8)
 
 ## Files Changed
 

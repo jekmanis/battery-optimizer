@@ -49,6 +49,33 @@ battery_optimizer:
   # Leave empty to disable temperature-aware learning
   battery_temp_sensor: "sensor.growatt_battery_battery_temperature"
 
+  # --------------------------------------------------------------------------
+  # Ambient temperature (thermal model)
+  # --------------------------------------------------------------------------
+  # The battery temperature forecast relaxes toward AMBIENT. Without an external
+  # source, ambient is guessed as min(recent battery temperatures) — in summer
+  # that is ~the current battery temperature, which makes the whole 33 h
+  # temperature forecast practically constant.
+  #
+  # Preferred: a real sensor in the room where the battery lives.
+  # outdoor_temp_sensor: sensor.garage_temperature
+  #
+  # Alternative: a HA weather entity with an hourly forecast (outdoor air).
+  # ambient_weather_entity: weather.forecast_home
+  #
+  # Fallback profile (used when neither of the above is set, and to extend a
+  # single sensor reading across the horizon). With no external source the
+  # rolling battery minimum anchors the profile's daily MAXIMUM — the pack is
+  # self-heated, so it never sits below ambient and its minimum is a ceiling on
+  # ambient, not the trough of the daily swing:
+  # ambient_diurnal_amplitude_c: 4.0   # half of the peak-to-peak daily swing
+  # ambient_diurnal_peak_hour: 15.0    # local hour of the daily maximum
+  # ambient_forecast_cache_minutes: 60
+  #
+  # Thermal model fallbacks, used until ~20 raw thermal samples are collected:
+  # thermal_default_cooling_rate_per_min: 0.012   # k1, Newtonian relaxation
+  # thermal_default_heating_c_per_kwh: 0.35       # k2, self-heating per kWh
+
   # Inverter energy sensors for precise energy measurement (0.1 kWh precision)
   # These cumulative daily sensors provide more accurate tracking than SOC-based calculation
   # Set use_inverter_energy_sensors to false to fall back to SOC-based calculation
@@ -162,7 +189,19 @@ battery_optimizer:
 
   # Value of one usable DC kWh left at the end of the known price horizon.
   # "auto" derives a conservative value from horizon prices, discharge conversion,
-  # and wear. Set a numeric EUR/kWh value explicitly, or 0 for legacy behavior.
+  # and wear.
+  #
+  # 0 is "no-salvage" mode: it declares stored energy worthless at the horizon,
+  # so every plan ends by spending it — the log shows the last slots as
+  # "EXPORT (until depleted) -> <min_soc>%". That is harmless while the daily
+  # re-optimization extends the horizon before those slots execute.
+  #
+  # Neither setting is universally correct, so the app only STATES which mode is
+  # active (INFO at startup and in the DP log) and never nags:
+  #   0      -> risks spending the battery at the horizon edge
+  #   "auto" -> risks stranding charge there and skipping evening slots priced
+  #             below the median forecast import price
+  # Pick per installation and record why, next to the value.
   terminal_energy_value_eur_kwh: "auto"
 
   # IMPORTANT: the import/export values above are examples. Verify trading
@@ -180,6 +219,34 @@ battery_optimizer:
   solcast_today_entity: sensor.solcast_pv_forecast_forecast_today
   solcast_tomorrow_entity: sensor.solcast_pv_forecast_forecast_tomorrow
 
+  # --- Reactive PV shortfall detection ---
+  # A shortfall is measured on COMPLETED slots using the average of
+  # pv_sample_seconds samples (slot energy), never a single instantaneous read.
+  pv_reactive_threshold: 0.5          # recalc when measured/forecast < this
+  pv_reactive_min_forecast_w: 200     # ignore slots forecast below this
+  # The streak is reset once a recalculation fires, so persistent cloud cover
+  # costs at most one recalculation per pv_reactive_consecutive_slots slots.
+  pv_reactive_consecutive_slots: 2    # required consecutive shortfall slots
+  pv_reactive_min_samples: 3          # min samples per slot to trust the mean
+  pv_sample_seconds: 60               # PV power sampling interval
+
+  # --- Sliding PV forecast bias ---
+  # Median actual/forecast ratio over the last pv_bias_window_minutes, clamped
+  # and applied to the CURRENT AND REMAINING horizon (not just one slot).
+  # Relaxes back to 1.0 over pv_bias_decay_slots when no fresh data arrives.
+  pv_bias_enabled: true
+  pv_bias_window_minutes: 120
+  pv_bias_min_slots: 2
+  pv_bias_min_factor: 0.2
+  pv_bias_max_factor: 1.5
+  pv_bias_decay_slots: 8
+  # Beyond the current local day the factor is attenuated toward 1.0: today's
+  # cloud cover is weather, not a calibration error of tomorrow's forecast.
+  # Each further day keeps weight**days of the deviation, floored separately.
+  # Set weight to 1.0 and the floor to 0.0 for the old whole-horizon behaviour.
+  pv_bias_next_day_weight: 0.5
+  pv_bias_next_day_min_factor: 0.7
+
   # SOC deviation threshold for schedule recalculation (%)
   # If actual SOC differs from expected by more than this, recalculate
   soc_deviation_threshold: 4
@@ -188,6 +255,28 @@ battery_optimizer:
   # Level 1: Log charge calculation breakdown and recalculation triggers
   # Level 2: Also log candidate charge slots, arbitrage analysis
   decision_log_level: 1
+
+  # ==========================================================================
+  # Inverter Control Timing / Blocking
+  # ==========================================================================
+  # set_wit_mode is a SYNCHRONOUS service call on the AppDaemon callback thread:
+  # every second of this timeout blocks every other callback of this app. A
+  # client-side timeout is NOT a lost command — verify-after-set covers it — so
+  # a short window is the safe choice. Also give AppDaemon more than one thread
+  # (appdaemon.yaml -> appdaemon: total_threads: 4).
+  set_wit_mode_timeout_seconds: 15
+
+  # Verify-after-set. The integration recomputes its Inverter Mode sensor on
+  # each coordinator poll (~30-60s), so the sensor LAGS a write. If the log
+  # shows many "mode mismatch ... resending once" lines that all recover on the
+  # re-check (sensor.battery_inverter_control_health -> resend_recovered_count),
+  # raise verify_delay_seconds rather than chasing the inverter.
+  verify_delay_seconds: 90       # first check after a mode is sent
+  verify_recheck_seconds: 60     # the single re-check after a resend
+
+  # Warn when one of this app's callbacks blocks the thread for longer than this
+  # (AppDaemon's own "Excessive time spent in callback" limit is 10s).
+  callback_warn_seconds: 10
 
   # ==========================================================================
   # Home Assistant Control Entities

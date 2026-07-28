@@ -117,8 +117,14 @@ class BatteryCostTracker:
         update_learning_sensor_func: Callable[[], None],
         # Logging
         log_func: Callable[..., None],
+        # Ambient temperature at "now" (Optional[float]). Without it,
+        # record_cooling falls back to min(recent battery temps), which in
+        # summer is ~the current battery temperature — so nearly every cooling
+        # observation was discarded and no cooling rate was ever learned.
+        get_ambient_temp_func: Optional[Callable[[], Optional[float]]] = None,
     ):
         self._config = config
+        self._get_ambient_temp = get_ambient_temp_func
         self._get_state = get_state_func
         self._call_service = call_service_func
         self._get_datetime = get_datetime_func
@@ -157,6 +163,15 @@ class BatteryCostTracker:
         self._stored_energy_kwh: Optional[float] = None
         self._current_mode: Optional["BatteryMode"] = None
         self._basis_migrated_this_runtime = False
+
+    def _ambient_temp(self) -> Optional[float]:
+        """Current ambient temperature estimate, or None when unavailable."""
+        if self._get_ambient_temp is None:
+            return None
+        try:
+            return self._get_ambient_temp()
+        except Exception:  # pragma: no cover - defensive
+            return None
 
     # =========================================================================
     # Public Properties
@@ -232,6 +247,65 @@ class BatteryCostTracker:
         self._avg_cost = self._compute_weighted_avg_cost(
             old_energy, self._avg_cost, added_energy, added_price
         )
+
+    def _resync_stored_energy(
+        self, current_soc: float, energy_in_transit_kwh: float = 0.0
+    ) -> None:
+        """Re-anchor the stored-energy accumulator to the measured SOC.
+
+        `_stored_energy_kwh` is otherwise a pure accumulator (+delta on charge,
+        -delta on discharge) that is only ever seeded at initialize()/sensor
+        recovery. It drifts: energy deltas below 0.05 kWh are discarded as
+        noise, midnight counter resets skip a delta, and conversion losses are
+        not modeled. The drift matters at one specific point — a genuinely
+        depleted battery. If the accumulator still claims stored energy at
+        min_soc, the next charge is weighted against a phantom old_energy and
+        the (possibly degenerate) old average survives a full depletion instead
+        of being replaced by the new energy's landed cost.
+
+        Resync when the battery is at/near min SOC (the case that actually
+        corrupts the cost basis), or as a coarse safety net when the accumulator
+        has drifted absurdly far (25% of capacity, floor 2 kWh) from the
+        SOC-derived value. The drift tolerance is deliberately several charge
+        slots wide: the accumulator tracks measured inverter energy, which is
+        the better signal for weighting, and the 1%-granular SOC sensor must not
+        be allowed to yank it around slot by slot.
+
+        Args:
+            current_soc: SOC measured now, i.e. AFTER any energy delta being
+                processed has already moved the battery.
+            energy_in_transit_kwh: signed kWh of that delta (+charge, -discharge)
+                so the accumulator is compared against — and re-anchored to —
+                the state BEFORE the event. Zero when called from a plain SOC
+                observation.
+        """
+        soc_energy_now = max(0.0, self._soc_to_energy_kwh(current_soc))
+        soc_energy_before = max(0.0, soc_energy_now - energy_in_transit_kwh)
+
+        if self._stored_energy_kwh is None:
+            self._stored_energy_kwh = soc_energy_before
+            return
+
+        # "Was the battery empty BEFORE this event?" — a 1 kWh charge already
+        # lifts the SOC sensor several percent off min_soc, so testing the
+        # post-event reading would miss exactly the case this exists for.
+        capacity = max(1e-9, self._config.battery_capacity)
+        soc_before = self._get_min_soc() + (soc_energy_before / capacity) * 100.0
+        depleted = soc_before <= self._get_min_soc() + 1.0
+        tolerance = max(2.0, 0.25 * self._config.battery_capacity)
+        drifted = abs(self._stored_energy_kwh - soc_energy_before) > tolerance
+
+        if not (depleted or drifted):
+            return
+        if abs(self._stored_energy_kwh - soc_energy_before) < 1e-9:
+            return
+
+        self._log(
+            f"Resyncing stored-energy accumulator {self._stored_energy_kwh:.3f} "
+            f"-> {soc_energy_before:.3f} kWh from SOC {current_soc:.1f}% "
+            f"({'depleted' if depleted else 'drift'})"
+        )
+        self._stored_energy_kwh = soc_energy_before
 
     def _grid_landed_cost(self, spot_price: float) -> float:
         """Cost per kWh stored from the grid, including conversion losses."""
@@ -513,6 +587,15 @@ class BatteryCostTracker:
             base_soc = self._last_soc if self._last_soc is not None else current_soc
             self._stored_energy_kwh = max(0.0, self._soc_to_energy_kwh(base_soc))
 
+        # Re-anchor to the measured SOC BEFORE old_energy is read, so a charge
+        # that follows a genuine depletion resets the cost basis instead of
+        # blending the new energy into a stale (possibly zero) average.
+        # current_soc already reflects this delta, hence the signed transit.
+        self._resync_stored_energy(
+            current_soc,
+            energy_in_transit_kwh=energy_kwh if is_charge else -energy_kwh,
+        )
+
         if is_charge:
             # Get price for charging period
             charge_price = self._get_price_for_slot(self._last_price_slot) if self._last_price_slot else None
@@ -564,7 +647,10 @@ class BatteryCostTracker:
                 soc_end=current_soc,
                 duration_minutes=duration_minutes,
                 energy_delivered_kwh=energy_kwh,
-                price_eur_kwh=discharge_price or 0.0
+                price_eur_kwh=discharge_price or 0.0,
+                battery_temp_start=self._last_sig_temp,
+                battery_temp_end=self._get_battery_temp(),
+                ambient_temp=self._ambient_temp(),
             )
 
         self._save_learning_data()
@@ -618,6 +704,10 @@ class BatteryCostTracker:
         # We only do SOC-based processing as fallback
         if self._energy_sensor_available:
             # Update tracking state, but skip cost/learning (handled by energy sensor listener)
+            # The accumulator IS re-anchored here: a depletion observed by the
+            # SOC sensor must land before the next charge event, otherwise that
+            # charge is weighted against phantom stored energy.
+            self._resync_stored_energy(current_soc)
             self._last_soc = current_soc
             self._last_soc_time = now
             self._last_sig_soc = current_soc
@@ -685,7 +775,10 @@ class BatteryCostTracker:
                 soc_start=self._last_soc,
                 soc_end=current_soc,
                 duration_minutes=duration_minutes,
-                price_eur_kwh=discharge_price or 0.0
+                price_eur_kwh=discharge_price or 0.0,
+                battery_temp_start=self._last_sig_temp,
+                battery_temp_end=self._get_battery_temp(),
+                ambient_temp=self._ambient_temp(),
             )
             self._save_learning_data()
             self._update_learning_sensor()
@@ -744,7 +837,8 @@ class BatteryCostTracker:
                     self._learning_engine.record_cooling(
                         temp_start=self._idle_start_temp,
                         temp_end=current_temp,
-                        duration_minutes=duration_minutes
+                        duration_minutes=duration_minutes,
+                        ambient_temp=self._ambient_temp(),
                     )
                     self._save_learning_data()
 

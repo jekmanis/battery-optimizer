@@ -8,6 +8,21 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+# Emitted at startup (config load) and by the DP whenever the deployed
+# configuration pins the end-of-horizon value to zero. Kept as one constant so
+# the config warning, the DP warning and the tests all assert the same text.
+TERMINAL_VALUE_ZERO_NOTICE = (
+    "terminal_energy_value_eur_kwh=0 is no-salvage mode: energy still in the "
+    "battery at the end of the price horizon is valued at zero, so the last "
+    "slots spend it (EXPORT/DISCHARGE until depleted). This is harmless as long "
+    "as the daily re-optimization extends the horizon before those slots "
+    "execute. The alternative, \"auto\", derives a salvage value from the median "
+    "forecast import price and instead risks stranding charge at the horizon "
+    "edge and skipping evening slots priced below that median. Neither is "
+    "universally correct — pick per installation."
+)
+
+
 @dataclass
 class BatteryOptimizerConfig:
     """
@@ -58,6 +73,18 @@ class BatteryOptimizerConfig:
     default_power_percent: int = 100
     # Default charge/discharge power when not specified per-slot.
 
+    # --- Verify-after-set timing -------------------------------------------
+    # The integration recomputes its Inverter Mode sensor on each coordinator
+    # poll (~30-60s), so the sensor LAGS a write. At a fixed delay a lagging
+    # sensor is indistinguishable from a lost command, which is why both the
+    # first check and the post-resend re-check are configurable.
+    verify_delay_seconds: int = 90       # first check after a mode was sent
+    verify_recheck_seconds: int = 60     # single re-check after a resend
+    # Per-call websocket timeout for set_wit_mode. This call is SYNCHRONOUS on
+    # the AppDaemon callback thread: every second here blocks every other
+    # callback of this app. Keep it just above the handler's normal duration.
+    set_wit_mode_timeout_seconds: int = 15
+
     # =========================================================================
     # Battery Parameters
     # =========================================================================
@@ -100,6 +127,11 @@ class BatteryOptimizerConfig:
     pv_forecast_unit: str = "W"  # Unit of pv_forecast_sensor: "W" or "kW"
     pv_reactive_threshold: float = 0.5  # Recalc if actual PV < this fraction of forecast
     pv_reactive_min_forecast_w: float = 200.0  # Only check PV shortfall when forecast > this (W)
+    # A shortfall is measured on COMPLETED slots from the mean of many samples
+    # (i.e. slot energy), never from a single instantaneous reading.
+    pv_reactive_consecutive_slots: int = 2  # Consecutive shortfall slots before a full recalc
+    pv_reactive_min_samples: int = 3  # Min samples in a slot before its mean is trusted
+    pv_sample_seconds: int = 60  # PV power sampling interval (s)
     inverter_mode_sensor: str = ""  # Integration "Inverter Mode" sensor. Used for
     # monitoring AND set_wit_mode verify-after-set. The entity id depends on the
     # config entry name (slugified "<entry> Inverter Mode"): e.g.
@@ -123,6 +155,39 @@ class BatteryOptimizerConfig:
     forecast_solar_api_key: str = ""  # optional paid API key
 
     pv_forecast_cache_minutes: int = 60  # how often to refresh forecast
+
+    # =========================================================================
+    # PV Forecast Bias
+    # =========================================================================
+    # Sliding median of measured/forecast PV over the last window, clamped and
+    # applied to the CURRENT AND REMAINING horizon (not just one slot).
+    pv_bias_enabled: bool = True
+    pv_bias_window_minutes: int = 120
+    pv_bias_min_slots: int = 2
+    pv_bias_min_factor: float = 0.2
+    pv_bias_max_factor: float = 1.5
+    pv_bias_decay_slots: int = 8  # slots without fresh data to relax back to 1.0
+    # Across a local-day boundary the bias is attenuated: today's cloud cover is
+    # weather, not a calibration error of the provider's model for tomorrow.
+    # Each further day keeps `weight ** days` of the deviation from 1.0, and a
+    # separate (looser) clamp floors the result for those slots.
+    pv_bias_next_day_weight: float = 0.5
+    pv_bias_next_day_min_factor: float = 0.7
+
+    # =========================================================================
+    # Ambient Temperature / Thermal Model
+    # =========================================================================
+    # Ambient must be a function of TIME across the horizon. Without an external
+    # source it was estimated as min(recent battery temps) — in summer that is
+    # ~the current battery temperature, so the projected trajectory was flat.
+    ambient_weather_entity: str = ""   # e.g. weather.forecast_home (hourly forecast)
+    outdoor_temp_sensor: str = ""      # preferred if the battery is indoors
+    ambient_diurnal_amplitude_c: float = 4.0   # half the peak-to-peak daily swing
+    ambient_diurnal_peak_hour: float = 15.0    # local hour of the daily maximum
+    ambient_forecast_cache_minutes: int = 60
+    # Thermal model fallbacks (used until enough samples are collected)
+    thermal_default_cooling_rate_per_min: float = 0.012
+    thermal_default_heating_c_per_kwh: float = 0.35
 
     # =========================================================================
     # SOC Limits (defaults - can be overridden by HA entities at runtime)
@@ -171,6 +236,11 @@ class BatteryOptimizerConfig:
     # Logging
     # =========================================================================
     decision_log_level: int = 1  # 0=minimal, 1=summary, 2=verbose
+    # AppDaemon serializes an app's callbacks on its worker thread(s) and warns
+    # at 10s by default ("Excessive time spent in callback"). We measure the
+    # same thing locally so the log names the offending callback and can point
+    # at total_threads.
+    callback_warn_seconds: float = 10.0
 
     # =========================================================================
     # Derived Properties (computed after initialization)
@@ -198,6 +268,51 @@ class BatteryOptimizerConfig:
         # Clamp load_quantile to valid range
         self.load_quantile = min(1.0, max(0.0, self.load_quantile))
 
+        # Reactive PV shortfall detection
+        self.pv_reactive_consecutive_slots = max(1, int(self.pv_reactive_consecutive_slots))
+        self.pv_reactive_min_samples = max(1, int(self.pv_reactive_min_samples))
+        # A sample interval longer than a slot could never produce a usable mean
+        self.pv_sample_seconds = max(
+            10, min(self.slot_minutes * 60, int(self.pv_sample_seconds))
+        )
+
+        # PV forecast bias
+        self.pv_bias_window_minutes = max(self.slot_minutes, int(self.pv_bias_window_minutes))
+        self.pv_bias_min_slots = max(1, int(self.pv_bias_min_slots))
+        self.pv_bias_min_factor = max(0.0, min(1.0, float(self.pv_bias_min_factor)))
+        self.pv_bias_max_factor = max(
+            self.pv_bias_min_factor + 0.01, float(self.pv_bias_max_factor)
+        )
+        self.pv_bias_decay_slots = max(1, int(self.pv_bias_decay_slots))
+        self.pv_bias_next_day_weight = max(
+            0.0, min(1.0, float(self.pv_bias_next_day_weight))
+        )
+        # Never tighter than the same-day clamp — attenuation must move the
+        # factor TOWARD 1.0, never further away from it.
+        self.pv_bias_next_day_min_factor = max(
+            self.pv_bias_min_factor,
+            min(1.0, float(self.pv_bias_next_day_min_factor)),
+        )
+
+        # Ambient / thermal model
+        self.ambient_diurnal_amplitude_c = max(0.0, float(self.ambient_diurnal_amplitude_c))
+        self.ambient_diurnal_peak_hour = float(self.ambient_diurnal_peak_hour) % 24.0
+        self.ambient_forecast_cache_minutes = max(1, int(self.ambient_forecast_cache_minutes))
+        self.thermal_default_cooling_rate_per_min = min(
+            0.1, max(0.001, float(self.thermal_default_cooling_rate_per_min))
+        )
+        self.thermal_default_heating_c_per_kwh = min(
+            2.0, max(0.0, float(self.thermal_default_heating_c_per_kwh))
+        )
+
+        # Inverter control timing / blocking
+        self.verify_delay_seconds = max(5, min(600, int(self.verify_delay_seconds)))
+        self.verify_recheck_seconds = max(5, min(600, int(self.verify_recheck_seconds)))
+        self.set_wit_mode_timeout_seconds = max(
+            5, min(120, int(self.set_wit_mode_timeout_seconds))
+        )
+        self.callback_warn_seconds = max(1.0, min(60.0, float(self.callback_warn_seconds)))
+
         # Compute derived values
         self.slot_hours = self.slot_minutes / 60.0
 
@@ -221,6 +336,12 @@ class BatteryOptimizerConfig:
         def log_warn(msg):
             if log_func:
                 log_func(msg, level="WARNING")
+
+        def log_info(msg):
+            # log_func is documented as optional, so every call site must be
+            # guarded — not just the warnings.
+            if log_func:
+                log_func(msg)
 
         # Extract discharge_rate with fallback to charge_rate
         charge_rate = float(args.get("charge_rate_kw", 4.5))
@@ -247,6 +368,8 @@ class BatteryOptimizerConfig:
             terminal_energy_value = None
         else:
             terminal_energy_value = max(0.0, float(terminal_value_raw))
+            if terminal_energy_value == 0.0:
+                log_info(TERMINAL_VALUE_ZERO_NOTICE)
 
         return cls(
             # Nord Pool
@@ -274,6 +397,11 @@ class BatteryOptimizerConfig:
             # Direct Control
             direct_control_buffer_minutes=int(args.get("direct_control_buffer_minutes", 5)),
             default_power_percent=int(args.get("default_power_percent", 100)),
+            verify_delay_seconds=int(args.get("verify_delay_seconds", 90)),
+            verify_recheck_seconds=int(args.get("verify_recheck_seconds", 60)),
+            set_wit_mode_timeout_seconds=int(
+                args.get("set_wit_mode_timeout_seconds", 15)
+            ),
 
             # Battery Parameters
             battery_capacity=float(args.get("battery_capacity_kwh", 14.3)),
@@ -315,6 +443,11 @@ class BatteryOptimizerConfig:
             pv_forecast_unit=args.get("pv_forecast_unit", "W"),
             pv_reactive_threshold=float(args.get("pv_reactive_threshold", 0.5)),
             pv_reactive_min_forecast_w=float(args.get("pv_reactive_min_forecast_w", 200.0)),
+            pv_reactive_consecutive_slots=max(
+                1, int(args.get("pv_reactive_consecutive_slots", 2))
+            ),
+            pv_reactive_min_samples=max(1, int(args.get("pv_reactive_min_samples", 3))),
+            pv_sample_seconds=int(args.get("pv_sample_seconds", 60)),
             inverter_mode_sensor=args.get("inverter_mode_sensor", ""),
 
             # PV Forecast Service
@@ -328,6 +461,33 @@ class BatteryOptimizerConfig:
             forecast_solar_kwp=float(args.get("forecast_solar_kwp", 0.0)),
             forecast_solar_api_key=args.get("forecast_solar_api_key", ""),
             pv_forecast_cache_minutes=int(args.get("pv_forecast_cache_minutes", 60)),
+
+            # PV Forecast Bias
+            pv_bias_enabled=bool(args.get("pv_bias_enabled", True)),
+            pv_bias_window_minutes=int(args.get("pv_bias_window_minutes", 120)),
+            pv_bias_min_slots=int(args.get("pv_bias_min_slots", 2)),
+            pv_bias_min_factor=float(args.get("pv_bias_min_factor", 0.2)),
+            pv_bias_max_factor=float(args.get("pv_bias_max_factor", 1.5)),
+            pv_bias_decay_slots=int(args.get("pv_bias_decay_slots", 8)),
+            pv_bias_next_day_weight=float(args.get("pv_bias_next_day_weight", 0.5)),
+            pv_bias_next_day_min_factor=float(
+                args.get("pv_bias_next_day_min_factor", 0.7)
+            ),
+
+            # Ambient / thermal model
+            ambient_weather_entity=args.get("ambient_weather_entity", ""),
+            outdoor_temp_sensor=args.get("outdoor_temp_sensor", ""),
+            ambient_diurnal_amplitude_c=float(args.get("ambient_diurnal_amplitude_c", 4.0)),
+            ambient_diurnal_peak_hour=float(args.get("ambient_diurnal_peak_hour", 15.0)),
+            ambient_forecast_cache_minutes=int(
+                args.get("ambient_forecast_cache_minutes", 60)
+            ),
+            thermal_default_cooling_rate_per_min=float(
+                args.get("thermal_default_cooling_rate_per_min", 0.012)
+            ),
+            thermal_default_heating_c_per_kwh=float(
+                args.get("thermal_default_heating_c_per_kwh", 0.35)
+            ),
 
             # SOC Limits
             default_min_soc=float(args.get("min_soc", 10)),
@@ -365,10 +525,24 @@ class BatteryOptimizerConfig:
 
             # Logging
             decision_log_level=int(args.get("decision_log_level", 1)),
+            callback_warn_seconds=float(args.get("callback_warn_seconds", 10.0)),
         )
 
-    def log_summary(self, log_func) -> None:
-        """Log a summary of the configuration."""
+    def log_summary(self, log_func, warn_func=None) -> None:
+        """Log a summary of the configuration.
+
+        Args:
+            log_func: INFO-level logger.
+            warn_func: Optional WARNING-level logger. Falls back to log_func so
+                existing callers keep working; the degenerate terminal-value
+                notice is then prefixed with "WARNING:" instead.
+        """
+        def warn(msg):
+            if warn_func is not None:
+                warn_func(msg)
+            else:
+                log_func(f"WARNING: {msg}")
+
         log_func(
             f"Nord Pool config: config_entry='{self.nordpool_config_entry}', "
             f"area='{self.nordpool_area}', sensor='{self.nordpool_sensor}'"
@@ -379,7 +553,26 @@ class BatteryOptimizerConfig:
         )
         if self.device_id:
             log_func(f"Direct control enabled via growatt_modbus/set_wit_mode (device: {self.device_id})")
+        log_func(
+            f"Inverter control timing: set_wit_mode timeout="
+            f"{self.set_wit_mode_timeout_seconds}s (blocks the callback thread), "
+            f"verify after {self.verify_delay_seconds}s, "
+            f"re-check {self.verify_recheck_seconds}s after a resend; "
+            f"slow-callback warning at {self.callback_warn_seconds:.0f}s"
+        )
         log_func(f"Loaded grid_fee: {self.grid_fee} EUR/kWh")
+        if self.terminal_energy_value_eur_kwh is None:
+            log_func(
+                "Terminal energy value: auto (derived from the median forecast "
+                "import price, discharge conversion and wear)"
+            )
+        elif self.terminal_energy_value_eur_kwh == 0.0:
+            log_func(TERMINAL_VALUE_ZERO_NOTICE)
+        else:
+            log_func(
+                f"Terminal energy value: "
+                f"{self.terminal_energy_value_eur_kwh:.4f} EUR/kWh (configured)"
+            )
         log_func(
             f"Config loaded: capacity={self.battery_capacity}kWh, "
             f"charge_rate={self.charge_rate}kW, discharge_rate={self.discharge_rate}kW, "
@@ -393,3 +586,28 @@ class BatteryOptimizerConfig:
             pv_sources.append(f"Forecast.Solar({self.forecast_solar_kwp}kWp)")
         if pv_sources:
             log_func(f"PV forecast: {' + '.join(pv_sources)}")
+        log_func(
+            f"PV bias: enabled={self.pv_bias_enabled}, "
+            f"window={self.pv_bias_window_minutes}min, "
+            f"clamp=[{self.pv_bias_min_factor}, {self.pv_bias_max_factor}], "
+            f"min_slots={self.pv_bias_min_slots}, decay={self.pv_bias_decay_slots} slots, "
+            f"next-day weight={self.pv_bias_next_day_weight} "
+            f"floor={self.pv_bias_next_day_min_factor}; "
+            f"reactive: threshold={self.pv_reactive_threshold}, "
+            f"consecutive_slots={self.pv_reactive_consecutive_slots}, "
+            f"min_samples={self.pv_reactive_min_samples}, "
+            f"sample_every={self.pv_sample_seconds}s"
+        )
+        if self.ambient_weather_entity:
+            ambient_source = f"weather forecast ({self.ambient_weather_entity})"
+        elif self.outdoor_temp_sensor:
+            ambient_source = f"outdoor sensor ({self.outdoor_temp_sensor})"
+        else:
+            ambient_source = "battery min-window heuristic + diurnal profile"
+        log_func(
+            f"Ambient: source={ambient_source}, "
+            f"diurnal amplitude=+-{self.ambient_diurnal_amplitude_c}C "
+            f"peaking at {self.ambient_diurnal_peak_hour:.0f}:00; "
+            f"thermal defaults k1={self.thermal_default_cooling_rate_per_min}/min, "
+            f"k2={self.thermal_default_heating_c_per_kwh}C/kWh"
+        )

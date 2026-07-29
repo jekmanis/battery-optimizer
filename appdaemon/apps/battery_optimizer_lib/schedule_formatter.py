@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .models import BatteryMode, PricePoint, ScheduleEntry
+from .soc_projection import SocProjectionParams, project_slot_soc
 from .timezone_utils import lookup_by_time
 
 
@@ -63,6 +64,9 @@ class ScheduleFormatterConfig:
     efficiency: float
     battery_wear_cost: float
     decision_log_level: int
+    # AC<->DC conversion efficiency. Needed because the fallback trajectory goes
+    # through the shared soc_projection model, which moves DC energy.
+    inverter_efficiency: float = 1.0
 
 
 class ScheduleFormatter:
@@ -81,6 +85,7 @@ class ScheduleFormatter:
         config: ScheduleFormatterConfig,
         log_func: Callable[[str], None],
         learning_engine=None,
+        temp_projector=None,
     ):
         """
         Initialize the schedule formatter.
@@ -89,10 +94,31 @@ class ScheduleFormatter:
             config: Static configuration for formatting
             log_func: Function to call for logging (typically self.log from AppDaemon)
             learning_engine: Optional BatteryLearningEngine for charge rate predictions
+            temp_projector: Optional shared thermal_model.TemperatureProjector.
+                Without it this fallback path would show a DIFFERENT temperature
+                model from the DP trajectory depending on which branch of
+                ``_format_soc_trajectory`` is taken.
         """
         self.config = config
         self.log = log_func
         self.learning_engine = learning_engine
+        self._temp_projector = temp_projector
+
+    def _projection_params(
+        self, min_soc: float, max_soc: float
+    ) -> SocProjectionParams:
+        """Battery parameters for the ONE shared slot-SOC transition model."""
+        return SocProjectionParams(
+            battery_capacity=self.config.battery_capacity,
+            efficiency=self.config.efficiency,
+            charge_rate=self.config.charge_rate,
+            discharge_rate=self.config.discharge_rate,
+            export_discharge_rate=self.config.export_discharge_rate,
+            inverter_efficiency=self.config.inverter_efficiency,
+            min_soc=min_soc,
+            max_soc=max_soc,
+            slot_minutes=self.config.slot_minutes,
+        )
 
     def log_schedule(
         self,
@@ -106,6 +132,7 @@ class ScheduleFormatter:
         projected_costs: Optional[Dict[datetime.datetime, float]] = None,
         local_tz=None,
         predict_load_kw: Optional[Callable[[datetime.datetime], float]] = None,
+        predict_pv_kw: Optional[Callable[[datetime.datetime], float]] = None,
         min_soc: float = 10.0,
         max_soc: float = 100.0,
     ):
@@ -125,6 +152,10 @@ class ScheduleFormatter:
             projected_costs: Projected battery cost at each slot
             local_tz: Local timezone for display
             predict_load_kw: Function to predict load for a given datetime
+            predict_pv_kw: Function to predict PV production for a given datetime.
+                Required for the fallback trajectory to agree with
+                ``soc_projection`` — PV surplus charges the battery in HOLD and
+                in self-consumption DISCHARGE.
             min_soc: Minimum SOC constraint (dynamic property)
             max_soc: Maximum SOC constraint (dynamic property)
         """
@@ -157,6 +188,7 @@ class ScheduleFormatter:
                 expected_temp=expected_temp,
                 local_tz=local_tz,
                 predict_load_kw=predict_load_kw,
+                predict_pv_kw=predict_pv_kw,
                 min_soc=min_soc,
                 max_soc=max_soc,
             )
@@ -203,6 +235,7 @@ class ScheduleFormatter:
         expected_temp: Optional[Dict[datetime.datetime, float]],
         local_tz,
         predict_load_kw: Optional[Callable[[datetime.datetime], float]],
+        predict_pv_kw: Optional[Callable[[datetime.datetime], float]] = None,
         min_soc: float = 10.0,
         max_soc: float = 100.0,
     ) -> str:
@@ -230,6 +263,7 @@ class ScheduleFormatter:
                 expected_temp=expected_temp,
                 local_tz=local_tz,
                 predict_load_kw=predict_load_kw,
+                predict_pv_kw=predict_pv_kw,
                 min_soc=min_soc,
                 max_soc=max_soc,
             )
@@ -257,10 +291,23 @@ class ScheduleFormatter:
         expected_temp: Optional[Dict[datetime.datetime, float]],
         local_tz,
         predict_load_kw: Optional[Callable[[datetime.datetime], float]],
+        predict_pv_kw: Optional[Callable[[datetime.datetime], float]] = None,
         min_soc: float = 10.0,
         max_soc: float = 100.0,
     ) -> str:
-        """Format trajectory using recalculated expected values (fallback)."""
+        """Format trajectory using recalculated expected values (fallback).
+
+        The slot transition goes through ``soc_projection.project_slot_soc`` —
+        the SAME model as the expected-SOC trajectory and the deviation
+        detector. This path used to carry a third, private transition model:
+        HOLD ignored PV surplus charging entirely (``end_soc = start_soc``) and
+        DISCHARGE drained at ``min(load, discharge_rate)`` on raw load without
+        subtracting PV or dividing by the inverter efficiency. On a sunny slot
+        (PV 4.0 kW, load 0.8 kW, SOC 50%) it printed 50.0%->50.0% for HOLD and
+        50.0%->48.6% for DISCHARGE where the shared model gives 55.3% for both —
+        a 5-7 point contradiction in the very log used to diagnose SOC
+        deviations.
+        """
         start_soc = lookup_by_time(expected_soc, hour, local_tz)
         start_temp = (
             lookup_by_time(expected_temp, hour, local_tz) if expected_temp else None
@@ -269,91 +316,26 @@ class ScheduleFormatter:
         if start_soc is None:
             return ""
 
-        if entry.mode == BatteryMode.CHARGE:
-            return self._format_charge_trajectory(start_soc, start_temp, max_soc)
-        elif entry.mode == BatteryMode.DISCHARGE:
-            return self._format_discharge_trajectory(
-                hour, start_soc, start_temp, min_soc, predict_load_kw, entry=entry
-            )
-        else:  # HOLD
-            return self._format_hold_trajectory(start_soc, start_temp)
-
-    def _format_charge_trajectory(
-        self,
-        start_soc: float,
-        start_temp: Optional[float],
-        max_soc: float,
-    ) -> str:
-        """Format trajectory for a CHARGE slot."""
-        if start_temp is not None and self.learning_engine:
-            # Use temperature-aware charging
-            energy_added, end_temp = self.learning_engine.predict_charge_energy_with_warming(
-                start_soc, start_temp, self.config.slot_minutes, temp_threshold=16.0
-            )
-            energy_to_battery = energy_added * self.config.efficiency
-            end_soc = min(
-                max_soc,
-                start_soc + (energy_to_battery / self.config.battery_capacity) * 100,
-            )
-            return f" {start_soc:5.1f}%->{end_soc:5.1f}% ({start_temp:.0f}C->{end_temp:.0f}C)"
-        else:
-            # Fallback: Use learned charge rate without temperature
-            effective_charge_rate = self.config.charge_rate
-            if self.learning_engine:
-                learned_rate = self.learning_engine.get_charge_rate_for_soc(start_soc)
-                if learned_rate is not None and learned_rate > 0:
-                    effective_charge_rate = learned_rate
-            energy_added = (
-                effective_charge_rate * self.config.efficiency * self.config.slot_hours
-            )
-            end_soc = min(
-                max_soc,
-                start_soc + (energy_added / self.config.battery_capacity) * 100,
-            )
-            return f" {start_soc:5.1f}%->{end_soc:5.1f}%"
-
-    def _format_discharge_trajectory(
-        self,
-        hour: datetime.datetime,
-        start_soc: float,
-        start_temp: Optional[float],
-        min_soc: float,
-        predict_load_kw: Optional[Callable[[datetime.datetime], float]],
-        entry: Optional[ScheduleEntry] = None,
-    ) -> str:
-        """Format trajectory for a DISCHARGE slot."""
-        if entry is not None and entry.export_rate is not None and entry.export_rate > 0:
-            edr = self.config.export_discharge_rate if self.config.export_discharge_rate > 0 else self.config.discharge_rate
-            energy_removed = edr * self.config.slot_hours
-        else:
-            load_kw = predict_load_kw(hour) if predict_load_kw else 0.5
-            energy_removed = (
-                min(load_kw, self.config.discharge_rate) * self.config.slot_hours
-            )
-        end_soc = max(
-            min_soc, start_soc - (energy_removed / self.config.battery_capacity) * 100
+        transition = project_slot_soc(
+            soc_start=start_soc,
+            mode=entry.mode,
+            params=self._projection_params(min_soc, max_soc),
+            load_kw=predict_load_kw(hour) if predict_load_kw else 0.0,
+            pv_kw=predict_pv_kw(hour) if predict_pv_kw else 0.0,
+            export_rate=entry.export_rate,
+            temp_start=start_temp,
+            learning_engine=self.learning_engine,
+            temp_projector=self._temp_projector,
+            slot_time=hour,
         )
 
-        if start_temp is not None and self.learning_engine:
-            end_temp = self.learning_engine.predict_temp_after_idle(
-                start_temp, self.config.slot_minutes
+        end_soc = transition.soc_end
+        end_temp = transition.temp_end
+        if start_temp is not None and end_temp is not None:
+            return (
+                f" {start_soc:5.1f}%->{end_soc:5.1f}% "
+                f"({start_temp:.0f}C->{end_temp:.0f}C)"
             )
-            return f" {start_soc:5.1f}%->{end_soc:5.1f}% ({start_temp:.0f}C->{end_temp:.0f}C)"
-        return f" {start_soc:5.1f}%->{end_soc:5.1f}%"
-
-    def _format_hold_trajectory(
-        self,
-        start_soc: float,
-        start_temp: Optional[float],
-    ) -> str:
-        """Format trajectory for a HOLD slot."""
-        end_soc = start_soc
-
-        if start_temp is not None and self.learning_engine:
-            end_temp = self.learning_engine.predict_temp_after_idle(
-                start_temp, self.config.slot_minutes
-            )
-            return f" {start_soc:5.1f}%->{end_soc:5.1f}% ({start_temp:.0f}C->{end_temp:.0f}C)"
         return f" {start_soc:5.1f}%->{end_soc:5.1f}%"
 
     def _format_reason_with_cost(
@@ -362,21 +344,46 @@ class ScheduleFormatter:
         hour: datetime.datetime,
         projected_costs: Optional[Dict[datetime.datetime, float]],
     ) -> str:
-        """Format reason string, showing projected cost for discharge slots."""
-        if entry.mode != BatteryMode.DISCHARGE or not projected_costs:
+        """Format the reason string so the leading number explains the decision.
+
+        Preferred form (DP supplied a marginal value):
+
+            0.1234 EUR/kWh avoided-import (grid 0.0712, stored 0.0000) load~...
+
+        The leading number is THIS slot's marginal economics as scored by the
+        DP. The tracked stored-energy basis stays visible as a separate figure —
+        it degenerates to 0.0000 whenever PV was booked at the zero export floor
+        (midday spot at/below the export fee), which is correct but explains
+        nothing about the decision. Before the fix that degenerate basis WAS the
+        only number shown, so every slot logged "0.0000 EUR/kWh".
+
+        Falls back to the legacy discharge-only formatting when no marginal
+        value is present (e.g. schedules restored from the HA sensor).
+        """
+        marginal = getattr(entry, "marginal_value_eur_kwh", None)
+        proj_cost = projected_costs.get(hour) if projected_costs else None
+
+        if marginal is None:
+            if entry.mode != BatteryMode.DISCHARGE or proj_cost is None:
+                return entry.reason
+            parts = entry.reason.split(" EUR/kWh")
+            if len(parts) == 2:
+                return f"{proj_cost:.4f} EUR/kWh (grid {parts[0]}){parts[1]}"
             return entry.reason
 
-        proj_cost = projected_costs.get(hour)
-        if proj_cost is None:
-            return entry.reason
-
-        # Parse grid price from reason: "X.XXXX EUR/kWh load~Y.YYkW"
         parts = entry.reason.split(" EUR/kWh")
-        if len(parts) == 2:
-            grid_price = parts[0]
-            rest = parts[1]
-            return f"{proj_cost:.4f} EUR/kWh (grid {grid_price}){rest}"
-        return entry.reason
+        if len(parts) != 2:
+            return entry.reason
+        grid_price, rest = parts
+
+        basis = getattr(entry, "value_basis", None) or "value"
+        detail = f"grid {grid_price}"
+        if proj_cost is not None:
+            detail += f", stored {proj_cost:.4f}"
+        line = f"{marginal:.4f} EUR/kWh {basis} ({detail}){rest}"
+        if proj_cost is not None and abs(proj_cost) <= 0.0005:
+            line += " [stored basis ~0: PV booked at export floor]"
+        return line
 
     def log_decision_context(
         self,
@@ -536,6 +543,7 @@ class ScheduleFormatter:
             entry = schedule[hour]
             wit_mode = resolve_wit_mode(entry)
             display = _WIT_MODE_DISPLAY.get(wit_mode, (wit_mode, "", "—"))
+            marginal = getattr(entry, "marginal_value_eur_kwh", None)
             schedule_data.append({
                 "time": hour.isoformat(),
                 "mode": entry.mode.name,
@@ -543,6 +551,9 @@ class ScheduleFormatter:
                 "wit_mode_name": display[0],
                 "export": display[2],
                 "reason": entry.reason,
+                # Decision economics per battery DC kWh (reporting only)
+                "value": round(marginal, 4) if marginal is not None else None,
+                "value_basis": getattr(entry, "value_basis", None),
             })
         return schedule_data
 
@@ -580,8 +591,8 @@ class ScheduleFormatter:
         now_slot = align_to_slot_func(now)
 
         lines: List[str] = []
-        lines.append("| Time | Mode | Export | SOC | Load | PV | Price |")
-        lines.append("|------|------|--------|-----|------|-----|-------|")
+        lines.append("| Time | Mode | Export | SOC | Load | PV | Price | Value |")
+        lines.append("|------|------|--------|-----|------|-----|-------|-------|")
 
         for hour in sorted(schedule.keys()):
             entry = schedule[hour]
@@ -628,8 +639,14 @@ class ScheduleFormatter:
             # Price from reason (format: "X.XXXX EUR/kWh ...")
             price_str = self._extract_price_from_reason(entry.reason)
 
+            # Decision economics per battery DC kWh (reporting only). Distinct
+            # from Price: it already includes conversion, wear and — for HOLD —
+            # the end-of-horizon salvage value.
+            marginal = getattr(entry, "marginal_value_eur_kwh", None)
+            value_str = f"{marginal:.4f}" if marginal is not None else ""
+
             lines.append(
-                f"| {time_str} | {icon} {mode_name} | {export_str} | {soc_str} | {load_str} | {pv_str} | {price_str} |"
+                f"| {time_str} | {icon} {mode_name} | {export_str} | {soc_str} | {load_str} | {pv_str} | {price_str} | {value_str} |"
             )
 
         return "\n".join(lines)

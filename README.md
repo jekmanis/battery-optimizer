@@ -146,10 +146,50 @@ Common parameters (see `apps.yaml.example` for the full, commented list):
 | `grid_fee_eur_kwh` / `grid_export_fee_eur_kwh` | 0.052 / 0.02 | Import fees added / export fee subtracted |
 | `import_price_multiplier` | 1.0 | Multiplier applied to spot plus import fees; use 1.21 only when those inputs exclude 21% VAT |
 | `battery_wear_cost_eur_kwh` | 0.017 | Per‑kWh wear cost discouraging marginal cycling |
-| `terminal_energy_value_eur_kwh` | `auto` | Values stored DC energy at the price horizon; `0` restores legacy depletion behavior |
+| `terminal_energy_value_eur_kwh` | `auto` | Values stored DC energy at the price horizon. `0` = no-salvage mode — see below |
 | `pv_threshold_w` | 500 | PV above which grid charging pauses |
 | `solcast_today_entity` / `_tomorrow_entity` | `sensor.solcast_*` | Optional PV forecast |
 | `device_id` | `""` | **Empty = dry‑run** (logs decisions, no inverter writes) |
+| `set_wit_mode_timeout_seconds` | 15 | Per‑call `hass_timeout`. This call **blocks the AppDaemon callback thread** — see *AppDaemon threads* |
+| `verify_delay_seconds` | 90 | Delay before the first verify‑after‑set read of the Inverter Mode sensor |
+| `verify_recheck_seconds` | 60 | Delay of the single re‑check performed after a resend |
+| `callback_warn_seconds` | 10 | Warn when one of this app's callbacks blocks for longer than this |
+
+### End‑of‑horizon value (`0` = no‑salvage mode)
+
+`terminal_energy_value_eur_kwh` prices whatever energy is still in the battery
+when the price horizon ends. With `auto` it is derived from the median forecast
+import price, discharge conversion and wear — a salvage value, not a terminal
+SOC target.
+
+Setting it to **`0` says stored energy is worthless at the horizon**, so the
+optimal plan is always to spend it there. That shows up as every schedule
+ending like:
+
+```
+07-30 00:30  DISCHARGE  ... (until depleted) [EXPORT] -> 11.2%
+```
+
+In practice this is usually harmless: those slots sit ~32 h out, and the daily
+13:15 re‑optimization extends the horizon with tomorrow's prices long before
+they execute.
+
+**Neither setting is universally right**, so the app only states which mode is
+active — at INFO, at startup and (rate‑limited) in the DP log:
+
+```
+INFO terminal_energy_value_eur_kwh=0 is no-salvage mode: ...
+     Neither is universally correct — pick per installation.
+```
+
+| Setting | Failure mode |
+|---|---|
+| `0` | spends the battery at the horizon edge |
+| `auto` | strands charge there; skips evening slots priced below the median |
+
+On the reference installation `"auto"` was tried and reverted: it stranded ~77% SOC at the horizon edge and skipped evening slots priced below the median, which cost more than the end-of-horizon spend it prevented.
+
+Choose per installation and record the reason next to the value in `apps.yaml`.
 
 By default, spot prices and import fees are assumed to already use the desired
 VAT basis. `import_price_multiplier` can apply VAT to the combined variable
@@ -222,7 +262,29 @@ uv run pytest tests/ --cov=appdaemon/apps --cov-report=term-missing
 - **Dry‑run:** set `device_id: ""` to log decisions without touching the inverter.
 - **Entities `unavailable` / `not found`:** confirm the Growatt sensor names match your install (integration v0.6.7+ device‑prefixes them, e.g. `sensor.growatt_battery_battery_soc`).
 - **`set_wit_mode` not found:** you're on the stock Growatt integration — install the [WIT fork](https://github.com/jekmanis/Growatt_ModbusTCP).
-- **`set_wit_mode` timeouts:** many sequential VPP register writes on a busy Modbus link can exceed AppDaemon's default 10 s service window. The optimizer now raises that per-call window to 30 s (`hass_timeout`) and inspects the service response. If AppDaemon still times out client-side (returns `None`), the mode is treated as *unconfirmed* (logged at WARNING) rather than silently assumed applied. About 90 s after every mode change (including `passthrough`), DirectControl reads the integration's **Inverter Mode** sensor (`sensor.growatt_inverter_mode` by default, overridable via `inverter_mode_sensor`) and, on a genuine mismatch, resends the command exactly once. A confirmed failure (the service raised) is logged at ERROR and is **not** recorded as sent, so it is retried on the next slot instead of being masked by duplicate suppression.
+- **`set_wit_mode` timeouts:** many sequential VPP register writes on a busy Modbus link can exceed AppDaemon's default 10 s service window. The optimizer sets that per-call window from `set_wit_mode_timeout_seconds` (**default 15 s**) and inspects the service response. If AppDaemon still times out client-side (returns `None`), the mode is treated as *unconfirmed* (logged at WARNING) rather than silently assumed applied — verify-after-set covers that case, which is why a short timeout is safe and a long one is not (it blocks every other callback). A confirmed failure (the service raised) is logged at ERROR and is **not** recorded as sent, so it is retried on the next slot instead of being masked by duplicate suppression.
+
+- **Mode mismatches / "resending once":** `verify_delay_seconds` (default 90 s) after every mode change — including `passthrough` — DirectControl reads the integration's **Inverter Mode** sensor (`sensor.growatt_inverter_mode` by default, overridable via `inverter_mode_sensor`). On a genuine mismatch it resends once and then re-checks **exactly once** after `verify_recheck_seconds` (default 60 s). If that second read still disagrees, the app logs an **ERROR** ("persistent mode mismatch after resend") and stops — never a third send, never a loop; the next slot retries normally.
+
+  Counters live on `sensor.battery_inverter_control_health` (and as the `inverter_control_health` attribute of `sensor.battery_optimizer`). Use them to tell the two causes apart:
+
+  | Symptom | Reading | Fix |
+  |---|---|---|
+  | HA modbus sensor merely lags | `resend_recovered_count` ≈ `resend_count`, `persistent_mismatch_count` = 0 | Raise `verify_delay_seconds` |
+  | Inverter really drops the override | `persistent_mismatch_count` growing | Inverter/firmware/config, not timing |
+  | Service itself failing | `resend_failed_count` growing | Check the Modbus connection |
+
+  The sensor is created with `set_state`, so it disappears after an HA restart until the app republishes it — alert on trends, don't rely on its history.
+
+- **AppDaemon threads — "Excessive time spent in callback (limit=10.0s)":** `set_wit_mode` is a **synchronous, blocking** service call on the AppDaemon callback thread. With the default single thread, one slow inverter write stalls schedule execution, the SOC listener and PV sampling alike (33 h of production logs: 70 overruns of 10–34 s, all on `thread-0`). Give this app more threads:
+
+  ```yaml
+  # appdaemon.yaml
+  appdaemon:
+    total_threads: 4
+  ```
+
+  (or pin the app with `pin_thread`). The app also measures its own callbacks and warns above `callback_warn_seconds`, naming the offending callback and repeating the `total_threads` advice after three overruns.
 
 ---
 

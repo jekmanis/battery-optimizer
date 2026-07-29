@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 from .models import BatteryMode, PricePoint, ScheduleEntry
 from .charge_rate_utils import compute_charge_rates_per_slot
+from .thermal_model import battery_power_for_entry
 from .timezone_utils import canonical_slot_key, instant_key
 
 
@@ -163,6 +164,8 @@ class DPOptimizer:
         log_fn: Optional[Callable] = None,
         decision_log_level: int = 0,
         pv_predictor: Optional[Callable[[datetime.datetime], float]] = None,
+        temp_projector=None,
+        warn_degenerate_terminal: bool = True,
     ):
         self._config = config
         self._predict_load_kw = load_predictor
@@ -172,6 +175,15 @@ class DPOptimizer:
         self._log_fn = log_fn
         self._decision_log_level = decision_log_level
         self._predict_pv_kw = pv_predictor
+        # Shared thermal model (thermal_model.TemperatureProjector). When absent
+        # the legacy mode-specific predictors are used so existing callers and
+        # tests keep working.
+        self._temp_projector = temp_projector
+        # Whether a terminal value pinned to 0 (legacy/degenerate mode) is
+        # surfaced at WARNING from this optimizer instance. The orchestrator
+        # sets it only for the daily/full optimization so the adaptive
+        # re-evaluations (every 15 min) don't produce 96 warnings a day.
+        self._warn_degenerate_terminal = warn_degenerate_terminal
 
     def _log(self, message: str, level: str = "INFO"):
         """Log a message using the provided log function."""
@@ -276,15 +288,32 @@ class DPOptimizer:
 
         terminal_rate = self._derive_terminal_rate(slots_sorted_by_time)
         if self._decision_log_level >= 1:
-            source = (
-                "auto: median horizon buy x inv_eff - wear"
-                if cfg.terminal_energy_value_eur_kwh is None
-                else "configured"
-            )
-            self._log(
-                f"Terminal energy value: {terminal_rate:.4f} EUR/kWh ({source}); "
-                f"net-load slots worth less than this are HELD"
-            )
+            if cfg.terminal_energy_value_eur_kwh == 0.0:
+                # No-salvage mode: nothing is "worth less than 0", so the plan
+                # spends the battery at the horizon edge. State the mode and its
+                # trade-off; do not prescribe a value. Both settings have a real
+                # failure mode and the right choice is installation-specific, so
+                # this is INFO, not a warning.
+                if self._warn_degenerate_terminal:
+                    self._log(
+                        "Terminal energy value: 0.0000 EUR/kWh (configured; "
+                        "no-salvage mode) — stored energy has no value at the end "
+                        "of the horizon, so the plan spends it there. Harmless "
+                        "while the daily re-optimization extends the horizon "
+                        "before those slots execute; see "
+                        "terminal_energy_value_eur_kwh in apps.yaml for the "
+                        "trade-off against \"auto\".",
+                    )
+            else:
+                source = (
+                    "auto: median horizon buy x inv_eff - wear"
+                    if cfg.terminal_energy_value_eur_kwh is None
+                    else "configured"
+                )
+                self._log(
+                    f"Terminal energy value: {terminal_rate:.4f} EUR/kWh ({source}); "
+                    f"net-load slots worth less than this are HELD"
+                )
 
         # Run DP to build schedule
         schedule, idx_trajectory, best_value = self._build_schedule(
@@ -309,7 +338,13 @@ class DPOptimizer:
 
         # Build temperature trajectory
         temp_trajectory = self._build_temp_trajectory(
-            slots_sorted_by_time, schedule, slot_fractions, current_temp
+            slots_sorted_by_time,
+            schedule,
+            slot_fractions,
+            current_temp,
+            charge_rates_per_slot=charge_rates_per_slot,
+            load_kw=load_kw,
+            pv_kw=pv_kw,
         )
 
         # Count actions
@@ -332,6 +367,50 @@ class DPOptimizer:
             self_consume_slot_count=self_consume_slot_count,
             terminal_value_eur_kwh=terminal_rate,
         )
+
+    def _buy_price(self, price: float) -> float:
+        """Marginal AC import price (EUR/kWh) including fees and taxes."""
+        cfg = self._config
+        return (price + cfg.grid_fee) * cfg.import_price_multiplier
+
+    def _sell_price(self, price: float) -> float:
+        """Marginal AC export revenue (EUR/kWh). NNS contract: floored at 0."""
+        cfg = self._config
+        return max(0.0, price * cfg.export_rate_multiplier - cfg.grid_export_fee)
+
+    def _marginal_slot_value(
+        self,
+        action: BatteryMode,
+        price: float,
+        is_export: bool,
+        terminal_rate: float,
+    ) -> Tuple[float, str]:
+        """EUR per battery DC kWh that this slot's decision is worth.
+
+        REPORTING ONLY — the DP objective never reads this. It re-uses the very
+        arithmetic `_run_dp` scores the slot with (`_buy_price`/`_sell_price`,
+        inverter conversion, wear), normalized to one DC kWh so the schedule log
+        can show why a slot was chosen. This is independent of the tracked
+        stored-energy cost basis, which legitimately degenerates to 0.0000 when
+        PV is booked at a zero export floor around midday.
+        """
+        cfg = self._config
+        if action == BatteryMode.DISCHARGE:
+            if is_export:
+                return (
+                    self._sell_price(price) * cfg.inverter_efficiency
+                    - cfg.battery_wear_cost,
+                    "export",
+                )
+            return (
+                self._buy_price(price) * cfg.inverter_efficiency
+                - cfg.battery_wear_cost,
+                "avoided-import",
+            )
+        if action == BatteryMode.CHARGE:
+            denom = max(1e-9, cfg.efficiency * cfg.inverter_efficiency)
+            return -self._buy_price(price) / denom, "landed-charge"
+        return terminal_rate, "kept"
 
     def _derive_terminal_rate(self, slots_list: List[PricePoint]) -> float:
         """EUR value of one stored DC kWh at the end of the horizon.
@@ -368,6 +447,9 @@ class DPOptimizer:
             current_temp=current_temp,
             get_charge_rate_for_soc=self._get_charge_rate_for_soc,
             predict_temp_after_duration=self._predict_temp_after_duration,
+            project_temp=(
+                self._temp_projector.project if self._temp_projector is not None else None
+            ),
             battery_capacity=self._config.battery_capacity,
             efficiency=self._config.efficiency,
             max_soc=self._config.max_soc,
@@ -409,24 +491,64 @@ class DPOptimizer:
         schedule: Dict[datetime.datetime, ScheduleEntry],
         slot_fractions: List[float],
         current_temp: Optional[float],
+        charge_rates_per_slot: Optional[List[float]] = None,
+        load_kw: Optional[List[float]] = None,
+        pv_kw: Optional[List[float]] = None,
     ) -> Dict[datetime.datetime, Tuple[Optional[float], Optional[float]]]:
-        """Build temperature trajectory based on scheduled modes."""
+        """Build temperature trajectory for the chosen schedule.
+
+        With a shared ``temp_projector`` the temperature evolves from the POWER
+        through the battery, not from the mode label: a 5.9 kW discharge heats
+        the pack just like a charge does. The old implementation branched on
+        ``mode == CHARGE`` only, so a horizon without a single CHARGE slot — the
+        production case — produced a monotonically non-increasing, practically
+        flat trajectory.
+
+        Note that this runs AFTER ``_build_schedule``: the trajectory is
+        reporting-only. Temperature influences DP decisions solely through
+        ``_compute_charge_rates_per_slot``.
+        """
         temp_trajectory: Dict[datetime.datetime, Tuple[Optional[float], Optional[float]]] = {}
         cfg = self._config
 
-        if current_temp is not None:
-            projected_temp = current_temp
-            for t, price_point in enumerate(slots_sorted_by_time):
-                hour = price_point.time
-                start_temp = projected_temp
-                slot_duration_minutes = cfg.slot_minutes * slot_fractions[t]
+        if current_temp is None:
+            return temp_trajectory
 
-                entry = schedule.get(hour)
-                if entry is not None and entry.mode == BatteryMode.CHARGE:
-                    projected_temp = self._predict_temp_after_duration(projected_temp, slot_duration_minutes)
-                else:
-                    projected_temp = self._predict_temp_after_idle(projected_temp, slot_duration_minutes)
-                temp_trajectory[hour] = (start_temp, projected_temp)
+        projected_temp = current_temp
+        for t, price_point in enumerate(slots_sorted_by_time):
+            hour = price_point.time
+            start_temp = projected_temp
+            slot_duration_minutes = cfg.slot_minutes * slot_fractions[t]
+            entry = schedule.get(hour)
+
+            if self._temp_projector is not None:
+                mode = entry.mode if entry is not None else BatteryMode.HOLD
+                charge_rate = (
+                    charge_rates_per_slot[t]
+                    if charge_rates_per_slot is not None and t < len(charge_rates_per_slot)
+                    else 0.0
+                )
+                slot_load = load_kw[t] if load_kw is not None and t < len(load_kw) else 0.0
+                slot_pv = pv_kw[t] if pv_kw is not None and t < len(pv_kw) else 0.0
+                power_kw = battery_power_for_entry(
+                    mode,
+                    charge_rate_kw=charge_rate,
+                    load_kw=slot_load,
+                    pv_kw=slot_pv,
+                    discharge_rate_kw=cfg.discharge_rate,
+                    export_discharge_rate_kw=cfg.effective_export_discharge_rate,
+                    export_rate=entry.export_rate if entry is not None else None,
+                    inverter_efficiency=cfg.inverter_efficiency,
+                )
+                projected_temp = self._temp_projector.project(
+                    projected_temp, hour, slot_duration_minutes, power_kw
+                )
+            elif entry is not None and entry.mode == BatteryMode.CHARGE:
+                projected_temp = self._predict_temp_after_duration(projected_temp, slot_duration_minutes)
+            else:
+                projected_temp = self._predict_temp_after_idle(projected_temp, slot_duration_minutes)
+
+            temp_trajectory[hour] = (start_temp, projected_temp)
 
         return temp_trajectory
 
@@ -501,7 +623,7 @@ class DPOptimizer:
 
         for t in range(n_list_slots):
             price = slots_list[t].price
-            buy_price = (price + cfg.grid_fee) * cfg.import_price_multiplier
+            buy_price = self._buy_price(price)
             fraction = slot_fractions_list[t]
             slot_load_kw = load_kw_list[t]
             slot_pv_kw = pv_kw_list[t] if pv_kw_list is not None else 0.0
@@ -520,7 +642,7 @@ class DPOptimizer:
             net_load_kwh = net_load_kw * cfg.slot_hours * fraction
 
             # Export variables — NNS contract: sell price floor at 0
-            sell_price = max(0.0, price * cfg.export_rate_multiplier - cfg.grid_export_fee)
+            sell_price = self._sell_price(price)
             export_discharge_kwh = cfg.effective_export_discharge_rate * cfg.slot_hours * fraction
             dc_export_discharge_kwh = export_discharge_kwh / inv_eff
             load_kwh = slot_load_kw * cfg.slot_hours * fraction
@@ -867,7 +989,7 @@ class DPOptimizer:
         if has_partial:
             price_point = slots_sorted_by_time[partial_index]
             price = price_point.price
-            buy_price = (price + cfg.grid_fee) * cfg.import_price_multiplier
+            buy_price = self._buy_price(price)
             fraction = slot_fractions[partial_index]
             slot_load_kw = load_kw[partial_index]
             slot_pv_kw = pv_kw[partial_index] if pv_kw is not None else 0.0
@@ -894,7 +1016,7 @@ class DPOptimizer:
             greedy_start_idx = _energy_to_index(start_energy, min_energy, step_kwh, n_states, "round")
 
             # HOLD — no grid charge; PV covers load, surplus charges battery for free
-            sell_price = max(0.0, price * cfg.export_rate_multiplier - cfg.grid_export_fee)
+            sell_price = self._sell_price(price)
             hold_pv_charge_kw = min(pv_surplus_kw, slot_charge_rate)
             hold_pv_energy = hold_pv_charge_kw * cfg.efficiency * cfg.slot_hours * fraction
             hold_new_energy = min(max_energy, start_energy + hold_pv_energy)
@@ -1123,14 +1245,23 @@ class DPOptimizer:
                     reason += " [pv>=load]"
                 elif lk - pv > 0:
                     keep_value = (
-                        (price + cfg.grid_fee) * cfg.import_price_multiplier
+                        self._buy_price(price)
                         * cfg.inverter_efficiency - cfg.battery_wear_cost
                     )
                     if keep_value < terminal_rate:
                         reason += (
                             f" [keep: {keep_value:.3f}<terminal {terminal_rate:.3f}]"
                         )
-            entry = ScheduleEntry(time=hour, mode=action, reason=reason)
+            marginal_value, value_basis = self._marginal_slot_value(
+                action, price, bool(is_export), terminal_rate
+            )
+            entry = ScheduleEntry(
+                time=hour,
+                mode=action,
+                reason=reason,
+                marginal_value_eur_kwh=marginal_value,
+                value_basis=value_basis,
+            )
             if action == BatteryMode.DISCHARGE:
                 entry.export_rate = 100 if is_export else 0
             elif action == BatteryMode.CHARGE and pv > 0:

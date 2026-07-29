@@ -248,7 +248,7 @@ class TestBatteryLearningEngine:
 
         # Verify it's valid JSON
         data = json.loads(json_str)
-        assert data["version"] == 5
+        assert data["version"] == 6  # v6 adds thermal_samples / thermal_coeffs
 
         # Create new engine and load
         new_engine = BatteryLearningEngine()
@@ -429,11 +429,16 @@ class TestAmbientTemperatureEstimation:
         assert 15.0 in learning_engine.stats.recent_min_temps
 
     def test_record_temperature_observation_limits_history(self, learning_engine):
-        """Should limit history to ~48 observations."""
-        for i in range(60):
+        """Should limit history to a 48 h window (192 samples at 15 min).
+
+        The window used to be 48 samples. Once observations became event driven
+        that covered only a few hours, which can never contain a diurnal
+        minimum — the value the ambient estimate is supposed to be.
+        """
+        for i in range(250):
             learning_engine.record_temperature_observation(10.0 + i * 0.1)
 
-        assert len(learning_engine.stats.recent_min_temps) == 48
+        assert len(learning_engine.stats.recent_min_temps) == 192
 
     def test_get_estimated_ambient_returns_minimum(self, learning_engine):
         """Should return minimum of recent observations as ambient."""
@@ -478,3 +483,211 @@ class TestAmbientTemperatureEstimation:
         # but still be well above 8°C after 1 hour
         assert predicted < 20.0
         assert predicted > 8.0
+
+    def test_min_temp_alias_matches_new_name(self, learning_engine):
+        """The renamed accessor and its backwards-compatible alias agree."""
+        for temp in [15.0, 12.0, 18.0]:
+            learning_engine.record_temperature_observation(temp)
+
+        assert learning_engine.get_estimated_ambient_min_temp() == 12.0
+        assert learning_engine.get_estimated_ambient_temp() == 12.0
+
+    def test_has_ambient_observations(self, learning_engine):
+        assert learning_engine.has_ambient_observations() is False
+        learning_engine.record_temperature_observation(27.4)
+        assert learning_engine.has_ambient_observations() is True
+
+
+class TestThermalCalibration:
+    """k1 / k2 calibration from raw thermal samples."""
+
+    def test_calibrate_recovers_known_coefficients(self, learning_engine):
+        """Least squares must recover synthetic coefficients without noise."""
+        k1_true = 0.02      # per minute
+        k2_true = 0.5       # C per kWh
+        k2_per_min = k2_true / 60.0
+
+        # Vary BOTH regressors so they are not collinear.
+        samples = []
+        for i in range(60):
+            t_start = 25.0 + (i % 12)
+            ambient = 20.0 + (i % 5)
+            power = [0.0, 1.5, 3.0, 4.5, 5.9][i % 5]
+            dt = 15.0
+            dtemp = (-k1_true * (t_start - ambient) + k2_per_min * power) * dt
+            samples.append((t_start, t_start + dtemp, dt, power, ambient))
+
+        for t_start, t_end, dt, power, ambient in samples:
+            assert learning_engine.record_thermal_observation(
+                temp_start=t_start,
+                temp_end=t_end,
+                duration_minutes=dt,
+                avg_power_kw=power,
+                ambient_temp=ambient,
+            )
+
+        result = learning_engine.calibrate_thermal_coefficients()
+        assert result is not None
+        k1, k2 = result
+        assert abs(k1 - k1_true) / k1_true < 0.05
+        assert abs(k2 - k2_true) / k2_true < 0.05
+
+        assert learning_engine.stats.thermal_coeffs["n"] == 60
+        assert learning_engine.get_heating_coefficient() == pytest.approx(k2, rel=1e-6)
+        assert learning_engine.get_cooling_rate_estimate(30.0) == pytest.approx(k1, rel=1e-6)
+
+    def test_calibration_needs_enough_samples(self, learning_engine):
+        for i in range(10):
+            learning_engine.record_thermal_observation(
+                temp_start=30.0, temp_end=30.5, duration_minutes=15.0,
+                avg_power_kw=4.0, ambient_temp=25.0,
+            )
+        assert learning_engine.calibrate_thermal_coefficients() is None
+        assert learning_engine.stats.thermal_coeffs == {}
+
+    def test_collinear_samples_do_not_produce_coefficients(self, learning_engine):
+        """All samples at the same power/delta cannot separate k1 from k2."""
+        for _ in range(30):
+            learning_engine.record_thermal_observation(
+                temp_start=30.0, temp_end=30.2, duration_minutes=15.0,
+                avg_power_kw=4.0, ambient_temp=25.0,
+            )
+        assert learning_engine.calibrate_thermal_coefficients() is None
+
+    def test_bootstrap_k2_from_warming_rates(self, learning_engine_with_warming_data):
+        """Already-collected charge warming rates seed k2 before calibration.
+
+        The task assumed k2 could be fitted from the ~250 stored observations.
+        It cannot: they carry no power. But their median C/min divided by the
+        nominal charge rate is an honest first estimate, so the model is not
+        stuck on the hardcoded default while new samples accumulate.
+        """
+        engine = learning_engine_with_warming_data
+        engine.stats.thermal_samples = []
+        engine.stats.thermal_coeffs = {}
+
+        k2 = engine.get_heating_coefficient()
+
+        # Fixture warms 10->14C and 16->20C over 60 min => 0.0667 C/min
+        expected = 0.0667 / engine.nominal_charge_rate * 60.0
+        assert k2 == pytest.approx(expected, rel=0.02)
+        assert k2 > 0.0
+        assert k2 != 0.35  # not the hardcoded default
+
+    def test_default_k2_without_any_data(self, learning_engine):
+        assert learning_engine.get_heating_coefficient() == pytest.approx(0.35)
+        assert learning_engine.get_heating_coefficient(default=0.5) == pytest.approx(0.5)
+
+    def test_record_discharging_captures_temps(self, learning_engine):
+        """Discharge observations must now carry thermal data.
+
+        Before the fix ``record_discharging`` had no temperature parameters at
+        all, so the learning data contained ZERO discharge thermal samples and
+        the heating coefficient was unfittable.
+        """
+        before = len(learning_engine.stats.thermal_samples)
+
+        learning_engine.record_discharging(
+            soc_start=80.0,
+            soc_end=70.0,
+            duration_minutes=30.0,
+            energy_delivered_kwh=1.43,
+            price_eur_kwh=0.1,
+            battery_temp_start=30.0,
+            battery_temp_end=32.0,
+            ambient_temp=27.0,
+        )
+
+        assert len(learning_engine.stats.thermal_samples) == before + 1
+        sample = learning_engine.stats.thermal_samples[-1]
+        assert sample[0] == 30.0
+        assert sample[1] == 32.0
+        assert sample[2] == 30.0
+        # 1.43 kWh over 0.5 h = 2.86 kW
+        assert sample[3] == pytest.approx(2.86, abs=0.01)
+        assert sample[4] == 27.0
+
+    def test_record_discharging_without_temps_is_unchanged(self, learning_engine):
+        learning_engine.record_discharging(
+            soc_start=80.0, soc_end=70.0, duration_minutes=30.0
+        )
+        assert learning_engine.stats.thermal_samples == []
+
+    def test_charging_also_feeds_thermal_samples(self, learning_engine):
+        """Warming is a function of power, not of mode — charge samples count."""
+        learning_engine.record_charging(
+            soc_start=30.0, soc_end=50.0, duration_minutes=60.0,
+            battery_temp=12.0, battery_temp_start=10.0, battery_temp_end=14.0,
+        )
+        assert len(learning_engine.stats.thermal_samples) == 1
+
+    def test_invalid_thermal_samples_rejected(self, learning_engine):
+        assert not learning_engine.record_thermal_observation(30.0, 31.0, 0.5, 4.0)
+        assert not learning_engine.record_thermal_observation(30.0, 60.0, 15.0, 4.0)
+        assert not learning_engine.record_thermal_observation(30.0, 31.0, 15.0, 25.0)
+        assert learning_engine.stats.thermal_samples == []
+
+    def test_thermal_samples_are_capped(self, learning_engine):
+        for i in range(400):
+            learning_engine.record_thermal_observation(
+                temp_start=25.0 + (i % 10),
+                temp_end=25.5 + (i % 10),
+                duration_minutes=15.0,
+                avg_power_kw=(i % 5),
+                ambient_temp=20.0,
+            )
+        assert len(learning_engine.stats.thermal_samples) == 300
+
+    def test_thermal_state_survives_json_round_trip(self, learning_engine):
+        for i in range(30):
+            learning_engine.record_thermal_observation(
+                temp_start=25.0 + (i % 8),
+                temp_end=25.4 + (i % 8),
+                duration_minutes=15.0,
+                avg_power_kw=[0.0, 2.0, 4.5][i % 3],
+                ambient_temp=22.0,
+            )
+        json_str = learning_engine.save_to_json()
+
+        restored = BatteryLearningEngine(battery_capacity_kwh=14.3)
+        assert restored.load_from_json(json_str)
+        assert len(restored.stats.thermal_samples) == 30
+        assert restored.stats.thermal_coeffs == learning_engine.stats.thermal_coeffs
+
+    def test_old_json_without_thermal_fields_still_loads(self, learning_engine):
+        old_json = json.dumps({
+            "version": 5,
+            "learned_efficiency": 0.88,
+            "stats": {"charge_rates_by_soc": {}, "total_energy_charged_kwh": 100.0},
+        })
+        assert learning_engine.load_from_json(old_json)
+        assert learning_engine.stats.thermal_samples == []
+        assert learning_engine.stats.thermal_coeffs == {}
+
+
+class TestBoundedTemperatureProjection:
+    """predict_temp_after_duration must not diverge."""
+
+    def test_projection_is_capped(self, learning_engine):
+        """132 slots x 15 min of linear warming used to reach ~230C."""
+        engine = learning_engine
+        for _ in range(5):
+            engine.record_charging(
+                soc_start=50.0, soc_end=52.0, duration_minutes=5.0,
+                battery_temp=33.0, battery_temp_start=33.0, battery_temp_end=33.5,
+            )
+
+        temp = 33.0
+        for _ in range(132):
+            temp = engine.predict_temp_after_duration(temp, 15.0)
+        assert temp <= 55.0
+
+    def test_thermal_fallback_without_warming_data(self, learning_engine):
+        """No learned warming rate -> thermal model, not a flat +0.1 C/min."""
+        for t in [27.0, 28.0, 30.0]:
+            learning_engine.record_temperature_observation(t)
+
+        predicted = learning_engine.predict_temp_after_duration(33.0, 15.0)
+        # Old model: 33 + 0.1*15 = 34.5 unconditionally.
+        assert predicted < 34.5
+        assert predicted > 27.0

@@ -19,7 +19,14 @@ apps_dir = Path(__file__).parent.parent / "appdaemon" / "apps"
 sys.path.insert(0, str(apps_dir))
 
 from battery_optimizer import BatteryMode, ScheduleEntry, BatteryOptimizer
-from battery_optimizer_lib import BatteryLearningEngine, BatteryOptimizerConfig, ScheduleFormatter, ScheduleFormatterConfig
+from battery_optimizer_lib import (
+    BatteryLearningEngine,
+    BatteryOptimizerConfig,
+    PvBiasConfig,
+    PvBiasTracker,
+    ScheduleFormatter,
+    ScheduleFormatterConfig,
+)
 
 
 class MockSocDeviationOptimizer:
@@ -1415,12 +1422,23 @@ class TestRecalculateRemainingScheduleWithExtraSlots:
 
             def find_optimal_schedule(self, prices, min_charge_slots, soc):
                 self._min_charge_slots_used = min_charge_slots
+                self._bias_factor_at_generate = self._pv_bias_factor
                 return {}
 
             def _get_battery_temp(self):
                 return None
 
-            def calculate_expected_soc_schedule(self, schedule, starting_soc, starting_temp=None):
+            def calculate_expected_soc_schedule(
+                self,
+                schedule,
+                starting_soc,
+                starting_temp=None,
+                current_slot=None,
+                minutes_into_slot=0.0,
+            ):
+                # Recorded so the test can assert the partial-slot context is
+                # forwarded by _recalculate_remaining_schedule.
+                self._expected_soc_args = (current_slot, minutes_into_slot)
                 return {}, {}
 
             def execute_scheduled_mode(self, kwargs, force=False):
@@ -1432,9 +1450,36 @@ class TestRecalculateRemainingScheduleWithExtraSlots:
             def _predict_load_kw(self, dt):
                 return 0.5
 
+            def _predict_pv_kw(self, dt):
+                return 0.0
+
         MockRecalculateOptimizer._recalculate_remaining_schedule = BatteryOptimizer._recalculate_remaining_schedule
+        # A recalculation must refresh the sliding PV bias factor BEFORE the
+        # schedule is generated, so the whole remaining horizon is planned on
+        # the corrected forecast.
+        MockRecalculateOptimizer._refresh_pv_bias_factor = BatteryOptimizer._refresh_pv_bias_factor
 
         opt = MockRecalculateOptimizer()
+        opt._pv_bias_factor = 1.0
+        opt._bias_factor_at_generate = None
+        opt._pv_bias = PvBiasTracker(
+            config=PvBiasConfig(
+                slot_minutes=60,
+                window_minutes=600,
+                min_slots=2,
+                min_samples_per_slot=1,
+            ),
+            align_to_slot_func=lambda dt: dt.replace(minute=0, second=0, microsecond=0),
+            log_func=opt.log,
+        )
+        # Two completed slots measured at 30% of forecast (07-27 cloud cover).
+        for hour in (3, 4):
+            slot = datetime.datetime(2024, 1, 15, hour, 0, 0)
+            opt._pv_bias.ensure_slot_forecast(slot, 3.0)
+            for i in range(10):
+                opt._pv_bias.add_sample(slot + datetime.timedelta(minutes=i), 0.9)
+        opt._pv_bias.close_slots_before(datetime.datetime(2024, 1, 15, 5, 0, 0))
+
         opt.schedule = {}
         opt.expected_soc_schedule = {}
         opt.expected_temp_schedule = {}
@@ -1467,8 +1512,24 @@ class TestRecalculateRemainingScheduleWithExtraSlots:
         # Verify logging indicates the boost
         assert any("boosting min_charge_slots by 2" in msg.lower() for msg in opt._log_messages)
 
+        # The PV bias factor was computed from the two shortfall slots (median
+        # ratio 0.30, slightly relaxed because the newest slot is 1.5 slots old)
+        # and was already in place when the schedule was generated.
+        assert 0.25 < opt._pv_bias_factor < 0.40
+        assert opt._bias_factor_at_generate == opt._pv_bias_factor
+
         # Verify the min_charge_slots used in optimization was boosted
         assert opt._min_charge_slots_used == 3  # 1 base + 2 extra
+
+        # The expected-SOC trajectory must be told how far into the current slot
+        # we already are (30 min into the 05:00 hourly slot), otherwise the
+        # first slot is projected as a full slot.
+        current_slot, minutes_into_slot = opt._expected_soc_args
+        assert current_slot == datetime.datetime(2024, 1, 15, 5, 0, 0)
+        assert minutes_into_slot == pytest.approx(30.0)
+        # And the anchor must be refreshed so the deviation detector does not
+        # double-count the elapsed part of the slot.
+        assert opt._expected_soc_anchor == datetime.datetime(2024, 1, 15, 5, 30, 0)
 
 
 class TestFifteenMinSocDeviation:
@@ -1594,3 +1655,171 @@ class TestFifteenMinSocDeviation:
         assert result.deviation is not None
         expected_deviation = 50.0 - expected_soc_now  # ~-3.12
         assert abs(result.deviation - expected_deviation) < 0.1
+
+
+class TestSocDeviationSharedProjection:
+    """
+    The detector must use the same slot physics as the DP and the expected-SOC
+    trajectory (battery_optimizer_lib/soc_projection.py).
+
+    Numbers come from the 2026-07-27 AppDaemon window: pv~4.46 kW, load~0.80 kW,
+    capacity 14.3 kWh, 15-minute slots.
+    """
+
+    CAPACITY = 14.3
+
+    @staticmethod
+    def _config(**overrides):
+        from battery_optimizer_lib import SocDeviationConfig
+
+        base = dict(
+            slot_minutes=15,
+            charge_rate=4.5,
+            discharge_rate=4.5,
+            efficiency=0.95,
+            battery_capacity=14.3,
+            min_soc=10.0,
+            max_soc=100.0,
+            soc_deviation_threshold=4.0,
+            grid_fee=0.05,
+        )
+        base.update(overrides)
+        return SocDeviationConfig(**base)
+
+    def test_discharge_with_pv_surplus_expects_rising_soc(self):
+        """DISCHARGE while pv >= load charges the battery — it is not "ahead"."""
+        from battery_optimizer_lib import SocDeviationDetector
+
+        detector = SocDeviationDetector(config=self._config())
+        slot = datetime.datetime(2026, 7, 27, 11, 45)
+        schedule = {
+            slot: ScheduleEntry(
+                time=slot, mode=BatteryMode.DISCHARGE, reason="[cloud-safe]", export_rate=0
+            )
+        }
+        fraction = 14.0 / 15.0
+        rise = (4.46 - 0.80) * 0.95 * 0.25 / self.CAPACITY * 100 * fraction
+        actual_soc = 27.0 + rise
+
+        result = detector.check_deviation(
+            current_soc=actual_soc,
+            schedule=schedule,
+            expected_soc_schedule={slot: 27.0},
+            now=slot + datetime.timedelta(minutes=14),
+            current_slot=slot,
+            local_tz=None,
+            predict_load_kw=lambda _dt: 0.80,
+            predict_pv_kw=lambda _dt: 4.46,
+        )
+
+        # Before the fix the detector projected a falling SOC and reported
+        # ~+5.7% "SOC ahead ... favorable deviation" for a perfectly on-plan
+        # battery (78 such events in the log).
+        assert result.should_recalculate is False
+        assert abs(result.deviation) < 0.01
+
+    def test_hold_with_pv_surplus_expects_rising_soc(self):
+        """HOLD stores PV surplus in both the DP and the expected trajectory."""
+        from battery_optimizer_lib import SocDeviationDetector
+
+        detector = SocDeviationDetector(config=self._config())
+        slot = datetime.datetime(2026, 7, 27, 12, 0)
+        schedule = {slot: ScheduleEntry(time=slot, mode=BatteryMode.HOLD, reason="pv")}
+        rise = (3.5 - 0.5) * 0.95 * 0.25 / self.CAPACITY * 100  # ~4.98%
+
+        result = detector.check_deviation(
+            current_soc=50.0 + rise,
+            schedule=schedule,
+            expected_soc_schedule={slot: 50.0},
+            now=slot + datetime.timedelta(minutes=15),
+            current_slot=slot,
+            local_tz=None,
+            predict_load_kw=lambda _dt: 0.5,
+            predict_pv_kw=lambda _dt: 3.5,
+        )
+
+        # Old model: HOLD "no change" -> +4.98% deviation -> recalculation.
+        assert result.should_recalculate is False
+        assert abs(result.deviation) < 0.01
+
+    def test_export_slot_uses_export_discharge_rate(self):
+        """An export slot drains at export_discharge_rate, not at the load rate."""
+        from battery_optimizer_lib import SocDeviationDetector
+
+        detector = SocDeviationDetector(config=self._config(export_discharge_rate=9.0))
+        slot = datetime.datetime(2026, 7, 27, 18, 0)
+        schedule = {
+            slot: ScheduleEntry(
+                time=slot, mode=BatteryMode.DISCHARGE, reason="max_export", export_rate=100
+            )
+        }
+        drop = 9.0 * 0.25 / self.CAPACITY * 100  # ~15.7%
+
+        result = detector.check_deviation(
+            current_soc=80.0 - drop,
+            schedule=schedule,
+            expected_soc_schedule={slot: 80.0},
+            now=slot + datetime.timedelta(minutes=15),
+            current_slot=slot,
+            local_tz=None,
+            predict_load_kw=lambda _dt: 0.5,
+            predict_pv_kw=lambda _dt: 0.0,
+        )
+
+        # Old model used the 0.5 kW load rate -> a bogus ~-14.9% shortfall.
+        assert result.should_recalculate is False
+        assert abs(result.deviation) < 0.01
+
+    def test_anchor_prevents_double_counting(self):
+        """A mid-slot recalculation anchors the trajectory at that instant."""
+        from battery_optimizer_lib import SocDeviationDetector
+
+        detector = SocDeviationDetector(config=self._config())
+        slot = datetime.datetime(2026, 7, 27, 11, 45)
+        anchor = slot + datetime.timedelta(minutes=14)  # 11:59 recalculation
+        now = anchor + datetime.timedelta(seconds=30)
+        schedule = {slot: ScheduleEntry(time=slot, mode=BatteryMode.CHARGE, reason="cheap")}
+
+        full_slot_gain = 4.5 * 0.95 * 0.25 / self.CAPACITY * 100  # ~7.48%
+        elapsed_gain = full_slot_gain * (0.5 / 15.0)  # only 30 seconds since anchor
+
+        result = detector.check_deviation(
+            current_soc=27.0 + elapsed_gain,
+            schedule=schedule,
+            expected_soc_schedule={slot: 27.0},
+            now=now,
+            current_slot=slot,
+            local_tz=None,
+            predict_load_kw=lambda _dt: 0.5,
+            predict_pv_kw=lambda _dt: 0.0,
+            expected_soc_anchor=anchor,
+        )
+
+        # Without the anchor the detector would apply 14.5/15 of the slot on top
+        # of a value that already describes 11:59 -> ~-7.2% phantom shortfall.
+        assert result.should_recalculate is False
+        assert abs(result.deviation) < 0.05
+
+    def test_stale_anchor_outside_slot_is_ignored(self):
+        """An anchor from an earlier slot must not silence deviation detection."""
+        from battery_optimizer_lib import SocDeviationDetector
+
+        detector = SocDeviationDetector(config=self._config())
+        slot = datetime.datetime(2026, 7, 27, 12, 0)
+        stale_anchor = slot - datetime.timedelta(minutes=20)
+        schedule = {slot: ScheduleEntry(time=slot, mode=BatteryMode.CHARGE, reason="cheap")}
+
+        result = detector.check_deviation(
+            current_soc=27.0,  # no charging happened at all
+            schedule=schedule,
+            expected_soc_schedule={slot: 27.0},
+            now=slot + datetime.timedelta(minutes=14),
+            current_slot=slot,
+            local_tz=None,
+            predict_load_kw=lambda _dt: 0.5,
+            predict_pv_kw=lambda _dt: 0.0,
+            expected_soc_anchor=stale_anchor,
+        )
+
+        # Full 14/15 of the charge slot is expected -> a real ~-7% shortfall.
+        assert result.deviation < -4.0

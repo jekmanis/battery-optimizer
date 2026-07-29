@@ -39,6 +39,17 @@ class ScheduleEntry:
     ac_charge_mode: Optional[str] = None
     # None = auto-detect, "disabled" / "pv_priority" / "ac_priority"
 
+    # --- Reporting fields (never read by the DP objective) ---
+    marginal_value_eur_kwh: Optional[float] = None
+    # EUR per battery DC kWh that THIS slot's decision is worth, using the same
+    # tariff arithmetic the DP scores the slot with. Reported so the schedule
+    # log explains the decision even when the tracked stored-energy cost basis
+    # has legitimately degenerated to 0.0000 (PV booked at a zero export floor).
+
+    value_basis: Optional[str] = None
+    # Which economics the number above describes: "avoided-import", "export",
+    # "landed-charge" or "kept".
+
 
 @dataclass
 class LearningStats:
@@ -60,6 +71,13 @@ class LearningStats:
     temp_cooling_rates: Dict[str, List[float]] = field(default_factory=dict)
     # Recent minimum battery temperatures for ambient estimation (last ~48h of observations)
     recent_min_temps: List[float] = field(default_factory=list)
+    # Raw thermal observations for k1/k2 calibration. Each sample is
+    # [T_start, T_end, duration_minutes, avg_battery_power_kw, ambient_temp].
+    # The aggregated temp_warming_rates / temp_cooling_rates cannot be used for
+    # this: they are already averaged and carry no power information.
+    thermal_samples: List[List[float]] = field(default_factory=list)
+    # Calibrated thermal coefficients: {"k1": per-minute, "k2": C/kWh, "n": samples}
+    thermal_coeffs: Dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)

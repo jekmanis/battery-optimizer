@@ -3,6 +3,7 @@ Unit tests for the DPOptimizer class.
 """
 
 import datetime
+import math
 import pytest
 from typing import Optional
 
@@ -1337,3 +1338,99 @@ class TestSellPriceFloor:
         # Should HOLD (PV charges battery for free), but no export revenue
         entry = list(result.schedule.values())[0]
         assert entry.mode in (BatteryMode.HOLD, BatteryMode.CHARGE)
+
+
+class TestTemperatureTrajectoryIsNotFlat:
+    """DEFECT 6/7 regression at the DP level.
+
+    Old behaviour: ``_build_temp_trajectory`` warmed only in CHARGE slots and
+    otherwise relaxed toward ONE constant ambient. With a price series that
+    yields no CHARGE slot, the trajectory was monotonically non-increasing and,
+    with the ambient estimate stuck near the current battery temperature,
+    practically flat — 5763 of 5891 logged rows read ``(33C->33C)``.
+    """
+
+    @staticmethod
+    def _expensive_prices(n=32):
+        base = datetime.datetime(2026, 7, 27, 16, 0)
+        return [
+            PricePoint(time=base + datetime.timedelta(minutes=15 * i), price=0.30)
+            for i in range(n)
+        ]
+
+    @staticmethod
+    def _config():
+        return DPOptimizerConfig(
+            battery_capacity=14.3,
+            min_soc=10.0,
+            max_soc=100.0,
+            efficiency=0.85,
+            discharge_rate=5.9,
+            slot_minutes=15,
+            soc_step_percent=1.0,
+            grid_fee=0.052,
+            battery_wear_cost=0.017,
+        )
+
+    def _run(self, temp_projector):
+        prices = self._expensive_prices()
+        optimizer = DPOptimizer(
+            config=self._config(),
+            load_predictor=lambda dt: 5.0,
+            charge_rate_predictor=lambda soc, temp: 4.5,
+            temp_after_charge_predictor=lambda temp, dur: temp + 0.1 * dur,
+            temp_after_idle_predictor=lambda temp, dur: temp,
+            temp_projector=temp_projector,
+        )
+        return optimizer.optimize(
+            prices=prices,
+            current_slot=prices[0].time,
+            current_soc=90.0,
+            current_temp=33.0,
+        )
+
+    def test_legacy_trajectory_is_flat_without_charge_slots(self):
+        """Documents the defect: no projector -> mode-based model -> flat."""
+        result = self._run(temp_projector=None)
+        assert result.charge_count == 0
+        ends = {round(end, 1) for _, end in result.temp_trajectory.values()}
+        assert ends == {33.0}
+
+    def test_shared_projector_gives_a_varying_trajectory(self):
+        from battery_optimizer_lib.thermal_model import TemperatureProjector
+
+        class _Diurnal:
+            def predict_c(self, dt):
+                if dt is None:
+                    return 27.0
+                hour = dt.hour + dt.minute / 60.0
+                return 31.0 + 4.0 * math.cos(2 * math.pi * (hour - 15.0) / 24.0)
+
+        result = self._run(temp_projector=TemperatureProjector(ambient_provider=_Diurnal()))
+
+        assert result.charge_count == 0
+        assert len(result.temp_trajectory) == 32
+        ends = [round(end, 1) for _, end in result.temp_trajectory.values()]
+        assert len(set(ends)) >= 3, f"Trajectory is still flat: {sorted(set(ends))}"
+
+    def test_discharging_slots_are_not_thermally_idle(self):
+        """A discharge slot must move the temperature by more than cooling alone."""
+        from battery_optimizer_lib.thermal_model import TemperatureProjector
+
+        class _FixedAmbient:
+            def predict_c(self, dt):
+                return 33.0
+
+        result = self._run(temp_projector=TemperatureProjector(ambient_provider=_FixedAmbient()))
+
+        discharge_slots = [
+            slot for slot, entry in result.schedule.items()
+            if entry.mode == BatteryMode.DISCHARGE
+        ]
+        assert discharge_slots, "scenario must produce discharge slots"
+
+        slot = sorted(discharge_slots)[0]
+        start_temp, end_temp = result.temp_trajectory[slot]
+        # At ambient == start temperature, pure relaxation is a no-op; anything
+        # above the start can only come from |P_bat| self-heating.
+        assert end_temp > start_temp

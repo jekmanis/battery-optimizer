@@ -7,10 +7,27 @@ and round-trip efficiency from observed battery performance.
 
 import datetime
 import json
+import math
 import statistics
 from typing import Dict, List, Optional, Tuple
 
 from .models import LearningStats
+from .thermal_model import (
+    DEFAULT_COOLING_RATE_PER_MIN,
+    DEFAULT_HEATING_C_PER_KWH,
+    MAX_BATTERY_TEMP_C,
+    step_temperature,
+)
+
+# Rolling window of battery temperature observations used to estimate the
+# ambient DAILY MINIMUM. 192 samples = 48 h at one sample per 15 min. The old
+# 48-sample window covered only ~12 h once observations became event-driven,
+# which is far too short to contain a diurnal minimum.
+TEMP_OBSERVATION_WINDOW = 192
+
+# Minimum number of raw thermal samples before k1/k2 are trusted.
+MIN_THERMAL_SAMPLES = 20
+MAX_THERMAL_SAMPLES = 300
 
 
 class BatteryLearningEngine:
@@ -33,7 +50,12 @@ class BatteryLearningEngine:
         max_soc: float = 100.0,
         log_func=None,
         temp_ranges: Optional[List[int]] = None,
+        default_cooling_rate_per_min: float = DEFAULT_COOLING_RATE_PER_MIN,
+        default_heating_c_per_kwh: float = DEFAULT_HEATING_C_PER_KWH,
     ):
+        self.default_cooling_rate_per_min = default_cooling_rate_per_min
+        self.default_heating_c_per_kwh = default_heating_c_per_kwh
+        self._thermal_samples_since_calibration = 0
         self.battery_capacity = battery_capacity_kwh
         self.nominal_charge_rate = nominal_charge_rate_kw
         self.nominal_efficiency = nominal_efficiency
@@ -194,6 +216,16 @@ class BatteryLearningEngine:
                     self.stats.temp_warming_rates[start_temp_range] = \
                         self.stats.temp_warming_rates[start_temp_range][-50:]
 
+        # Raw thermal sample for k1/k2 calibration. Charging samples are kept
+        # alongside discharging ones: |P_bat| is the regressor, not the mode.
+        if battery_temp_start is not None and battery_temp_end is not None:
+            self.record_thermal_observation(
+                temp_start=battery_temp_start,
+                temp_end=battery_temp_end,
+                duration_minutes=duration_minutes,
+                avg_power_kw=charge_rate,
+            )
+
         # Update totals
         self.stats.total_energy_charged_kwh += energy_added
         self.stats.total_charge_cost_eur += energy_added * charge_price
@@ -214,9 +246,18 @@ class BatteryLearningEngine:
         soc_end: float,
         duration_minutes: float,
         energy_delivered_kwh: Optional[float] = None,
-        price_eur_kwh: float = 0.0
+        price_eur_kwh: float = 0.0,
+        battery_temp_start: Optional[float] = None,
+        battery_temp_end: Optional[float] = None,
+        ambient_temp: Optional[float] = None,
     ):
-        """Record a discharging observation."""
+        """Record a discharging observation.
+
+        ``battery_temp_start``/``battery_temp_end`` feed the thermal calibration.
+        Before they existed the learning data contained ZERO discharge thermal
+        observations, so the heating coefficient could not be fitted at all —
+        which is exactly why discharging was modelled as thermally idle.
+        """
         if duration_minutes <= 0 or soc_start <= soc_end:
             return
 
@@ -233,6 +274,15 @@ class BatteryLearningEngine:
         # Update totals
         self.stats.total_energy_discharged_kwh += energy_delivered_kwh
         self.stats.total_discharge_revenue_eur += energy_delivered_kwh * price_eur_kwh
+
+        if battery_temp_start is not None and battery_temp_end is not None:
+            self.record_thermal_observation(
+                temp_start=battery_temp_start,
+                temp_end=battery_temp_end,
+                duration_minutes=duration_minutes,
+                avg_power_kw=discharge_rate,
+                ambient_temp=ambient_temp,
+            )
 
         self.log(f"Learning: Recorded discharge {soc_start:.1f}%->{soc_end:.1f}% ({energy_delivered_kwh:.3f} kWh [{energy_source}]) "
                  f"in {duration_minutes:.0f}min, rate={discharge_rate:.2f}kW")
@@ -252,31 +302,193 @@ class BatteryLearningEngine:
 
         self.stats.recent_min_temps.append(temp)
 
-        # Keep last ~48 observations (assuming hourly recording, ~2 days of data)
-        max_observations = 48
+        # Keep a 48 h window (192 samples at 15 min). Observations are event
+        # driven as well as timer driven, so a short window can cover only a few
+        # hours and would never contain an overnight trough.
+        max_observations = TEMP_OBSERVATION_WINDOW
         if len(self.stats.recent_min_temps) > max_observations:
             self.stats.recent_min_temps = self.stats.recent_min_temps[-max_observations:]
 
-    def get_estimated_ambient_temp(self, default: float = 10.0) -> float:
+    def get_estimated_ambient_min_temp(self, default: float = 10.0) -> float:
         """
-        Get estimated ambient temperature based on recent minimum observations.
+        Rolling minimum battery temperature — an UPPER BOUND on ambient.
 
-        Uses the minimum of recent battery temperature observations as a proxy
-        for ambient temperature (coldest the battery gets when idle).
+        The pack is self-heated and approaches ambient from above without ever
+        falling below it, so ``min(T_bat)`` over the window bounds ambient from
+        above; it is not the trough of the ambient swing.
+        ``AmbientTemperatureService`` therefore anchors it as the daily MAXIMUM
+        of its fallback diurnal profile — treating it as the minimum and adding
+        the amplitude produced an "ambient" hotter than the battery itself.
 
         Args:
-            default: Default ambient if no observations available (°C)
-
-        Returns:
-            Estimated ambient temperature (°C)
+            default: Value to return when no observations are available (°C)
         """
         if not self.stats.recent_min_temps:
             return default
+        return min(self.stats.recent_min_temps)
 
-        # Use minimum of recent observations as ambient estimate
-        # Add small buffer (1°C) since battery may not fully reach ambient
-        min_temp = min(self.stats.recent_min_temps)
-        return min_temp
+    def has_ambient_observations(self) -> bool:
+        """Whether any battery temperature observation has been recorded."""
+        return bool(self.stats.recent_min_temps)
+
+    def get_estimated_ambient_temp(self, default: float = 10.0) -> float:
+        """Backwards-compatible alias for :meth:`get_estimated_ambient_min_temp`."""
+        return self.get_estimated_ambient_min_temp(default=default)
+
+    # ------------------------------------------------------------------
+    # Thermal model calibration (k1 relaxation, k2 self-heating)
+    # ------------------------------------------------------------------
+
+    def record_thermal_observation(
+        self,
+        temp_start: float,
+        temp_end: float,
+        duration_minutes: float,
+        avg_power_kw: float,
+        ambient_temp: Optional[float] = None,
+    ) -> bool:
+        """Store a raw thermal sample for k1/k2 least-squares calibration.
+
+        Args:
+            temp_start: Battery temperature at the start of the interval (°C)
+            temp_end: Battery temperature at the end of the interval (°C)
+            duration_minutes: Interval length (minutes)
+            avg_power_kw: Mean magnitude of battery power over the interval (kW)
+            ambient_temp: Ambient during the interval; estimated when omitted
+
+        Returns:
+            True when the sample was accepted.
+        """
+        if temp_start is None or temp_end is None:
+            return False
+        if duration_minutes is None or duration_minutes < 1.0:
+            return False
+        if avg_power_kw is None:
+            return False
+
+        power = abs(float(avg_power_kw))
+        if power >= 20.0:
+            return False
+        if abs(float(temp_end) - float(temp_start)) >= 20.0:
+            return False
+
+        if ambient_temp is None:
+            ambient_temp = self.get_estimated_ambient_min_temp(default=10.0)
+
+        self.stats.thermal_samples.append([
+            float(temp_start),
+            float(temp_end),
+            float(duration_minutes),
+            power,
+            float(ambient_temp),
+        ])
+        if len(self.stats.thermal_samples) > MAX_THERMAL_SAMPLES:
+            self.stats.thermal_samples = self.stats.thermal_samples[-MAX_THERMAL_SAMPLES:]
+
+        self._thermal_samples_since_calibration += 1
+        if self._thermal_samples_since_calibration >= 10:
+            self._thermal_samples_since_calibration = 0
+            self.calibrate_thermal_coefficients()
+
+        return True
+
+    def calibrate_thermal_coefficients(self) -> Optional[Tuple[float, float]]:
+        """Fit ``(T_end - T_start)/dt = -k1*(T_start - Ta) + k2'*|P|``.
+
+        Solved as a 2x2 normal-equation system in pure Python (numpy is not a
+        dependency of this project). ``k2'`` is converted from °C/(min·kW) to
+        °C/kWh by multiplying with 60.
+
+        Returns ``(k1, k2)`` or None when there is not enough data.
+        """
+        samples = self.stats.thermal_samples
+        if len(samples) < MIN_THERMAL_SAMPLES:
+            return None
+
+        s11 = s12 = s22 = b1 = b2 = 0.0
+        used = 0
+        for sample in samples:
+            if len(sample) < 5:
+                continue
+            t_start, t_end, dt_min, power, ambient = sample[:5]
+            if dt_min <= 0:
+                continue
+            y = (t_end - t_start) / dt_min
+            x1 = -(t_start - ambient)   # coefficient of k1
+            x2 = power                  # coefficient of k2'
+            s11 += x1 * x1
+            s12 += x1 * x2
+            s22 += x2 * x2
+            b1 += x1 * y
+            b2 += x2 * y
+            used += 1
+
+        if used < MIN_THERMAL_SAMPLES:
+            return None
+
+        det = s11 * s22 - s12 * s12
+        if abs(det) < 1e-12:
+            # Regressors are collinear (e.g. every sample at the same power).
+            return None
+
+        k1 = (b1 * s22 - b2 * s12) / det
+        k2_per_min = (b2 * s11 - b1 * s12) / det
+        k2 = k2_per_min * 60.0  # °C per kWh through the battery
+
+        k1 = min(0.1, max(0.001, k1))
+        k2 = min(2.0, max(0.0, k2))
+
+        self.stats.thermal_coeffs = {"k1": k1, "k2": k2, "n": float(used)}
+        self.log(
+            f"Learning: Calibrated thermal model k1={k1:.4f}/min, "
+            f"k2={k2:.3f}C/kWh from {used} samples"
+        )
+        return k1, k2
+
+    def get_heating_coefficient(
+        self, default: Optional[float] = None
+    ) -> float:
+        """``k2`` in °C per kWh moved through the battery.
+
+        Fallback chain:
+        1. Calibrated value (>= ``MIN_THERMAL_SAMPLES`` raw samples)
+        2. Bootstrap from the already-collected charge warming rates:
+           ``median(°C/min) / nominal_charge_rate * 60``
+        3. Configured default
+        """
+        if default is None:
+            default = self.default_heating_c_per_kwh
+
+        coeffs = self.stats.thermal_coeffs
+        if coeffs and coeffs.get("n", 0) >= MIN_THERMAL_SAMPLES and "k2" in coeffs:
+            return float(coeffs["k2"])
+
+        all_rates: List[float] = []
+        for rates in self.stats.temp_warming_rates.values():
+            all_rates.extend(rates[-10:])
+        if all_rates and self.nominal_charge_rate > 0:
+            median_c_per_min = statistics.median(all_rates)
+            bootstrap = median_c_per_min / self.nominal_charge_rate * 60.0
+            return min(2.0, max(0.0, bootstrap))
+
+        return default
+
+    def get_cooling_rate_estimate(
+        self, starting_temp: float, default: Optional[float] = None
+    ) -> float:
+        """``k1`` for a starting temperature, always returning a usable value."""
+        if default is None:
+            default = self.default_cooling_rate_per_min
+
+        learned = self.get_cooling_rate(starting_temp)
+        if learned is not None:
+            return learned
+
+        coeffs = self.stats.thermal_coeffs
+        if coeffs and coeffs.get("n", 0) >= MIN_THERMAL_SAMPLES and "k1" in coeffs:
+            return float(coeffs["k1"])
+
+        return default
 
     def record_cooling(
         self,
@@ -448,24 +660,51 @@ class BatteryLearningEngine:
     def predict_temp_after_duration(
         self,
         start_temp: float,
-        duration_minutes: float
+        duration_minutes: float,
+        ambient_temp: Optional[float] = None,
+        battery_power_kw: Optional[float] = None,
     ) -> float:
         """
         Predict battery temperature after charging for a given duration.
 
+        When a warming rate has been learned for this temperature bucket it is
+        used directly: it already nets self-heating against relaxation at that
+        temperature. Otherwise the shared thermal model is used (relaxation
+        toward ambient + ``k2 * |P|``), which is far better behaved than the old
+        flat ``+0.1 °C/min``.
+
+        The result is capped at ``MAX_BATTERY_TEMP_C``. Without that cap,
+        ``charge_rate_utils.compute_charge_rates_per_slot`` projected 132 slots
+        of unbounded linear warming and reached ~230 °C by the end of a 33 h
+        horizon.
+
         Args:
             start_temp: Starting battery temperature (°C)
             duration_minutes: Charging duration in minutes
+            ambient_temp: Ambient to relax toward (estimated when omitted)
+            battery_power_kw: Charge power (nominal rate when omitted)
 
         Returns:
             Predicted temperature after charging
         """
         warming_rate = self.get_warming_rate(start_temp)
-        if warming_rate is None:
-            # Default warming rate if no data (conservative estimate)
-            warming_rate = 0.1  # °C/minute
+        if warming_rate is not None:
+            return min(MAX_BATTERY_TEMP_C, start_temp + (warming_rate * duration_minutes))
 
-        return start_temp + (warming_rate * duration_minutes)
+        if ambient_temp is None:
+            ambient_temp = self.get_estimated_ambient_min_temp(default=10.0)
+        if battery_power_kw is None:
+            battery_power_kw = self.nominal_charge_rate
+
+        predicted = step_temperature(
+            start_temp=start_temp,
+            ambient_temp=ambient_temp,
+            duration_minutes=duration_minutes,
+            battery_power_kw=battery_power_kw,
+            cooling_rate_per_min=self.get_cooling_rate_estimate(start_temp),
+            heating_c_per_kwh=self.get_heating_coefficient(),
+        )
+        return min(MAX_BATTERY_TEMP_C, predicted)
 
     def predict_temp_after_idle(
         self,
@@ -493,22 +732,26 @@ class BatteryLearningEngine:
         """
         # Use estimated ambient if not provided
         if ambient_temp is None:
-            ambient_temp = self.get_estimated_ambient_temp(default=10.0)
+            ambient_temp = self.get_estimated_ambient_min_temp(default=10.0)
 
         if start_temp <= ambient_temp:
             # Already at or below ambient, won't cool further
             return start_temp
 
         # Try to use learned cooling rate, fall back to default
-        learned_rate = self.get_cooling_rate(start_temp)
-        cooling_rate = learned_rate if learned_rate is not None else default_cooling_rate
+        cooling_rate = self.get_cooling_rate_estimate(
+            start_temp, default=default_cooling_rate
+        )
 
-        # Exponential decay: temp approaches ambient
-        # T(t) = ambient + (start - ambient) * e^(-rate * t)
-        import math
-        temp_diff = start_temp - ambient_temp
-        decay_factor = math.exp(-cooling_rate * duration_minutes)
-        return ambient_temp + (temp_diff * decay_factor)
+        # Zero battery power: the shared thermal model degenerates to the
+        # exponential decay this method has always used.
+        return step_temperature(
+            start_temp=start_temp,
+            ambient_temp=ambient_temp,
+            duration_minutes=duration_minutes,
+            battery_power_kw=0.0,
+            cooling_rate_per_min=cooling_rate,
+        )
 
     def get_time_to_reach_temp(
         self,
@@ -660,8 +903,8 @@ class BatteryLearningEngine:
                     "observations": count
                 }
 
-        # Estimated ambient temperature
-        estimated_ambient = self.get_estimated_ambient_temp(default=10.0)
+        # Estimated ambient daily minimum
+        estimated_ambient = self.get_estimated_ambient_min_temp(default=10.0)
 
         return {
             "learned_efficiency": round(self.learned_efficiency, 3),
@@ -675,12 +918,19 @@ class BatteryLearningEngine:
             "temp_warming_rates": warming_rates_summary,
             "temp_cooling_rates": cooling_rates_summary,
             "estimated_ambient_temp": round(estimated_ambient, 1),
+            "thermal_samples": len(self.stats.thermal_samples),
+            "thermal_k1_per_min": round(self.get_cooling_rate_estimate(estimated_ambient), 4),
+            "thermal_k2_c_per_kwh": round(self.get_heating_coefficient(), 3),
+            "thermal_calibrated": bool(
+                self.stats.thermal_coeffs
+                and self.stats.thermal_coeffs.get("n", 0) >= MIN_THERMAL_SAMPLES
+            ),
         }
 
     def save_to_json(self) -> str:
         """Serialize learning state for persistence."""
         data = {
-            "version": 5,  # v5 removes global confidence (use per-bucket confidence instead)
+            "version": 6,  # v6 adds thermal_samples / thermal_coeffs
             "learned_efficiency": self.learned_efficiency,
             "stats": self.stats.to_dict(),
         }

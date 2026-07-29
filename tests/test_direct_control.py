@@ -5,7 +5,10 @@ Covers:
   schedules verification, logs WARNING
 - confirmed failure (exception or success=False) -> returns False, does NOT
   record last-sent, schedules no verification
-- verify-after-set mismatch -> resends once (bypassing duplicate suppression)
+- verify-after-set mismatch -> resends once (bypassing duplicate suppression),
+  then re-checks exactly once; a persistent mismatch escalates to ERROR without
+  ever sending a third time (bounded ladder, no resend loop)
+- verify/timeout delays are configurable and counters are exposed
 - verify-after-set match -> no resend
 - verify-after-set unavailable sensor -> cannot verify, no resend
 - pending verification timer is superseded when a new mode is applied
@@ -109,8 +112,11 @@ def test_timeout_none_is_unconfirmed_but_records_and_schedules():
     result = dc.apply_mode(hold_entry())
 
     assert result is True
-    # hass_timeout was passed on the service call
-    assert app.service_calls[0][1].get("hass_timeout") == 30
+    # hass_timeout was passed on the service call, at the CONFIGURED value.
+    # It is deliberately not hard-coded any more: the call is synchronous on the
+    # AppDaemon callback thread, so the timeout is a blocking budget.
+    assert app.service_calls[0][1].get("hass_timeout") == dc._set_mode_timeout
+    assert dc._set_mode_timeout == BatteryOptimizerConfig().set_wit_mode_timeout_seconds
     # last-sent recorded so the schedule isn't spammed
     assert dc._last_mode_sent == "hold"
     assert dc._last_mode_time is not None
@@ -118,7 +124,8 @@ def test_timeout_none_is_unconfirmed_but_records_and_schedules():
     assert "WARNING" in app.levels()
     # verification scheduled
     assert len(app.run_in_calls) == 1
-    assert app.run_in_calls[0][1] == 90
+    assert app.run_in_calls[0][1] == dc._verify_delay
+    assert app.run_in_calls[0][2]["attempt"] == 1
 
 
 def test_failure_exception_returns_false_and_does_not_record():
@@ -163,7 +170,7 @@ def test_service_call_kwargs_only_hass_timeout_plus_schema_fields():
     assert "return_result" not in kwargs
     assert "return_response" not in kwargs
     # hass_timeout is the only non-service-data kwarg (consumed by the plugin).
-    assert kwargs.get("hass_timeout") == 30
+    assert kwargs.get("hass_timeout") == dc._set_mode_timeout
     # Everything else must be a field the set_wit_mode voluptuous schema allows.
     allowed = {
         "hass_timeout",  # AppDaemon HASS plugin formal parameter
@@ -264,8 +271,14 @@ def test_verify_match_does_not_resend():
     assert len(app.service_calls) == calls_before  # no extra service call
 
 
-def test_verify_mismatch_resends_once():
-    """Sensor reports a different status -> resend exactly once."""
+def test_verify_mismatch_resends_once_and_rechecks():
+    """Sensor reports a different status -> resend once, then re-check ONCE.
+
+    Changed semantics (was: resend and never look again). Without the re-check
+    the log could never distinguish "the HA modbus sensor merely lagged" from
+    "the inverter really dropped back to Passthrough" — the production log shows
+    30 mismatches with no evidence either way.
+    """
     dc, app = make_dc()
     app.states[DEFAULT_MODE_STATUS_ENTITY] = "Passthrough"  # expected Preserve SOC
 
@@ -277,8 +290,124 @@ def test_verify_mismatch_resends_once():
     # exactly one additional set_wit_mode call (the resend)
     assert len(app.service_calls) == calls_before + 1
     assert "WARNING" in app.levels()
-    # the resend must NOT schedule another verification (no infinite loop)
-    assert len(app.run_in_calls) == 1
+    # exactly one follow-up verification, at the (shorter) re-check delay
+    assert len(app.run_in_calls) == 2
+    assert app.run_in_calls[1][2]["attempt"] == 2
+    assert app.run_in_calls[1][1] == dc._verify_recheck_delay
+    assert dc.get_diagnostics()["mismatch_count"] == 1
+    assert dc.get_diagnostics()["resend_count"] == 1
+
+
+def test_second_verification_after_resend_matches_logs_recovery():
+    """The sensor catches up after the resend -> recovery is recorded."""
+    dc, app = make_dc()
+    app.states[DEFAULT_MODE_STATUS_ENTITY] = "Passthrough"
+
+    dc.apply_mode(hold_entry())
+    app.fire_last_timer()                       # attempt 1: mismatch -> resend
+    calls_after_resend = len(app.service_calls)
+
+    # Sensor now reflects the mode (it was simply lagging the coordinator poll).
+    app.states[DEFAULT_MODE_STATUS_ENTITY] = "Preserve SOC"
+    app.fire_last_timer()                       # attempt 2: match
+
+    assert len(app.service_calls) == calls_after_resend   # no third send
+    assert len(app.run_in_calls) == 2                     # no third timer
+    diag = dc.get_diagnostics()
+    assert diag["resend_recovered_count"] == 1
+    assert diag["persistent_mismatch_count"] == 0
+    assert any("recovered after resend" in m for m, _ in app.logs)
+
+
+def test_persistent_mismatch_escalates_to_error_and_does_not_loop():
+    """Sensor never agrees -> ERROR after the re-check, and the ladder STOPS."""
+    dc, app = make_dc()
+    app.states[DEFAULT_MODE_STATUS_ENTITY] = "Passthrough"
+
+    dc.apply_mode(hold_entry())
+    sends_after_apply = len(app.service_calls)
+    app.fire_last_timer()   # attempt 1: mismatch -> resend + schedule attempt 2
+    app.fire_last_timer()   # attempt 2: still mismatch -> ERROR, stop
+
+    # Exactly two sends in total: the original and one resend.
+    assert len(app.service_calls) == sends_after_apply + 1
+    # Exactly two timers: the first check and the single re-check.
+    assert len(app.run_in_calls) == 2
+    diag = dc.get_diagnostics()
+    assert diag["persistent_mismatch_count"] == 1
+    assert diag["mismatch_count"] == 2
+    assert diag["resend_recovered_count"] == 0
+    assert any(
+        lvl == "ERROR" and "persistent mode mismatch" in m for m, lvl in app.logs
+    )
+    assert diag["last_mismatch"]["actual"] == "Passthrough"
+    assert diag["last_mismatch"]["attempt"] == 2
+
+
+def test_failed_resend_is_counted_and_stops_the_ladder():
+    """A resend that fails outright is counted and does not re-check."""
+    dc, app = make_dc()
+    app.states[DEFAULT_MODE_STATUS_ENTITY] = "Passthrough"
+
+    dc.apply_mode(hold_entry())
+    app.call_service_raise = RuntimeError("boom")
+    app.fire_last_timer()
+
+    assert dc.get_diagnostics()["resend_failed_count"] == 1
+    assert len(app.run_in_calls) == 1  # no re-check after a failed resend
+    assert any(lvl == "ERROR" and "resend of hold failed" in m for m, lvl in app.logs)
+
+
+def test_verify_delay_and_timeout_are_configurable():
+    """apps.yaml can compensate a lagging modbus sensor without a code change."""
+    dc, app = make_dc(
+        verify_delay_seconds=30,
+        verify_recheck_seconds=20,
+        set_wit_mode_timeout_seconds=10,
+    )
+    app.states[DEFAULT_MODE_STATUS_ENTITY] = "Passthrough"
+
+    dc.apply_mode(hold_entry())
+
+    assert app.service_calls[0][1]["hass_timeout"] == 10
+    assert app.run_in_calls[0][1] == 30
+
+    app.fire_last_timer()
+    assert app.run_in_calls[1][1] == 20
+
+
+def test_get_diagnostics_shape():
+    """The diagnostics sensor payload is stable and starts at zero."""
+    dc, _app = make_dc()
+    diag = dc.get_diagnostics()
+
+    expected_keys = {
+        "mismatch_count", "resend_count", "resend_recovered_count",
+        "resend_failed_count", "persistent_mismatch_count",
+        "unverifiable_count", "verified_count", "last_mismatch",
+        "verify_delay_seconds", "verify_recheck_seconds",
+        "set_wit_mode_timeout_seconds",
+    }
+    assert set(diag) == expected_keys
+    assert diag["last_mismatch"] is None
+    assert all(
+        diag[k] == 0 for k in expected_keys
+        if k.endswith("_count")
+    )
+
+
+def test_unverifiable_reads_are_counted():
+    """A sensor that can't be read is counted separately from a mismatch."""
+    dc, app = make_dc()
+    app.states[DEFAULT_MODE_STATUS_ENTITY] = "unavailable"
+
+    dc.apply_mode(hold_entry())
+    app.fire_last_timer()
+
+    diag = dc.get_diagnostics()
+    assert diag["unverifiable_count"] == 1
+    assert diag["mismatch_count"] == 0
+    assert diag["resend_count"] == 0
 
 
 def test_verify_mismatch_bypasses_duplicate_suppression():

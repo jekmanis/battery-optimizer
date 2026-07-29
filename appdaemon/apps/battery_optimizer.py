@@ -9,7 +9,9 @@ Author: AppDaemon Battery Optimizer
 
 import appdaemon.plugins.hass.hassapi as hass
 import datetime
+import functools
 import math
+import time
 from typing import Dict, List, Optional, Tuple
 
 # Import from the battery_optimizer_lib package
@@ -44,6 +46,9 @@ from battery_optimizer_lib import (
     BatteryCostConfig,
     # Charge rate utilities
     compute_charge_rates_per_slot,
+    # Shared slot SOC transition model
+    SocProjectionParams,
+    project_slot_soc,
     # SOC deviation detection
     SocDeviationDetector,
     SocDeviationConfig,
@@ -55,12 +60,44 @@ from battery_optimizer_lib import (
     # PV forecast service
     PvForecastService,
     PvForecastServiceConfig,
+    # PV forecast bias
+    PvBiasTracker,
+    PvBiasConfig,
+    # Shared thermal model + ambient temperature
+    TemperatureProjector,
+    AmbientTemperatureService,
+    AmbientServiceConfig,
 )
 from battery_optimizer_lib.pv_profile import PvProfile
 from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
 
 
+def _timed_callback(func):
+    """Measure a callback's wall time and warn when it hogs the thread.
 
+    AppDaemon runs an app's callbacks on a shared worker thread and prints
+    "Excessive time spent in callback ... (limit=10.0s)" when one overruns —
+    without naming what this app was doing. Since `set_wit_mode` is a SYNCHRONOUS
+    service call, one slow inverter write stalls every other callback of this
+    app. Measuring here names the callback and lets us advise `total_threads`.
+
+    functools.wraps + *args/**kwargs is mandatory: AppDaemon inspects and calls
+    these with positional args (`execute_scheduled_mode(kwargs, force=True)`),
+    and the signature must survive untouched.
+    """
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        started = time.monotonic()
+        try:
+            return func(self, *args, **kwargs)
+        finally:
+            try:
+                self._record_callback_duration(
+                    func.__name__, time.monotonic() - started
+                )
+            except Exception:
+                pass
+    return wrapper
 
 
 
@@ -93,8 +130,23 @@ class BatteryOptimizer(hass.Hass):
         self.last_optimization: Optional[datetime.datetime] = None
         self.expected_soc_schedule: Dict[datetime.datetime, float] = {}
         self.expected_temp_schedule: Dict[datetime.datetime, float] = {}
+        # Wall-clock instant the expected SOC trajectory starts from. The first
+        # entry of expected_soc_schedule describes THIS instant, not the slot
+        # boundary, whenever the trajectory was built mid-slot.
+        self._expected_soc_anchor: Optional[datetime.datetime] = None
         self._last_nonzero_load_w: Optional[float] = None
         self._previous_schedule_from_sensor: Optional[Dict[datetime.datetime, BatteryMode]] = None
+        # Sliding PV forecast bias multiplier applied to the remaining horizon.
+        self._pv_bias_factor: float = 1.0
+
+        # Inverter-control health counters (exposed on a diagnostics sensor).
+        self._apply_failure_count: int = 0
+        self._consecutive_apply_failures: int = 0
+        self._apply_success_count: int = 0
+        self._callback_overrun_count: int = 0
+        self._slowest_callback: Optional[Tuple[str, float]] = None
+        self._threads_hint_logged: bool = False
+        self._last_terminal_warning_time: Optional[datetime.datetime] = None
 
         # Decision context tracking (for transparency logging and sensor exposure)
         self._last_recalc_trigger: str = "startup"  # "startup", "daily_13:15", "soc_deviation", "manual", "battery_depleted"
@@ -117,6 +169,29 @@ class BatteryOptimizer(hass.Hass):
             log_func=self.log,
         )
         self._init_learning_engine()
+
+        # Ambient temperature: weather forecast -> outdoor sensor -> diurnal
+        # profile around the learned battery minimum. Never a single constant
+        # for the whole horizon.
+        self._ambient_service = AmbientTemperatureService(
+            config=AmbientServiceConfig.from_main_config(self.config),
+            get_state_func=self.get_state,
+            call_service_func=self.call_service,
+            get_datetime_func=self.datetime,
+            get_timezone_func=self._get_local_timezone,
+            log_func=self.log,
+            min_temp_provider=self._estimated_ambient_min_temp,
+        )
+
+        # One thermal model for the DP trajectory, the expected-SOC trajectory,
+        # the schedule log and the charge-rate pre-computation.
+        self._temp_projector = TemperatureProjector(
+            learning_engine=self.learning_engine,
+            ambient_provider=self._ambient_service,
+            log_func=self.log,
+            default_cooling_rate=self.config.thermal_default_cooling_rate_per_min,
+            default_heating_c_per_kwh=self.config.thermal_default_heating_c_per_kwh,
+        )
 
         # Load profile for probabilistic scheduling
         self.load_profile = LoadProfile(
@@ -151,6 +226,13 @@ class BatteryOptimizer(hass.Hass):
             get_state_func=self.get_state,
             get_datetime_func=self.datetime,
             get_timezone_func=self._get_local_timezone,
+            log_func=self.log,
+        )
+
+        # Sliding PV forecast bias tracker (slot-energy sampling + bias factor)
+        self._pv_bias = PvBiasTracker(
+            config=PvBiasConfig.from_main_config(self.config),
+            align_to_slot_func=self._align_to_slot,
             log_func=self.log,
         )
 
@@ -192,9 +274,11 @@ class BatteryOptimizer(hass.Hass):
                 efficiency=self.config.efficiency,
                 battery_wear_cost=self.config.battery_wear_cost,
                 decision_log_level=self.config.decision_log_level,
+                inverter_efficiency=self.config.inverter_efficiency,
             ),
             log_func=self.log,
             learning_engine=self.learning_engine,
+            temp_projector=self._temp_projector,
         )
 
         # Battery cost tracker (must be after learning engine and price service)
@@ -214,6 +298,7 @@ class BatteryOptimizer(hass.Hass):
             save_learning_data_func=self._save_learning_data,
             update_learning_sensor_func=self._update_learning_sensor,
             log_func=self.log,
+            get_ambient_temp_func=lambda: self._ambient_service.predict_c(self.datetime()),
         )
         self._init_battery_cost()
 
@@ -237,6 +322,24 @@ class BatteryOptimizer(hass.Hass):
 
         # Schedule execution every slot (hourly if slot_minutes=60)
         self.run_every(self.execute_scheduled_mode, self._next_slot_time(), self.config.slot_minutes * 60)
+
+        # Sample PV power frequently so a slot's shortfall is judged on its
+        # ENERGY (mean of many samples), not one boundary reading.
+        self.run_every(
+            self._sample_pv,
+            self.datetime() + datetime.timedelta(seconds=10),
+            self.config.pv_sample_seconds,
+        )
+
+        # Sample battery temperature on a TIMER. Before this, observations only
+        # arrived from SOC-change and mode-transition events, so the rolling
+        # window could span a few hours instead of the assumed two days and
+        # could never contain a diurnal minimum.
+        self.run_every(
+            self._record_ambient_observation,
+            self.datetime() + datetime.timedelta(seconds=20),
+            self.config.slot_minutes * 60,
+        )
 
         # Record load observations (can be more frequent than schedule slots)
         self.run_every(
@@ -274,13 +377,73 @@ class BatteryOptimizer(hass.Hass):
 
         # Create sensor for exposing schedule
         self._update_schedule_sensor()
+        self._update_control_health_sensor()
 
         self.log("Battery Optimizer initialized successfully")
+
+    def _should_warn_degenerate_terminal(self) -> bool:
+        """Rate-limit the legacy terminal-value warning to once every 6 hours.
+
+        The schedule is rebuilt every 15 minutes; without this the degenerate
+        configuration would produce ~96 identical WARNINGs a day and be ignored
+        exactly like the 70 identical INFO lines it replaces.
+        """
+        if self.config.terminal_energy_value_eur_kwh != 0.0:
+            return False
+        now = self.datetime()
+        last = getattr(self, "_last_terminal_warning_time", None)
+        if last is not None:
+            last, now_cmp = normalize_tz_pair(last, now)
+            if (now_cmp - last).total_seconds() < 6 * 3600:
+                return False
+        self._last_terminal_warning_time = now
+        return True
+
+    def _record_callback_duration(self, name: str, seconds: float) -> None:
+        """Warn about a callback that blocked the AppDaemon worker thread."""
+        limit = getattr(self.config, "callback_warn_seconds", 10.0)
+        if self._slowest_callback is None or seconds > self._slowest_callback[1]:
+            self._slowest_callback = (name, seconds)
+        if seconds <= limit:
+            return
+
+        self._callback_overrun_count += 1
+        self.log(
+            f"Callback {name} took {seconds:.1f}s (> {limit:.0f}s) — AppDaemon "
+            f"serializes this app's callbacks, so everything else waited",
+            level="WARNING",
+        )
+        if self._callback_overrun_count >= 3 and not self._threads_hint_logged:
+            self._threads_hint_logged = True
+            self.log(
+                "Repeated slow callbacks: give this app more AppDaemon threads "
+                "(appdaemon.yaml -> appdaemon: total_threads: 4, or an app-level "
+                "pin_thread). set_wit_mode is a blocking service call; with a "
+                "single thread it stalls schedule execution, SOC listeners and "
+                "PV sampling alike.",
+                level="WARNING",
+            )
+
+    def _estimated_ambient_min_temp(self) -> Optional[float]:
+        """Learning engine's rolling battery minimum, or None if it has none."""
+        engine = getattr(self, "learning_engine", None)
+        if engine is None or not engine.has_ambient_observations():
+            return None
+        return engine.get_estimated_ambient_min_temp()
+
+    def _record_ambient_observation(self, kwargs=None):
+        """Timer callback: keep the ambient observation window time-uniform."""
+        temp = self._get_battery_temp()
+        if temp is not None:
+            self.learning_engine.record_temperature_observation(temp)
+        self._ambient_service.refresh()
 
     def _load_config(self):
         """Load configuration from apps.yaml into typed config object."""
         self.config = BatteryOptimizerConfig.from_args(self.args, log_func=self.log)
-        self.config.log_summary(self.log)
+        self.config.log_summary(
+            self.log, warn_func=lambda msg: self.log(msg, level="WARNING")
+        )
 
     # =========================================================================
     # Price Fetching (delegates to NordPoolPriceService)
@@ -375,8 +538,11 @@ class BatteryOptimizer(hass.Hass):
         if not prices:
             return {}
 
-        # Refresh PV forecast (no-ops if cache is fresh)
+        # Refresh PV and ambient forecasts (no-ops if the caches are fresh)
         self._pv_forecast_service.refresh()
+        ambient_service = getattr(self, "_ambient_service", None)
+        if ambient_service is not None:
+            ambient_service.refresh()
 
         now = self.datetime()
         current_slot = self._align_to_slot(now)
@@ -402,6 +568,11 @@ class BatteryOptimizer(hass.Hass):
         minutes_into_slot = max(0.0, (now - current_slot).total_seconds() / 60.0)
         current_temp = self._get_battery_temp()
 
+        # Rate-limited legacy-terminal-value warning. Resolved defensively:
+        # several test doubles borrow this method without the full app state.
+        _warn_gate = getattr(self, "_should_warn_degenerate_terminal", None)
+        warn_degenerate_terminal = bool(_warn_gate()) if callable(_warn_gate) else False
+
         # Create optimizer with fresh config (min_soc/max_soc are dynamic properties)
         optimizer = DPOptimizer(
             config=DPOptimizerConfig.from_main_config(
@@ -414,6 +585,8 @@ class BatteryOptimizer(hass.Hass):
             log_fn=self.log,
             decision_log_level=self.config.decision_log_level,
             pv_predictor=self._predict_pv_kw,
+            temp_projector=getattr(self, "_temp_projector", None),
+            warn_degenerate_terminal=warn_degenerate_terminal,
         )
 
         # Run optimization
@@ -647,7 +820,13 @@ class BatteryOptimizer(hass.Hass):
         current_soc: float,
         current_temp: Optional[float],
     ) -> List[float]:
-        """Pre-compute temperature-aware charge rates for each slot."""
+        """Pre-compute temperature-aware charge rates for each slot.
+
+        This is the only path where the temperature forecast changes DP
+        decisions, so it uses the shared projector (time-varying ambient,
+        bounded) rather than the unbounded linear warming projection.
+        """
+        projector = getattr(self, "_temp_projector", None)
         return compute_charge_rates_per_slot(
             slots_sorted_by_time=slots_sorted_by_time,
             slot_fractions=slot_fractions,
@@ -656,6 +835,7 @@ class BatteryOptimizer(hass.Hass):
             current_temp=current_temp,
             get_charge_rate_for_soc=self.learning_engine.get_charge_rate_for_soc,
             predict_temp_after_duration=self.learning_engine.predict_temp_after_duration,
+            project_temp=projector.project if projector is not None else None,
             battery_capacity=self.config.battery_capacity,
             efficiency=self.config.efficiency,
             max_soc=self.max_soc,
@@ -665,29 +845,74 @@ class BatteryOptimizer(hass.Hass):
         self,
         schedule: Dict[datetime.datetime, ScheduleEntry],
         starting_soc: float,
-        starting_temp: Optional[float] = None
+        starting_temp: Optional[float] = None,
+        current_slot: Optional[datetime.datetime] = None,
+        minutes_into_slot: float = 0.0,
     ) -> Tuple[Dict[datetime.datetime, float], Dict[datetime.datetime, float]]:
         """
         Calculate expected SOC and temperature at each slot based on schedule.
         Used for adaptive optimization to detect deviations.
 
+        The slot transition itself is delegated to ``project_slot_soc`` so that
+        this trajectory, the deviation detector and the DP share one physics
+        model (see battery_optimizer_lib/soc_projection.py).
+
         Args:
             schedule: Schedule entries keyed by slot datetime
             starting_soc: Initial SOC percentage
             starting_temp: Initial battery temperature in Celsius (optional)
+            current_slot: Slot the projection starts in. When given together
+                with ``minutes_into_slot``, only the remaining part of that slot
+                is projected — exactly like ``DPOptimizer`` does with
+                ``slot_fractions`` (see ``_compute_slot_fractions``). Without it
+                every slot is treated as a full slot (legacy behaviour).
+            minutes_into_slot: Minutes already elapsed in ``current_slot``.
 
         Returns:
             Tuple of (soc_trajectory, temp_trajectory) dicts keyed by slot datetime
 
         Notes:
-            - Discharge drains at predicted load rate
+            - The recorded value for a slot is the SOC/temperature at the START
+              of the projected interval. For a partial first slot that is the
+              projection instant, not the slot boundary.
+            - Discharge drains at predicted net load (PV serves load first) and
+              stores PV surplus; export slots drain at the export rate
             - Charge adds energy using temperature-aware rates when temp available
-            - Temperature evolves during CHARGE slots based on learned warming rates
+            - Temperature evolves in EVERY slot through the shared thermal model
+              (``thermal_model.TemperatureProjector``): relaxation toward a
+              time-varying ambient plus ``k2*|P_bat|``. Discharging heats the
+              pack too — it is not thermally idle.
         """
         expected_soc = {}
         expected_temp = {}
         current_soc = starting_soc
         current_temp = starting_temp
+
+        # Built inline (not via a helper) so that any object providing the same
+        # config/min_soc/max_soc surface can reuse this method directly.
+        params = SocProjectionParams(
+            battery_capacity=self.config.battery_capacity,
+            efficiency=self.config.efficiency,
+            charge_rate=self.config.charge_rate,
+            discharge_rate=self.config.discharge_rate,
+            export_discharge_rate=self.config.export_discharge_rate,
+            inverter_efficiency=self.config.inverter_efficiency,
+            min_soc=self.min_soc,
+            max_soc=self.max_soc,
+            slot_minutes=self.config.slot_minutes,
+        )
+        # Same partial-slot formula as _compute_slot_fractions / DPOptimizer.
+        first_fraction = min(
+            1.0,
+            max(0.0, (self.config.slot_minutes - minutes_into_slot) / max(1, self.config.slot_minutes)),
+        )
+        local_tz = None
+        if current_slot is not None:
+            get_tz = getattr(self, "_get_local_timezone", None)
+            if get_tz is not None:
+                local_tz = get_tz()
+        partial_applied = False
+        temp_projector = getattr(self, "_temp_projector", None)
 
         for hour in sorted(schedule.keys()):
             entry = schedule[hour]
@@ -695,72 +920,27 @@ class BatteryOptimizer(hass.Hass):
             if current_temp is not None:
                 expected_temp[hour] = current_temp
 
-            if entry.mode == BatteryMode.CHARGE:
-                # Use temperature-aware charging if temp available and learning engine exists
-                if current_temp is not None and self.learning_engine:
-                    # Use predict_charge_energy_with_warming for accurate cold->warm transitions
-                    energy_added, end_temp = self.learning_engine.predict_charge_energy_with_warming(
-                        current_soc,
-                        current_temp,
-                        self.config.slot_minutes,
-                        temp_threshold=16.0
-                    )
-                    # Apply efficiency (predict_charge_energy_with_warming returns grid energy)
-                    energy_to_battery = energy_added * self.config.efficiency
-                    soc_increase = (energy_to_battery / self.config.battery_capacity) * 100
-                    current_soc = min(self.max_soc, current_soc + soc_increase)
-                    current_temp = end_temp
-                else:
-                    # Fallback: Use SOC-only learned charge rate
-                    effective_charge_rate = self.config.charge_rate
-                    learned_rate = self.learning_engine.get_charge_rate_for_soc(current_soc)
-                    if learned_rate is not None and learned_rate > 0:
-                        effective_charge_rate = learned_rate
+            fraction = 1.0
+            if (current_slot is not None and not partial_applied
+                    and datetimes_match_slot(hour, current_slot, local_tz)):
+                fraction = first_fraction
+                partial_applied = True
 
-                    # Charging: grid energy * efficiency goes into battery
-                    energy_added = effective_charge_rate * self.config.efficiency * self.config.slot_hours
-                    soc_increase = (energy_added / self.config.battery_capacity) * 100
-                    current_soc = min(self.max_soc, current_soc + soc_increase)
-
-            elif entry.mode == BatteryMode.DISCHARGE:
-                # Discharging: export drains at full rate, self-consumption at net load after PV
-                if entry.export_rate is not None and entry.export_rate > 0:
-                    energy_removed = self.config.effective_export_discharge_rate * self.config.slot_hours
-                else:
-                    load_kw = self._predict_load_kw(hour)
-                    pv_kw = self._predict_pv_kw(hour)
-                    net_load_kw = max(0.0, load_kw - pv_kw)
-                    energy_removed = min(net_load_kw, self.config.discharge_rate) * self.config.slot_hours
-                    # PV surplus charges battery (confirmed: discharge_to_load charges from PV)
-                    pv_surplus = max(0.0, pv_kw - load_kw)
-                    if pv_surplus > 0:
-                        pv_charge_kw = min(pv_surplus, self.config.charge_rate)
-                        energy_added = pv_charge_kw * self.config.efficiency * self.config.slot_hours
-                        soc_increase = (energy_added / self.config.battery_capacity) * 100
-                        current_soc = min(self.max_soc, current_soc + soc_increase)
-                soc_decrease = (energy_removed / self.config.battery_capacity) * 100
-                current_soc = max(self.min_soc, current_soc - soc_decrease)
-                # Temperature cools toward ambient during discharge (no active warming)
-                if current_temp is not None and self.learning_engine:
-                    current_temp = self.learning_engine.predict_temp_after_idle(
-                        current_temp, self.config.slot_minutes
-                    )
-
-            else:  # HOLD
-                # Hold: no grid charge, but PV surplus charges battery for free
-                pv_kw = self._predict_pv_kw(hour)
-                load_kw = self._predict_load_kw(hour)
-                pv_surplus = max(0.0, pv_kw - load_kw)
-                if pv_surplus > 0:
-                    pv_charge_kw = min(pv_surplus, self.config.charge_rate)
-                    energy_added = pv_charge_kw * self.config.efficiency * self.config.slot_hours
-                    soc_increase = (energy_added / self.config.battery_capacity) * 100
-                    current_soc = min(self.max_soc, current_soc + soc_increase)
-                # Temperature cools toward ambient during idle (PV charge doesn't warm battery significantly)
-                if current_temp is not None and self.learning_engine:
-                    current_temp = self.learning_engine.predict_temp_after_idle(
-                        current_temp, self.config.slot_minutes
-                    )
+            transition = project_slot_soc(
+                soc_start=current_soc,
+                mode=entry.mode,
+                params=params,
+                load_kw=self._predict_load_kw(hour),
+                pv_kw=self._predict_pv_kw(hour),
+                fraction=fraction,
+                export_rate=entry.export_rate,
+                temp_start=current_temp,
+                learning_engine=self.learning_engine,
+                temp_projector=temp_projector,
+                slot_time=hour,
+            )
+            current_soc = transition.soc_end
+            current_temp = transition.temp_end
 
         return expected_soc, expected_temp
 
@@ -768,6 +948,7 @@ class BatteryOptimizer(hass.Hass):
     # Schedule Execution
     # =========================================================================
 
+    @_timed_callback
     def full_optimize(self, kwargs=None):
         """
         Perform full optimization - called daily at 13:15 and at startup.
@@ -812,6 +993,9 @@ class BatteryOptimizer(hass.Hass):
             self.log("No future prices available, skipping optimization", level="WARNING")
             return
 
+        # Freeze the PV bias factor for the whole generation pass
+        self._refresh_pv_bias_factor()
+
         # Calculate minimum charge slots needed to survive the planning horizon
         charge_hours_needed = self.calculate_min_charge_slots_for_horizon(current_soc, future_prices)
         self.log(f"Current SOC: {current_soc}%, min charge slots needed: {charge_hours_needed}")
@@ -822,11 +1006,23 @@ class BatteryOptimizer(hass.Hass):
         # On restart, preserve CHARGE/DISCHARGE intent for current slot if it was active before
         self._preserve_mode_on_restart(current_slot)
 
-        # Calculate expected SOC and temperature trajectory
+        # Calculate expected SOC and temperature trajectory. The current slot is
+        # already partially elapsed, so only its remaining fraction is projected
+        # (matching the DP's slot_fractions) — otherwise the next slot boundary
+        # would compare actual SOC against a full extra slot of charging.
         current_temp = self._get_battery_temp()
+        # self.datetime() is naive local; _align_to_slot() returns tz-aware via
+        # ensure_local_tz(). Subtracting them directly raises TypeError.
+        now_cmp, slot_cmp = normalize_tz_pair(now, current_slot)
+        minutes_into_slot = max(0.0, (now_cmp - slot_cmp).total_seconds() / 60.0)
         self.expected_soc_schedule, self.expected_temp_schedule = self.calculate_expected_soc_schedule(
-            self.schedule, current_soc, starting_temp=current_temp
+            self.schedule,
+            current_soc,
+            starting_temp=current_temp,
+            current_slot=current_slot,
+            minutes_into_slot=minutes_into_slot,
         )
+        self._expected_soc_anchor = now
 
         # Log the generated schedule (with expected SOC and temperature)
         self._schedule_formatter.log_schedule(
@@ -838,6 +1034,7 @@ class BatteryOptimizer(hass.Hass):
             projected_costs=self._last_projected_costs,
             local_tz=self._get_local_timezone(),
             predict_load_kw=self._predict_load_kw,
+            predict_pv_kw=self._predict_pv_kw,
             min_soc=self.min_soc,
             max_soc=self.max_soc,
         )
@@ -864,6 +1061,7 @@ class BatteryOptimizer(hass.Hass):
 
         self.log("Full optimization complete")
 
+    @_timed_callback
     def adaptive_optimize(self, kwargs=None):
         """
         Adaptive re-evaluation on a configurable interval.
@@ -893,30 +1091,123 @@ class BatteryOptimizer(hass.Hass):
             self._direct_control.apply_mode(entry)
             return
 
-        # Reactive PV check: if actual PV is significantly below forecast,
-        # recalculate — the DP will adjust using actual SOC (which may be lower
-        # if battery was covering load during cloud cover).
-        forecast_pv_kw = self._predict_pv_kw(self._align_to_slot(self.datetime()))
-        forecast_pv_w = forecast_pv_kw * 1000
-        if forecast_pv_w > self.config.pv_reactive_min_forecast_w:
-            actual_pv_w = pv_power  # already read above
-            if actual_pv_w < forecast_pv_w * self.config.pv_reactive_threshold:
-                self.log(
-                    f"PV below forecast: actual={actual_pv_w:.0f}W vs "
-                    f"forecast={forecast_pv_w:.0f}W "
-                    f"({actual_pv_w/forecast_pv_w*100:.0f}%), recalculating"
-                )
-                # Bypass the normal forecast cache and cap the current slot at
-                # observed production. The forced provider read is separately
-                # rate-limited, so persistent clouds cannot hammer the API or
-                # immediately reintroduce the same optimistic cached value.
-                self._pv_forecast_service.refresh_for_shortfall(
-                    self._align_to_slot(self.datetime()),
-                    actual_pv_w / 1000.0,
-                )
-                self._recalculate_remaining_schedule(current_soc)
-                return
+        # Reactive PV check on the just-COMPLETED slot.  The comparison uses the
+        # slot's mean measured power (slot energy / slot hours) built from many
+        # samples, never a single instantaneous reading taken at the boundary,
+        # and requires `pv_reactive_consecutive_slots` consecutive shortfalls
+        # before paying for a full recalculation.
+        self._check_pv_shortfall(current_soc)
 
+    def _check_pv_shortfall(self, current_soc: float) -> bool:
+        """Evaluate the completed slot for a measured PV shortfall.
+
+        Returns True if a recalculation was triggered.
+        """
+        now = self.datetime()
+        now_slot = self._align_to_slot(now)
+
+        # Snapshot the RAW forecast before refresh_for_shortfall can cap it.
+        self._pv_bias.ensure_slot_forecast(now_slot, self._predict_pv_kw_raw(now_slot))
+
+        # Idempotent — the sampling timer may have closed these already.
+        if self._pv_bias.close_slots_before(now_slot):
+            self._refresh_pv_bias_factor()
+
+        prev_slot = now_slot - datetime.timedelta(minutes=self.config.slot_minutes)
+        completed = self._pv_bias.get_closed(prev_slot)
+        if completed is None or completed.samples < self.config.pv_reactive_min_samples:
+            return False
+        if completed.forecast_kw * 1000.0 <= self.config.pv_reactive_min_forecast_w:
+            return False
+        if completed.ratio >= self.config.pv_reactive_threshold:
+            return False
+
+        streak = self._pv_bias.shortfall_streak
+        detail = (
+            f"PV below forecast at {prev_slot.strftime('%H:%M')}: "
+            f"actual={completed.actual_kw * 1000:.0f}W vs "
+            f"forecast={completed.forecast_kw * 1000:.0f}W "
+            f"({completed.ratio * 100:.0f}%, n={completed.samples})"
+        )
+        if streak < self.config.pv_reactive_consecutive_slots:
+            self.log(
+                f"{detail}, streak {streak}/"
+                f"{self.config.pv_reactive_consecutive_slots} — no recalc "
+                f"(bias={self._pv_bias_factor:.2f})"
+            )
+            return False
+
+        self.log(
+            f"{detail}, streak {streak} — recalculating "
+            f"(bias={self._pv_bias_factor:.2f})"
+        )
+        # Bypass the normal forecast cache and cap the current slot at observed
+        # production. The forced provider read is separately rate-limited, so
+        # persistent clouds cannot hammer the API or immediately reintroduce the
+        # same optimistic cached value.
+        self._pv_forecast_service.refresh_for_shortfall(
+            now_slot, completed.actual_kw
+        )
+        # Restart the streak: without this the counter only ever grows while the
+        # clouds last, so after the first trigger EVERY following slot would
+        # recalculate. The guard is "N consecutive shortfalls since the last
+        # recalculation", not "since the last sunny slot".
+        self._pv_bias.reset_shortfall_streak()
+        self._last_recalc_trigger = "pv_shortfall"
+        self._last_recalc_time = now
+        self._recalculate_remaining_schedule(current_soc)
+        return True
+
+    def _get_pv_power_optional(self) -> Optional[float]:
+        """Current PV power (W), or None when the sensor is unavailable.
+
+        Unlike `_get_pv_power()` this does NOT collapse an unavailable sensor
+        into 0 W — a missing reading must not be recorded as "no production".
+        """
+        return self._sensors.get_float(self.config.pv_power_sensor)
+
+    def _sample_pv(self, kwargs=None):
+        """Accumulate PV power samples and close completed slots."""
+        try:
+            now = self.datetime()
+            now_slot = self._align_to_slot(now)
+
+            closed = self._pv_bias.close_slots_before(now_slot)
+            for entry in closed:
+                if (self.config.decision_log_level >= 1
+                        and entry.forecast_kw * 1000.0
+                        >= self.config.pv_reactive_min_forecast_w):
+                    self.log(
+                        f"PV slot {entry.slot.strftime('%m-%d %H:%M')}: "
+                        f"actual={entry.actual_kw * 1000:.0f}W vs "
+                        f"forecast={entry.forecast_kw * 1000:.0f}W "
+                        f"(ratio {entry.ratio:.2f}, n={entry.samples})"
+                    )
+            if closed:
+                self._refresh_pv_bias_factor()
+
+            # Snapshot the RAW forecast for the open slot (first write wins).
+            self._pv_bias.ensure_slot_forecast(
+                now_slot, self._predict_pv_kw_raw(now_slot)
+            )
+
+            pv_w = self._get_pv_power_optional()
+            if pv_w is not None and pv_w >= 0:
+                self._pv_bias.add_sample(now, pv_w / 1000.0)
+        except Exception as e:
+            self.log(f"PV sampling failed: {e}", level="WARNING")
+
+    def _refresh_pv_bias_factor(self) -> float:
+        """Recompute the sliding PV bias factor and log material changes."""
+        now = self.datetime()
+        new_factor = self._pv_bias.get_factor(now)
+        if abs(new_factor - self._pv_bias_factor) >= 0.02:
+            self.log(
+                f"PV bias factor {self._pv_bias_factor:.2f} -> {new_factor:.2f} "
+                f"({self._pv_bias.describe(now)})"
+            )
+        self._pv_bias_factor = new_factor
+        return new_factor
 
     def _recalculate_remaining_schedule(self, current_soc: float, extra_charge_slots: int = 0):
         """
@@ -941,6 +1232,9 @@ class BatteryOptimizer(hass.Hass):
 
         self.log(f"Recalculating with {len(future_prices)} future price points "
                  f"({future_prices[0].time.strftime('%m-%d %H:%M')} to {future_prices[-1].time.strftime('%m-%d %H:%M')})")
+
+        # Freeze the PV bias factor for the whole generation pass
+        self._refresh_pv_bias_factor()
 
         # Recalculate minimum charge slots needed to survive the remaining horizon
         charge_hours_needed = self.calculate_min_charge_slots_for_horizon(current_soc, future_prices)
@@ -967,11 +1261,17 @@ class BatteryOptimizer(hass.Hass):
         # Recalculate expected SOC
         current_temp = self._get_battery_temp()
         future_schedule = {k: v for k, v in self.schedule.items() if dt_ge(k, now_slot, local_tz)}
+        # See full_optimize(): naive self.datetime() vs tz-aware slot boundary.
+        now_cmp, slot_cmp = normalize_tz_pair(now, now_slot)
+        minutes_into_slot = max(0.0, (now_cmp - slot_cmp).total_seconds() / 60.0)
         self.expected_soc_schedule, self.expected_temp_schedule = self.calculate_expected_soc_schedule(
             future_schedule,
             current_soc,
-            starting_temp=current_temp
+            starting_temp=current_temp,
+            current_slot=now_slot,
+            minutes_into_slot=minutes_into_slot,
         )
+        self._expected_soc_anchor = now
 
         # Log recalculated schedule (current/future only)
         if self.config.decision_log_level >= 1:
@@ -984,6 +1284,7 @@ class BatteryOptimizer(hass.Hass):
                 projected_costs=self._last_projected_costs,
                 local_tz=local_tz,
                 predict_load_kw=self._predict_load_kw,
+                predict_pv_kw=self._predict_pv_kw,
                 min_soc=self.min_soc,
                 max_soc=self.max_soc,
             )
@@ -993,6 +1294,7 @@ class BatteryOptimizer(hass.Hass):
 
         self._update_schedule_sensor()
 
+    @_timed_callback
     def execute_scheduled_mode(self, kwargs, force: bool = False):
         """
         Execute the scheduled mode for the current slot.
@@ -1103,7 +1405,55 @@ class BatteryOptimizer(hass.Hass):
         # Send command to inverter
         success = self._direct_control.apply_mode(entry)
         if not success:
+            self._apply_failure_count += 1
+            self._consecutive_apply_failures += 1
             self.log("Failed to apply mode — will retry next slot", level="WARNING")
+            if self._consecutive_apply_failures >= 3:
+                # Three slots in a row means the inverter has been running on
+                # its panel-configured base mode for ~45 minutes.
+                self.log(
+                    f"{self._consecutive_apply_failures} consecutive apply_mode "
+                    f"failures — the inverter is NOT following the schedule. "
+                    f"Check the growatt_modbus connection and "
+                    f"sensor.battery_inverter_control_health.",
+                    level="ERROR",
+                )
+        else:
+            self._apply_success_count += 1
+            self._consecutive_apply_failures = 0
+        self._update_control_health_sensor()
+
+    def _update_control_health_sensor(self) -> None:
+        """Publish inverter-control diagnostics as its own HA sensor.
+
+        Created with set_state (like the markdown sensor), so it is not declared
+        in homeassistant/packages and disappears until the app republishes it
+        after an HA restart. Use it for alerting on trends, not as history.
+        """
+        try:
+            diagnostics = self._direct_control.get_diagnostics()
+            self.set_state(
+                "sensor.battery_inverter_control_health",
+                # MUST be a string: HA states are strings, and an int 0 is
+                # falsy — it was dropped from the POST body, so HA rejected the
+                # whole call with "[400] Bad Request" on every mode apply.
+                state=str(diagnostics.get("persistent_mismatch_count", 0)),
+                attributes={
+                    **diagnostics,
+                    "apply_failures": self._apply_failure_count,
+                    "consecutive_apply_failures": self._consecutive_apply_failures,
+                    "apply_successes": self._apply_success_count,
+                    "callback_overruns": self._callback_overrun_count,
+                    "slowest_callback": (
+                        f"{self._slowest_callback[0]} "
+                        f"{self._slowest_callback[1]:.1f}s"
+                        if self._slowest_callback else None
+                    ),
+                    "friendly_name": "Inverter Control Health",
+                },
+            )
+        except Exception as e:
+            self.log(f"Error updating control health sensor: {e}", level="WARNING")
 
 
     def _check_soc_boundaries(self, current_soc: float) -> bool:
@@ -1287,6 +1637,7 @@ class BatteryOptimizer(hass.Hass):
             grid_fee=self.config.grid_fee,
             import_price_multiplier=self.config.import_price_multiplier,
             inverter_efficiency=self.config.inverter_efficiency,
+            export_discharge_rate=self.config.export_discharge_rate,
             decision_log_level=self.config.decision_log_level,
         )
         detector = SocDeviationDetector(
@@ -1305,6 +1656,8 @@ class BatteryOptimizer(hass.Hass):
             local_tz=local_tz,
             current_temp=current_temp,
             predict_load_kw=self._predict_load_kw,
+            predict_pv_kw=self._predict_pv_kw,
+            expected_soc_anchor=getattr(self, "_expected_soc_anchor", None),
             get_cheapest_upcoming_prices=self._get_cheapest_upcoming_prices,
             get_discharge_threshold=self._get_discharge_threshold,
         )
@@ -1430,6 +1783,7 @@ class BatteryOptimizer(hass.Hass):
     # SOC State Change Handler
     # =========================================================================
 
+    @_timed_callback
     def _on_soc_change(self, entity, attribute, old, new, kwargs):
         """
         Handle SOC state changes - instant response to battery level changes.
@@ -1481,6 +1835,7 @@ class BatteryOptimizer(hass.Hass):
         self._cost_tracker.load_from_ha()
         self._schedule_startup_optimization()
 
+    @_timed_callback
     def _on_energy_sensor_change(self, entity, attribute, old, new, kwargs):
         """
         Handle changes to inverter energy sensors.
@@ -1941,7 +2296,36 @@ class BatteryOptimizer(hass.Hass):
         return (self.config.base_consumption / 1000.0) * correction
 
     def _predict_pv_kw(self, dt: datetime.datetime) -> float:
-        """Predict PV production (kW) for a slot.
+        """Predict PV production (kW) for a slot, corrected for forecast bias.
+
+        The sliding bias factor (measured/forecast median over the last window)
+        is applied to the CURRENT AND EVERY REMAINING slot, so a systematically
+        optimistic provider forecast is corrected across the whole horizon
+        rather than only in the single slot where the shortfall was observed.
+
+        Beyond the current local day the factor is attenuated by
+        ``PvBiasTracker.factor_for_slot``: today's cloud cover is weather, not a
+        calibration error of tomorrow's forecast, and the daily 13:15 run would
+        otherwise plan all of tomorrow on a 0.2x-clamped PV forecast.
+
+        Past slots are left raw: they are only rendered for logging and must
+        keep showing what was actually forecast at the time.
+        """
+        raw = self._predict_pv_kw_raw(dt)
+        if raw <= 0.0 or self._pv_bias_factor == 1.0:
+            return raw
+        now = self.datetime()
+        slot = self._align_to_slot(dt)
+        current_slot = self._align_to_slot(now)
+        if not dt_ge(slot, current_slot, self._get_local_timezone()):
+            return raw
+        factor = self._pv_bias.factor_for_slot(self._pv_bias_factor, now, slot)
+        if factor == 1.0:
+            return raw
+        return max(0.0, raw * factor)
+
+    def _predict_pv_kw_raw(self, dt: datetime.datetime) -> float:
+        """Predict PV production (kW) for a slot — provider value, no bias.
 
         Three-tier fallback:
         1. PV forecast service (Solcast / Forecast.Solar) — per-slot forecast
@@ -2188,10 +2572,16 @@ class BatteryOptimizer(hass.Hass):
                     "load_profile_stats": self._get_load_profile_stats(),
                     "load_profile_observations": self.load_profile.stats.observation_count,
                     "pv_profile_observations": self.pv_profile.stats.observation_count,
+                    # Sliding PV forecast bias
+                    "pv_bias_factor": self._pv_bias_factor,
+                    "pv_bias_samples": self._pv_bias.ratio_count(self.datetime()),
+                    "pv_bias_enabled": self.config.pv_bias_enabled,
                     "slot_minutes": self.config.slot_minutes,
                     # Slot outcome monitoring
                     "slot_outcomes_recent": self._outcome_tracker.get_recent_outcomes(10),
                     "prediction_accuracy": self._outcome_tracker.get_accuracy_stats(),
+                    # Inverter control health (verify-after-set counters)
+                    "inverter_control_health": self._direct_control.get_diagnostics(),
                     "friendly_name": "Battery Optimizer"
                 }
             )

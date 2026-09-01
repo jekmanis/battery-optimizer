@@ -135,3 +135,54 @@ class PredictionAccuracyStats:
         known_fields = {f.name for f in cls.__dataclass_fields__.values()}
         filtered_data = {k: v for k, v in data.items() if k in known_fields}
         return cls(**filtered_data)
+
+
+@dataclass(frozen=True)
+class ScheduleModeCounts:
+    """Mode census of a schedule, counted from the entries themselves.
+
+    The DP reports its own counts, but the orchestrator mutates the schedule
+    afterwards (the cloud-safe HOLD -> DISCHARGE(to load) conversion). Reporting
+    the DP's pre-conversion counts printed two contradictory censuses back to
+    back on every sunny run: "Schedule generated: ... 30 hold" followed a few
+    lines later by the schedule log's own "Total: ... 6 hold". Counts must be
+    derived from the schedule that will actually execute.
+    """
+
+    charge: int = 0
+    hold: int = 0
+    export: int = 0          # DISCHARGE with export_rate > 0
+    self_consume: int = 0    # DISCHARGE to load
+
+    @property
+    def discharge(self) -> int:
+        return self.export + self.self_consume
+
+    def summary_parts(self) -> List[str]:
+        """The shared wording of the "N charge, M discharge(self), ..." line."""
+        parts = [f"{self.charge} charge"]
+        if self.self_consume:
+            parts.append(f"{self.self_consume} discharge(self)")
+        if self.export:
+            parts.append(f"{self.export} discharge(export)")
+        parts.append(f"{self.hold} hold")
+        return parts
+
+
+def count_schedule_modes(schedule: Dict[datetime.datetime, ScheduleEntry]
+                         ) -> ScheduleModeCounts:
+    """Count modes in a schedule as it stands (post any conversion)."""
+    charge = hold = export = self_consume = 0
+    for entry in schedule.values():
+        if entry.mode == BatteryMode.CHARGE:
+            charge += 1
+        elif entry.mode == BatteryMode.HOLD:
+            hold += 1
+        elif entry.mode == BatteryMode.DISCHARGE:
+            if entry.export_rate is not None and entry.export_rate > 0:
+                export += 1
+            else:
+                self_consume += 1
+    return ScheduleModeCounts(
+        charge=charge, hold=hold, export=export, self_consume=self_consume
+    )

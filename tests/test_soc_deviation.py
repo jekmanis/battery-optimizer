@@ -115,6 +115,7 @@ class MockSocDeviationOptimizer:
 
 # Bind the actual methods from BatteryOptimizer
 MockSocDeviationOptimizer._check_soc_deviation = BatteryOptimizer._check_soc_deviation
+MockSocDeviationOptimizer._build_soc_deviation_detector = BatteryOptimizer._build_soc_deviation_detector
 MockSocDeviationOptimizer._get_cheapest_upcoming_prices = BatteryOptimizer._get_cheapest_upcoming_prices
 
 
@@ -757,6 +758,7 @@ class TestExpectedSocCalculationWithLearnedRate:
                 return 0.0
 
         MockCalculateOptimizer.calculate_expected_soc_schedule = BatteryOptimizer.calculate_expected_soc_schedule
+        MockCalculateOptimizer.project_schedule_trajectory = BatteryOptimizer.project_schedule_trajectory
 
         optimizer = MockCalculateOptimizer()
 
@@ -1823,3 +1825,138 @@ class TestSocDeviationSharedProjection:
 
         # Full 14/15 of the charge slot is expected -> a real ~-7% shortfall.
         assert result.deviation < -4.0
+
+
+class TestExpectedSocAtInstant:
+    """``expected_soc_at`` — the mid-slot value the pre-execution check needs.
+
+    ``execute_scheduled_mode`` used to compare the LIVE SOC against
+    ``expected_soc_schedule[current_slot]``, the START-of-slot value, with no
+    interpolation. Mid-slot entry points (``_on_enabled_change``,
+    ``on_override_change``, ``_apply_manual_mode('Auto')``) all call
+    ``execute_scheduled_mode(None)``, so 7 minutes into a 5 kW DISCHARGE slot
+    the battery is legitimately several points below the start value and the
+    3.0-point ``soc_shortfall_recalc_threshold`` fired on elapsed time alone.
+    """
+
+    CAPACITY = 14.3
+
+    @staticmethod
+    def _detector(**overrides):
+        from battery_optimizer_lib import SocDeviationConfig, SocDeviationDetector
+
+        base = dict(
+            slot_minutes=15,
+            charge_rate=4.5,
+            discharge_rate=5.0,
+            efficiency=0.95,
+            battery_capacity=14.3,
+            min_soc=10.0,
+            max_soc=100.0,
+            soc_deviation_threshold=4.0,
+            grid_fee=0.05,
+        )
+        base.update(overrides)
+        return SocDeviationDetector(config=SocDeviationConfig(**base))
+
+    @staticmethod
+    def _discharge_slot():
+        slot = datetime.datetime(2026, 7, 27, 19, 0)
+        schedule = {
+            slot: ScheduleEntry(
+                time=slot, mode=BatteryMode.DISCHARGE, reason="self", export_rate=0
+            )
+        }
+        return slot, schedule
+
+    def test_midslot_expectation_follows_the_battery_down(self):
+        slot, schedule = self._discharge_slot()
+        detector = self._detector()
+
+        drop = 5.0 * 0.25 / self.CAPACITY * 100 * (7.0 / 15.0)  # ~4.1%
+        on_plan_soc = 60.0 - drop
+
+        expected = detector.expected_soc_at(
+            current_soc=on_plan_soc,
+            schedule=schedule,
+            expected_soc_schedule={slot: 60.0},
+            now=slot + datetime.timedelta(minutes=7),
+            current_slot=slot,
+            local_tz=None,
+            predict_load_kw=lambda _dt: 6.0,
+            predict_pv_kw=lambda _dt: 0.0,
+        )
+
+        assert expected == pytest.approx(on_plan_soc, abs=0.01)
+        # The old start-of-slot comparison saw a 4.1-point "shortfall" here,
+        # above the 3.0 default threshold, and recalculated for nothing.
+        assert 60.0 - on_plan_soc > 3.0
+
+    def test_start_of_slot_returns_the_stored_value(self):
+        slot, schedule = self._discharge_slot()
+        detector = self._detector()
+
+        expected = detector.expected_soc_at(
+            current_soc=60.0,
+            schedule=schedule,
+            expected_soc_schedule={slot: 60.0},
+            now=slot,
+            current_slot=slot,
+            local_tz=None,
+            predict_load_kw=lambda _dt: 6.0,
+            predict_pv_kw=lambda _dt: 0.0,
+        )
+
+        assert expected == pytest.approx(60.0)
+
+    def test_anchor_inside_the_slot_is_not_double_counted(self):
+        """A trajectory anchored mid-slot already describes the anchor instant."""
+        slot, schedule = self._discharge_slot()
+        detector = self._detector()
+        anchor = slot + datetime.timedelta(minutes=7)
+
+        expected = detector.expected_soc_at(
+            current_soc=60.0,
+            schedule=schedule,
+            expected_soc_schedule={slot: 60.0},
+            now=anchor,
+            current_slot=slot,
+            local_tz=None,
+            predict_load_kw=lambda _dt: 6.0,
+            predict_pv_kw=lambda _dt: 0.0,
+            expected_soc_anchor=anchor,
+        )
+
+        assert expected == pytest.approx(60.0)
+
+    def test_missing_slot_returns_none(self):
+        slot, schedule = self._discharge_slot()
+        detector = self._detector()
+
+        assert detector.expected_soc_at(
+            current_soc=60.0,
+            schedule=schedule,
+            expected_soc_schedule={},
+            now=slot + datetime.timedelta(minutes=7),
+            current_slot=slot,
+            local_tz=None,
+        ) is None
+
+    def test_pv_surplus_makes_the_expectation_rise(self):
+        """Same shared physics as the deviation check: pv >= load charges."""
+        slot, schedule = self._discharge_slot()
+        detector = self._detector()
+
+        rise = (4.46 - 0.80) * 0.95 * 0.25 / self.CAPACITY * 100 * (10.0 / 15.0)
+        expected = detector.expected_soc_at(
+            current_soc=27.0,
+            schedule=schedule,
+            expected_soc_schedule={slot: 27.0},
+            now=slot + datetime.timedelta(minutes=10),
+            current_slot=slot,
+            local_tz=None,
+            predict_load_kw=lambda _dt: 0.80,
+            predict_pv_kw=lambda _dt: 4.46,
+        )
+
+        assert expected == pytest.approx(27.0 + rise, abs=0.01)

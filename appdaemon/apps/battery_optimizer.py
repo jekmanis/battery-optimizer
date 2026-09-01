@@ -38,7 +38,10 @@ from battery_optimizer_lib import (
     ensure_local_tz,
     align_to_slot,
     next_slot_time,
+    prev_slot_time,
+    slot_offset,
     next_interval_time,
+    lookup_by_time,
     # HA helpers
     SensorReader,
     # Cost tracker
@@ -68,6 +71,8 @@ from battery_optimizer_lib import (
     AmbientTemperatureService,
     AmbientServiceConfig,
 )
+from battery_optimizer_lib.direct_control import ApplyOutcome
+from battery_optimizer_lib.models import ScheduleModeCounts, count_schedule_modes
 from battery_optimizer_lib.pv_profile import PvProfile
 from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
 
@@ -143,6 +148,14 @@ class BatteryOptimizer(hass.Hass):
         self._apply_failure_count: int = 0
         self._consecutive_apply_failures: int = 0
         self._apply_success_count: int = 0
+        # A command that timed out client-side was NEVER confirmed: it must not
+        # count as a success, and a run of them is exactly the hung-modbus case.
+        self._apply_unconfirmed_count: int = 0
+        self._consecutive_apply_unconfirmed: int = 0
+        # Neutral outcomes — nothing was transmitted, so they say nothing about
+        # inverter health either way.
+        self._apply_duplicate_count: int = 0
+        self._apply_dry_run_count: int = 0
         self._callback_overrun_count: int = 0
         self._slowest_callback: Optional[Tuple[str, float]] = None
         self._threads_hint_logged: bool = False
@@ -154,6 +167,9 @@ class BatteryOptimizer(hass.Hass):
         self._last_depletion_recalc_time: Optional[datetime.datetime] = None
         self._last_soc_deviation: Optional[float] = None  # Deviation that triggered recalculation
         self._last_min_charge_slots: int = 0  # Min charge slots from last calculation
+        # Mode census of the last schedule as it will execute (post cloud-safe
+        # conversion), not the DP's pre-conversion counts.
+        self._last_schedule_counts: ScheduleModeCounts = ScheduleModeCounts()
         self._last_charge_slots: List[Dict] = []  # Selected charge slots with prices
         self._last_projected_costs: Dict[datetime.datetime, float] = {}  # Projected battery cost evolution
         self._last_dp_soc_trajectory: Dict[datetime.datetime, Tuple[float, float]] = {}  # DP's SOC trajectory (start, end) per slot
@@ -431,6 +447,7 @@ class BatteryOptimizer(hass.Hass):
             return None
         return engine.get_estimated_ambient_min_temp()
 
+    @_timed_callback
     def _record_ambient_observation(self, kwargs=None):
         """Timer callback: keep the ambient observation window time-uniform."""
         temp = self._get_battery_temp()
@@ -599,6 +616,10 @@ class BatteryOptimizer(hass.Hass):
         )
 
         schedule = result.schedule
+        # Reported trajectories. Rebuilt below if the schedule is modified after
+        # the DP ran — they must describe the plan that will actually execute.
+        soc_trajectory = result.soc_trajectory
+        temp_trajectory = result.temp_trajectory
 
         # Cloud-safe conversion: HOLD → DISCHARGE(to load) during PV hours.
         # discharge_to_load charges from PV surplus (confirmed on Growatt WIT),
@@ -628,6 +649,30 @@ class BatteryOptimizer(hass.Hass):
         if cloud_safe_count > 0:
             self.log(f"Cloud-safe: converted {cloud_safe_count} HOLD→DISCHARGE(to load) "
                      f"slots during PV hours (buy_price > wear_cost)")
+            # The DP built its trajectories for the PRE-conversion HOLD plan:
+            # flat SOC and a cooling pack, while the plan that executes drains
+            # the battery on every cloudy minute and heats it. Those same
+            # trajectories are what the schedule log prefers (schedule_formatter
+            # falls back to the expected-SOC map only when they are absent), so
+            # leaving them stale means the log used to diagnose SOC deviations
+            # describes a plan nobody runs. Rebuild through the shared model.
+            soc_trajectory, temp_trajectory = self.project_schedule_trajectory(
+                schedule,
+                current_soc_for_calc,
+                starting_temp=current_temp,
+                current_slot=current_slot,
+                minutes_into_slot=minutes_into_slot,
+            )
+            if current_temp is None:
+                # Parity with DPOptimizer._build_temp_trajectory: no starting
+                # temperature means no temperature trajectory at all.
+                temp_trajectory = {}
+
+        # Mode census of the plan that will actually execute. Derived here, at
+        # the same point as the trajectory rebuild above, so the summary line
+        # can never describe the pre-conversion schedule again.
+        schedule_counts = count_schedule_modes(schedule)
+        self._last_schedule_counts = schedule_counts
 
         # Project landed costs when the plan can add stored energy. Besides
         # explicit CHARGE, HOLD and discharge-to-load can accept PV surplus.
@@ -672,17 +717,24 @@ class BatteryOptimizer(hass.Hass):
                 predict_pv_func=self._predict_pv_kw,
                 charge_rates_by_slot=slot_charge_rates_by_slot,
                 slot_fractions_by_slot=slot_fractions_by_slot,
+                # Same CHARGE/thermal model as project_schedule_trajectory, so
+                # the projected-cost column cannot disagree with the SOC and
+                # temperature ones.
+                starting_temp=current_temp,
+                learning_engine=getattr(self, "learning_engine", None),
+                # getattr, like project_schedule_trajectory above: the test
+                # doubles for this method construct neither attribute.
+                temp_projector=getattr(self, "_temp_projector", None),
             )
             self._last_projected_costs = projected_costs
         else:
             self._last_projected_costs = {}
 
-        parts = [f"{result.charge_count} charge"]
-        if result.self_consume_slot_count:
-            parts.append(f"{result.self_consume_slot_count} discharge(self)")
-        if result.export_slot_count:
-            parts.append(f"{result.export_slot_count} discharge(export)")
-        parts.append(f"{result.hold_count} hold")
+        # Counted from the FINAL schedule, not from result.*_count: the DP
+        # counted the pre-conversion plan, so on any run with cloud_safe_count
+        # > 0 this line contradicted the schedule log's own "Total:" census a
+        # few lines below it.
+        parts = schedule_counts.summary_parts()
         self.log(f"Schedule generated: {', '.join(parts)} slots "
                  f"(slot={self.config.slot_minutes}min, "
                  f"load_quantile={self.config.load_quantile:.2f}, min_charge_slots={min_charge_slots})")
@@ -703,9 +755,10 @@ class BatteryOptimizer(hass.Hass):
                 min_soc=self.min_soc,
             )
 
-        # Store trajectories for use in _log_schedule
-        self._last_dp_soc_trajectory = result.soc_trajectory
-        self._last_dp_temp_trajectory = result.temp_trajectory
+        # Store trajectories for use in _log_schedule (rebuilt above if the
+        # cloud-safe conversion changed the schedule).
+        self._last_dp_soc_trajectory = soc_trajectory
+        self._last_dp_temp_trajectory = temp_trajectory
 
         return schedule
 
@@ -883,11 +936,43 @@ class BatteryOptimizer(hass.Hass):
               time-varying ambient plus ``k2*|P_bat|``. Discharging heats the
               pack too — it is not thermally idle.
         """
-        expected_soc = {}
-        expected_temp = {}
-        current_soc = starting_soc
-        current_temp = starting_temp
+        soc_trajectory, temp_trajectory = self.project_schedule_trajectory(
+            schedule,
+            starting_soc,
+            starting_temp=starting_temp,
+            current_slot=current_slot,
+            minutes_into_slot=minutes_into_slot,
+        )
+        expected_soc = {slot: pair[0] for slot, pair in soc_trajectory.items()}
+        expected_temp = {
+            slot: pair[0]
+            for slot, pair in temp_trajectory.items()
+            if pair[0] is not None
+        }
+        return expected_soc, expected_temp
 
+    def project_schedule_trajectory(
+        self,
+        schedule: Dict[datetime.datetime, ScheduleEntry],
+        starting_soc: float,
+        starting_temp: Optional[float] = None,
+        current_slot: Optional[datetime.datetime] = None,
+        minutes_into_slot: float = 0.0,
+    ) -> Tuple[
+        Dict[datetime.datetime, Tuple[float, float]],
+        Dict[datetime.datetime, Tuple[Optional[float], Optional[float]]],
+    ]:
+        """Walk a schedule through the shared slot-SOC/thermal models.
+
+        Returns ``({slot: (soc_start, soc_end)}, {slot: (temp_start, temp_end)})``
+        — the same shape ``DPOptimizerResult`` uses, so a schedule that was
+        modified after the DP ran (the cloud-safe HOLD -> DISCHARGE conversion)
+        can have its reported trajectories rebuilt for the plan that will
+        actually execute.
+
+        The transition itself is ``soc_projection.project_slot_soc`` — never a
+        local re-implementation (CLAUDE.md "One slot-SOC model").
+        """
         # Built inline (not via a helper) so that any object providing the same
         # config/min_soc/max_soc surface can reuse this method directly.
         params = SocProjectionParams(
@@ -914,11 +999,15 @@ class BatteryOptimizer(hass.Hass):
         partial_applied = False
         temp_projector = getattr(self, "_temp_projector", None)
 
+        soc_trajectory: Dict[datetime.datetime, Tuple[float, float]] = {}
+        temp_trajectory: Dict[
+            datetime.datetime, Tuple[Optional[float], Optional[float]]
+        ] = {}
+        current_soc = starting_soc
+        current_temp = starting_temp
+
         for hour in sorted(schedule.keys()):
             entry = schedule[hour]
-            expected_soc[hour] = current_soc
-            if current_temp is not None:
-                expected_temp[hour] = current_temp
 
             fraction = 1.0
             if (current_slot is not None and not partial_applied
@@ -939,10 +1028,12 @@ class BatteryOptimizer(hass.Hass):
                 temp_projector=temp_projector,
                 slot_time=hour,
             )
+            soc_trajectory[hour] = (current_soc, transition.soc_end)
+            temp_trajectory[hour] = (current_temp, transition.temp_end)
             current_soc = transition.soc_end
             current_temp = transition.temp_end
 
-        return expected_soc, expected_temp
+        return soc_trajectory, temp_trajectory
 
     # =========================================================================
     # Schedule Execution
@@ -1088,7 +1179,7 @@ class BatteryOptimizer(hass.Hass):
                 reason="solar_override",
             )
             self._handle_mode_transition(BatteryMode.HOLD)
-            self._direct_control.apply_mode(entry)
+            self._apply_mode_tracked(entry)
             return
 
         # Reactive PV check on the just-COMPLETED slot.  The comparison uses the
@@ -1113,7 +1204,13 @@ class BatteryOptimizer(hass.Hass):
         if self._pv_bias.close_slots_before(now_slot):
             self._refresh_pv_bias_factor()
 
-        prev_slot = now_slot - datetime.timedelta(minutes=self.config.slot_minutes)
+        # DST-safe: wall-clock subtraction on an aware datetime is a 1h15m step
+        # across the Europe/Riga autumn fold (and -45min in spring), which made
+        # get_closed() miss the slot that just closed. prev_slot_time moves by
+        # one slot as a UTC instant.
+        prev_slot = prev_slot_time(
+            now_slot, self.config.slot_minutes, self._get_local_timezone()
+        )
         completed = self._pv_bias.get_closed(prev_slot)
         if completed is None or completed.samples < self.config.pv_reactive_min_samples:
             return False
@@ -1166,6 +1263,7 @@ class BatteryOptimizer(hass.Hass):
         """
         return self._sensors.get_float(self.config.pv_power_sensor)
 
+    @_timed_callback
     def _sample_pv(self, kwargs=None):
         """Accumulate PV power samples and close completed slots."""
         try:
@@ -1326,7 +1424,26 @@ class BatteryOptimizer(hass.Hass):
         # didn't reach its target SOC.
         current_soc = self._get_current_soc()
         if current_soc is not None and self.expected_soc_schedule:
-            expected_soc = self.expected_soc_schedule.get(current_slot)
+            # Compare against the plan AT THIS INSTANT, not at the slot
+            # boundary. Mid-slot entry points (override toggle, manual "Auto",
+            # a forced re-execution) land part-way into a slot, where the
+            # start-of-slot value is several points above reality during a
+            # DISCHARGE — that difference is elapsed time, not a shortfall, and
+            # it used to trip soc_shortfall_recalc_threshold on its own. The
+            # interpolation goes through the shared soc_projection model via
+            # SocDeviationDetector, never a local formula.
+            expected_soc = self._build_soc_deviation_detector().expected_soc_at(
+                current_soc=current_soc,
+                schedule=self.schedule,
+                expected_soc_schedule=self.expected_soc_schedule,
+                now=now,
+                current_slot=current_slot,
+                local_tz=local_tz,
+                current_temp=self._get_battery_temp(),
+                predict_load_kw=self._predict_load_kw,
+                predict_pv_kw=self._predict_pv_kw,
+                expected_soc_anchor=getattr(self, "_expected_soc_anchor", None),
+            )
             if expected_soc is not None:
                 soc_shortfall = expected_soc - current_soc
                 if soc_shortfall > self.config.soc_shortfall_recalc_threshold:
@@ -1371,9 +1488,18 @@ class BatteryOptimizer(hass.Hass):
             actual_pv_w=self._get_pv_power(),
             actual_mode=self._get_inverter_mode(),
         )
-        next_slot = current_slot + datetime.timedelta(minutes=self.config.slot_minutes)
-        predicted_soc_end = self.expected_soc_schedule.get(next_slot,
-                            self.expected_soc_schedule.get(current_slot, current_soc or 50.0))
+        # DST-safe slot step + tz-normalized lookup: plain `+ timedelta` and a
+        # bare dict .get() both miss around a DST transition.
+        next_slot = slot_offset(current_slot, self.config.slot_minutes, 1, local_tz)
+        predicted_soc_end = lookup_by_time(
+            self.expected_soc_schedule, next_slot, local_tz
+        )
+        if predicted_soc_end is None:
+            predicted_soc_end = lookup_by_time(
+                self.expected_soc_schedule, current_slot, local_tz
+            )
+        if predicted_soc_end is None:
+            predicted_soc_end = current_soc if current_soc is not None else 50.0
         self._outcome_tracker.record_slot_start(
             slot_time=current_slot,
             mode=entry.mode.name,
@@ -1403,11 +1529,55 @@ class BatteryOptimizer(hass.Hass):
         self._handle_mode_transition(entry.mode)
 
         # Send command to inverter
-        success = self._direct_control.apply_mode(entry)
-        if not success:
+        self._apply_mode_tracked(entry)
+
+    def _apply_mode_tracked(self, entry: ScheduleEntry) -> bool:
+        """Send one mode command and account for its outcome.
+
+        EVERY ``DirectControl.apply_mode`` call must go through here. Five of
+        the six call sites used to discard the boolean result, so:
+
+        * a successful safety HOLD never reset ``_consecutive_apply_failures``
+          — the counter kept climbing across unrelated slots and eventually
+          raised the "inverter is NOT following the schedule" ERROR while the
+          inverter was in fact obeying every command;
+        * a FAILED safety apply (min-SOC HOLD, max-SOC HOLD, solar override,
+          manual mode) was completely silent — the battery kept discharging
+          below min_soc with nothing in the log.
+
+        It accounts for the OUTCOME, not for ``apply_mode``'s boolean. That
+        boolean is True for three cases the inverter never acknowledged — a dry
+        run, a duplicate that was never transmitted, and a client-side timeout —
+        and counting them as successes reset ``_consecutive_apply_failures`` on
+        every call. With growatt_modbus hung but not raising, every command hit
+        its ``hass_timeout``, the health sensor reported climbing
+        ``apply_successes``, and the "inverter is NOT following the schedule"
+        ERROR could never fire. Now:
+
+        * SENT                -> success, resets both streaks;
+        * FAILED              -> failure, escalates after 3 in a row;
+        * UNCONFIRMED_TIMEOUT -> NOT a success (leaves the failure streak
+          alone) and escalates on its own after 3 in a row;
+        * SKIPPED_DUPLICATE / DRY_RUN -> neutral, no streak is touched.
+
+        Args:
+            entry: Schedule entry to send to the inverter.
+
+        Returns:
+            False only for a CONFIRMED failure — an unconfirmed timeout still
+            returns True because DirectControl recorded it as sent and
+            verify-after-set is what resolves it.
+        """
+        outcome = self._direct_control.apply_mode_with_outcome(entry)
+
+        if outcome is ApplyOutcome.FAILED:
             self._apply_failure_count += 1
             self._consecutive_apply_failures += 1
-            self.log("Failed to apply mode — will retry next slot", level="WARNING")
+            self.log(
+                f"Failed to apply mode {entry.mode.name} ({entry.reason}) — "
+                f"will retry next slot",
+                level="WARNING",
+            )
             if self._consecutive_apply_failures >= 3:
                 # Three slots in a row means the inverter has been running on
                 # its panel-configured base mode for ~45 minutes.
@@ -1418,10 +1588,32 @@ class BatteryOptimizer(hass.Hass):
                     f"sensor.battery_inverter_control_health.",
                     level="ERROR",
                 )
+        elif outcome is ApplyOutcome.UNCONFIRMED_TIMEOUT:
+            self._apply_unconfirmed_count += 1
+            self._consecutive_apply_unconfirmed += 1
+            if self._consecutive_apply_unconfirmed >= 3:
+                self.log(
+                    f"{self._consecutive_apply_unconfirmed} consecutive "
+                    f"unconfirmed apply_mode timeouts — the inverter is NOT "
+                    f"following the schedule (no command has been acknowledged). "
+                    f"Check the growatt_modbus connection and "
+                    f"sensor.battery_inverter_control_health.",
+                    level="ERROR",
+                )
+        elif outcome is ApplyOutcome.SKIPPED_DUPLICATE:
+            # Nothing was transmitted — neither evidence of health nor of
+            # failure, so no streak may be reset here.
+            self._apply_duplicate_count += 1
+        elif outcome is ApplyOutcome.DRY_RUN:
+            # Dry-run must not look like perfect health on the sensor.
+            self._apply_dry_run_count += 1
         else:
             self._apply_success_count += 1
             self._consecutive_apply_failures = 0
+            self._consecutive_apply_unconfirmed = 0
+
         self._update_control_health_sensor()
+        return outcome is not ApplyOutcome.FAILED
 
     def _update_control_health_sensor(self) -> None:
         """Publish inverter-control diagnostics as its own HA sensor.
@@ -1443,6 +1635,13 @@ class BatteryOptimizer(hass.Hass):
                     "apply_failures": self._apply_failure_count,
                     "consecutive_apply_failures": self._consecutive_apply_failures,
                     "apply_successes": self._apply_success_count,
+                    # Added, never renamed: an unconfirmed timeout used to be
+                    # indistinguishable from a confirmed send on this sensor.
+                    "apply_unconfirmed": self._apply_unconfirmed_count,
+                    "consecutive_apply_unconfirmed":
+                        self._consecutive_apply_unconfirmed,
+                    "apply_duplicates_skipped": self._apply_duplicate_count,
+                    "apply_dry_runs": self._apply_dry_run_count,
                     "callback_overruns": self._callback_overrun_count,
                     "slowest_callback": (
                         f"{self._slowest_callback[0]} "
@@ -1481,7 +1680,7 @@ class BatteryOptimizer(hass.Hass):
                 reason="safety_min_soc",
             )
             self._handle_mode_transition(BatteryMode.HOLD)
-            self._direct_control.apply_mode(entry)
+            self._apply_mode_tracked(entry)
             # Schedule re-optimization to find charging opportunities
             if (self._last_depletion_recalc_time is None or
                     (now - self._last_depletion_recalc_time).total_seconds() > 1800):
@@ -1499,7 +1698,7 @@ class BatteryOptimizer(hass.Hass):
                 reason="safety_max_soc",
             )
             self._handle_mode_transition(BatteryMode.HOLD)
-            self._direct_control.apply_mode(entry)
+            self._apply_mode_tracked(entry)
             return True
 
         # Switch DISCHARGE → HOLD at max SOC when PV covers load, so surplus
@@ -1517,7 +1716,7 @@ class BatteryOptimizer(hass.Hass):
                     reason="safety_max_soc_pv_export",
                 )
                 self._handle_mode_transition(BatteryMode.HOLD)
-                self._direct_control.apply_mode(entry)
+                self._apply_mode_tracked(entry)
                 return True
 
         return False
@@ -1602,6 +1801,35 @@ class BatteryOptimizer(hass.Hass):
         hold_prices.sort()
         return hold_prices[:count]
 
+    def _build_soc_deviation_detector(self) -> SocDeviationDetector:
+        """Build a detector from the CURRENT dynamic config.
+
+        min_soc/max_soc are HA-backed properties, so the detector is rebuilt per
+        use rather than cached. Shared by the periodic deviation check and by
+        the pre-execution "SOC behind plan" test in `execute_scheduled_mode`,
+        which must interpolate the same way (see `expected_soc_at`).
+        """
+        config = SocDeviationConfig(
+            slot_minutes=self.config.slot_minutes,
+            charge_rate=self.config.charge_rate,
+            discharge_rate=self.config.discharge_rate,
+            efficiency=self.config.efficiency,
+            battery_capacity=self.config.battery_capacity,
+            min_soc=self.min_soc,
+            max_soc=self.max_soc,
+            soc_deviation_threshold=self.config.soc_deviation_threshold,
+            grid_fee=self.config.grid_fee,
+            import_price_multiplier=self.config.import_price_multiplier,
+            inverter_efficiency=self.config.inverter_efficiency,
+            export_discharge_rate=self.config.export_discharge_rate,
+            decision_log_level=self.config.decision_log_level,
+        )
+        return SocDeviationDetector(
+            config=config,
+            learning_engine=self.learning_engine,
+            log_func=self.log,
+        )
+
     def _check_soc_deviation(self, current_soc: float) -> bool:
         """
         Check if SOC deviates significantly from expected and trigger recalculation.
@@ -1624,27 +1852,7 @@ class BatteryOptimizer(hass.Hass):
         current_slot = self._align_to_slot(now)
         current_temp = self._get_battery_temp()
 
-        # Create detector with current config (min_soc/max_soc are dynamic properties)
-        config = SocDeviationConfig(
-            slot_minutes=self.config.slot_minutes,
-            charge_rate=self.config.charge_rate,
-            discharge_rate=self.config.discharge_rate,
-            efficiency=self.config.efficiency,
-            battery_capacity=self.config.battery_capacity,
-            min_soc=self.min_soc,
-            max_soc=self.max_soc,
-            soc_deviation_threshold=self.config.soc_deviation_threshold,
-            grid_fee=self.config.grid_fee,
-            import_price_multiplier=self.config.import_price_multiplier,
-            inverter_efficiency=self.config.inverter_efficiency,
-            export_discharge_rate=self.config.export_discharge_rate,
-            decision_log_level=self.config.decision_log_level,
-        )
-        detector = SocDeviationDetector(
-            config=config,
-            learning_engine=self.learning_engine,
-            log_func=self.log,
-        )
+        detector = self._build_soc_deviation_detector()
 
         # Run deviation check
         result = detector.check_deviation(
@@ -1766,7 +1974,7 @@ class BatteryOptimizer(hass.Hass):
                 reason=f"manual_{mode.name.lower()}",
             )
             self._handle_mode_transition(mode)
-            self._direct_control.apply_mode(entry)
+            self._apply_mode_tracked(entry)
         elif mode_str == "Auto":
             # Turn off override to fully resume automatic scheduling
             self.log("Manual mode set to Auto, turning off override and resuming schedule")
@@ -2162,8 +2370,11 @@ class BatteryOptimizer(hass.Hass):
         # Record in load profile
         self.load_profile.record(now, load_w)
 
-        # Record prediction for the next slot (to compare at next observation)
-        next_slot = now + datetime.timedelta(minutes=self.config.slot_minutes)
+        # Record prediction for the next slot (to compare at next observation).
+        # DST-safe step (see timezone_utils.slot_offset).
+        next_slot = slot_offset(
+            now, self.config.slot_minutes, 1, self._get_local_timezone()
+        )
         predicted_kw = self._predict_load_kw(next_slot)
         self.prediction_tracker.record_prediction(next_slot, predicted_kw)
 
@@ -2310,6 +2521,14 @@ class BatteryOptimizer(hass.Hass):
 
         Past slots are left raw: they are only rendered for logging and must
         keep showing what was actually forecast at the time.
+
+        A slot whose provider value was already capped at OBSERVED production by
+        ``PvForecastService.refresh_for_shortfall`` is also left raw: that value
+        carries the shortfall itself, and the bias factor is the median of the
+        very same shortfall ratios. Applying both discounted the current slot
+        twice (4.0 kW forecast, two measured 0.8 kW slots -> ~0.16 kW planned
+        instead of 0.8), which fed the DP a phantom collapse right where it had
+        the best measurement it will ever get.
         """
         raw = self._predict_pv_kw_raw(dt)
         if raw <= 0.0 or self._pv_bias_factor == 1.0:
@@ -2318,6 +2537,8 @@ class BatteryOptimizer(hass.Hass):
         slot = self._align_to_slot(dt)
         current_slot = self._align_to_slot(now)
         if not dt_ge(slot, current_slot, self._get_local_timezone()):
+            return raw
+        if self._pv_forecast_service.is_observation_capped(slot):
             return raw
         factor = self._pv_bias.factor_for_slot(self._pv_bias_factor, now, slot)
         if factor == 1.0:

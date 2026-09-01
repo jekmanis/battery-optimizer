@@ -64,7 +64,22 @@ class AmbientServiceConfig:
     diurnal_peak_hour: float = 15.0    # local hour of the daily maximum
 
     cache_minutes: int = 60
+    # How long to wait before retrying after a FAILED fetch. Backing a failure
+    # off for the full ``cache_minutes`` punished the FIRST-ever failure as
+    # hard as a permanent one: AppDaemon restarts, full_optimize runs before
+    # the HA weather integration has loaded, and the single "entity not found"
+    # then pinned T_ambient(t) on the outdoor-sensor / diurnal fallback for an
+    # hour — degrading the DP-facing charge rates. No caller passes force=True,
+    # so nothing recovered it early. Same knob and semantics as
+    # PvForecastServiceConfig.failure_retry_minutes.
+    failure_retry_minutes: int = 10
     slot_minutes: int = 15
+
+    # Per-call websocket timeout for ``weather/get_forecasts``. The call is
+    # SYNCHRONOUS and made from an AppDaemon callback thread, so an unbounded
+    # one stalls schedule execution, the SOC listener and PV sampling alike
+    # (see CLAUDE.md, "Runtime constraints").
+    forecast_timeout_seconds: float = 10.0
 
     # Used when literally nothing is known.
     fallback_ambient_c: float = 10.0
@@ -81,6 +96,7 @@ class AmbientServiceConfig:
             diurnal_amplitude_c=cfg.ambient_diurnal_amplitude_c,
             diurnal_peak_hour=cfg.ambient_diurnal_peak_hour,
             cache_minutes=cfg.ambient_forecast_cache_minutes,
+            failure_retry_minutes=cfg.ambient_forecast_failure_retry_minutes,
             slot_minutes=cfg.slot_minutes,
         )
 
@@ -112,6 +128,16 @@ class AmbientTemperatureService:
         self._cache: Dict[datetime.datetime, float] = {}
         self._cache_timestamp: Optional[datetime.datetime] = None
 
+        # When a forecast fetch was last ATTEMPTED, successful or not. The
+        # cache-age guard keys off this rather than ``_cache_timestamp``: while
+        # the entity was failing, ``_cache_timestamp`` stayed None, so the
+        # back-off never engaged and every optimize / adaptive recalculation /
+        # PV-shortfall recalculation / 15-min ambient timer re-issued the
+        # blocking call.
+        self._last_fetch_attempt: Optional[datetime.datetime] = None
+        # Failure/success is a STATE: warn when it changes, not on every call.
+        self._fetch_failing: bool = False
+
         # Last outdoor sensor reading and when it was taken.
         self._sensor_temp: Optional[float] = None
         self._sensor_time: Optional[datetime.datetime] = None
@@ -139,15 +165,31 @@ class AmbientTemperatureService:
         """
         now = self.datetime()
 
-        if not force and self._cache_timestamp is not None:
-            age_minutes = (now - self._cache_timestamp).total_seconds() / 60.0
-            if age_minutes < self._config.cache_minutes:
-                self._read_outdoor_sensor(now)
-                return False
+        # Two different back-offs, because success and failure are not the same
+        # event. A fresh forecast is good for ``cache_minutes``. A FAILED
+        # attempt must be retried far sooner: keying the back-off off the last
+        # attempt alone made the very first failure (typically a weather
+        # integration that has not loaded yet, seconds after an AppDaemon
+        # restart) suppress every retry for a full hour, with no caller passing
+        # force=True to break out.
+        if not force:
+            if self._cache_timestamp is not None:
+                age_minutes = (now - self._cache_timestamp).total_seconds() / 60.0
+                if age_minutes < self._config.cache_minutes:
+                    self._read_outdoor_sensor(now)
+                    return False
+            if self._last_fetch_attempt is not None:
+                attempt_age_minutes = (
+                    now - self._last_fetch_attempt
+                ).total_seconds() / 60.0
+                if attempt_age_minutes < self._failure_retry_minutes():
+                    self._read_outdoor_sensor(now)
+                    return False
 
         updated = False
 
         if self._config.weather_entity:
+            self._last_fetch_attempt = now
             try:
                 data = self._fetch_weather_forecast()
                 if data:
@@ -158,9 +200,14 @@ class AmbientTemperatureService:
                         f"Ambient forecast updated from {self._config.weather_entity}: "
                         f"{len(data)} slots, {min(data.values()):.1f}..{max(data.values()):.1f}C"
                     )
+                    self._note_fetch_result(True)
                     updated = True
+                else:
+                    self._note_fetch_result(
+                        False, f"{self._config.weather_entity} returned no hourly forecast"
+                    )
             except Exception as e:  # pragma: no cover - defensive
-                self.log(f"Ambient weather fetch failed: {e}", level="WARNING")
+                self._note_fetch_result(False, str(e))
                 self.log(traceback.format_exc(), level="DEBUG")
 
         if self._read_outdoor_sensor(now):
@@ -170,6 +217,49 @@ class AmbientTemperatureService:
             self._source = "min_window" if self.min_temp_provider else "none"
 
         return updated
+
+    def _failure_retry_minutes(self) -> float:
+        """Back-off after a failed fetch, never above the cache TTL."""
+        return max(
+            1.0,
+            min(
+                float(self._config.failure_retry_minutes),
+                float(self._config.cache_minutes),
+            ),
+        )
+
+    def _note_fetch_result(self, ok: bool, detail: str = "") -> None:
+        """Log forecast availability on STATE CHANGE only.
+
+        Both failure paths used to log at DEBUG, so a permanently broken
+        weather entity was invisible while it kept costing a blocking service
+        call on every refresh. Warning on every call would be the opposite
+        mistake, so only the transitions are reported.
+        """
+        if ok:
+            if self._fetch_failing:
+                self.log(
+                    f"Ambient forecast recovered from {self._config.weather_entity}",
+                    level="INFO",
+                )
+            self._fetch_failing = False
+            return
+
+        if not self._fetch_failing:
+            self._fetch_failing = True
+            self.log(
+                f"Ambient forecast unavailable ({self._config.weather_entity}): "
+                f"{detail or 'no data'}. Falling back to the outdoor sensor / "
+                f"diurnal profile; retrying at most every "
+                f"{self._failure_retry_minutes():.0f} min.",
+                level="WARNING",
+            )
+        else:
+            self.log(
+                f"Ambient forecast still unavailable "
+                f"({self._config.weather_entity}): {detail or 'no data'}",
+                level="DEBUG",
+            )
 
     def predict_c(self, dt: Optional[datetime.datetime] = None) -> Optional[float]:
         """Ambient temperature (C) for the slot containing ``dt``.
@@ -273,6 +363,8 @@ class AmbientTemperatureService:
                     entity_id=self._config.weather_entity,
                     type="hourly",
                     return_result=True,
+                    # Bounded: this runs on an AppDaemon callback thread.
+                    hass_timeout=self._config.forecast_timeout_seconds,
                 )
                 entries = self._extract_forecast_entries(response)
             except Exception as e:

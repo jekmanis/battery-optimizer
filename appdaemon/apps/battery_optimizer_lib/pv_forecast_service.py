@@ -44,6 +44,21 @@ class PvForecastServiceConfig:
     # Cache settings
     pv_forecast_cache_minutes: int = 60
 
+    # How long to wait before retrying after a FAILED provider fetch. The
+    # cache-age guard keys off the last successful fetch, so without a separate
+    # attempt-based back-off a permanently broken provider was re-tried by every
+    # optimize / adaptive / PV-shortfall pass — each one a blocking
+    # ``requests.get`` on an AppDaemon callback thread. Deliberately much
+    # shorter than ``pv_forecast_cache_minutes`` so a transient failure (HA
+    # integration still loading, one HTTP hiccup) recovers quickly.
+    failure_retry_minutes: int = 10
+
+    # Per-call HTTP timeout for the Forecast.Solar REST API. SYNCHRONOUS and
+    # made from an AppDaemon callback thread, so it must be bounded tightly
+    # (see CLAUDE.md, "Runtime constraints"). Matches the ambient service's
+    # forecast timeout.
+    forecast_timeout_seconds: float = 10.0
+
     # Slot resolution
     slot_minutes: int = 15
 
@@ -69,6 +84,7 @@ class PvForecastServiceConfig:
             forecast_solar_kwp=cfg.forecast_solar_kwp,
             forecast_solar_api_key=cfg.forecast_solar_api_key,
             pv_forecast_cache_minutes=cfg.pv_forecast_cache_minutes,
+            failure_retry_minutes=cfg.pv_forecast_failure_retry_minutes,
             slot_minutes=cfg.slot_minutes,
         )
 
@@ -98,10 +114,24 @@ class PvForecastService:
         # Cache: slot-aligned naive local datetime -> kW
         self._cache: Dict[datetime.datetime, float] = {}
         self._cache_timestamp: Optional[datetime.datetime] = None
+        # Slots whose cached value was capped at OBSERVED production by
+        # refresh_for_shortfall(). Such a value already carries the shortfall,
+        # so the caller must not additionally scale it by the PV bias factor —
+        # the bias factor is the median of exactly the same shortfall ratios,
+        # and applying both discounts the slot twice (4.0 kW forecast + two
+        # 0.8 kW measured slots planned the current slot at ~0.16 kW).
+        self._observation_capped: set = set()
         # Reactive PV checks may request a refresh before the normal cache TTL.
         # Keep a separate attempt timestamp so repeated shortfall checks cannot
         # hammer Forecast.Solar (or repeatedly query HA sensor attributes).
         self._last_forced_refresh_attempt: Optional[datetime.datetime] = None
+        # When a provider fetch was last ATTEMPTED, successful or not. The
+        # cache-age guard keys off ``_cache_timestamp``, which is written only
+        # on success, so a provider that is down never engaged it: every
+        # optimize / adaptive / PV-shortfall pass re-issued the blocking
+        # ``requests.get``. Failed attempts back off for
+        # ``failure_retry_minutes`` instead of the full cache interval.
+        self._last_fetch_attempt: Optional[datetime.datetime] = None
 
     @property
     def has_forecast(self) -> bool:
@@ -153,12 +183,61 @@ class PvForecastService:
         key = self._slot_key(dt)
         observed_kw = max(0.0, float(actual_kw))
         forecast_kw = self._cache.get(key)
-        self._cache[key] = (
-            min(forecast_kw, observed_kw)
-            if forecast_kw is not None
-            else observed_kw
-        )
+        if forecast_kw is None or observed_kw < forecast_kw:
+            self._cache[key] = observed_kw
+            # Mark the slot so callers can skip the PV bias factor for it (see
+            # is_observation_capped). A successful provider refresh replaces the
+            # cache wholesale and clears these marks, which is why the mark is
+            # set AFTER refresh().
+            #
+            # Only mark when the observation ACTUALLY lowered the cached value.
+            # Marking unconditionally suppressed the bias factor for slots the
+            # measurement never capped: with bias 0.2, a fresh 0.5 kW forecast
+            # against 0.8 kW observed left the DP planning 0.5 kW instead of
+            # 0.1 kW. An existing mark is never cleared here — the cached value
+            # may still be an earlier, lower observation cap.
+            self._observation_capped.add(key)
+        self._prune_observation_capped()
         return refreshed
+
+    def is_observation_capped(self, dt: datetime.datetime) -> bool:
+        """Whether this slot's cached forecast was capped at observed production.
+
+        A capped value is already discounted by the measurement, so applying the
+        sliding PV bias factor on top of it double-counts the same shortfall.
+        """
+        if not self._observation_capped:
+            return False
+        self._prune_observation_capped()
+        if not self._observation_capped:
+            return False
+        return self._slot_key(dt) in self._observation_capped
+
+    def _prune_observation_capped(self) -> None:
+        """Drop caps for slots that are already in the past.
+
+        A cap only matters while its slot is current or future — the DP never
+        looks backwards. The set used to be cleared only by a successful
+        provider refresh or the stale-cache purge, both unreachable when no
+        provider is configured (``refresh`` returns early) or while a configured
+        provider stays down, yet ``refresh_for_shortfall`` keeps writing to it.
+        Over weeks of uptime that grew without bound, and every stale mark
+        permanently suppressed the bias factor for its slot.
+        """
+        if not self._observation_capped:
+            return
+        try:
+            current = self._slot_key(self.datetime())
+        except Exception:  # pragma: no cover - defensive
+            return
+        stale = set()
+        for key in self._observation_capped:
+            try:
+                if key < current:
+                    stale.add(key)
+            except TypeError:  # pragma: no cover - mixed naive/aware keys
+                continue
+        self._observation_capped -= stale
 
     def refresh(self, force: bool = False) -> bool:
         """
@@ -190,14 +269,27 @@ class PvForecastService:
                     return False
             self._last_forced_refresh_attempt = now
 
-        # Check cache freshness
-        if not force and self._cache_timestamp is not None:
-            age_minutes = (now - self._cache_timestamp).total_seconds() / 60.0
-            if age_minutes < self._config.pv_forecast_cache_minutes:
-                return False  # Cache is fresh
+        if not force:
+            # Cache freshness (last SUCCESSFUL fetch).
+            if self._cache_timestamp is not None:
+                age_minutes = (now - self._cache_timestamp).total_seconds() / 60.0
+                if age_minutes < self._config.pv_forecast_cache_minutes:
+                    return False  # Cache is fresh
+
+            # Failure back-off (last ATTEMPT, successful or not). Without this a
+            # provider that is down was re-tried by every caller, each attempt a
+            # blocking requests.get / HA state read on a callback thread.
+            if self._last_fetch_attempt is not None:
+                attempt_age_minutes = (
+                    now - self._last_fetch_attempt
+                ).total_seconds() / 60.0
+                if attempt_age_minutes < self._failure_retry_minutes():
+                    return False
 
         if not self._config.solcast_configured and not self._config.forecast_solar_configured:
             return False
+
+        self._last_fetch_attempt = now
 
         # Try Solcast first
         if self._config.solcast_configured:
@@ -206,6 +298,8 @@ class PvForecastService:
                 if data:
                     self._cache = data
                     self._cache_timestamp = now
+                    # Fresh provider data supersedes any observation cap.
+                    self._observation_capped.clear()
                     self.log(
                         f"PV forecast updated from Solcast: {len(data)} slots, "
                         f"peak {max(data.values()):.2f} kW"
@@ -222,6 +316,8 @@ class PvForecastService:
                 if data:
                     self._cache = data
                     self._cache_timestamp = now
+                    # Fresh provider data supersedes any observation cap.
+                    self._observation_capped.clear()
                     self.log(
                         f"PV forecast updated from Forecast.Solar: {len(data)} slots, "
                         f"peak {max(data.values()):.2f} kW"
@@ -248,9 +344,20 @@ class PvForecastService:
                     level="WARNING",
                 )
                 self._cache.clear()
+                self._observation_capped.clear()
                 self._cache_timestamp = None
 
         return False
+
+    def _failure_retry_minutes(self) -> float:
+        """Back-off after a failed provider attempt, never above the cache TTL."""
+        return max(
+            1.0,
+            min(
+                float(self._config.failure_retry_minutes),
+                float(self._config.pv_forecast_cache_minutes),
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Solcast
@@ -344,7 +451,8 @@ class PvForecastService:
         else:
             url = f"https://api.forecast.solar/estimate/{lat}/{lon}/{dec}/{az}/{kwp}"
 
-        response = requests.get(url, timeout=30)
+        # Bounded: this runs synchronously on an AppDaemon callback thread.
+        response = requests.get(url, timeout=cfg.forecast_timeout_seconds)
         response.raise_for_status()
         data = response.json()
 

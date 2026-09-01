@@ -156,6 +156,7 @@ via the `growatt_modbus/set_wit_mode` HA service (no raw register writes):
 - AC charge mode auto-selects `pv_priority` vs `ac_priority` based on current PV power
 - Duplicate commands within half a slot are skipped; `release_control()` reverts to `passthrough`
 - Reliability: each call passes `hass_timeout=config.set_wit_mode_timeout_seconds` (default **15**) and inspects the service response. A raised/`success=False` result is a confirmed failure (ERROR, returns False, last-sent NOT recorded so it retries next slot). A `None` result is an unconfirmed client-side timeout (WARNING, last-sent recorded to avoid schedule spam). The timeout is short *because* the None path is safe: verify-after-set catches a genuinely lost command, whereas a long timeout blocks every other callback of this app.
+- Health accounting reads `apply_mode_with_outcome`'s `ApplyOutcome`, never the boolean: `apply_mode` returns True for three outcomes the inverter never acknowledged (`DRY_RUN`, `SKIPPED_DUPLICATE`, `UNCONFIRMED_TIMEOUT`), so only `SENT` resets `_consecutive_apply_failures`, an unconfirmed timeout escalates to the same ERROR after 3 in a row (the hung-modbus case), and a duplicate skip or dry run is neutral.
 - Verify-after-set is a **bounded two-step ladder**, max 2 checks and 2 sends per `apply_mode` — never a resend loop:
   1. after `verify_delay_seconds` (default 90) the Inverter Mode sensor (`sensor.growatt_inverter_mode` default, or `inverter_mode_sensor`) is read; a genuine mismatch → WARNING + resend once (bypassing duplicate suppression) + schedule check 2;
   2. after `verify_recheck_seconds` (default 60): match → INFO "recovered after resend"; mismatch → **ERROR** and stop (the next slot retries).
@@ -287,6 +288,18 @@ Procedure:
 Before deploying, smoke-test the new code against the LIVE `apps.yaml`
 (`BatteryOptimizerConfig.from_args`) and import every module — the unit suite
 does not cover the orchestrator, so a config or wiring break only shows up here.
+
+`scripts/deploy.ps1` automates exactly that procedure (Windows PowerShell 5.1):
+git-clean check plus the commit/branch it will deploy, `pytest`, `py_compile`,
+`scripts/smoke_config.py` against a temp copy of the LIVE `apps.yaml` (deleted
+immediately — the share's `apps.yaml` is only ever read), a timestamped
+`backup-<ts>/` on the share keeping the 5 newest, stop → copy (pruning `.py`
+files the repo no longer has) → `__pycache__` cleanup → SHA256 verification →
+start. Start with `-DryRun`, which runs every check and prints the planned copy
+list while writing nothing; `-Restore <backup-dir>` rolls a deploy back through
+the same stop/copy/start dance. Add-on stop/start goes through HA's Supervisor
+proxy when `-HaToken` is given, otherwise the script pauses for you to do it in
+the UI. See `scripts/README.md`.
 
 ## Development
 

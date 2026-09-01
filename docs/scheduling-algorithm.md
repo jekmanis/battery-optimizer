@@ -87,15 +87,24 @@ trigger a re-optimization.
 
 ### Shared slot transition (`soc_projection.py`)
 
-Four components must agree on what one slot does to the SOC: the DP (which
+Five components must agree on what one slot does to the SOC: the DP (which
 chooses the plan), the expected-SOC trajectory
 (`BatteryOptimizer.calculate_expected_soc_schedule`), the deviation detector
-(`SocDeviationDetector`), and the schedule log's fallback trajectory
+(`SocDeviationDetector`), the schedule log's fallback trajectory
 (`ScheduleFormatter._format_expected_trajectory`, used whenever
-`dp_soc_trajectory` does not cover a slot). The latter three delegate to
+`dp_soc_trajectory` does not cover a slot) and the projected-cost column
+(`BatteryCostTracker.project_costs`). The latter four delegate to
 `battery_optimizer_lib/soc_projection.py::project_slot_soc`; the DP keeps its own
 inlined transition because it is fused with the value recursion and the discrete
 energy grid. `tests/test_soc_projection.py` pins them together.
+
+`project_costs` was the fourth private copy: it capped charging with its own
+headroom arithmetic and clamped a DISCHARGE at `min_soc` *before* adding PV
+surplus, where the shared model adds PV, clamps at `max_soc`, then subtracts. It
+now derives both the SOC and the DC energies it prices from
+`project_slot_soc`'s `SocTransition`; only the landed-cost and weighted-average
+arithmetic stays local, so the projected-cost column cannot drift from the
+SOC/deviation columns of the same log.
 
 The formatter was the last holdout and had to carry `inverter_efficiency` and a
 `predict_pv_kw` callback to join: its HOLD branch printed `end_soc = start_soc`
@@ -153,7 +162,14 @@ T(t+dt) = Ta(t) + (T(t) - Ta(t)) * exp(-k1*dt) + k2 * |P_bat| * dt/60
    pack. Never reintroduce a `mode == CHARGE` branch in a temperature path.
    `thermal_model.battery_power_for_entry` is the single place that derives
    `|P_bat|` from a scheduled slot, and its energy split mirrors
-   `soc_projection.project_slot_soc` exactly.
+   `soc_projection.project_slot_soc` exactly — including the case where a
+   `DISCHARGE` slot has `pv >= load`. There the shared SOC model *charges* the
+   pack from `min(pv - load, charge_rate)`, so reporting 0 kW made a pack whose
+   SOC was rising read as thermally idle. The orchestrator's cloud-safe
+   HOLD -> `discharge_to_load` conversion turns midday HOLD slots into DISCHARGE,
+   so that was the routine midday case, and it was a `mode`-keyed special case of
+   exactly the kind this invariant forbids. `DISCHARGE` with `pv >= load` and
+   `HOLD` with the same forecast must return the same `|P_bat|`.
 2. **Ambient is `T_ambient(t)`, never one scalar for the horizon.**
    `ambient_service.AmbientTemperatureService` resolves it per slot with the chain
    *HA weather forecast -> outdoor temperature sensor -> diurnal profile around the
@@ -182,11 +198,34 @@ T(t+dt) = Ta(t) + (T(t) - Ta(t)) * exp(-k1*dt) + k2 * |P_bat| * dt/60
 
 ### Calibration
 
-`k1`/`k2` are fitted by ordinary least squares over `LearningStats.thermal_samples`
-(`[T_start, T_end, dt, |P_bat|, T_ambient]`, last 300), solved as 2x2 normal equations
-in pure Python. At least 20 samples are required and the regressors must not be
+`k1`/`k2` are fitted over `LearningStats.thermal_samples`
+(`[T_start, T_end, dt, |P_bat|, T_ambient]`, last 300) **to the exponential model
+above, not to its Euler linearisation**. The fit minimises the residual of
+`step_temperature` itself,
+
+```
+r = (T_start - Ta) * exp(-k1*dt) + k2 * |P_bat| * dt/60 - (T_end - Ta)
+```
+
+by damped Gauss-Newton in pure Python, starting from the Euler normal-equation
+solution. Fitting the Euler form `(T_end-T_start)/dt = -k1*(T_start-Ta) + k2'*|P|`
+directly — as the calibration originally did — recovers a `k1` low by roughly
+`k1*dt/2`: **2.9 % at dt=5 min, 16.0 % at 30 min and 28.7 % at 60 min** for
+`k1 = 0.012/min`. Thermal samples span whole charge/discharge sessions, so 20-40 min
+intervals are the norm and the bias was systematic against the very projector the
+coefficients feed. `k2` is fitted directly in C per kWh and is unaffected by the
+linearisation. At least 20 samples are required and the regressors must not be
 collinear (all-equal power cannot separate relaxation from heating). Results are
 clamped to `k1 ∈ [0.001, 0.1]` per minute and `k2 ∈ [0, 2]` C/kWh.
+
+**One ambient source for both recorders.** `record_charging` and
+`record_discharging` feed a single pooled regression whose relaxation regressor is
+`-(T_start - Ta)`, so both must take `ambient_temp` from the ambient service.
+`record_charging` used to have no such parameter and fell back to the rolling
+battery-temperature minimum: in summer that sits ~10 C above the real ambient, so
+two thermally identical samples entered the fit as `x1 = -3` (charge) and
+`x1 = -13` (discharge) and `k1` absorbed the charge/discharge mode instead of the
+relaxation.
 
 Until then `get_heating_coefficient()` **bootstraps** from the already-collected
 charge warming rates: `median(C/min) / nominal_charge_rate * 60`. This matters

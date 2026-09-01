@@ -11,6 +11,8 @@ from battery_optimizer_lib.timezone_utils import (
     align_to_slot,
     canonical_slot_key,
     next_slot_time,
+    prev_slot_time,
+    slot_offset,
     next_interval_time,
     lookup_by_time,
 )
@@ -182,6 +184,60 @@ class TestNextSlotTime:
         now = datetime.datetime(2024, 3, 31, 2, 45, tzinfo=riga)
         next_slot = next_slot_time(now, 15, riga)
         assert (next_slot.hour, next_slot.minute) == (4, 0)
+
+
+class TestPrevSlotTime:
+    """Tests for prev_slot_time / slot_offset (DST-safe slot arithmetic).
+
+    Regression: ``_check_pv_shortfall`` used
+    ``now_slot - timedelta(minutes=slot_minutes)`` on an AWARE datetime. Around
+    the Europe/Riga autumn fold that is a 1h15m step backwards and in spring a
+    -45min step, so ``PvBiasTracker.get_closed(prev_slot)`` looked up a slot
+    that never closed and the reactive check silently stopped working for an
+    hour twice a year.
+    """
+
+    def test_prev_15min_slot(self):
+        now = datetime.datetime(2024, 1, 15, 10, 20, 0)
+        assert prev_slot_time(now, 15) == datetime.datetime(2024, 1, 15, 10, 0)
+
+    def test_prev_slot_crosses_midnight(self):
+        now = datetime.datetime(2024, 1, 15, 0, 5, 0)
+        prev = prev_slot_time(now, 30)
+        assert prev == datetime.datetime(2024, 1, 14, 23, 30)
+
+    def test_prev_slot_leaves_the_second_dst_fold(self, riga_timezone):
+        """From the SECOND 03:00 the previous slot is the first 03:45."""
+        riga = riga_timezone
+        now = datetime.datetime(2024, 10, 27, 3, 5, tzinfo=riga, fold=1)
+        prev = prev_slot_time(now, 15, riga)
+        assert (prev.hour, prev.minute, prev.fold) == (3, 45, 0)
+        # Wall-clock subtraction produced 02:45 — a slot that never closed.
+        assert (now.replace(second=0) - datetime.timedelta(minutes=15)).hour == 2
+
+    def test_prev_slot_skips_the_spring_gap(self, riga_timezone):
+        """04:00 follows 02:45 directly — 03:45 does not exist."""
+        riga = riga_timezone
+        now = datetime.datetime(2024, 3, 31, 4, 10, tzinfo=riga)
+        prev = prev_slot_time(now, 15, riga)
+        assert (prev.hour, prev.minute) == (2, 45)
+
+    def test_prev_and_next_are_inverses_across_the_fold(self, riga_timezone):
+        riga = riga_timezone
+        slot = datetime.datetime(2024, 10, 27, 3, 30, tzinfo=riga, fold=1)
+        stepped_back = prev_slot_time(slot, 15, riga)
+        forward = next_slot_time(stepped_back, 15, riga)
+        assert forward.replace(second=0) == slot
+
+    def test_slot_offset_moves_several_slots(self):
+        now = datetime.datetime(2024, 1, 15, 10, 20, 0)
+        # 10:20 aligns to 10:15 first.
+        assert slot_offset(now, 15, 4) == datetime.datetime(2024, 1, 15, 11, 15)
+        assert slot_offset(now, 15, -4) == datetime.datetime(2024, 1, 15, 9, 15)
+
+    def test_slot_offset_zero_aligns(self):
+        now = datetime.datetime(2024, 1, 15, 10, 20, 37)
+        assert slot_offset(now, 15, 0) == datetime.datetime(2024, 1, 15, 10, 15)
 
 
 class TestNextIntervalTime:

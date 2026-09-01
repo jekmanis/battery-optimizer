@@ -236,3 +236,151 @@ class TestTemperatureProjector:
     def test_default_cooling_rate_without_data(self, learning_engine):
         projector = TemperatureProjector(learning_engine=learning_engine)
         assert projector.cooling_rate(33.0) == pytest.approx(DEFAULT_COOLING_RATE_PER_MIN)
+
+
+class TestDischargeWithPvSurplus:
+    """``DISCHARGE`` while ``pv >= load`` is a PV CHARGE, not a thermal idle.
+
+    ``soc_projection.project_slot_soc``'s self-consumption branch stores
+    ``min(max(0, pv-load), charge_rate) * efficiency * hours`` in exactly this
+    regime, so the SOC rises.  ``battery_power_for_entry`` used to return 0 kW
+    for it (``min(net_load, rate)`` with ``net_load == 0``), which is the
+    mode-keyed special case the one-thermal-model invariant forbids: the pack
+    was modelled as thermally idle while it was charging.  The orchestrator's
+    cloud-safe HOLD -> ``discharge_to_load`` conversion turns midday HOLD slots
+    into DISCHARGE, so this is the routine midday case.
+    """
+
+    def test_discharge_with_pv_surplus_is_not_zero_power(self):
+        power = battery_power_for_entry(
+            BatteryMode.DISCHARGE,
+            charge_rate_kw=4.5,
+            load_kw=0.6,
+            pv_kw=3.6,
+            discharge_rate_kw=5.0,
+            inverter_efficiency=0.95,
+        )
+        assert power == pytest.approx(3.0)
+
+    def test_discharge_pv_surplus_is_capped_by_the_charge_rate(self):
+        power = battery_power_for_entry(
+            BatteryMode.DISCHARGE,
+            charge_rate_kw=2.0,
+            load_kw=0.5,
+            pv_kw=8.0,
+            discharge_rate_kw=5.0,
+        )
+        assert power == pytest.approx(2.0)
+
+    @pytest.mark.parametrize(
+        "load_kw,pv_kw",
+        [(0.0, 4.0), (0.6, 3.6), (1.0, 1.0), (2.0, 6.5), (0.4, 0.4001)],
+    )
+    def test_hold_and_discharge_agree_when_pv_covers_load(self, load_kw, pv_kw):
+        """Same physics -> same |P_bat|, whatever the schedule calls the slot."""
+        kwargs = dict(
+            charge_rate_kw=4.5,
+            load_kw=load_kw,
+            pv_kw=pv_kw,
+            discharge_rate_kw=5.0,
+            inverter_efficiency=0.95,
+        )
+        assert battery_power_for_entry(
+            BatteryMode.DISCHARGE, **kwargs
+        ) == pytest.approx(battery_power_for_entry(BatteryMode.HOLD, **kwargs))
+
+    def test_export_discharge_is_unaffected_by_pv_surplus(self):
+        """An export slot discharges at the export rate regardless of PV."""
+        power = battery_power_for_entry(
+            BatteryMode.DISCHARGE,
+            charge_rate_kw=4.5,
+            load_kw=0.5,
+            pv_kw=6.0,
+            discharge_rate_kw=5.0,
+            export_discharge_rate_kw=4.0,
+            export_rate=100.0,
+            inverter_efficiency=0.95,
+        )
+        assert power == pytest.approx(4.0 / 0.95)
+
+    def test_discharge_with_net_load_is_unchanged(self):
+        power = battery_power_for_entry(
+            BatteryMode.DISCHARGE,
+            charge_rate_kw=4.5,
+            load_kw=3.0,
+            pv_kw=0.5,
+            discharge_rate_kw=5.0,
+            inverter_efficiency=0.95,
+        )
+        assert power == pytest.approx(2.5 / 0.95)
+
+    def test_pv_surplus_discharge_warms_the_pack(self):
+        """The end-to-end consequence: a charging pack no longer reads flat."""
+        projector = TemperatureProjector(fallback_ambient_c=30.0)
+        power = battery_power_for_entry(
+            BatteryMode.DISCHARGE,
+            charge_rate_kw=4.5,
+            load_kw=0.5,
+            pv_kw=4.5,
+            discharge_rate_kw=5.0,
+        )
+        idle = projector.project(33.0, None, 60.0, 0.0)
+        charging = projector.project(33.0, None, 60.0, power)
+        assert charging > idle + 1.0
+
+    def test_power_matches_the_energy_that_moves_the_soc(self):
+        """|P_bat| must be the power behind ``project_slot_soc``'s DC energy.
+
+        Guards the A-finding at the seam: the thermal model and the SOC model
+        have to be describing the same battery.
+        """
+        from battery_optimizer_lib.soc_projection import (
+            SocProjectionParams,
+            project_slot_soc,
+        )
+
+        params = SocProjectionParams(
+            battery_capacity=14.3,
+            efficiency=0.95,
+            charge_rate=4.5,
+            discharge_rate=5.0,
+            inverter_efficiency=0.95,
+            min_soc=10.0,
+            max_soc=100.0,
+            slot_minutes=60,
+        )
+        cases = [
+            (BatteryMode.DISCHARGE, 0.5, 4.5),   # PV surplus -> charging
+            (BatteryMode.DISCHARGE, 3.0, 0.5),   # net load -> discharging
+            (BatteryMode.HOLD, 0.5, 4.5),
+            (BatteryMode.HOLD, 3.0, 0.5),
+        ]
+        for mode, load_kw, pv_kw in cases:
+            transition = project_slot_soc(
+                soc_start=50.0,
+                mode=mode,
+                params=params,
+                load_kw=load_kw,
+                pv_kw=pv_kw,
+            )
+            power = battery_power_for_entry(
+                mode,
+                charge_rate_kw=params.charge_rate,
+                load_kw=load_kw,
+                pv_kw=pv_kw,
+                discharge_rate_kw=params.discharge_rate,
+                export_discharge_rate_kw=params.effective_export_discharge_rate,
+                inverter_efficiency=params.inverter_efficiency,
+            )
+            # DC energy in is stored AFTER the retention factor; DC energy out
+            # is what leaves the pack. |P_bat| is the pre-retention rate, so
+            # the charging comparison divides it back out.
+            moved_kwh = (
+                transition.dc_energy_in_kwh / params.efficiency
+                + transition.dc_energy_out_kwh
+            )
+            assert power * params.slot_hours == pytest.approx(moved_kwh, abs=1e-9), (
+                f"{mode.name} load={load_kw} pv={pv_kw}"
+            )
+            if pv_kw > load_kw:
+                assert power > 0.0

@@ -5,6 +5,7 @@ instead of writing TOU registers.
 """
 
 import datetime
+import enum
 from typing import Optional
 
 from .models import BatteryMode, ScheduleEntry
@@ -56,6 +57,30 @@ VERIFY_RECHECK_SECONDS = 60
 SET_WIT_MODE_TIMEOUT_SECONDS = 15
 
 
+class ApplyOutcome(enum.Enum):
+    """What actually happened to one ``apply_mode`` command.
+
+    The boolean returned by ``apply_mode`` cannot separate these, and THREE of
+    them are True: a dry run, a duplicate that was never transmitted, and a
+    client-side timeout nobody confirmed. Treating all three as "the inverter
+    obeyed" is what let a hung growatt_modbus publish climbing apply_successes
+    while the "inverter is NOT following the schedule" escalation could never
+    fire — every call timed out at ``hass_timeout``, logged a WARNING and
+    returned True.
+    """
+
+    SENT = "sent"                        # confirmed by the service response
+    UNCONFIRMED_TIMEOUT = "unconfirmed"  # client-side timeout, outcome unknown
+    SKIPPED_DUPLICATE = "duplicate"      # identical command, nothing transmitted
+    DRY_RUN = "dry_run"                  # device_id == "" — nothing transmitted
+    FAILED = "failed"                    # confirmed failure
+
+    @property
+    def confirmed(self) -> bool:
+        """True only when the inverter actually acknowledged the command."""
+        return self is ApplyOutcome.SENT
+
+
 class DirectControl:
     """Sends mode commands to WIT inverter via HA service calls."""
 
@@ -104,6 +129,12 @@ class DirectControl:
         self._verified_count = 0
         self._last_mismatch: Optional[dict] = None
 
+        # Outcome of the last apply_mode command, and a tally per outcome.
+        # These are what separate "the inverter acknowledged N commands" from
+        # "N commands timed out unconfirmed" / "N were never transmitted".
+        self.last_apply_outcome: Optional[ApplyOutcome] = None
+        self._apply_outcome_counts: dict = {}
+
     @property
     def device_id(self) -> str:
         return self.config.device_id
@@ -119,18 +150,37 @@ class DirectControl:
     def apply_mode(self, entry: ScheduleEntry) -> bool:
         """Send mode command to inverter via set_wit_mode service.
 
+        Backward-compatible boolean wrapper around
+        :meth:`apply_mode_with_outcome`: False only for a CONFIRMED failure.
+        Callers that need to distinguish "the inverter acknowledged" from
+        "nothing was transmitted" or "we never found out" must use
+        ``apply_mode_with_outcome`` (or read ``last_apply_outcome``).
+
         Args:
             entry: Schedule entry with mode, and optional export_rate
                    and ac_charge_mode.
 
         Returns:
-            True if service call succeeded (or dry-run), False otherwise.
+            True unless the service call confirmed a failure.
+        """
+        return self.apply_mode_with_outcome(entry) is not ApplyOutcome.FAILED
+
+    def apply_mode_with_outcome(self, entry: ScheduleEntry) -> ApplyOutcome:
+        """Send mode command to inverter and report what actually happened.
+
+        Args:
+            entry: Schedule entry with mode, and optional export_rate
+                   and ac_charge_mode.
+
+        Returns:
+            The :class:`ApplyOutcome` for this command. Also stored on
+            ``self.last_apply_outcome`` and counted in ``get_diagnostics()``.
         """
         if not self.device_id:
             self.app.log(
                 f"DirectControl: dry-run {entry.mode.name} ({entry.reason})"
             )
-            return True
+            return self._record_outcome(ApplyOutcome.DRY_RUN)
 
         mode = entry.mode
         duration = self._duration_for_slot()
@@ -173,7 +223,7 @@ class DirectControl:
                 f"(last sent {self._seconds_since_last():.0f}s ago)",
                 level="DEBUG",
             )
-            return True
+            return self._record_outcome(ApplyOutcome.SKIPPED_DUPLICATE)
 
         # Supersede any verification pending from a previous send BEFORE we send
         # (regardless of this send's outcome). Otherwise a confirmed failure
@@ -201,7 +251,7 @@ class DirectControl:
                 "not recording last-sent so a resend can correct it",
                 level="ERROR",
             )
-            return False
+            return self._record_outcome(ApplyOutcome.FAILED)
 
         # outcome is True (confirmed) or None (unconfirmed — client-side
         # timeout, command usually still applied). In both cases record the
@@ -219,7 +269,18 @@ class DirectControl:
             )
 
         self._schedule_verification(mode_str, params)
-        return True
+        return self._record_outcome(
+            ApplyOutcome.SENT if outcome is True
+            else ApplyOutcome.UNCONFIRMED_TIMEOUT
+        )
+
+    def _record_outcome(self, outcome: ApplyOutcome) -> ApplyOutcome:
+        """Store and count one apply outcome, then return it unchanged."""
+        self.last_apply_outcome = outcome
+        self._apply_outcome_counts[outcome] = (
+            self._apply_outcome_counts.get(outcome, 0) + 1
+        )
+        return outcome
 
     def release_control(self) -> bool:
         """Release all overrides — inverter reverts to base mode."""
@@ -494,8 +555,22 @@ class DirectControl:
             problem, not a timing one.
           * resend_failed_count growing -> the set_wit_mode service itself is
             failing; check the Modbus connection.
+          * unconfirmed_count growing while sent_count stays flat -> every
+            set_wit_mode call is hitting its client-side timeout. That is a hung
+            growatt_modbus, even though apply_mode keeps returning True.
         """
+        counts = self._apply_outcome_counts
         return {
+            "sent_count": counts.get(ApplyOutcome.SENT, 0),
+            "unconfirmed_count": counts.get(ApplyOutcome.UNCONFIRMED_TIMEOUT, 0),
+            "duplicate_skipped_count": counts.get(
+                ApplyOutcome.SKIPPED_DUPLICATE, 0
+            ),
+            "dry_run_count": counts.get(ApplyOutcome.DRY_RUN, 0),
+            "failed_count": counts.get(ApplyOutcome.FAILED, 0),
+            "last_apply_outcome": (
+                self.last_apply_outcome.value if self.last_apply_outcome else None
+            ),
             "mismatch_count": self._mismatch_count,
             "resend_count": self._resend_count,
             "resend_recovered_count": self._resend_recovered_count,

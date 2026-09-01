@@ -341,6 +341,9 @@ class _PartialSlotSocOptimizer:
 _PartialSlotSocOptimizer.calculate_expected_soc_schedule = (
     BatteryOptimizer.calculate_expected_soc_schedule
 )
+_PartialSlotSocOptimizer.project_schedule_trajectory = (
+    BatteryOptimizer.project_schedule_trajectory
+)
 
 
 class TestExpectedSocSchedulePartialFirstSlot:

@@ -509,6 +509,112 @@ class TestCaching:
         assert svc.refresh(force=True) is True
         assert fetch_count == 2
 
+    def test_failing_provider_is_not_retried_on_every_refresh(self):
+        """DEFECT F1 — the cache-age guard keyed off the last SUCCESS only.
+
+        ``_cache_timestamp`` is written only when a provider returns data, so
+        while Solcast / Forecast.Solar were down the guard never engaged and
+        every optimize / adaptive / PV-shortfall pass re-issued the fetch —
+        for Forecast.Solar a 30 s blocking ``requests.get`` on an AppDaemon
+        callback thread.
+        """
+        config = PvForecastServiceConfig(
+            solcast_today_entity="sensor.solcast_today",
+            pv_forecast_cache_minutes=60,
+            failure_retry_minutes=10,
+            slot_minutes=15,
+        )
+        now = {"t": datetime.datetime(2026, 3, 24, 12, 0, tzinfo=TZ_PLUS2)}
+        fetches = {"n": 0}
+
+        svc = _make_service(config=config, states={})
+
+        def failing_get_state(entity_id, attribute=None):
+            fetches["n"] += 1
+            return None
+
+        svc.get_state = failing_get_state
+        svc.datetime = lambda: now["t"]
+
+        assert svc.refresh() is False
+        assert fetches["n"] == 1
+
+        # Immediately afterwards (and repeatedly): no second attempt.
+        for minutes in (0, 1, 5, 9):
+            now["t"] = datetime.datetime(
+                2026, 3, 24, 12, 0, tzinfo=TZ_PLUS2
+            ) + datetime.timedelta(minutes=minutes)
+            assert svc.refresh() is False
+        assert fetches["n"] == 1, "a dead provider was retried on every refresh()"
+
+        # After the failure-retry interval it is attempted again.
+        now["t"] = datetime.datetime(
+            2026, 3, 24, 12, 11, tzinfo=TZ_PLUS2
+        )
+        assert svc.refresh() is False
+        assert fetches["n"] == 2
+
+    def test_failure_retry_is_much_shorter_than_the_cache_interval(self):
+        """A transient failure must recover in minutes, not in a full TTL."""
+        config = PvForecastServiceConfig(
+            solcast_today_entity="sensor.solcast_today",
+            pv_forecast_cache_minutes=60,
+            failure_retry_minutes=10,
+            slot_minutes=15,
+        )
+        now = {"t": datetime.datetime(2026, 3, 24, 12, 0, tzinfo=TZ_PLUS2)}
+        good_state = {
+            "state": "5.0",
+            "attributes": {"detailedForecast": [_solcast_entry(10, 0, 3.0)]},
+        }
+        available = {"ok": False}
+
+        svc = _make_service(config=config, states={})
+
+        def flaky_get_state(entity_id, attribute=None):
+            if not available["ok"]:
+                return None
+            return good_state if attribute == "all" else good_state["state"]
+
+        svc.get_state = flaky_get_state
+        svc.datetime = lambda: now["t"]
+
+        assert svc.refresh() is False
+        available["ok"] = True
+
+        now["t"] = datetime.datetime(2026, 3, 24, 12, 11, tzinfo=TZ_PLUS2)
+        assert svc.refresh() is True
+        assert svc.has_forecast
+
+        # ... and once it succeeded, the full cache TTL applies again.
+        now["t"] = datetime.datetime(2026, 3, 24, 12, 30, tzinfo=TZ_PLUS2)
+        assert svc.refresh() is False
+
+    def test_forecast_solar_http_timeout_is_bounded(self):
+        """The blocking REST call runs on an AppDaemon callback thread."""
+        config = PvForecastServiceConfig(
+            forecast_solar_lat=56.9,
+            forecast_solar_lon=24.1,
+            forecast_solar_kwp=5.0,
+            slot_minutes=15,
+        )
+        assert config.forecast_timeout_seconds == 10.0
+
+        with patch(
+            "battery_optimizer_lib.pv_forecast_service.requests"
+        ) as mock_requests:
+            mock_response = MagicMock()
+            mock_response.json.return_value = {
+                "result": {"watt_hours_period": {"2026-03-24 10:00:00": 2000}}
+            }
+            mock_requests.get.return_value = mock_response
+
+            svc = _make_service(config=config, states={})
+            assert svc.refresh() is True
+
+        _, kwargs = mock_requests.get.call_args
+        assert kwargs["timeout"] == pytest.approx(10.0)
+
     def test_shortfall_refresh_caps_current_slot_when_provider_is_unchanged(self):
         """A stale provider response cannot restore the optimistic current slot."""
         config = PvForecastServiceConfig(
@@ -555,6 +661,142 @@ class TestCaching:
         slot = datetime.datetime(2026, 3, 24, 10, 0, tzinfo=TZ_PLUS2)
         assert svc.refresh_for_shortfall(slot, actual_kw=0.2) is False
         assert svc.predict_kw(slot) == pytest.approx(0.2)
+
+    def test_capped_slot_is_marked_so_callers_can_skip_the_bias_factor(self):
+        """The cap already carries the shortfall — the bias must not re-apply it.
+
+        ``_predict_pv_kw`` multiplies by the sliding PV bias factor, which is the
+        median of exactly the shortfall ratios that produced this cap. Without
+        this marker, a 4.0 kW forecast measured at 0.8 kW was planned at
+        ~0.16 kW: the same shortfall counted twice.
+        """
+        config = PvForecastServiceConfig(
+            solcast_today_entity="sensor.solcast_today",
+            pv_forecast_cache_minutes=60,
+            slot_minutes=15,
+        )
+        state = {
+            "state": "5.0",
+            "attributes": {
+                "detailedForecast": [
+                    _solcast_entry(10, 0, 4.0),
+                    _solcast_entry(10, 15, 4.0),
+                ],
+            },
+        }
+        # The clock must sit inside the shortfall slot: caps for PAST slots are
+        # pruned (they can no longer affect the DP).
+        svc = _make_service(
+            config=config,
+            states={"sensor.solcast_today": state},
+            now=datetime.datetime(2026, 3, 24, 10, 0, tzinfo=TZ_PLUS2),
+        )
+        assert svc.refresh() is True
+
+        slot = datetime.datetime(2026, 3, 24, 10, 0, tzinfo=TZ_PLUS2)
+        other = datetime.datetime(2026, 3, 24, 10, 15, tzinfo=TZ_PLUS2)
+        assert svc.is_observation_capped(slot) is False
+
+        svc.refresh_for_shortfall(slot, actual_kw=0.8)
+
+        assert svc.is_observation_capped(slot) is True
+        # Only the observed slot is capped; the rest stay provider-driven.
+        assert svc.is_observation_capped(other) is False
+
+    def test_fresh_provider_data_clears_the_observation_cap(self):
+        """A new forecast replaces the cache, so the old cap no longer applies."""
+        config = PvForecastServiceConfig(
+            solcast_today_entity="sensor.solcast_today",
+            pv_forecast_cache_minutes=60,
+            slot_minutes=15,
+        )
+        state = {
+            "state": "5.0",
+            "attributes": {"detailedForecast": [_solcast_entry(10, 0, 4.0)]},
+        }
+        svc = _make_service(
+            config=config,
+            states={"sensor.solcast_today": state},
+            now=datetime.datetime(2026, 3, 24, 10, 0, tzinfo=TZ_PLUS2),
+        )
+        assert svc.refresh() is True
+
+        slot = datetime.datetime(2026, 3, 24, 10, 0, tzinfo=TZ_PLUS2)
+        svc.refresh_for_shortfall(slot, actual_kw=0.8)
+        assert svc.is_observation_capped(slot) is True
+
+        # A later forced refresh that actually returns data re-populates _cache.
+        svc._last_forced_refresh_attempt = None
+        assert svc.refresh(force=True) is True
+        assert svc.is_observation_capped(slot) is False
+        assert svc.predict_kw(slot) == pytest.approx(4.0)
+
+    def test_capped_mark_requires_the_observation_to_actually_lower_the_slot(self):
+        """DEFECT F4 — a slot the measurement did not cap must keep the bias.
+
+        ``refresh_for_shortfall`` used to mark the slot unconditionally, even
+        when the freshly fetched forecast was already at or below the observed
+        production. ``_predict_pv_kw`` then skipped the sliding bias factor for
+        a slot nothing had capped: with bias 0.2, a fresh 0.5 kW forecast
+        against 0.8 kW observed left the DP planning 0.5 kW instead of 0.1 kW.
+        """
+        config = PvForecastServiceConfig(
+            solcast_today_entity="sensor.solcast_today",
+            pv_forecast_cache_minutes=60,
+            slot_minutes=15,
+        )
+        state = {
+            "state": "5.0",
+            "attributes": {"detailedForecast": [_solcast_entry(12, 0, 0.5)]},
+        }
+        now = datetime.datetime(2026, 3, 24, 12, 0, tzinfo=TZ_PLUS2)
+        svc = _make_service(
+            config=config, states={"sensor.solcast_today": state}, now=now
+        )
+        assert svc.refresh() is True
+
+        slot = datetime.datetime(2026, 3, 24, 12, 0, tzinfo=TZ_PLUS2)
+        svc.refresh_for_shortfall(slot, actual_kw=0.8)
+
+        assert svc.is_observation_capped(slot) is False
+        assert svc.predict_kw(slot) == pytest.approx(0.5)
+
+        # The mirror case: the observation IS below the forecast, so it caps.
+        state["attributes"]["detailedForecast"] = [_solcast_entry(12, 0, 0.8)]
+        svc._last_forced_refresh_attempt = None
+        svc.refresh_for_shortfall(slot, actual_kw=0.5)
+
+        assert svc.is_observation_capped(slot) is True
+        assert svc.predict_kw(slot) == pytest.approx(0.5)
+
+    def test_observation_caps_do_not_accumulate_for_past_slots(self):
+        """DEFECT F3 — the capped set was only ever cleared by a good refresh.
+
+        With no provider configured ``refresh()`` returns early, so neither the
+        success path nor the stale-cache purge could clear
+        ``_observation_capped``, yet ``refresh_for_shortfall`` keeps writing to
+        it every time a shortfall is detected. Over weeks of uptime the set grew
+        without bound and every stale entry permanently suppressed the bias
+        factor for its slot.
+        """
+        config = PvForecastServiceConfig(slot_minutes=15)  # no provider at all
+        now = {"t": datetime.datetime(2026, 3, 24, 8, 0, tzinfo=TZ_PLUS2)}
+        svc = _make_service(config=config)
+        svc.datetime = lambda: now["t"]
+
+        for i in range(40):
+            now["t"] = datetime.datetime(
+                2026, 3, 24, 8, 0, tzinfo=TZ_PLUS2
+            ) + datetime.timedelta(minutes=15 * i)
+            svc.refresh_for_shortfall(now["t"], actual_kw=0.3)
+            assert len(svc._observation_capped) == 1
+
+        # Only the current slot is still marked.
+        assert svc.is_observation_capped(now["t"]) is True
+        assert (
+            svc.is_observation_capped(now["t"] - datetime.timedelta(minutes=15))
+            is False
+        )
 
     def test_stale_cache_triggers_refetch(self):
         """After cache_minutes elapse, refresh should re-fetch."""

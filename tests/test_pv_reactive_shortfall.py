@@ -40,12 +40,24 @@ def _dt(hour, minute=0, second=0):
 
 
 class _FakeForecastService:
+    """Stand-in that models the real observation-cap bookkeeping.
+
+    ``refresh_for_shortfall`` caps the affected slot at the observed production
+    and marks it, so ``_predict_pv_kw`` can skip the bias factor there instead
+    of discounting the same shortfall twice.
+    """
+
     def __init__(self):
         self.shortfall_calls = []
+        self.capped_slots = set()
 
     def refresh_for_shortfall(self, dt, actual_kw):
         self.shortfall_calls.append((dt, actual_kw))
+        self.capped_slots.add(align_to_slot(dt, 15, TZ))
         return False
+
+    def is_observation_capped(self, dt):
+        return align_to_slot(dt, 15, TZ) in self.capped_slots
 
 
 class MockPvOptimizer:
@@ -424,3 +436,43 @@ class TestSamplePv:
         opt._get_pv_power_optional = boom
         opt._sample_pv()  # must not raise
         assert "PV sampling failed" in opt.messages()
+
+
+# ---------------------------------------------------------------------------
+# The shortfall slot must be discounted ONCE
+# ---------------------------------------------------------------------------
+
+class TestShortfallSlotIsDiscountedOnce:
+    """``refresh_for_shortfall`` caps the current slot at observed production.
+
+    The bias factor is the median of exactly those shortfall ratios, so
+    multiplying the capped value by it counted the same cloud twice: a 4.0 kW
+    forecast with two measured 0.8 kW slots planned the current slot at
+    ~0.16 kW instead of 0.8 kW, handing the DP a phantom collapse in the one
+    slot where it had a real measurement.
+    """
+
+    def _after_shortfall(self):
+        opt = MockPvOptimizer(now=_dt(15, 30, 5), raw_forecast_kw=4.0)
+        _measure_slot(opt, _dt(15, 0), 4.0, 0.8)
+        _measure_slot(opt, _dt(15, 15), 4.0, 0.8)
+        assert opt._check_pv_shortfall(current_soc=80.0) is True
+        assert opt._pv_forecast_service.shortfall_calls
+        return opt
+
+    def test_bias_factor_is_itself_the_shortfall(self):
+        opt = self._after_shortfall()
+        assert opt._pv_bias_factor == pytest.approx(0.2, abs=0.05)
+
+    def test_capped_current_slot_keeps_the_observed_value(self):
+        opt = self._after_shortfall()
+        # The forecast service now serves the observed 0.8 kW for this slot.
+        opt._raw_forecast_kw = 0.8
+        assert opt._predict_pv_kw(_dt(15, 30)) == pytest.approx(0.8)
+
+    def test_uncapped_future_slots_still_get_the_bias(self):
+        opt = self._after_shortfall()
+        opt._raw_forecast_kw = 4.0
+        later = opt._predict_pv_kw(_dt(16, 30))
+        assert later == pytest.approx(4.0 * opt._pv_bias_factor)
+        assert later < 4.0

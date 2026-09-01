@@ -179,6 +179,65 @@ def align_to_slot(
     )
 
 
+def slot_offset(
+    dt: datetime.datetime,
+    slot_minutes: int,
+    slots: int,
+    local_tz: Optional[datetime.tzinfo] = None
+) -> datetime.datetime:
+    """
+    Return the slot boundary ``slots`` slots away from the one containing ``dt``.
+
+    Wall-clock arithmetic on an aware datetime is wrong across a DST
+    transition: ``dt - timedelta(minutes=15)`` around the Europe/Riga autumn
+    fold is a 1h15m step (and a -45min step in spring), so the caller's slot
+    lookup misses the slot it meant.  Elapsed time is therefore added as a UTC
+    instant, the same idiom ``next_slot_time`` has always used.
+
+    Args:
+        dt: Any datetime inside the reference slot
+        slot_minutes: Slot duration in minutes
+        slots: Number of slots to move (negative moves backwards)
+        local_tz: Optional local timezone
+
+    Returns:
+        Slot-aligned datetime with seconds/microseconds zeroed
+    """
+    dt = ensure_local_tz(dt, local_tz)
+    current_slot = align_to_slot(dt, slot_minutes)
+    delta = datetime.timedelta(minutes=slot_minutes * slots)
+    if _is_aware(current_slot):
+        # Move in UTC so a spring gap is skipped and both autumn fold slots
+        # remain reachable.
+        shifted = (current_slot.astimezone(UTC) + delta).astimezone(
+            current_slot.tzinfo
+        )
+    else:
+        shifted = current_slot + delta
+    return shifted.replace(second=0, microsecond=0)
+
+
+def prev_slot_time(
+    now: datetime.datetime,
+    slot_minutes: int,
+    local_tz: Optional[datetime.tzinfo] = None
+) -> datetime.datetime:
+    """
+    Get the start of the slot immediately BEFORE the one containing ``now``.
+
+    DST-safe counterpart of :func:`next_slot_time` (see :func:`slot_offset`).
+
+    Args:
+        now: Current datetime
+        slot_minutes: Slot duration in minutes
+        local_tz: Optional local timezone
+
+    Returns:
+        Datetime of the previous slot boundary
+    """
+    return slot_offset(now, slot_minutes, -1, local_tz)
+
+
 def next_slot_time(
     now: datetime.datetime,
     slot_minutes: int,
@@ -195,16 +254,7 @@ def next_slot_time(
     Returns:
         Datetime of next slot boundary (with 5 seconds offset for safety)
     """
-    now = ensure_local_tz(now, local_tz)
-    current_slot = align_to_slot(now, slot_minutes)
-    if _is_aware(current_slot):
-        # Add elapsed time in UTC so a spring gap is skipped and both autumn
-        # fold slots are scheduled.
-        result = (current_slot.astimezone(UTC) +
-                  datetime.timedelta(minutes=slot_minutes)).astimezone(current_slot.tzinfo)
-        return result.replace(second=5, microsecond=0)
-
-    return (current_slot + datetime.timedelta(minutes=slot_minutes)).replace(
+    return slot_offset(now, slot_minutes, 1, local_tz).replace(
         second=5, microsecond=0
     )
 

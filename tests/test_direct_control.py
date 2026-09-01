@@ -20,6 +20,7 @@ import pytest
 
 from battery_optimizer_lib.config import BatteryOptimizerConfig
 from battery_optimizer_lib.direct_control import (
+    ApplyOutcome,
     DirectControl,
     DEFAULT_MODE_STATUS_ENTITY,
 )
@@ -387,9 +388,15 @@ def test_get_diagnostics_shape():
         "unverifiable_count", "verified_count", "last_mismatch",
         "verify_delay_seconds", "verify_recheck_seconds",
         "set_wit_mode_timeout_seconds",
+        # Per-outcome tally: a dry run, a suppressed duplicate and an
+        # unconfirmed timeout are all "True" from apply_mode, and only
+        # sent_count means the inverter acknowledged anything.
+        "sent_count", "unconfirmed_count", "duplicate_skipped_count",
+        "dry_run_count", "failed_count", "last_apply_outcome",
     }
     assert set(diag) == expected_keys
     assert diag["last_mismatch"] is None
+    assert diag["last_apply_outcome"] is None
     assert all(
         diag[k] == 0 for k in expected_keys
         if k.endswith("_count")
@@ -519,3 +526,76 @@ def test_release_control_failure_returns_false():
     assert result is False
     assert dc._last_mode_sent is None
     assert len(app.run_in_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# apply_mode_with_outcome: the boolean's three flavours of "True"
+#
+# apply_mode returns True for a dry run, for a duplicate that was never
+# transmitted and for an unconfirmed client-side timeout. The orchestrator used
+# that boolean for health accounting, so a hung growatt_modbus (timeouts, no
+# exception) published climbing apply_successes and the "inverter is NOT
+# following the schedule" escalation could never fire.
+# ---------------------------------------------------------------------------
+
+def test_outcome_confirmed_send_is_sent():
+    dc, app = make_dc()
+    app.call_service_return = {"success": True}
+
+    assert dc.apply_mode_with_outcome(hold_entry()) is ApplyOutcome.SENT
+    assert dc.last_apply_outcome is ApplyOutcome.SENT
+    assert ApplyOutcome.SENT.confirmed is True
+    assert dc.get_diagnostics()["sent_count"] == 1
+    assert dc.get_diagnostics()["last_apply_outcome"] == "sent"
+
+
+def test_outcome_timeout_is_unconfirmed_not_sent():
+    dc, app = make_dc()
+    app.call_service_return = None
+
+    outcome = dc.apply_mode_with_outcome(hold_entry())
+
+    assert outcome is ApplyOutcome.UNCONFIRMED_TIMEOUT
+    assert outcome.confirmed is False
+    # Backward compatible: still "not a failure" for the boolean caller.
+    assert dc.apply_mode(charge_entry()) is True
+    assert dc.get_diagnostics()["unconfirmed_count"] == 2
+    assert dc.get_diagnostics()["sent_count"] == 0
+
+
+def test_outcome_duplicate_is_skipped_and_nothing_is_transmitted():
+    dc, app = make_dc()
+
+    assert dc.apply_mode_with_outcome(hold_entry()) is ApplyOutcome.SENT
+    assert (dc.apply_mode_with_outcome(hold_entry())
+            is ApplyOutcome.SKIPPED_DUPLICATE)
+
+    assert len(app.service_calls) == 1  # the duplicate never went out
+    assert dc.get_diagnostics()["duplicate_skipped_count"] == 1
+
+
+def test_outcome_dry_run_when_no_device_id():
+    dc, app = make_dc(device_id="")
+
+    assert dc.apply_mode_with_outcome(hold_entry()) is ApplyOutcome.DRY_RUN
+
+    assert app.service_calls == []
+    assert dc.get_diagnostics()["dry_run_count"] == 1
+    assert dc.get_diagnostics()["sent_count"] == 0
+
+
+def test_outcome_success_false_response_is_failed():
+    dc, app = make_dc()
+    app.call_service_return = {"success": False, "error": "nope"}
+
+    assert dc.apply_mode_with_outcome(hold_entry()) is ApplyOutcome.FAILED
+    assert dc.apply_mode(hold_entry()) is False  # boolean wrapper agrees
+    assert dc.get_diagnostics()["failed_count"] == 2
+
+
+def test_outcome_exception_is_failed():
+    dc, app = make_dc()
+    app.call_service_raise = RuntimeError("boom")
+
+    assert dc.apply_mode_with_outcome(hold_entry()) is ApplyOutcome.FAILED
+    assert dc.get_diagnostics()["failed_count"] == 1

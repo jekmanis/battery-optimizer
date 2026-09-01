@@ -155,6 +155,12 @@ class BatteryOptimizerConfig:
     forecast_solar_api_key: str = ""  # optional paid API key
 
     pv_forecast_cache_minutes: int = 60  # how often to refresh forecast
+    # Retry interval after a FAILED provider fetch. Much shorter than the cache
+    # TTL: the cache-age guard keys off the last SUCCESS, so a provider that is
+    # down would otherwise be re-tried by every optimize / adaptive /
+    # PV-shortfall pass (each a blocking HTTP call on a callback thread), while
+    # a transient failure must still recover within minutes.
+    pv_forecast_failure_retry_minutes: int = 10
 
     # =========================================================================
     # PV Forecast Bias
@@ -185,6 +191,11 @@ class BatteryOptimizerConfig:
     ambient_diurnal_amplitude_c: float = 4.0   # half the peak-to-peak daily swing
     ambient_diurnal_peak_hour: float = 15.0    # local hour of the daily maximum
     ambient_forecast_cache_minutes: int = 60
+    # Retry interval after a FAILED weather-forecast fetch (same semantics as
+    # pv_forecast_failure_retry_minutes). Backing a failure off for the full
+    # cache interval left T_ambient(t) on the diurnal fallback for an hour after
+    # a restart that raced the HA weather integration.
+    ambient_forecast_failure_retry_minutes: int = 10
     # Thermal model fallbacks (used until enough samples are collected)
     thermal_default_cooling_rate_per_min: float = 0.012
     thermal_default_heating_c_per_kwh: float = 0.35
@@ -298,6 +309,22 @@ class BatteryOptimizerConfig:
         self.ambient_diurnal_amplitude_c = max(0.0, float(self.ambient_diurnal_amplitude_c))
         self.ambient_diurnal_peak_hour = float(self.ambient_diurnal_peak_hour) % 24.0
         self.ambient_forecast_cache_minutes = max(1, int(self.ambient_forecast_cache_minutes))
+        # A retry interval above the cache TTL would be a no-op back-off.
+        self.pv_forecast_cache_minutes = max(1, int(self.pv_forecast_cache_minutes))
+        self.pv_forecast_failure_retry_minutes = max(
+            1,
+            min(
+                int(self.pv_forecast_failure_retry_minutes),
+                self.pv_forecast_cache_minutes,
+            ),
+        )
+        self.ambient_forecast_failure_retry_minutes = max(
+            1,
+            min(
+                int(self.ambient_forecast_failure_retry_minutes),
+                self.ambient_forecast_cache_minutes,
+            ),
+        )
         self.thermal_default_cooling_rate_per_min = min(
             0.1, max(0.001, float(self.thermal_default_cooling_rate_per_min))
         )
@@ -461,6 +488,9 @@ class BatteryOptimizerConfig:
             forecast_solar_kwp=float(args.get("forecast_solar_kwp", 0.0)),
             forecast_solar_api_key=args.get("forecast_solar_api_key", ""),
             pv_forecast_cache_minutes=int(args.get("pv_forecast_cache_minutes", 60)),
+            pv_forecast_failure_retry_minutes=int(
+                args.get("pv_forecast_failure_retry_minutes", 10)
+            ),
 
             # PV Forecast Bias
             pv_bias_enabled=bool(args.get("pv_bias_enabled", True)),
@@ -481,6 +511,9 @@ class BatteryOptimizerConfig:
             ambient_diurnal_peak_hour=float(args.get("ambient_diurnal_peak_hour", 15.0)),
             ambient_forecast_cache_minutes=int(
                 args.get("ambient_forecast_cache_minutes", 60)
+            ),
+            ambient_forecast_failure_retry_minutes=int(
+                args.get("ambient_forecast_failure_retry_minutes", 10)
             ),
             thermal_default_cooling_rate_per_min=float(
                 args.get("thermal_default_cooling_rate_per_min", 0.012)

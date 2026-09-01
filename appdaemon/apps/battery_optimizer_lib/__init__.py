@@ -41,7 +41,10 @@ from .timezone_utils import (
     ensure_local_tz,
     align_to_slot,
     next_slot_time,
+    prev_slot_time,
+    slot_offset,
     next_interval_time,
+    lookup_by_time,
 )
 from .ha_helpers import SensorReader
 from .cost_tracker import BatteryCostTracker, BatteryCostConfig
@@ -92,7 +95,10 @@ __all__ = [
     "ensure_local_tz",
     "align_to_slot",
     "next_slot_time",
+    "prev_slot_time",
+    "slot_offset",
     "next_interval_time",
+    "lookup_by_time",
     # Functions
     "_quantile",
     # Cost tracker

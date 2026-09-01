@@ -289,6 +289,18 @@ Before deploying, smoke-test the new code against the LIVE `apps.yaml`
 (`BatteryOptimizerConfig.from_args`) and import every module — the unit suite
 does not cover the orchestrator, so a config or wiring break only shows up here.
 
+`scripts/deploy.ps1` automates exactly that procedure (Windows PowerShell 5.1):
+git-clean check plus the commit/branch it will deploy, `pytest`, `py_compile`,
+`scripts/smoke_config.py` against a temp copy of the LIVE `apps.yaml` (deleted
+immediately — the share's `apps.yaml` is only ever read), a timestamped
+`backup-<ts>/` on the share keeping the 5 newest, stop → copy (pruning `.py`
+files the repo no longer has) → `__pycache__` cleanup → SHA256 verification →
+start. Start with `-DryRun`, which runs every check and prints the planned copy
+list while writing nothing; `-Restore <backup-dir>` rolls a deploy back through
+the same stop/copy/start dance. Add-on stop/start goes through HA's Supervisor
+proxy when `-HaToken` is given, otherwise the script pauses for you to do it in
+the UI. See `scripts/README.md`.
+
 ## Development
 
 This is a Python AppDaemon project. Use `uv` for running Python scripts and syntax checks. No formatter or linter is enforced.

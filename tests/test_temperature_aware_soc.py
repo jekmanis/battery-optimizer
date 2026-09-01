@@ -256,6 +256,7 @@ from battery_optimizer import BatteryOptimizer
 
 # Bind the relevant methods to our mock
 MockOptimizer.calculate_expected_soc_schedule = BatteryOptimizer.calculate_expected_soc_schedule
+MockOptimizer.project_schedule_trajectory = BatteryOptimizer.project_schedule_trajectory
 MockOptimizer.find_optimal_schedule = BatteryOptimizer.find_optimal_schedule
 MockOptimizer._ensure_current_slot_price = BatteryOptimizer._ensure_current_slot_price
 MockOptimizer._compute_slot_fractions = BatteryOptimizer._compute_slot_fractions
@@ -1045,3 +1046,87 @@ class TestChargeRateProjectionIsBounded:
             project_temp=projector.project,
         )
         assert max(seen) < 60.0
+
+
+class TestCloudSafeConversionRebuildsTrajectories:
+    """The reported trajectories must describe the plan that will EXECUTE.
+
+    ``find_optimal_schedule`` rewrites HOLD -> DISCHARGE(to load) for PV hours
+    AFTER the DP has already built ``soc_trajectory`` / ``temp_trajectory``.
+    Those DP trajectories are what ``schedule_formatter`` prefers (it falls back
+    to the expected-SOC map only when they are missing), so leaving them stale
+    printed a flat SOC and a cooling pack for a plan that actually drains and
+    heats the battery — inside the very log used to diagnose SOC deviations.
+    """
+
+    START_SOC = 100.0
+    START_TEMP = 20.0
+    BASE = datetime.datetime(2026, 7, 27, 10, 0)
+
+    def _optimizer(self):
+        opt = MockOptimizer(slot_minutes=60, discharge_rate=4.5)
+        # Stored energy is worth far more than any horizon price, so the DP
+        # holds; the battery starts at max_soc so it cannot charge either.
+        opt.config.terminal_energy_value_eur_kwh = 1.0
+        opt.config.battery_wear_cost = 0.0
+        opt._ambient_service = FixedAmbient(20.0)
+        opt._predict_load_kw = lambda dt: 1.0
+        # Sunny, but PV does not cover the load: HOLD stays flat while
+        # discharge-to-load drains. That difference is the whole point.
+        opt._predict_pv_kw = lambda dt: 0.3
+        opt.set_battery_temp(self.START_TEMP)
+        opt.set_datetime(self.BASE)
+        return opt
+
+    def _run(self):
+        opt = self._optimizer()
+        prices = [
+            PricePoint(time=self.BASE + datetime.timedelta(hours=i), price=0.20)
+            for i in range(8)
+        ]
+        schedule = opt.find_optimal_schedule(prices, 0, current_soc=self.START_SOC)
+        assert schedule
+        return opt, schedule
+
+    def test_conversion_actually_happened(self):
+        _opt, schedule = self._run()
+        converted = [e for e in schedule.values() if "[cloud-safe]" in e.reason]
+        assert converted, "scenario no longer exercises the conversion"
+        assert all(e.mode == BatteryMode.DISCHARGE for e in converted)
+
+    def test_soc_trajectory_drains_like_the_converted_plan(self):
+        opt, schedule = self._run()
+        soc_traj = opt._last_dp_soc_trajectory
+        assert soc_traj
+
+        first = min(schedule)
+        start_soc, end_soc = soc_traj[first]
+        assert start_soc == pytest.approx(self.START_SOC)
+        # The stale DP trajectory reported a flat HOLD (no PV surplus at
+        # 0.3 kW PV vs 1.0 kW load), i.e. end_soc == start_soc.
+        assert end_soc < start_soc - 1.0
+
+    def test_trajectories_match_the_shared_model_for_the_final_schedule(self):
+        opt, schedule = self._run()
+
+        rebuilt_soc, rebuilt_temp = opt.project_schedule_trajectory(
+            schedule,
+            self.START_SOC,
+            starting_temp=self.START_TEMP,
+            current_slot=self.BASE,
+            minutes_into_slot=0.0,
+        )
+
+        assert opt._last_dp_soc_trajectory == rebuilt_soc
+        assert opt._last_dp_temp_trajectory == rebuilt_temp
+
+    def test_temperature_trajectory_reflects_the_discharge(self):
+        """Warming is a function of |P_bat| — a discharging pack heats up."""
+        opt, schedule = self._run()
+        temps = opt._last_dp_temp_trajectory
+        assert temps
+
+        first = min(schedule)
+        start_temp, end_temp = temps[first]
+        assert start_temp == pytest.approx(self.START_TEMP)
+        assert end_temp is not None

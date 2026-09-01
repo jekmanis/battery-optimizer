@@ -112,7 +112,15 @@ def battery_power_for_entry(
 
     * ``CHARGE``            -> the (learned) charge rate
     * ``DISCHARGE`` export  -> the export discharge rate, DC side
-    * ``DISCHARGE`` self    -> ``min(max(0, load-pv), discharge_rate)``, DC side
+    * ``DISCHARGE`` self    -> ``min(max(0, load-pv), discharge_rate)``, DC side,
+      **or**, when ``pv >= load``, the same PV-surplus charging power ``HOLD``
+      reports. ``project_slot_soc``'s self-consumption branch charges the pack
+      from ``min(max(0, pv-load), charge_rate)`` in exactly that regime, so
+      returning 0 kW here modelled a pack whose SOC was rising as thermally
+      idle. The orchestrator's cloud-safe HOLD -> ``discharge_to_load``
+      conversion makes midday ``DISCHARGE`` slots with ``pv > load`` routine,
+      so this was the common case, not an edge case — and a ``mode``-keyed
+      special case of exactly the kind the one-thermal-model invariant forbids.
     * ``HOLD``              -> ``min(max(0, pv-load), charge_rate)`` (PV surplus)
     """
     inv_eff = inverter_efficiency if inverter_efficiency and inverter_efficiency > 0 else 1.0
@@ -131,7 +139,14 @@ def battery_power_for_entry(
                 else discharge_rate_kw
             )
             return max(0.0, edr) / inv_eff
-        return min(net_load_kw, max(0.0, discharge_rate_kw)) / inv_eff
+        # Self-consumption. ``net_load_kw`` and ``pv_surplus_kw`` are mutually
+        # exclusive by construction, so this is the sum of the two branches
+        # ``project_slot_soc`` applies: DC drawn to serve the net load, plus DC
+        # stored from PV surplus. With ``pv >= load`` it reduces to the HOLD
+        # expression below — the pack is charging, not idling.
+        discharge_kw = min(net_load_kw, max(0.0, discharge_rate_kw)) / inv_eff
+        pv_charge_kw = min(pv_surplus_kw, charge_rate_kw)
+        return discharge_kw + pv_charge_kw
 
     # HOLD — the battery only sees PV surplus, if any.
     return min(pv_surplus_kw, charge_rate_kw)

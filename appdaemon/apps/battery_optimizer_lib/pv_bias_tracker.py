@@ -127,19 +127,81 @@ class PvBiasTracker:
         # Sliding (slot_start, ratio) history used for the bias factor.
         self._ratios: List[Tuple[datetime.datetime, float]] = []
         self._shortfall_streak: int = 0
+        # Last timezone discovered from *align_to_slot_func*.  Kept only as a
+        # fallback for a transiently naive alignment function — it is re-derived
+        # on every localization, see :meth:`_key_tz`.
+        self._tz: Optional[datetime.tzinfo] = None
 
     # ------------------------------------------------------------------
     # Keys
     # ------------------------------------------------------------------
 
+    def _key_tz(self, sample: datetime.datetime) -> Optional[datetime.tzinfo]:
+        """Return the timezone the alignment function produces *right now*.
+
+        This must NOT be cached across the horizon.  The orchestrator's
+        ``_get_local_timezone`` returns a **fixed-offset** ``datetime.timezone``
+        recomputed from the current wall clock (AppDaemon's ``self.datetime()``
+        is naive in production, so the value falls back to
+        ``datetime.now().astimezone().tzinfo``).  That object is ``UTC+03:00``
+        in summer and ``UTC+02:00`` in winter.
+
+        A permanently cached ``+03:00`` therefore survived the autumn DST
+        transition: ``_localize`` kept stamping naive input (``add_sample`` with
+        ``self.datetime()``) with the stale offset while the already-aware
+        ``now_slot`` used by ``ensure_slot_forecast`` / ``close_slots_before``
+        moved to ``+02:00``.  The same wall-clock instant then produced two
+        different slot keys — one ClosedSlot with a forecast and no samples,
+        another with samples and no forecast, both rejected by
+        ``_register_closed`` — so the sliding bias factor and the reactive
+        shortfall detector went silently dead until the next restart.
+
+        Re-deriving is a single ``align_to_slot`` call, which is cheap.  The
+        last successful discovery is kept only as a fallback for an alignment
+        function that transiently raises or returns naive.
+        """
+        try:
+            aligned = self._align_to_slot(sample)
+        except (TypeError, ValueError):
+            return self._tz
+        if aligned.tzinfo is not None and aligned.utcoffset() is not None:
+            self._tz = aligned.tzinfo
+        return self._tz
+
+    def _localize(self, dt: datetime.datetime) -> datetime.datetime:
+        """Bring an externally supplied datetime into the tracker's key space.
+
+        AppDaemon's ``self.datetime()`` is **naive local time** in production
+        while every stored slot key is tz-aware (``align_to_slot`` attaches the
+        HA local timezone).  Subtracting one from the other raises ``TypeError``,
+        and that exception used to be swallowed: ``_prune`` then kept every
+        entry forever and ``get_factor``/``describe`` reported an age of zero, so
+        the sliding window and the decay-to-1.0 relaxation were silently dead —
+        a stale 0.2 factor survived for days with no fresh observations.
+
+        A naive value is therefore interpreted as local wall time and stamped
+        with the alignment function's timezone.  If that function is itself
+        naive (no local timezone configured) the value is left alone, so a fully
+        naive tracker stays internally consistent.
+        """
+        if dt.tzinfo is not None and dt.utcoffset() is not None:
+            return dt
+        tz = self._key_tz(dt)
+        if tz is None:
+            return dt
+        return dt.replace(tzinfo=tz)
+
     def _key(self, dt: datetime.datetime) -> datetime.datetime:
         """Slot-align *dt* and return a DST-safe dictionary key."""
-        return canonical_slot_key(self._align_to_slot(dt))
+        return canonical_slot_key(self._align_to_slot(self._localize(dt)))
 
-    @staticmethod
-    def _order(dt: datetime.datetime) -> datetime.datetime:
-        """Return a value safe for chronological ordering of slot keys."""
-        return instant_key(dt)
+    def _order(self, dt: datetime.datetime) -> datetime.datetime:
+        """Return a value safe for chronological ordering of slot keys.
+
+        Naive input is localized first — mixing a naive ``now`` with aware slot
+        keys is the defect this method exists to prevent.
+        """
+        return instant_key(self._localize(dt))
 
     # ------------------------------------------------------------------
     # Sampling
@@ -299,21 +361,45 @@ class PvBiasTracker:
     # ------------------------------------------------------------------
 
     def _prune(self, now: datetime.datetime) -> None:
+        """Drop ratio observations older than ``window_minutes``.
+
+        Every value is normalized through :meth:`_order` first, so a naive
+        ``now`` (AppDaemon's ``self.datetime()``) is comparable with the aware
+        slot keys.  An entry that is *still* incomparable after normalization is
+        a genuine bug: it is logged and DISCARDED rather than kept, because
+        keeping it is what disabled the window in production.
+        """
         if not self._ratios:
             return
-        now_key = self._order(canonical_slot_key(now))
+        now_key = self._order(now)
         window = datetime.timedelta(minutes=self._config.window_minutes)
         kept: List[Tuple[datetime.datetime, float]] = []
         for slot, ratio in self._ratios:
             try:
                 age = now_key - self._order(slot)
             except TypeError:
-                # Mixed naive/aware history — keep the entry rather than crash.
-                kept.append((slot, ratio))
+                self._log_error(
+                    f"PV bias: discarding unusable ratio observation {slot!r} "
+                    f"(not comparable with now={now!r})"
+                )
                 continue
             if age <= window:
                 kept.append((slot, ratio))
         self._ratios = kept
+
+    def _log_error(self, message: str) -> None:
+        if self._log is None:
+            return
+        try:
+            self._log(message, level="ERROR")
+        except TypeError:  # pragma: no cover - log callable without level kwarg
+            self._log(message)
+
+    def _age_minutes(
+        self, now: datetime.datetime, slot: datetime.datetime
+    ) -> float:
+        """Minutes between the newest observation *slot* and *now*."""
+        return (self._order(now) - self._order(slot)).total_seconds() / 60.0
 
     def ratio_count(self, now: datetime.datetime) -> int:
         """Number of in-window ratio observations."""
@@ -338,12 +424,7 @@ class PvBiasTracker:
         factor = max(self._config.min_factor, min(self._config.max_factor, factor))
 
         newest = max((slot for slot, _ in self._ratios), key=self._order)
-        try:
-            age_minutes = (
-                self._order(canonical_slot_key(now)) - self._order(newest)
-            ).total_seconds() / 60.0
-        except TypeError:
-            age_minutes = 0.0
+        age_minutes = self._age_minutes(now, newest)
         age_slots = age_minutes / max(1, self._config.slot_minutes)
         if age_slots > 1.0:
             t = min(1.0, (age_slots - 1.0) / max(1, self._config.decay_slots))
@@ -389,7 +470,7 @@ class PvBiasTracker:
         """
         if factor == 1.0:
             return 1.0
-        days = self._day_distance(now, slot)
+        days = self._day_distance(self._localize(now), self._localize(slot))
         if days <= 0:
             return factor
 
@@ -407,12 +488,7 @@ class PvBiasTracker:
         if not self._ratios:
             return "no observations"
         newest = max((slot for slot, _ in self._ratios), key=self._order)
-        try:
-            age_minutes = (
-                self._order(canonical_slot_key(now)) - self._order(newest)
-            ).total_seconds() / 60.0
-        except TypeError:
-            age_minutes = 0.0
+        age_minutes = self._age_minutes(now, newest)
         return (
             f"median of {len(self._ratios)} slots over "
             f"{self._config.window_minutes}min, newest {age_minutes:.0f}min ago"

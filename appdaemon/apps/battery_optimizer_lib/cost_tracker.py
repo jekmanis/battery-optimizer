@@ -618,8 +618,14 @@ class BatteryCostTracker:
 
             # Feed learning engine with actual measured energy
             battery_temp = self._get_battery_temp()
+            # `is not None`, never truthiness: a genuine 0.0 % reading right
+            # after a depletion is the deep-discharge sample the charge-rate /
+            # efficiency / thermal curves most need. Treating it as "unset"
+            # substituted current_soc, which makes soc_end == soc_start and
+            # trips learning_engine.record_charging's `soc_end <= soc_start`
+            # early return — the observation was silently dropped.
             self._learning_engine.record_charging(
-                soc_start=self._last_soc if self._last_soc else current_soc,
+                soc_start=self._last_soc if self._last_soc is not None else current_soc,
                 soc_end=current_soc,
                 duration_minutes=duration_minutes,
                 energy_from_grid_kwh=(
@@ -630,7 +636,11 @@ class BatteryCostTracker:
                 battery_temp=battery_temp,
                 battery_temp_start=self._last_sig_temp,
                 battery_temp_end=battery_temp,
-                energy_to_battery_kwh=energy_kwh  # Actual measured energy from inverter
+                energy_to_battery_kwh=energy_kwh,  # Actual measured energy from inverter
+                # Same ambient source as record_discharging: both feed one
+                # pooled k1/k2 regression, so a different fallback here would
+                # correlate the relaxation regressor with the mode.
+                ambient_temp=self._ambient_temp(),
             )
         else:
             # Discharge
@@ -643,7 +653,7 @@ class BatteryCostTracker:
                 )
 
             self._learning_engine.record_discharging(
-                soc_start=self._last_soc if self._last_soc else current_soc,
+                soc_start=self._last_soc if self._last_soc is not None else current_soc,
                 soc_end=current_soc,
                 duration_minutes=duration_minutes,
                 energy_delivered_kwh=energy_kwh,
@@ -759,7 +769,8 @@ class BatteryCostTracker:
                 charge_price=charge_cost,
                 battery_temp=battery_temp_end,
                 battery_temp_start=self._last_sig_temp,
-                battery_temp_end=battery_temp_end
+                battery_temp_end=battery_temp_end,
+                ambient_temp=self._ambient_temp(),
             )
             self._save_learning_data()
             self._update_learning_sensor()
@@ -943,6 +954,9 @@ class BatteryCostTracker:
         predict_pv_func: Optional[Callable[[datetime.datetime], float]] = None,
         charge_rates_by_slot: Optional[Dict[datetime.datetime, float]] = None,
         slot_fractions_by_slot: Optional[Dict[datetime.datetime, float]] = None,
+        starting_temp: Optional[float] = None,
+        learning_engine: Optional["BatteryLearningEngine"] = None,
+        temp_projector=None,
     ) -> Tuple[Dict[datetime.datetime, float], float]:
         """
         Project battery avg cost evolution through a schedule.
@@ -956,49 +970,48 @@ class BatteryCostTracker:
             predict_pv_func: Optional function returning predicted PV generation in kW
             charge_rates_by_slot: Optional dict mapping datetime to charge rate (kW)
             slot_fractions_by_slot: Optional dict mapping datetime to slot fraction (0-1)
+            starting_temp: Battery temperature (C) at the projection instant, or
+                None when unknown.
+            learning_engine: Optional BatteryLearningEngine. Together with
+                ``starting_temp`` it makes the CHARGE slots use
+                ``predict_charge_energy_with_warming`` — the same per-slot,
+                temperature-evolving learned rate the expected-SOC trajectory
+                uses. Without both, the shared model falls back to the flat
+                ``charge_rate * efficiency * duration`` and this column would
+                disagree with the SOC/deviation columns of the same log.
+            temp_projector: Optional ``thermal_model.TemperatureProjector`` so
+                temperature evolves through the ONE thermal model in every mode
+                (see ``project_schedule_trajectory``, which this mirrors).
 
         Returns:
             Tuple of (dict mapping slot -> projected cost at START of that slot, final avg cost)
         """
         from .models import BatteryMode
+        from .soc_projection import SocProjectionParams, project_slot_soc
 
         slot_hours = self._config.slot_minutes / 60.0
         projected_costs: Dict[datetime.datetime, float] = {}
         current_soc = starting_soc
         current_cost = starting_cost
+        current_temp = starting_temp
 
-        def apply_pv_surplus(
+        def stored_from_pv(
             soc: float,
             avg_cost: float,
-            pv_surplus_kw: float,
-            slot_charge_rate: float,
-            fraction: float,
+            energy_added_kwh: float,
             spot_price: Optional[float],
-        ) -> Tuple[float, float]:
-            """Apply surplus-PV charging for HOLD or discharge-to-load mode."""
-            if pv_surplus_kw <= 0:
-                return soc, avg_cost
+        ) -> float:
+            """New weighted average after storing surplus PV in the battery."""
+            if energy_added_kwh <= 0:
+                return avg_cost
             old_energy = max(0.0, self._soc_to_energy_kwh(soc))
-            pv_charge_dc = min(pv_surplus_kw, slot_charge_rate) * slot_hours * fraction
-            energy_added = pv_charge_dc * self._config.efficiency
-            headroom_kwh = max(
-                0.0,
-                self._soc_to_energy_kwh(self._get_max_soc())
-                - self._soc_to_energy_kwh(soc),
-            )
-            energy_added = min(energy_added, headroom_kwh)
             source_cost = (
                 self._pv_opportunity_cost(spot_price)
                 if spot_price is not None else avg_cost
             )
-            new_cost = self._compute_weighted_avg_cost(
-                old_energy, avg_cost, energy_added, source_cost
+            return self._compute_weighted_avg_cost(
+                old_energy, avg_cost, energy_added_kwh, source_cost
             )
-            new_soc = min(
-                self._get_max_soc(),
-                soc + (energy_added / self._config.battery_capacity) * 100,
-            )
-            return new_soc, new_cost
 
         for hour in sorted(schedule.keys()):
             projected_costs[hour] = current_cost
@@ -1018,13 +1031,51 @@ class BatteryCostTracker:
             pv_kw = max(0.0, predict_pv_func(hour)) if predict_pv_func is not None else 0.0
             pv_surplus_kw = max(0.0, pv_kw - load_kw)
 
+            # THE slot-SOC model. This used to be a fourth private
+            # implementation of the transition, and it disagreed with the
+            # shared one: it capped charging at the per-slot rate, then clamped
+            # DISCHARGE at min_soc BEFORE adding PV surplus, so soc=11,
+            # min_soc=10, dc_out=2, dc_in=1 ended at 10 % here and 11 % in the
+            # expected-SOC / deviation columns of the same log.
+            params = SocProjectionParams(
+                battery_capacity=self._config.battery_capacity,
+                efficiency=self._config.efficiency,
+                charge_rate=slot_charge_rate,
+                discharge_rate=self._config.discharge_rate,
+                export_discharge_rate=self._config.export_discharge_rate,
+                inverter_efficiency=self._config.inverter_efficiency,
+                min_soc=self._get_min_soc(),
+                max_soc=self._get_max_soc(),
+                slot_minutes=self._config.slot_minutes,
+            )
+            transition = project_slot_soc(
+                soc_start=current_soc,
+                mode=entry.mode,
+                params=params,
+                load_kw=load_kw,
+                pv_kw=pv_kw,
+                fraction=fraction,
+                export_rate=entry.export_rate,
+                # Same arguments BatteryOptimizer.project_schedule_trajectory
+                # passes, so the projected-cost column cannot be built from a
+                # different charge model than the SOC/deviation columns.
+                temp_start=current_temp,
+                learning_engine=learning_engine,
+                temp_projector=temp_projector,
+                slot_time=hour,
+            )
+
+            # Only stored energy moves the cost basis, and only up to the
+            # headroom the shared model's max_soc clamp actually allows.
+            headroom_kwh = max(
+                0.0,
+                self._soc_to_energy_kwh(self._get_max_soc())
+                - self._soc_to_energy_kwh(current_soc),
+            )
+            energy_added = max(0.0, min(transition.dc_energy_in_kwh, headroom_kwh))
+
             if entry.mode == BatteryMode.CHARGE:
-                old_energy = max(0, self._soc_to_energy_kwh(current_soc))
-                charge_dc = slot_charge_rate * slot_hours * fraction
-                energy_added = charge_dc * self._config.efficiency
-                # Calculate headroom: (max_soc - current_soc) in kWh
-                headroom_kwh = max(0.0, self._soc_to_energy_kwh(self._get_max_soc()) - self._soc_to_energy_kwh(current_soc))
-                energy_added = max(0.0, min(energy_added, headroom_kwh))
+                old_energy = max(0.0, self._soc_to_energy_kwh(current_soc))
 
                 # Attribute the actual stored energy proportionally when the
                 # headroom cap truncates a mixed PV/grid charge.
@@ -1050,45 +1101,15 @@ class BatteryCostTracker:
                 current_cost = self._compute_weighted_avg_cost(
                     old_energy, current_cost, energy_added, landed_cost
                 )
-
-                current_soc = min(self._get_max_soc(), current_soc + (energy_added / self._config.battery_capacity) * 100)
-
-            elif entry.mode == BatteryMode.DISCHARGE:
-                if entry.export_rate is not None and entry.export_rate > 0:
-                    # Export rate is AC output; account for battery-to-AC loss.
-                    edr = self._config.effective_export_discharge_rate
-                    energy_removed = (
-                        edr * slot_hours * fraction
-                        / max(1e-9, self._config.inverter_efficiency)
-                    )
-                else:
-                    # PV serves load first. Remaining AC load requires more DC
-                    # battery energy because of inverter conversion loss.
-                    net_load_kw = max(0.0, load_kw - pv_kw)
-                    energy_removed = (
-                        min(net_load_kw, self._config.discharge_rate)
-                        * slot_hours * fraction
-                        / max(1e-9, self._config.inverter_efficiency)
-                    )
-                current_soc = max(self._get_min_soc(), current_soc - (energy_removed / self._config.battery_capacity) * 100)
-                if entry.export_rate is None or entry.export_rate <= 0:
-                    current_soc, current_cost = apply_pv_surplus(
-                        current_soc,
-                        current_cost,
-                        pv_surplus_kw,
-                        slot_charge_rate,
-                        fraction,
-                        spot_price,
-                    )
-
-            elif entry.mode == BatteryMode.HOLD and pv_surplus_kw > 0:
-                current_soc, current_cost = apply_pv_surplus(
-                    current_soc,
-                    current_cost,
-                    pv_surplus_kw,
-                    slot_charge_rate,
-                    fraction,
-                    spot_price,
+            else:
+                # HOLD and self-consumption DISCHARGE: any DC energy in is
+                # surplus PV. Discharging removes energy without changing the
+                # per-kWh average, so nothing else touches the cost basis.
+                current_cost = stored_from_pv(
+                    current_soc, current_cost, energy_added, spot_price
                 )
+
+            current_soc = transition.soc_end
+            current_temp = transition.temp_end
 
         return projected_costs, current_cost

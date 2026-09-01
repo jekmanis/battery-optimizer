@@ -18,6 +18,7 @@ import inspect
 import pytest
 
 import battery_optimizer as bo
+from battery_optimizer_lib.direct_control import ApplyOutcome
 
 
 class FakeOptimizer(bo.BatteryOptimizer):
@@ -33,6 +34,10 @@ class FakeOptimizer(bo.BatteryOptimizer):
         self._apply_failure_count = 0
         self._consecutive_apply_failures = 0
         self._apply_success_count = 0
+        self._apply_unconfirmed_count = 0
+        self._consecutive_apply_unconfirmed = 0
+        self._apply_duplicate_count = 0
+        self._apply_dry_run_count = 0
         self._last_terminal_warning_time = None
         self._now = datetime.datetime(2026, 7, 28, 16, 0)
 
@@ -61,6 +66,11 @@ class FakeOptimizer(bo.BatteryOptimizer):
         ("adaptive_optimize", "(self, kwargs=None)"),
         ("_on_soc_change", "(self, entity, attribute, old, new, kwargs)"),
         ("_on_energy_sensor_change", "(self, entity, attribute, old, new, kwargs)"),
+        # The two PV/ambient timer callbacks run on the same shared worker
+        # thread and were shipped undecorated, so a slow HA read from either
+        # was invisible in the overrun accounting.
+        ("_record_ambient_observation", "(self, kwargs=None)"),
+        ("_sample_pv", "(self, kwargs=None)"),
     ],
 )
 def test_timed_callbacks_keep_their_signatures(name, expected):
@@ -246,3 +256,236 @@ def test_control_health_sensor_survives_a_broken_direct_control():
 
     assert "sensor.battery_inverter_control_health" not in app.states
     assert "WARNING" in app.levels()
+
+
+# ---------------------------------------------------------------------------
+# Every scheduled callback is instrumented
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "execute_scheduled_mode",
+        "full_optimize",
+        "adaptive_optimize",
+        "_on_soc_change",
+        "_on_energy_sensor_change",
+        "_record_ambient_observation",
+        "_sample_pv",
+    ],
+)
+def test_scheduled_callbacks_are_timed(name):
+    """`@_timed_callback` sets `__wrapped__` via functools.wraps."""
+    method = getattr(bo.BatteryOptimizer, name)
+    assert hasattr(method, "__wrapped__"), f"{name} is not instrumented"
+
+
+# ---------------------------------------------------------------------------
+# Every apply_mode goes through one accounting helper
+# ---------------------------------------------------------------------------
+
+class RecordingDirectControl:
+    """apply_mode_with_outcome returning a scripted sequence of outcomes.
+
+    Accepts booleans for readability: True -> SENT, False -> FAILED.
+    """
+
+    def __init__(self, *results):
+        self.results = [
+            ApplyOutcome.SENT if r is True
+            else ApplyOutcome.FAILED if r is False
+            else r
+            for r in results
+        ]
+        self.calls = []
+        self._diag = {"persistent_mismatch_count": 0}
+
+    def apply_mode_with_outcome(self, entry):
+        self.calls.append(entry)
+        return self.results.pop(0) if self.results else ApplyOutcome.SENT
+
+    def get_diagnostics(self):
+        return dict(self._diag)
+
+
+def _entry(reason="safety_min_soc", mode=None):
+    return bo.ScheduleEntry(
+        time=datetime.datetime(2026, 7, 28, 16, 0),
+        mode=mode or bo.BatteryMode.HOLD,
+        reason=reason,
+    )
+
+
+def test_successful_apply_resets_the_consecutive_failure_counter():
+    """A safety HOLD that WORKED used to leave the counter climbing.
+
+    Only `execute_scheduled_mode` accounted for its result, so the three
+    `_check_soc_boundaries` paths, the solar override and manual mode never
+    reset it — the "inverter is NOT following the schedule" ERROR eventually
+    fired while every command was in fact being obeyed.
+    """
+    app = FakeOptimizer()
+    app._direct_control = RecordingDirectControl(True)
+    app._consecutive_apply_failures = 2
+
+    assert app._apply_mode_tracked(_entry()) is True
+    assert app._consecutive_apply_failures == 0
+    assert app._apply_success_count == 1
+    assert "ERROR" not in app.levels()
+
+
+def test_failed_apply_is_never_silent():
+    """A failed safety apply used to produce no log line at all."""
+    app = FakeOptimizer()
+    app._direct_control = RecordingDirectControl(False)
+
+    assert app._apply_mode_tracked(_entry("safety_min_soc")) is False
+    assert app._apply_failure_count == 1
+    assert app._consecutive_apply_failures == 1
+    warnings = [m for m, lvl in app.logs if lvl == "WARNING"]
+    assert any("Failed to apply mode" in m for m in warnings)
+    # The message names WHICH command failed.
+    assert any("safety_min_soc" in m for m in warnings)
+
+
+def test_three_consecutive_failures_escalate_to_error():
+    app = FakeOptimizer()
+    app._direct_control = RecordingDirectControl(False, False, False)
+
+    for _ in range(3):
+        app._apply_mode_tracked(_entry())
+
+    assert app._consecutive_apply_failures == 3
+    errors = [m for m, lvl in app.logs if lvl == "ERROR"]
+    assert len(errors) == 1
+    assert "NOT following the schedule" in errors[0]
+
+
+def test_a_success_between_failures_prevents_the_error():
+    app = FakeOptimizer()
+    app._direct_control = RecordingDirectControl(False, True, False, False)
+
+    for _ in range(4):
+        app._apply_mode_tracked(_entry())
+
+    assert app._consecutive_apply_failures == 2
+    assert "ERROR" not in app.levels()
+
+
+def test_health_sensor_is_published_after_every_apply():
+    app = FakeOptimizer()
+    app._direct_control = RecordingDirectControl(True)
+
+    app._apply_mode_tracked(_entry())
+
+    assert "sensor.battery_inverter_control_health" in app.states
+
+
+# ---------------------------------------------------------------------------
+# Only a CONFIRMED send counts as health
+#
+# apply_mode returns True for three outcomes the inverter never acknowledged:
+# a dry run, a duplicate that was never transmitted, and a client-side timeout.
+# Counting them as successes reset _consecutive_apply_failures on every call, so
+# with growatt_modbus hung-but-not-raising the health sensor reported climbing
+# apply_successes and the "NOT following the schedule" ERROR could never fire.
+# ---------------------------------------------------------------------------
+
+def test_unconfirmed_timeout_is_not_a_success():
+    app = FakeOptimizer()
+    app._direct_control = RecordingDirectControl(ApplyOutcome.UNCONFIRMED_TIMEOUT)
+    app._consecutive_apply_failures = 2
+
+    # Still True: DirectControl recorded it as sent and verify-after-set is what
+    # resolves it — but it must not be booked as a success.
+    assert app._apply_mode_tracked(_entry()) is True
+    assert app._apply_success_count == 0
+    assert app._apply_unconfirmed_count == 1
+    assert app._consecutive_apply_failures == 2, "an unconfirmed send reset the streak"
+    assert app._consecutive_apply_unconfirmed == 1
+
+
+def test_three_consecutive_unconfirmed_timeouts_escalate_to_error():
+    """The hung-modbus case: every call times out, nothing is ever confirmed."""
+    app = FakeOptimizer()
+    app._direct_control = RecordingDirectControl(
+        *([ApplyOutcome.UNCONFIRMED_TIMEOUT] * 3)
+    )
+
+    for _ in range(3):
+        app._apply_mode_tracked(_entry())
+
+    errors = [m for m, lvl in app.logs if lvl == "ERROR"]
+    assert len(errors) == 1
+    assert "NOT following the schedule" in errors[0]
+    assert app._apply_unconfirmed_count == 3
+    assert app._apply_success_count == 0
+
+
+def test_a_confirmed_send_clears_the_unconfirmed_streak():
+    app = FakeOptimizer()
+    app._direct_control = RecordingDirectControl(
+        ApplyOutcome.UNCONFIRMED_TIMEOUT,
+        ApplyOutcome.UNCONFIRMED_TIMEOUT,
+        ApplyOutcome.SENT,
+        ApplyOutcome.UNCONFIRMED_TIMEOUT,
+    )
+
+    for _ in range(4):
+        app._apply_mode_tracked(_entry())
+
+    assert app._consecutive_apply_unconfirmed == 1
+    assert app._apply_success_count == 1
+    assert "ERROR" not in app.levels()
+
+
+def test_duplicate_skip_is_neutral_and_does_not_reset_the_failure_streak():
+    """Nothing was transmitted, so it is evidence of neither health nor failure."""
+    app = FakeOptimizer()
+    app._direct_control = RecordingDirectControl(
+        ApplyOutcome.FAILED,
+        ApplyOutcome.SKIPPED_DUPLICATE,
+        ApplyOutcome.FAILED,
+        ApplyOutcome.SKIPPED_DUPLICATE,
+        ApplyOutcome.FAILED,
+    )
+
+    for _ in range(5):
+        app._apply_mode_tracked(_entry())
+
+    assert app._consecutive_apply_failures == 3
+    assert app._apply_duplicate_count == 2
+    assert app._apply_success_count == 0
+    errors = [m for m, lvl in app.logs if lvl == "ERROR"]
+    assert len(errors) == 1
+
+
+def test_dry_run_does_not_report_perfect_health():
+    app = FakeOptimizer()
+    app._direct_control = RecordingDirectControl(*([ApplyOutcome.DRY_RUN] * 3))
+
+    for _ in range(3):
+        assert app._apply_mode_tracked(_entry()) is True
+
+    assert app._apply_dry_run_count == 3
+    assert app._apply_success_count == 0
+    assert app._apply_failure_count == 0
+    attrs = app.states["sensor.battery_inverter_control_health"]["attributes"]
+    assert attrs["apply_dry_runs"] == 3
+    assert attrs["apply_successes"] == 0
+
+
+def test_health_sensor_exposes_the_new_counters_without_renaming_the_old():
+    app = FakeOptimizer()
+    app._direct_control = RecordingDirectControl(ApplyOutcome.UNCONFIRMED_TIMEOUT)
+
+    app._apply_mode_tracked(_entry())
+
+    attrs = app.states["sensor.battery_inverter_control_health"]["attributes"]
+    for old in ("apply_failures", "consecutive_apply_failures", "apply_successes",
+                "callback_overruns", "slowest_callback"):
+        assert old in attrs, f"{old} was renamed — the sensor must stay compatible"
+    assert attrs["apply_unconfirmed"] == 1
+    assert attrs["consecutive_apply_unconfirmed"] == 1
+    assert attrs["apply_duplicates_skipped"] == 0
+    assert attrs["apply_dry_runs"] == 0

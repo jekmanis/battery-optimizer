@@ -280,3 +280,269 @@ class TestCaching:
         now["t"] = BASE + datetime.timedelta(minutes=90)
         svc.refresh()
         assert fetches["n"] == 2
+
+
+class TestFailedFetchBackOff:
+    """A failing weather entity must not be re-fetched on every refresh().
+
+    ``_cache_timestamp`` was assigned only in the success branch, so while
+    ``_fetch_weather_forecast`` returned {} the cache-age guard never engaged.
+    ``refresh()`` is called by every full optimize, every adaptive and
+    PV-shortfall recalculation and the 15-min ambient observation timer, and
+    each one then re-issued a blocking ``weather/get_forecasts`` call_service on
+    an AppDaemon callback thread. Both failure paths logged at DEBUG only, so
+    the cost was invisible.
+    """
+
+    def test_empty_response_backs_off_for_the_failure_retry_interval(self):
+        now = {"t": BASE}
+        fetches = {"n": 0}
+
+        def call_service(service, **kwargs):
+            fetches["n"] += 1
+            return {}
+
+        cfg = AmbientServiceConfig(
+            weather_entity="weather.home", cache_minutes=60, failure_retry_minutes=10
+        )
+        svc = _service(
+            cfg, call_service_func=call_service, get_datetime_func=lambda: now["t"]
+        )
+        assert svc.refresh() is False
+        assert fetches["n"] == 1
+
+        for minutes in (1, 5, 9):
+            now["t"] = BASE + datetime.timedelta(minutes=minutes)
+            svc.refresh()
+        assert fetches["n"] == 1, "a failing entity was retried on every refresh"
+
+        now["t"] = BASE + datetime.timedelta(minutes=11)
+        svc.refresh()
+        assert fetches["n"] == 2
+
+    def test_raising_service_backs_off_too(self):
+        now = {"t": BASE}
+        fetches = {"n": 0}
+
+        def call_service(service, **kwargs):
+            fetches["n"] += 1
+            raise RuntimeError("entity not found")
+
+        cfg = AmbientServiceConfig(
+            weather_entity="weather.home", cache_minutes=60, failure_retry_minutes=10
+        )
+        svc = _service(
+            cfg, call_service_func=call_service, get_datetime_func=lambda: now["t"]
+        )
+        svc.refresh()
+        now["t"] = BASE + datetime.timedelta(minutes=5)
+        svc.refresh()
+        assert fetches["n"] == 1
+
+    def test_first_failure_recovers_well_before_the_cache_interval(self):
+        """A restart that races the HA weather integration must self-heal fast.
+
+        The back-off used to key off ``_last_fetch_attempt`` alone, which is set
+        unconditionally, so the FIRST-ever failure — typically one "entity not
+        found" seconds after an AppDaemon restart, before the weather
+        integration has loaded — suppressed every retry for a full
+        ``cache_minutes`` (60). No caller passes force=True, so T_ambient(t) sat
+        on the outdoor-sensor / diurnal fallback for an hour and degraded the
+        DP-facing charge rates.
+        """
+        now = {"t": BASE}
+        fetches = {"n": 0}
+
+        def call_service(service, **kwargs):
+            fetches["n"] += 1
+            if fetches["n"] == 1:
+                raise RuntimeError("Entity weather.home not found")
+            return {"forecast": _forecast_entries(BASE, REAL_TEMPS)}
+
+        cfg = AmbientServiceConfig(
+            weather_entity="weather.home", cache_minutes=60, failure_retry_minutes=10
+        )
+        svc = _service(
+            cfg, call_service_func=call_service, get_datetime_func=lambda: now["t"]
+        )
+        assert svc.refresh() is False
+        assert svc.has_forecast is False
+
+        # Immediately after the failure: still backing off.
+        now["t"] = BASE + datetime.timedelta(minutes=2)
+        assert svc.refresh() is False
+        assert fetches["n"] == 1
+
+        # Past failure_retry_minutes but far inside cache_minutes: retried,
+        # succeeds, and the real forecast is used.
+        now["t"] = BASE + datetime.timedelta(minutes=12)
+        assert svc.refresh() is True
+        assert fetches["n"] == 2
+        assert svc.source == "forecast"
+        assert svc.predict_c(BASE) == pytest.approx(REAL_TEMPS[0])
+
+    def test_success_is_cached_for_the_full_cache_interval(self):
+        """The short retry applies to FAILURES only, not to a good forecast."""
+        now = {"t": BASE}
+        fetches = {"n": 0}
+
+        def call_service(service, **kwargs):
+            fetches["n"] += 1
+            return {"forecast": _forecast_entries(BASE, REAL_TEMPS)}
+
+        cfg = AmbientServiceConfig(
+            weather_entity="weather.home", cache_minutes=60, failure_retry_minutes=10
+        )
+        svc = _service(
+            cfg, call_service_func=call_service, get_datetime_func=lambda: now["t"]
+        )
+        assert svc.refresh() is True
+
+        for minutes in (11, 30, 59):
+            now["t"] = BASE + datetime.timedelta(minutes=minutes)
+            svc.refresh()
+        assert fetches["n"] == 1, "a fresh forecast was re-fetched at the retry cadence"
+
+        now["t"] = BASE + datetime.timedelta(minutes=61)
+        svc.refresh()
+        assert fetches["n"] == 2
+
+    def test_force_still_bypasses_the_back_off(self):
+        fetches = {"n": 0}
+
+        def call_service(service, **kwargs):
+            fetches["n"] += 1
+            return {}
+
+        cfg = AmbientServiceConfig(weather_entity="weather.home", cache_minutes=60)
+        svc = _service(cfg, call_service_func=call_service)
+        svc.refresh()
+        svc.refresh(force=True)
+        assert fetches["n"] == 2
+
+    def test_outdoor_sensor_is_still_read_while_backing_off(self):
+        """The back-off must not starve the cheap, non-blocking fallback."""
+        now = {"t": BASE}
+        reads = {"n": 0}
+
+        def get_state(entity, **kwargs):
+            reads["n"] += 1
+            return "21.5"
+
+        cfg = AmbientServiceConfig(
+            weather_entity="weather.home",
+            outdoor_temp_sensor="sensor.outdoor",
+            cache_minutes=60,
+        )
+        svc = _service(
+            cfg,
+            call_service_func=lambda s, **k: {},
+            get_state_func=get_state,
+            get_datetime_func=lambda: now["t"],
+        )
+        svc.refresh()
+        before = reads["n"]
+        # Inside the failure retry window, so the forecast fetch is skipped.
+        now["t"] = BASE + datetime.timedelta(minutes=5)
+        svc.refresh()
+        assert reads["n"] > before
+        assert svc.predict_c(BASE) is not None
+
+
+class TestForecastCallIsBounded:
+    def test_call_service_passes_a_hass_timeout(self):
+        """The call is synchronous on an AppDaemon callback thread."""
+        calls = []
+
+        def call_service(service, **kwargs):
+            calls.append(kwargs)
+            return {"forecast": _forecast_entries(BASE, REAL_TEMPS)}
+
+        cfg = AmbientServiceConfig(weather_entity="weather.home")
+        svc = _service(cfg, call_service_func=call_service)
+        svc.refresh()
+
+        assert calls
+        assert calls[0]["hass_timeout"] == pytest.approx(
+            cfg.forecast_timeout_seconds
+        )
+        assert cfg.forecast_timeout_seconds > 0
+
+    def test_timeout_is_configurable(self):
+        calls = []
+        cfg = AmbientServiceConfig(
+            weather_entity="weather.home", forecast_timeout_seconds=3.0
+        )
+        svc = _service(
+            cfg,
+            call_service_func=lambda s, **k: (calls.append(k), {})[1],
+        )
+        svc.refresh()
+        assert calls[0]["hass_timeout"] == pytest.approx(3.0)
+
+
+class TestFetchFailureLogging:
+    """First failure and every subsequent state change warn; the rest are DEBUG."""
+
+    @staticmethod
+    def _capture():
+        records = []
+
+        def log(msg, level="INFO"):
+            records.append((level, msg))
+
+        return records, log
+
+    @staticmethod
+    def _warnings(records):
+        return [m for lvl, m in records if lvl == "WARNING"]
+
+    def test_first_failure_warns_once_then_stays_quiet(self):
+        now = {"t": BASE}
+        records, log = self._capture()
+        cfg = AmbientServiceConfig(weather_entity="weather.home", cache_minutes=60)
+        svc = _service(
+            cfg,
+            call_service_func=lambda s, **k: {},
+            get_datetime_func=lambda: now["t"],
+            log_func=log,
+        )
+        svc.refresh()
+        assert len(self._warnings(records)) == 1
+        assert "weather.home" in self._warnings(records)[0]
+
+        for i in range(1, 6):
+            now["t"] = BASE + datetime.timedelta(minutes=61 * i)
+            svc.refresh()
+        assert len(self._warnings(records)) == 1, "warned on every retry"
+
+    def test_recovery_is_reported_and_re_arms_the_warning(self):
+        now = {"t": BASE}
+        state = {"ok": False}
+        records, log = self._capture()
+
+        def call_service(service, **kwargs):
+            if state["ok"]:
+                return {"forecast": _forecast_entries(BASE, REAL_TEMPS)}
+            return {}
+
+        cfg = AmbientServiceConfig(weather_entity="weather.home", cache_minutes=60)
+        svc = _service(
+            cfg,
+            call_service_func=call_service,
+            get_datetime_func=lambda: now["t"],
+            log_func=log,
+        )
+        svc.refresh()
+        assert len(self._warnings(records)) == 1
+
+        state["ok"] = True
+        now["t"] = BASE + datetime.timedelta(minutes=61)
+        assert svc.refresh() is True
+        assert any("recovered" in m for _, m in records)
+
+        # Failing again is a NEW state change and must warn again.
+        state["ok"] = False
+        now["t"] = BASE + datetime.timedelta(minutes=122)
+        svc.refresh()
+        assert len(self._warnings(records)) == 2

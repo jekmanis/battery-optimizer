@@ -459,3 +459,210 @@ class TestMedianHelper:
         assert _median([3.0, 1.0, 2.0]) == 2.0
         assert _median([1.0, 2.0, 3.0, 4.0]) == 2.5
         assert _median([]) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# NAIVE ``now`` from AppDaemon (production defect)
+# ---------------------------------------------------------------------------
+
+def _naive(hour, minute=0, second=0, day=27):
+    """A NAIVE local timestamp — exactly what AppDaemon's self.datetime() returns."""
+    return datetime.datetime(2026, 7, day, hour, minute, second)
+
+
+class TestNaiveNow:
+    """``self.datetime()`` is naive local time while slot keys are tz-aware.
+
+    Subtracting one from the other raises TypeError.  That exception used to be
+    swallowed, so ``_prune`` kept every observation forever and ``get_factor``
+    /``describe`` reported an age of zero: the sliding window and the
+    decay-to-1.0 relaxation were silently disabled, and a stale 0.2 factor
+    survived for days with no fresh observations at all.
+    """
+
+    def _cloudy_hour(self, tracker):
+        """Four cloudy 15-min slots (ratio 0.2), closed at 12:00."""
+        for i in range(4):
+            _fill_slot(tracker, _dt(11, 0) + datetime.timedelta(minutes=15 * i),
+                       3.0, 0.6)
+        tracker.close_slots_before(_dt(12, 0))
+
+    def test_naive_now_prunes_out_of_window_ratios(self):
+        t = _make_tracker(min_slots=2, window_minutes=120)
+        self._cloudy_hour(t)
+        assert t.ratio_count(_naive(12, 0)) == 4
+        # Three days later, with zero fresh observations, nothing may survive.
+        assert t.ratio_count(_naive(12, 0, day=30)) == 0
+        assert t.get_factor(_naive(12, 0, day=30)) == 1.0
+
+    def test_naive_now_prunes_exactly_like_aware_now(self):
+        t = _make_tracker(min_slots=2, window_minutes=120)
+        self._cloudy_hour(t)
+        # 11:00 and 11:15 are older than the 120-minute window at 13:20.
+        assert t.ratio_count(_naive(13, 20)) == t.ratio_count(_dt(13, 20)) == 2
+
+    def test_naive_now_relaxes_factor_towards_one(self):
+        t = _make_tracker(min_slots=2, decay_slots=8, window_minutes=600)
+        self._cloudy_hour(t)
+        fresh = t.get_factor(_naive(12, 0))
+        assert fresh == pytest.approx(0.2, abs=1e-3)
+        mid = t.get_factor(_naive(12, 45))  # 4 slots after the newest obs
+        assert fresh < mid < 1.0
+        # Past decay_slots of staleness the factor is fully relaxed.
+        assert t.get_factor(_naive(14, 15)) == pytest.approx(1.0)
+        assert t.get_factor(_naive(12, 45)) == t.get_factor(_dt(12, 45))
+
+    def test_naive_now_describe_reports_real_age(self):
+        t = _make_tracker(min_slots=2, window_minutes=600)
+        self._cloudy_hour(t)
+        # Newest observation is the 11:45 slot.
+        assert "newest 15min ago" in t.describe(_naive(12, 0))
+        assert "newest 90min ago" in t.describe(_naive(13, 15))
+        assert t.describe(_naive(12, 0)) == t.describe(_dt(12, 0))
+
+    def test_naive_now_closes_slots(self):
+        t = _make_tracker()
+        _fill_slot(t, _dt(12, 0), 3.0, 1.0)
+        _fill_slot(t, _dt(12, 15), 3.0, 1.0)
+        closed = t.close_slots_before(_naive(12, 30))
+        assert [c.slot.hour * 60 + c.slot.minute for c in closed] == [720, 735]
+        assert t.close_slots_before(_naive(12, 30)) == []
+        assert t.slot_sample_count(_naive(12, 30)) == 0
+
+    def test_naive_samples_share_the_slot_with_aware_samples(self):
+        t = _make_tracker()
+        t.ensure_slot_forecast(_naive(12, 30), 4.0)
+        t.add_sample(_naive(12, 31), 1.0)
+        t.add_sample(_dt(12, 32), 3.0)
+        assert t.get_slot_forecast(_dt(12, 30)) == pytest.approx(4.0)
+        assert t.slot_sample_count(_dt(12, 30)) == 2
+        assert t.slot_mean_kw(_naive(12, 30)) == pytest.approx(2.0)
+        t.close_slots_before(_dt(12, 45))
+        assert t.get_closed(_naive(12, 30)) is not None
+
+    def test_naive_now_attenuates_next_day_factor(self):
+        t = _make_tracker(next_day_weight=0.5, next_day_min_factor=0.7)
+        # Same local day: untouched.
+        assert t.factor_for_slot(0.3, _naive(12, 0), _dt(18, 0)) == pytest.approx(0.3)
+        # Tomorrow: attenuated and floored, same as with an aware now.
+        tomorrow = _dt(10, 0, day=28)
+        assert t.factor_for_slot(0.3, _naive(12, 0), tomorrow) == pytest.approx(0.7)
+        assert (t.factor_for_slot(0.3, _naive(12, 0), tomorrow)
+                == t.factor_for_slot(0.3, _dt(12, 0), tomorrow))
+
+    def test_incomparable_history_is_dropped_and_logged(self):
+        """A residual mismatch must never be treated as 'age 0' again."""
+        messages = []
+
+        def align(dt):  # naive-preserving alignment (no local timezone known)
+            return dt.replace(minute=(dt.minute // 15) * 15, second=0, microsecond=0)
+
+        t = PvBiasTracker(
+            config=PvBiasConfig(min_slots=1, min_samples_per_slot=1),
+            align_to_slot_func=align,
+            log_func=lambda msg, **kw: messages.append((msg, kw.get("level"))),
+        )
+        _fill_slot(t, _dt(11, 0), 3.0, 0.6, samples=5)
+        t.close_slots_before(_dt(11, 15))
+        assert t.ratio_count(_dt(11, 15)) == 1
+        # Naive now against aware keys with no timezone to bridge them: the
+        # observation is unusable, so it is discarded (not silently kept).
+        assert t.ratio_count(_naive(11, 15)) == 0
+        assert messages and messages[0][1] == "ERROR"
+        assert t.get_factor(_naive(11, 15)) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# DST OFFSET CHANGE — the tracker's key timezone must not be cached forever
+# ---------------------------------------------------------------------------
+
+class TestDstOffsetChange:
+    """The alignment function's timezone changes offset at a DST transition.
+
+    ``battery_optimizer._get_local_timezone`` returns a **fixed-offset**
+    ``datetime.timezone`` recomputed from the current wall clock (AppDaemon's
+    ``self.datetime()`` is naive in production).  It is ``+03:00`` in summer and
+    ``+02:00`` in winter.
+
+    ``_key_tz`` used to cache that object permanently on first use, so after the
+    autumn transition ``_localize`` still stamped naive input with ``+03:00``
+    while aware slot values had moved to ``+02:00``.  ``add_sample`` (naive
+    ``self.datetime()``) and ``ensure_slot_forecast`` /
+    ``close_slots_before`` (aware ``now_slot``) then disagreed about which slot
+    a reading belonged to: one ClosedSlot carried a forecast with no samples,
+    another samples with no forecast, both were rejected by
+    ``_register_closed``, and the bias factor plus the reactive shortfall
+    detector went dead until the next restart.
+    """
+
+    def _tracker_with_switchable_tz(self):
+        """Tracker whose alignment timezone can be flipped mid-test."""
+        holder = {"tz": TZ_PLUS3}
+        config = PvBiasConfig(
+            enabled=True,
+            slot_minutes=15,
+            window_minutes=120,
+            min_slots=1,
+            min_forecast_kw=0.2,
+            min_factor=0.2,
+            max_factor=1.5,
+            decay_slots=8,
+            min_samples_per_slot=3,
+            shortfall_threshold=0.5,
+        )
+        tracker = PvBiasTracker(
+            config=config,
+            align_to_slot_func=lambda dt: align_to_slot(dt, 15, holder["tz"]),
+            log_func=lambda msg, **kw: None,
+        )
+        return tracker, holder
+
+    def test_naive_and_aware_agree_after_the_offset_changes(self):
+        t, holder = self._tracker_with_switchable_tz()
+
+        # --- Summer (+03:00): a normal slot, sampled through the NAIVE path.
+        summer_slot = datetime.datetime(2026, 7, 27, 12, 0, tzinfo=TZ_PLUS3)
+        t.ensure_slot_forecast(summer_slot, 3.0)
+        for i in range(5):
+            t.add_sample(datetime.datetime(2026, 7, 27, 12, i), 3.0)
+        assert t.slot_sample_count(summer_slot) == 5
+        closed_summer = t.close_slots_before(
+            datetime.datetime(2026, 7, 27, 12, 15, tzinfo=TZ_PLUS3)
+        )
+        assert len(closed_summer) == 1
+        assert closed_summer[0].ratio == pytest.approx(1.0)
+
+        # --- Autumn transition: the provider now hands out +02:00.
+        holder["tz"] = TZ_PLUS2
+
+        winter_slot = datetime.datetime(2026, 11, 15, 12, 0, tzinfo=TZ_PLUS2)
+        # Aware path (orchestrator's now_slot).
+        t.ensure_slot_forecast(winter_slot, 4.0)
+        # Naive path (AppDaemon's self.datetime()), same wall-clock slot.
+        for i in range(5):
+            t.add_sample(datetime.datetime(2026, 11, 15, 12, i + 1), 0.4)
+
+        # Both paths must address ONE slot.
+        assert t.get_slot_forecast(datetime.datetime(2026, 11, 15, 12, 7)) == \
+            pytest.approx(4.0)
+        assert t.slot_sample_count(winter_slot) == 5
+        assert t.slot_mean_kw(datetime.datetime(2026, 11, 15, 12, 7)) == \
+            pytest.approx(0.4)
+
+        closed = t.close_slots_before(
+            datetime.datetime(2026, 11, 15, 12, 15, tzinfo=TZ_PLUS2)
+        )
+        assert len(closed) == 1
+        entry = closed[0]
+        assert entry.forecast_kw == pytest.approx(4.0)
+        assert entry.samples == 5
+        assert entry.actual_kw == pytest.approx(0.4)
+        assert entry.ratio == pytest.approx(0.1)
+
+        # The observation is usable, so the bias factor and the reactive
+        # shortfall detector both see it.
+        now = datetime.datetime(2026, 11, 15, 12, 15, tzinfo=TZ_PLUS2)
+        assert t.ratio_count(now) == 1
+        assert t.get_factor(now) == pytest.approx(0.2)  # clamped at min_factor
+        assert t.shortfall_streak == 1
+        assert t.get_closed(datetime.datetime(2026, 11, 15, 12, 7)) is not None

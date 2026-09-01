@@ -137,27 +137,8 @@ class SocDeviationDetector:
         # Get schedule entry for current slot
         entry = lookup_by_time(schedule, current_slot, local_tz)
 
-        # Calculate time fraction into current slot. The expected trajectory may
-        # have been anchored mid-slot (partial first slot); in that case its
-        # first value already describes the anchor instant, so interpolation
-        # must start there instead of at the slot boundary.
-        now_cmp = self._normalize_for_compare(now, local_tz)
-        slot_cmp = self._normalize_for_compare(current_slot, local_tz)
-        start_cmp = slot_cmp
-        if expected_soc_anchor is not None:
-            anchor_cmp = self._normalize_for_compare(expected_soc_anchor, local_tz)
-            slot_end_cmp = slot_cmp + datetime.timedelta(minutes=self.config.slot_minutes)
-            if slot_cmp <= anchor_cmp < slot_end_cmp:
-                start_cmp = anchor_cmp
-
-        minutes_into_slot = max(0.0, (now_cmp - start_cmp).total_seconds() / 60.0)
-        fraction = min(1.0, minutes_into_slot / max(1, self.config.slot_minutes))
-        # How much of the slot itself has elapsed — used for "how much charging
-        # time is left" projections, which are independent of the anchor.
-        elapsed_slot_fraction = min(
-            1.0,
-            max(0.0, (now_cmp - slot_cmp).total_seconds() / 60.0)
-            / max(1, self.config.slot_minutes),
+        fraction, elapsed_slot_fraction = self._slot_fractions(
+            now, current_slot, local_tz, expected_soc_anchor
         )
 
         # Interpolate expected SOC based on elapsed time in slot
@@ -234,6 +215,76 @@ class SocDeviationDetector:
             )
 
         return result
+
+    def _slot_fractions(
+        self,
+        now: datetime.datetime,
+        current_slot: datetime.datetime,
+        local_tz,
+        expected_soc_anchor: Optional[datetime.datetime],
+    ) -> tuple:
+        """Return ``(projection_fraction, elapsed_slot_fraction)`` for *now*.
+
+        The expected trajectory may have been anchored mid-slot (partial first
+        slot); in that case its first value already describes the anchor
+        instant, so the projection must start there instead of at the slot
+        boundary — otherwise the elapsed part of the slot is counted twice.
+        ``elapsed_slot_fraction`` is how much of the slot ITSELF has elapsed and
+        is independent of the anchor ("how much charging time is left").
+        """
+        now_cmp = self._normalize_for_compare(now, local_tz)
+        slot_cmp = self._normalize_for_compare(current_slot, local_tz)
+        start_cmp = slot_cmp
+        if expected_soc_anchor is not None:
+            anchor_cmp = self._normalize_for_compare(expected_soc_anchor, local_tz)
+            slot_end_cmp = slot_cmp + datetime.timedelta(minutes=self.config.slot_minutes)
+            if slot_cmp <= anchor_cmp < slot_end_cmp:
+                start_cmp = anchor_cmp
+
+        minutes_into_slot = max(0.0, (now_cmp - start_cmp).total_seconds() / 60.0)
+        fraction = min(1.0, minutes_into_slot / max(1, self.config.slot_minutes))
+        elapsed_slot_fraction = min(
+            1.0,
+            max(0.0, (now_cmp - slot_cmp).total_seconds() / 60.0)
+            / max(1, self.config.slot_minutes),
+        )
+        return fraction, elapsed_slot_fraction
+
+    def expected_soc_at(
+        self,
+        current_soc: float,
+        schedule: Dict[datetime.datetime, ScheduleEntry],
+        expected_soc_schedule: Dict[datetime.datetime, float],
+        now: datetime.datetime,
+        current_slot: datetime.datetime,
+        local_tz,
+        current_temp: Optional[float] = None,
+        predict_load_kw: Optional[Callable[[datetime.datetime], float]] = None,
+        predict_pv_kw: Optional[Callable[[datetime.datetime], float]] = None,
+        expected_soc_anchor: Optional[datetime.datetime] = None,
+    ) -> Optional[float]:
+        """Expected SOC at the instant ``now``, not at the slot boundary.
+
+        Callers that compare a LIVE SOC reading against the plan must use this
+        rather than ``expected_soc_schedule[current_slot]``: mid-slot entry
+        points (override toggles, manual "Auto", a forced re-execution) can land
+        7 minutes into a 5 kW DISCHARGE slot, where the start-of-slot value is
+        several points above reality and any shortfall threshold fires on a
+        difference that is pure elapsed time.
+
+        Returns None when the slot has no expected value.
+        """
+        expected_soc = lookup_by_time(expected_soc_schedule, current_slot, local_tz)
+        if expected_soc is None:
+            return None
+        entry = lookup_by_time(schedule, current_slot, local_tz)
+        fraction, _elapsed = self._slot_fractions(
+            now, current_slot, local_tz, expected_soc_anchor
+        )
+        return self._interpolate_expected_soc(
+            expected_soc, entry, fraction, current_soc, current_slot, current_temp,
+            predict_load_kw, predict_pv_kw,
+        )
 
     def _projection_params(self) -> SocProjectionParams:
         """Build shared slot-SOC projection parameters from the detector config."""

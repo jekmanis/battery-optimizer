@@ -14,7 +14,12 @@ import datetime
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
-from .models import BatteryMode, PricePoint, ScheduleEntry
+from .models import (
+    BatteryMode,
+    PricePoint,
+    ScheduleEntry,
+    count_schedule_modes,
+)
 from .soc_projection import SocProjectionParams, project_slot_soc
 from .timezone_utils import lookup_by_time
 
@@ -202,25 +207,9 @@ class ScheduleFormatter:
 
         self.log("=" * 60)
 
-        # Summary counts
-        charge_count = len(
-            [e for e in schedule.values() if e.mode == BatteryMode.CHARGE]
-        )
-        export_count = len(
-            [e for e in schedule.values()
-             if e.mode == BatteryMode.DISCHARGE and e.export_rate is not None and e.export_rate > 0]
-        )
-        self_consume_count = len(
-            [e for e in schedule.values()
-             if e.mode == BatteryMode.DISCHARGE and (e.export_rate is None or e.export_rate == 0)]
-        )
-        hold_count = len([e for e in schedule.values() if e.mode == BatteryMode.HOLD])
-        parts = [f"{charge_count} charge"]
-        if self_consume_count:
-            parts.append(f"{self_consume_count} discharge(self)")
-        if export_count:
-            parts.append(f"{export_count} discharge(export)")
-        parts.append(f"{hold_count} hold")
+        # Summary counts — the same helper the orchestrator's "Schedule
+        # generated:" line uses, so the two censuses cannot drift apart again.
+        parts = count_schedule_modes(schedule).summary_parts()
         self.log(f"Total: {', '.join(parts)} slots")
 
     def _format_soc_trajectory(

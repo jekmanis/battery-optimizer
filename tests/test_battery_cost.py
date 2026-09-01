@@ -833,3 +833,479 @@ class TestFifteenMinCostTracking:
         # final_cost should NOT match 30-min or 60-min calculations
         assert abs(final_cost - cost_if_30min) > 0.001
         assert abs(final_cost - cost_if_60min) > 0.001
+
+
+class TestProjectCostsUsesTheSharedSocModel:
+    """``project_costs`` must not own a fourth slot-SOC transition.
+
+    It used to re-implement the transition inline, and the copy differed from
+    ``soc_projection.project_slot_soc``: it clamped DISCHARGE at ``min_soc``
+    BEFORE adding PV surplus and capped charging with its own headroom
+    arithmetic.  Anything the projected-cost column disagreed with the
+    expected-SOC and deviation columns about landed in the same log, which is
+    the class of contradiction that caused the production recalculation loop.
+    """
+
+    @pytest.fixture
+    def optimizer(self):
+        return MockCostOptimizer(inverter_efficiency=0.95, slot_minutes=15)
+
+    @staticmethod
+    def _params(tracker):
+        from battery_optimizer_lib.soc_projection import SocProjectionParams
+
+        cfg = tracker._config
+        return SocProjectionParams(
+            battery_capacity=cfg.battery_capacity,
+            efficiency=cfg.efficiency,
+            charge_rate=cfg.charge_rate,
+            discharge_rate=cfg.discharge_rate,
+            export_discharge_rate=cfg.export_discharge_rate,
+            inverter_efficiency=cfg.inverter_efficiency,
+            min_soc=tracker._get_min_soc(),
+            max_soc=tracker._get_max_soc(),
+            slot_minutes=cfg.slot_minutes,
+        )
+
+    def _mixed_schedule(self, base):
+        """CHARGE, PV-surplus DISCHARGE, net-load DISCHARGE, export, HOLD."""
+        slots = [base + datetime.timedelta(minutes=15 * i) for i in range(6)]
+        modes = [
+            BatteryMode.DISCHARGE,   # net load -> discharges into the min_soc clamp
+            BatteryMode.CHARGE,
+            BatteryMode.DISCHARGE,   # pv > load -> PV charges the pack
+            BatteryMode.DISCHARGE,   # export
+            BatteryMode.HOLD,        # pv > load
+            BatteryMode.CHARGE,
+        ]
+        schedule = {}
+        for slot, mode in zip(slots, modes):
+            entry = make_schedule_entry(slot, mode)
+            schedule[slot] = entry
+        schedule[slots[3]].export_rate = 100.0
+        return slots, schedule
+
+    @pytest.mark.parametrize("starting_soc", [10.5, 99.0])
+    def test_end_soc_per_slot_equals_project_slot_soc(
+        self, optimizer, monkeypatch, starting_soc
+    ):
+        from battery_optimizer_lib import soc_projection
+
+        base = datetime.datetime(2024, 1, 1, 10, 0)
+        slots, schedule = self._mixed_schedule(base)
+        # starting_soc=10.5 drives the first DISCHARGE into the min_soc clamp;
+        # starting_soc=99.0 drives the CHARGE slots into the max_soc clamp.
+        load_by_slot = {
+            slots[0]: 9.0, slots[1]: 0.5, slots[2]: 0.4,
+            slots[3]: 0.5, slots[4]: 0.3, slots[5]: 0.5,
+        }
+        pv_by_slot = {
+            slots[0]: 0.0, slots[1]: 0.0, slots[2]: 4.0,
+            slots[3]: 3.0, slots[4]: 5.0, slots[5]: 0.0,
+        }
+        prices = {slot: 0.10 for slot in slots}
+
+        real = soc_projection.project_slot_soc
+        seen = []
+
+        def spy(**kwargs):
+            result = real(**kwargs)
+            seen.append((kwargs["soc_start"], result.soc_end))
+            return result
+
+        monkeypatch.setattr(soc_projection, "project_slot_soc", spy)
+
+        tracker = optimizer._cost_tracker
+        tracker.project_costs(
+            schedule=schedule,
+            starting_soc=starting_soc,
+            starting_cost=0.12,
+            prices_by_slot=prices,
+            predict_load_func=lambda s: load_by_slot[s],
+            predict_pv_func=lambda s: pv_by_slot[s],
+        )
+
+        assert len(seen) == len(slots), "project_costs bypassed the shared model"
+
+        # Independently chained reference trajectory.
+        params = self._params(tracker)
+        soc = starting_soc
+        expected = []
+        for slot in slots:
+            transition = real(
+                soc_start=soc,
+                mode=schedule[slot].mode,
+                params=params,
+                load_kw=load_by_slot[slot],
+                pv_kw=pv_by_slot[slot],
+                fraction=1.0,
+                export_rate=schedule[slot].export_rate,
+            )
+            soc = transition.soc_end
+            expected.append(soc)
+
+        assert [end for _, end in seen] == pytest.approx(expected)
+        # Each slot starts where the previous one ended: one continuous model.
+        assert [start for start, _ in seen] == pytest.approx(
+            [starting_soc] + expected[:-1]
+        )
+
+        # The clamp cases really were exercised.
+        assert min(expected) >= tracker._get_min_soc() - 1e-9
+        assert max(expected) <= tracker._get_max_soc() + 1e-9
+        if starting_soc < 20.0:
+            assert expected[0] == pytest.approx(tracker._get_min_soc())
+        else:
+            assert max(expected) == pytest.approx(tracker._get_max_soc())
+
+    def test_pv_surplus_during_discharge_charges_before_the_min_soc_clamp(
+        self, optimizer
+    ):
+        """A cloud-safe HOLD->discharge_to_load slot at min_soc must still charge.
+
+        The old inline copy clamped at ``min_soc`` first and only then added PV
+        surplus; the shared model adds PV, clamps at ``max_soc``, then
+        subtracts. With the battery sitting at the floor and PV covering the
+        load, the projected column must show the pack RISING.
+        """
+        base = datetime.datetime(2024, 1, 1, 12, 0)
+        schedule = {base: make_schedule_entry(base, BatteryMode.DISCHARGE)}
+        tracker = optimizer._cost_tracker
+
+        projected, final_cost = tracker.project_costs(
+            schedule=schedule,
+            starting_soc=tracker._get_min_soc(),
+            starting_cost=0.20,
+            prices_by_slot={base: 0.10},
+            predict_load_func=lambda _: 0.4,
+            predict_pv_func=lambda _: 4.0,
+        )
+
+        assert projected[base] == pytest.approx(0.20)
+        # PV surplus was stored, so the cost basis moved toward the foregone
+        # export value instead of staying put.
+        assert final_cost < 0.20
+
+    def test_slot_fractions_are_honoured_by_the_shared_model(self, optimizer):
+        base = datetime.datetime(2024, 1, 1, 10, 0)
+        schedule = {base: make_schedule_entry(base, BatteryMode.CHARGE)}
+        tracker = optimizer._cost_tracker
+
+        _, full = tracker.project_costs(
+            schedule=schedule,
+            starting_soc=50.0,
+            starting_cost=0.30,
+            prices_by_slot={base: 0.10},
+            predict_load_func=lambda _: 0.5,
+        )
+        _, half = tracker.project_costs(
+            schedule=schedule,
+            starting_soc=50.0,
+            starting_cost=0.30,
+            prices_by_slot={base: 0.10},
+            predict_load_func=lambda _: 0.5,
+            slot_fractions_by_slot={base: 0.5},
+        )
+        # Half the energy at the same landed cost moves the average half as far.
+        assert 0.30 > half > full
+class _RecordingLearningEngine:
+    """Learning-engine stub that records what the cost tracker feeds it."""
+
+    def __init__(self):
+        self.charge_calls = []
+        self.discharge_calls = []
+
+    def record_charging(self, **kwargs):
+        self.charge_calls.append(kwargs)
+
+    def record_discharging(self, **kwargs):
+        self.discharge_calls.append(kwargs)
+
+    def record_temperature_observation(self, temp):
+        pass
+
+    def record_cooling(self, **kwargs):
+        pass
+
+    def get_charge_rate_for_soc(self, soc, temp=None):
+        return None
+
+    def predict_temp_after_idle(self, temp, duration_minutes):
+        return temp
+
+
+class TestDepletedSocStartIsNotFalsy:
+    """A measured SOC of 0.0 % is an observation, not "unset".
+
+    ``_process_energy_change`` used ``self._last_soc if self._last_soc else
+    current_soc``.  Right after a genuine depletion ``_last_soc == 0.0`` is
+    falsy, so the tracker substituted the *current* SOC and called
+    ``record_charging(soc_start=current_soc, soc_end=current_soc)``.  That trips
+    ``learning_engine.record_charging``'s ``soc_end <= soc_start`` early return,
+    so the charge-rate, efficiency and thermal samples of the deep-discharge
+    curve - exactly the ones the model has fewest of - were silently dropped.
+    """
+
+    @staticmethod
+    def _make_tracker(engine, soc_holder, state):
+        clock = {"now": datetime.datetime(2024, 1, 15, 10, 0)}
+
+        tracker = BatteryCostTracker(
+            config=BatteryCostConfig(
+                battery_capacity=10.0,
+                efficiency=1.0,
+                slot_minutes=15,
+                charge_rate=4.0,
+                discharge_rate=4.0,
+                use_inverter_energy_sensors=True,
+            ),
+            get_state_func=lambda e: state.get(e),
+            call_service_func=lambda *a, **k: None,
+            get_datetime_func=lambda: clock["now"],
+            get_timezone_func=lambda: None,
+            align_to_slot_func=lambda dt: dt.replace(
+                minute=(dt.minute // 15) * 15, second=0, microsecond=0
+            ),
+            get_min_soc_func=lambda: 0.0,
+            get_max_soc_func=lambda: 100.0,
+            get_current_soc_func=lambda: soc_holder["soc"],
+            get_battery_temp_func=lambda: 20.0,
+            learning_engine=engine,
+            get_cached_prices_func=lambda: [],
+            save_learning_data_func=lambda: None,
+            update_learning_sensor_func=lambda: None,
+            log_func=lambda *a, **k: None,
+        )
+        tracker.initialize()
+        return tracker, clock
+
+    def test_charge_after_depletion_keeps_soc_start_at_zero(self):
+        engine = _RecordingLearningEngine()
+        soc_holder = {"soc": 20.0}
+        state = {
+            "sensor.growatt_battery_charge_today": "5.0",
+            "sensor.growatt_battery_discharge_today": "3.0",
+        }
+        tracker, clock = self._make_tracker(engine, soc_holder, state)
+
+        # Discharge the pack all the way to 0 %.
+        clock["now"] += datetime.timedelta(minutes=30)
+        soc_holder["soc"] = 0.0
+        state["sensor.growatt_battery_discharge_today"] = "5.0"
+        tracker.on_energy_sensor_change(
+            "sensor.growatt_battery_discharge_today", "3.0", "5.0"
+        )
+        assert tracker.last_soc == 0.0
+
+        # Now charge: the SOC sensor has moved off the floor.
+        clock["now"] += datetime.timedelta(minutes=15)
+        soc_holder["soc"] = 2.0
+        state["sensor.growatt_battery_charge_today"] = "6.0"
+        tracker.on_energy_sensor_change(
+            "sensor.growatt_battery_charge_today", "5.0", "6.0"
+        )
+
+        assert len(engine.charge_calls) == 1
+        call = engine.charge_calls[0]
+        assert call["soc_start"] == 0.0
+        # The observation must be usable: record_charging drops soc_end <= soc_start.
+        assert call["soc_end"] > call["soc_start"]
+
+    def test_discharge_after_depletion_keeps_soc_start_at_zero(self):
+        engine = _RecordingLearningEngine()
+        soc_holder = {"soc": 20.0}
+        state = {
+            "sensor.growatt_battery_charge_today": "5.0",
+            "sensor.growatt_battery_discharge_today": "3.0",
+        }
+        tracker, clock = self._make_tracker(engine, soc_holder, state)
+
+        clock["now"] += datetime.timedelta(minutes=30)
+        soc_holder["soc"] = 0.0
+        state["sensor.growatt_battery_discharge_today"] = "5.0"
+        tracker.on_energy_sensor_change(
+            "sensor.growatt_battery_discharge_today", "3.0", "5.0"
+        )
+
+        # A second discharge event while the SOC sensor reports 1 % (PV briefly
+        # lifted it off the floor): the baseline is still the recorded 0.0 %.
+        clock["now"] += datetime.timedelta(minutes=15)
+        soc_holder["soc"] = 1.0
+        state["sensor.growatt_battery_discharge_today"] = "5.5"
+        tracker.on_energy_sensor_change(
+            "sensor.growatt_battery_discharge_today", "5.0", "5.5"
+        )
+
+        assert len(engine.discharge_calls) == 2
+        assert engine.discharge_calls[1]["soc_start"] == 0.0
+
+
+class _WarmingChargeEngine:
+    """Learning engine whose warming model differs sharply from the flat rate."""
+
+    def __init__(self, ac_kwh_per_15min: float = 3.0, warming_per_15min: float = 2.0):
+        self._ac = ac_kwh_per_15min
+        self._warming = warming_per_15min
+        self.warming_calls = []
+
+    def get_charge_rate_for_soc(self, soc, temp=None):
+        return None  # force the flat branch to use the configured nominal rate
+
+    def predict_charge_energy_with_warming(
+        self, current_soc, start_temp, duration_minutes, temp_threshold=16.0
+    ):
+        self.warming_calls.append((current_soc, start_temp, duration_minutes))
+        scale = duration_minutes / 15.0
+        return self._ac * scale, start_temp + self._warming * scale
+
+    def predict_temp_after_idle(self, temp, duration_minutes):
+        return temp
+
+
+class TestProjectCostsUsesTheLearnedChargeModel:
+    """The projected-cost column must use the same CHARGE model as the SOC column.
+
+    ``project_costs`` called ``project_slot_soc`` without ``learning_engine``
+    and ``temp_start``, so its CHARGE slots silently fell back to the flat
+    ``charge_rate * efficiency * duration`` while
+    ``project_schedule_trajectory`` - which passes both - used
+    ``predict_charge_energy_with_warming``.  One log then carried two different
+    charge models, the contradiction that adopting the shared model was
+    supposed to remove.
+    """
+
+    @staticmethod
+    def _params(tracker, charge_rate=None):
+        from battery_optimizer_lib.soc_projection import SocProjectionParams
+
+        cfg = tracker._config
+        return SocProjectionParams(
+            battery_capacity=cfg.battery_capacity,
+            efficiency=cfg.efficiency,
+            charge_rate=cfg.charge_rate if charge_rate is None else charge_rate,
+            discharge_rate=cfg.discharge_rate,
+            export_discharge_rate=cfg.export_discharge_rate,
+            inverter_efficiency=cfg.inverter_efficiency,
+            min_soc=tracker._get_min_soc(),
+            max_soc=tracker._get_max_soc(),
+            slot_minutes=cfg.slot_minutes,
+        )
+
+    def test_charge_slot_matches_project_slot_soc_with_the_engine(self):
+        from battery_optimizer_lib.soc_projection import project_slot_soc
+
+        optimizer = MockCostOptimizer(slot_minutes=15)
+        tracker = optimizer._cost_tracker
+        engine = _WarmingChargeEngine()
+
+        base = datetime.datetime(2024, 1, 15, 3, 0)
+        schedule = {base: make_schedule_entry(base, BatteryMode.CHARGE)}
+        prices = {base: 0.10}
+
+        _, learned_cost = tracker.project_costs(
+            schedule=schedule,
+            starting_soc=50.0,
+            starting_cost=0.30,
+            prices_by_slot=prices,
+            predict_load_func=lambda _: 0.5,
+            starting_temp=20.0,
+            learning_engine=engine,
+        )
+        assert engine.warming_calls, "project_costs never reached the warming model"
+
+        def cost_for(dc_in: float) -> float:
+            old_energy = tracker._soc_to_energy_kwh(50.0)
+            landed = tracker._grid_landed_cost(0.10)
+            return (old_energy * 0.30 + dc_in * landed) / (old_energy + dc_in)
+
+        params = self._params(tracker)
+        with_engine = project_slot_soc(
+            soc_start=50.0,
+            mode=BatteryMode.CHARGE,
+            params=params,
+            load_kw=0.5,
+            pv_kw=0.0,
+            temp_start=20.0,
+            learning_engine=engine,
+        )
+        flat = project_slot_soc(
+            soc_start=50.0,
+            mode=BatteryMode.CHARGE,
+            params=params,
+            load_kw=0.5,
+            pv_kw=0.0,
+        )
+        assert with_engine.dc_energy_in_kwh != pytest.approx(flat.dc_energy_in_kwh)
+
+        assert learned_cost == pytest.approx(cost_for(with_engine.dc_energy_in_kwh))
+        assert learned_cost != pytest.approx(cost_for(flat.dc_energy_in_kwh))
+
+    def test_temperature_evolves_across_slots_like_the_soc_trajectory(self, monkeypatch):
+        from battery_optimizer_lib import soc_projection
+
+        optimizer = MockCostOptimizer(slot_minutes=15)
+        tracker = optimizer._cost_tracker
+        engine = _WarmingChargeEngine()
+
+        base = datetime.datetime(2024, 1, 15, 3, 0)
+        slots = [base + datetime.timedelta(minutes=15 * i) for i in range(3)]
+        schedule = {s: make_schedule_entry(s, BatteryMode.CHARGE) for s in slots}
+
+        real = soc_projection.project_slot_soc
+        seen = []
+
+        def spy(**kwargs):
+            result = real(**kwargs)
+            seen.append((kwargs, result))
+            return result
+
+        monkeypatch.setattr(soc_projection, "project_slot_soc", spy)
+
+        tracker.project_costs(
+            schedule=schedule,
+            starting_soc=50.0,
+            starting_cost=0.30,
+            prices_by_slot={s: 0.10 for s in slots},
+            predict_load_func=lambda _: 0.5,
+            starting_temp=20.0,
+            learning_engine=engine,
+        )
+
+        assert len(seen) == 3
+        # Each slot starts at the previous slot end temperature (+2 C/slot here).
+        temps_in = [kwargs["temp_start"] for kwargs, _ in seen]
+        assert temps_in == pytest.approx([20.0, 22.0, 24.0])
+        assert all(kwargs["learning_engine"] is engine for kwargs, _ in seen)
+        assert [kwargs["slot_time"] for kwargs, _ in seen] == slots
+
+    def test_defaults_preserve_the_flat_rate_behaviour(self):
+        """Callers that pass neither temp nor engine keep the old projection."""
+        from battery_optimizer_lib.soc_projection import project_slot_soc
+
+        optimizer = MockCostOptimizer(slot_minutes=15)
+        tracker = optimizer._cost_tracker
+
+        base = datetime.datetime(2024, 1, 15, 3, 0)
+        schedule = {base: make_schedule_entry(base, BatteryMode.CHARGE)}
+
+        _, final_cost = tracker.project_costs(
+            schedule=schedule,
+            starting_soc=50.0,
+            starting_cost=0.30,
+            prices_by_slot={base: 0.10},
+            predict_load_func=lambda _: 0.5,
+        )
+
+        flat = project_slot_soc(
+            soc_start=50.0,
+            mode=BatteryMode.CHARGE,
+            params=self._params(tracker),
+            load_kw=0.5,
+            pv_kw=0.0,
+        )
+        old_energy = tracker._soc_to_energy_kwh(50.0)
+        landed = tracker._grid_landed_cost(0.10)
+        expected = (old_energy * 0.30 + flat.dc_energy_in_kwh * landed) / (
+            old_energy + flat.dc_energy_in_kwh
+        )
+        assert final_cost == pytest.approx(expected)

@@ -30,7 +30,14 @@ from .pv_profile import PvProfile
 from .learning_engine import BatteryLearningEngine
 from .load_profile import LoadProfile, _quantile
 from .price_service import NordPoolPriceService
-from .direct_control import DirectControl
+from .direct_control import (
+    ApplyOutcome,
+    DirectControl,
+    ModeSensorVerifier,
+    RegisterVerifier,
+    VerificationOutcome,
+    VerificationResult,
+)
 from .dp_optimizer import DPOptimizer, DPOptimizerConfig, DPOptimizerResult
 from .timezone_utils import (
     normalize_tz_pair,
@@ -64,6 +71,7 @@ from .thermal_model import (
     MAX_BATTERY_TEMP_C,
 )
 from .ambient_service import AmbientTemperatureService, AmbientServiceConfig
+from .callback_lock import CallbackLock
 
 __all__ = [
     # Config
@@ -81,6 +89,11 @@ __all__ = [
     "LoadProfile",
     "NordPoolPriceService",
     "DirectControl",
+    "ApplyOutcome",
+    "ModeSensorVerifier",
+    "RegisterVerifier",
+    "VerificationOutcome",
+    "VerificationResult",
     "SensorReader",
     # DP Optimizer
     "DPOptimizer",
@@ -135,4 +148,6 @@ __all__ = [
     # Ambient temperature service
     "AmbientTemperatureService",
     "AmbientServiceConfig",
+    # Thread safety
+    "CallbackLock",
 ]

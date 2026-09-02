@@ -12,12 +12,16 @@ small, pure pieces added for this: the timing decorator, the overrun accounting,
 the rate-limited terminal warning gate, and the health-sensor payload.
 """
 
+import ast
 import datetime
 import inspect
+import threading
+import time
 
 import pytest
 
 import battery_optimizer as bo
+from battery_optimizer_lib.callback_lock import CallbackLock
 from battery_optimizer_lib.direct_control import ApplyOutcome
 
 
@@ -26,6 +30,12 @@ class FakeOptimizer(bo.BatteryOptimizer):
 
     def __init__(self, **config_overrides):
         self.config = bo.BatteryOptimizerConfig(**config_overrides)
+        # initialize() creates the app lock as its very first statement; this
+        # double skips initialize(), so it builds one itself. log_func stays
+        # None so a depth-0 `unlocked()` (this double calls
+        # `_apply_mode_tracked` directly, outside any callback frame) does not
+        # inject an ERROR into `logs`.
+        self._lock = CallbackLock()
         self.logs = []
         self.states = {}
         self._callback_overrun_count = 0
@@ -489,3 +499,191 @@ def test_health_sensor_exposes_the_new_counters_without_renaming_the_old():
     assert attrs["consecutive_apply_unconfirmed"] == 1
     assert attrs["apply_duplicates_skipped"] == 0
     assert attrs["apply_dry_runs"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Thread safety: the app lock wired into the orchestrator
+#
+# AppDaemon 4.5.13 with `total_threads: 4` + `pin_app: false` round-robins this
+# app's callbacks across worker threads, so the accounting below is now
+# concurrent.  `_timed_callback` runs every callback under one app-wide
+# CallbackLock; `record_external_callback_duration` is the one entry point
+# reached from OUTSIDE that decorator (DirectControl's verify callbacks) and
+# has to take the lock itself.
+# ---------------------------------------------------------------------------
+
+def test_external_callback_durations_are_exact_under_concurrency():
+    """Design test 17: 8 threads x 100 overruns -> exact count, one hint."""
+    app = FakeOptimizer(callback_warn_seconds=10.0)
+
+    def hammer():
+        for _ in range(100):
+            app.record_external_callback_duration("DirectControl._verify_mode", 15.8)
+
+    threads = [threading.Thread(target=hammer) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # `+= 1` is a read-modify-write; without the lock this loses increments.
+    assert app._callback_overrun_count == 800
+    # The one-shot hint is a check-then-set: without the lock several threads
+    # pass the `not self._threads_hint_logged` test before any of them sets it.
+    hints = [m for m, _l in app.logs if "total_threads" in m]
+    assert len(hints) == 1
+    assert "pin_app: false" in hints[0]
+    assert app._slowest_callback == ("DirectControl._verify_mode", 15.8)
+
+
+def test_the_decorator_serializes_callbacks_and_counts_the_lock_wait():
+    """Two callbacks on one app never overlap, and the waiter's wait is timed.
+
+    The measured duration must include time spent waiting for the app lock:
+    that wait is time the callback occupied its AppDaemon worker thread, which
+    is exactly what the overrun accounting exists to surface.
+    """
+    intervals = []
+    durations = []
+    ready = threading.Barrier(2)
+
+    class Probe:
+        config = bo.BatteryOptimizerConfig()
+
+        def __init__(self):
+            self._lock = CallbackLock()
+            self._guard = threading.Lock()
+
+        def _record_callback_duration(self, name, seconds):
+            with self._guard:
+                durations.append((name, seconds))
+
+        @bo._timed_callback
+        def slow(self, kwargs=None):
+            start = time.monotonic()
+            ready.wait(timeout=5)
+            time.sleep(0.30)
+            with self._guard:
+                intervals.append((start, time.monotonic()))
+
+        @bo._timed_callback
+        def other(self, kwargs=None):
+            start = time.monotonic()
+            time.sleep(0.01)
+            with self._guard:
+                intervals.append((start, time.monotonic()))
+
+    probe = Probe()
+    a = threading.Thread(target=probe.slow)
+    b = threading.Thread(target=lambda: (ready.wait(timeout=5), probe.other()))
+    a.start()
+    b.start()
+    a.join(timeout=10)
+    b.join(timeout=10)
+
+    assert len(intervals) == 2
+    (s1, e1), (s2, e2) = sorted(intervals)
+    assert e1 <= s2 or e2 <= s1, "callbacks overlapped — the app lock is not held"
+
+    by_name = dict(durations)
+    assert by_name["slow"] >= 0.30
+    # `other` slept 10 ms but waited behind a 300 ms callback.
+    assert by_name["other"] >= 0.25, (
+        "lock wait is missing from the measurement — time.monotonic() must be "
+        "sampled outside the acquire"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Static guards: the blocking inverter calls, and only those, run unlocked
+#
+# The orchestrator is not unit-tested (CLAUDE.md), so these read its source.
+# ---------------------------------------------------------------------------
+
+_BLOCKING_CALLS = ("apply_mode", "apply_mode_with_outcome", "release_control")
+# The only two frames allowed to issue a blocking inverter call.
+_ALLOWED_CALLERS = {"_apply_mode_tracked", "_on_enabled_change"}
+
+
+def _orchestrator_tree():
+    source = inspect.getsource(bo)
+    return source, ast.parse(source)
+
+
+def test_the_inverter_write_runs_inside_an_unlocked_region():
+    source = inspect.getsource(bo.BatteryOptimizer._apply_mode_tracked)
+
+    assert "with self._lock.unlocked():" in source
+    body = source.split("with self._lock.unlocked():", 1)[1]
+    first_statement = body.strip().splitlines()[0].strip()
+    assert first_statement == (
+        "outcome = self._direct_control.apply_mode_with_outcome(entry)"
+    ), "only the blocking inverter call may run unlocked"
+    # Accounting must be back under the lock.
+    assert "self._update_control_health_sensor()" in body
+    assert "self._note_applied_mode(entry)" in body
+
+
+def test_every_blocking_inverter_call_is_unlocked_and_in_an_allowed_frame():
+    """No `apply_mode` / `release_control` outside the two documented sites."""
+    source, tree = _orchestrator_tree()
+
+    unlocked_ranges = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.With):
+            continue
+        for item in node.items:
+            call = item.context_expr
+            if (isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "unlocked"):
+                unlocked_ranges.append((node.lineno, node.end_lineno))
+
+    assert unlocked_ranges, "no unlocked() region found in the orchestrator"
+
+    found = []
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(func):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in _BLOCKING_CALLS):
+                continue
+            target = node.func.value
+            if not (isinstance(target, ast.Attribute)
+                    and target.attr == "_direct_control"):
+                continue
+            found.append((func.name, node.lineno))
+
+    assert found, "the blocking inverter calls disappeared — update this test"
+    for name, lineno in found:
+        assert name in _ALLOWED_CALLERS, (
+            f"blocking inverter call in {name} (line {lineno}); it must go "
+            f"through _apply_mode_tracked"
+        )
+        assert any(start <= lineno <= end for start, end in unlocked_ranges), (
+            f"the inverter call in {name} (line {lineno}) is not inside a "
+            f"`with self._lock.unlocked():` region — it would hold the app "
+            f"lock for the whole ~15 s modbus write"
+        )
+
+
+def test_initialize_creates_the_lock_before_anything_else():
+    source = inspect.getsource(bo.BatteryOptimizer.initialize)
+    body = [
+        line.strip() for line in source.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    # def, docstring, then the lock, then the guarded body.
+    assert body[2] == "self._lock = CallbackLock(log_func=self.log)"
+    assert body[3] == "with self._lock:"
+
+
+def test_external_duration_hook_takes_the_app_lock():
+    source = inspect.getsource(bo.BatteryOptimizer.record_external_callback_duration)
+
+    assert "with self._lock:" in source, (
+        "record_external_callback_duration is called from DirectControl's "
+        "worker thread and must take the app lock"
+    )

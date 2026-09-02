@@ -85,6 +85,66 @@ Temperature-aware charge rates are predicted before the DP from the learned
 SOC/temperature model. These are planning estimates; actual SOC deviation can
 trigger a re-optimization.
 
+### One bound on the learned charge rate
+
+`BatteryLearningEngine.get_charge_rate_for_soc` is the ONE gate every consumer of
+a learned battery power passes through: the DP (via
+`charge_rate_utils.compute_charge_rates_per_slot`), the expected-SOC trajectory
+(via `soc_projection._effective_charge_rate`), the deviation detector (via
+`_project_charge_completion` and `_calculate_extra_charge_slots`) and the
+orchestrator's status sensors. The plausibility bound therefore lives there and
+nowhere else — three ad-hoc clamps in three consumers is exactly the drift the
+"one model" rule exists to prevent.
+
+Two lines of defence, both derived from the same constants in
+`learning_engine.py`:
+
+1. **At ingest.** `record_charging` / `record_discharging` reject an observation
+   whose interval is shorter than `min_observation_minutes` (default
+   `MIN_OBSERVATION_MINUTES = 1.0`) or whose implied rate exceeds
+   `max_plausible_rate_kw = max(charge_rate, discharge_rate) * max_rate_factor`
+   (default `DEFAULT_MAX_RATE_FACTOR = 2.0`). Rejections are logged
+   (`Learning: rejected implausible …`) and counted in
+   `get_learning_summary()["rejected_observations"]`.
+2. **At read.** `_plausible_rates` filters every median window *before* the
+   `[-10:]` slice, and `_bounded_median` clamps the result. `load_from_json`
+   runs the same filter (`sanitize_stats`) so a file written before the ingest
+   guards existed is neutralised in memory on load and written back clean on the
+   next save.
+
+**Why 2x nominal.** The reference installation is configured at 4.5 kW and its
+observation history has a hard physical ceiling at ~6.8 kW (the inverter's
+warm-battery rate, 1.5x nominal). A 1.5x bound would clip that genuine cluster;
+2x keeps it and still rejects everything a 15-minute slot cannot deliver.
+
+**Why a 1-minute floor.** The inverter energy counters move in 0.1 kWh steps and
+the SOC sensor in 1% (0.143 kWh) steps, so below a minute the quotient is
+quantization noise, not a rate.
+
+**What this cost in production (2026-09-02).** `cost_tracker` derived an
+observation's duration from `_last_sig_soc_time`, which the SOC listener
+re-stamps milliseconds before the energy-sensor callback records the charge. A
+genuine 0.1 kWh delta over a 10-40 ms "duration" produced 34535 kW and 44653 kW
+observations. The live file's 0-25 %/>20 C bucket held
+`[2.806, 34535.687, 44653.932, 14308.71, 5.959]`, so the median served to every
+consumer was **14308.71 kW**. Three consumers then produced three different
+numbers for the same 05:00 CHARGE slot, all from that one file:
+
+| consumer | path | rate | slot effect |
+|---|---|---|---|
+| DP | `charge_rate_utils` at projected SOC/temp | 10.95 kW | +18.2 %/slot planned |
+| expected-SOC trajectory | `project_slot_soc` at 10 %, 16 C | 3.01 kW | +5.0 %/slot |
+| deviation detector | `_project_charge_completion` at 10 %, 21.9 C | 14308.71 kW | "projected to reach 21894.1 %" |
+
+The DP's 10.95 kW is the tell: `compute_charge_rates_per_slot` walks the SOC
+forward assuming continuous charging, so the first slot's 14308.71 kW saturated
+the projection at 100 % and *every remaining slot* was priced from the
+`90-100`/`>20` bucket (median 10.95 kW) instead of the bucket it would really be
+in. Reality delivered 6.86 kW (SOC 9 %→21 % in 15 min).
+
+`scripts/clean_learning_data.py` inspects a learning file and writes a cleaned
+copy using the same `sanitize_stats` rule; it never modifies its input.
+
 ### Shared slot transition (`soc_projection.py`)
 
 Five components must agree on what one slot does to the SOC: the DP (which
@@ -216,7 +276,22 @@ intervals are the norm and the bias was systematic against the very projector th
 coefficients feed. `k2` is fitted directly in C per kWh and is unaffected by the
 linearisation. At least 20 samples are required and the regressors must not be
 collinear (all-equal power cannot separate relaxation from heating). Results are
-clamped to `k1 ∈ [0.001, 0.1]` per minute and `k2 ∈ [0, 2]` C/kWh.
+clamped to `k1 ∈ [MIN_COOLING_RATE_PER_MIN, MAX_COOLING_RATE_PER_MIN] = [0.001, 0.1]`
+per minute and `k2 ∈ [0, MAX_HEATING_C_PER_KWH] = [0, 3]` C/kWh.
+
+`|P_bat|` is the `k2` regressor, so `record_thermal_observation` rejects any
+sample whose power exceeds the same `max_plausible_rate_kw` bound the charge-rate
+consumers use — a corrupted power does not merely add noise here, it drags the
+whole pooled fit. `load_from_json` discards a persisted `thermal_coeffs` that
+fails `thermal_coeffs_are_sane` (outside those ranges, or non-finite) and
+`reset_thermal_calibration()` re-bootstraps from scratch on demand.
+
+The `k2` ceiling was raised from 2 to 3 C/kWh because 2 was **binding on real
+data**: the reference pack measured 21.9 C → 25.8 C while storing 1.716 kWh in
+one 15-minute slot = 2.27 C/kWh, and the warming-rate bootstrap wanted 2.105.
+A high `k2` on this installation is a genuine property of a small thermal mass,
+not evidence of corruption — the corruption showed up in the *rate*, not in the
+temperature.
 
 **One ambient source for both recorders.** `record_charging` and
 `record_discharging` feed a single pooled regression whose relaxation regressor is
@@ -315,6 +390,26 @@ forces a rate-limited forecast refresh, caps that slot at the observed output,
 and replans. This prevents the normal forecast cache from repeatedly selecting
 HOLD from a stale optimistic value.
 
+### The ramp gate: `pv_reactive_min_forecast_w`
+
+One threshold gates *both* the reactive shortfall check and the sliding bias
+window (`PvBiasConfig.min_forecast_kw` is derived from it), so a slot below it
+contributes neither a recalculation trigger nor a ratio observation.
+
+It must sit above the sunrise/sunset ramp. On 2026-09-02 the 07:00 and 07:15
+slots were forecast at 292 W and measured 0 W; with the old 200 W gate those two
+ratio-0.0 observations were the entire evidence base, and the median dropped the
+whole-horizon bias onto the 0.20 clamp at 07:30 — a 5x under-forecast of a sunny
+day derived from two pre-production slots. A few minutes of ramp-timing error is
+a ~100% *relative* error on a ramp slot while being economically meaningless:
+below the site's baseline load the DP's net load `max(0, load - pv)` barely
+moves either way.
+
+The default is therefore 600 W — above the ramp, roughly one baseline house
+load, and still only ~12% of a 5 kW array's peak, so genuine daytime cloud
+events are unaffected. `pv_bias_min_slots` (default 2) is the second guard: the
+factor stays at 1.0 until that many qualifying observations are in the window.
+
 ## Battery cost tracking
 
 The weighted average stored-energy cost is persisted across restarts and exposed
@@ -355,15 +450,37 @@ stored-energy cost of `(0.108 - 0.02) / 0.85 = 0.1036` EUR/kWh.
 ### Source attribution
 
 Inverter charge counters do not label the source of each kWh, so measured
-charging is attributed by the currently commanded mode
-(`_observed_charge_cost`):
+charging is attributed by `_observed_charge_cost`. The commanded mode is the
+first input, but **it is not sufficient on its own**: a source is only accepted
+when it could physically have supplied the energy. The rules are evaluated in
+order.
 
-| Active mode | Source | Cost applied |
-|---|---|---|
-| CHARGE | grid | `grid_landed_cost` (conservative if PV also contributed) |
-| HOLD / DISCHARGE | pv | `pv_opportunity_cost` (discharge-to-load still accepts surplus PV into the battery) |
-| unknown (before first mode callback) | grid | `grid_landed_cost` (conservative) |
-| slot price unavailable | — | current average preserved unchanged |
+| # | Condition | Source | Cost applied |
+|---|---|---|---|
+| 1 | commanded mode is CHARGE | `grid` | `grid_landed_cost` (conservative if PV also contributed) |
+| 2 | a `grid_charge` command is still in force at the inverter | `grid-command` | `grid_landed_cost` |
+| 3 | HOLD / DISCHARGE and measured PV >= `cost_pv_attribution_min_w` | `pv` | `pv_opportunity_cost` (discharge-to-load still accepts surplus PV into the battery) |
+| 4 | HOLD / DISCHARGE and measured PV below the floor | `no-pv-grid` | `grid_landed_cost` |
+| 5 | HOLD / DISCHARGE and no PV reading available at all | `pv` | `pv_opportunity_cost` (legacy behaviour; no PV provider injected) |
+| 6 | unknown (before first mode callback) | `unknown-grid` | `grid_landed_cost` (conservative) |
+| — | slot price unavailable | — | current average preserved unchanged |
+
+Rules 2 and 4 exist because the mode the *app* believes it is in is not the mode
+the *inverter* is executing. A `set_wit_mode` override runs for `slot_minutes +
+direct_control_buffer_minutes`, so a grid charge commanded at 05:00 is still
+running when the app moves to HOLD at 05:15. On 2026-09-02 the +0.1 kWh measured
+five seconds after that transition — an hour before sunrise — was booked
+`[inverter, pv]` at 0.0253 EUR/kWh and pulled the basis from 0.1261 to 0.1199.
+Rule 2 keeps grid attribution for the remainder of that command plus
+`cost_grid_charge_grace_seconds` after another mode supersedes it (the energy
+counters lag the command); rule 4 is the backstop for any other night-time
+charge. Both guards fail *toward* the grid cost, which is the conservative
+direction: it never books unpaid-for energy at a lower cost than it had.
+
+`cost_pv_attribution_min_w` (default 100 W) is the PV floor. The PV reading and
+the grid-charge window are injected into `BatteryCostTracker`
+(`get_pv_power_w_func`, `grid_charge_active_func`) rather than read off the app,
+so the rule is unit-testable; without a PV provider the tracker keeps rule 5.
 
 ### Pricing of energy deltas
 
@@ -419,6 +536,19 @@ re-anchors it to the SOC-derived value in two cases:
 `energy_in_transit_kwh` (+charge, −discharge) that reconstructs the pre-event
 state. Every resync is logged. `_compute_weighted_avg_cost` itself is correct
 and is not modified — with `old_energy = 0` it already returns `added_price`.
+
+The log line spells the in-transit term out, because consecutive resyncs at the
+same SOC otherwise read as a contradiction:
+
+```text
+Resyncing stored-energy accumulator 0.100 -> 0.143 kWh (SOC 11.0% = 0.143 kWh) (depleted)
+Resyncing stored-energy accumulator 0.143 -> 0.043 kWh (SOC 11.0% = 0.143 kWh less the 0.100 kWh charged in this event) (depleted)
+```
+
+The first is a plain SOC observation (`process_soc_change`, no delta), which
+anchors to the SOC *now*. The second comes from the energy-delta path
+(`_process_energy_change`), which anchors to the state *before* the delta. Both
+are correct; only the message hid the 0.100 kWh that separates them.
 
 ### A PV basis of 0.0000 is correct
 

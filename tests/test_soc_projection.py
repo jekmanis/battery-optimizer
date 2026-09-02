@@ -618,3 +618,141 @@ class TestScheduleFormatterUsesTheSharedModel:
         assert logged == pytest.approx(expected, abs=0.05)
         # 3 kW AC for 15 min at 90% = 0.833 kWh DC, not 0.75.
         assert logged < 80.0 - (3.0 * 0.25 / CAPACITY) * 100
+
+
+class TestDetectorAgreesWithTheSharedModel:
+    """The deviation detector is the THIRD consumer of the slot-SOC model.
+
+    ``TestSharedProjectionMatchesDp`` pins DP vs ``project_slot_soc``. This class
+    closes the triangle: ``SocDeviationDetector._interpolate_expected_soc`` must
+    give the same SOC for the same slot.
+
+    The ONE legitimate difference is ``rate_lookup_soc``: the detector looks the
+    charge rate up at the ACTUAL SOC (that is what the inverter's rate depends on
+    right now) while the trajectory looks it up at the PLANNED SOC. When the two
+    coincide — the case that matters, because a deviation is measured against a
+    trajectory built from the same reading — the answers must be identical.
+
+    Production 2026-09-02 is what happens when they do not: the DP planned the
+    05:00 CHARGE slot at 10.95 kW (+18.2 %/slot), the expected-SOC trajectory
+    used 3.01 kW (+5.0 %/slot) and the detector used 14308.71 kW — three numbers
+    for one slot, all from the same learning file, because a poisoned bucket is
+    reached by a different fallback in each path.
+    """
+
+    @staticmethod
+    def _detector(learning_engine=None, **overrides):
+        from battery_optimizer_lib.soc_deviation import (
+            SocDeviationConfig,
+            SocDeviationDetector,
+        )
+
+        base = dict(
+            slot_minutes=15,
+            charge_rate=4.5,
+            discharge_rate=4.5,
+            efficiency=0.95,
+            battery_capacity=CAPACITY,
+            min_soc=10.0,
+            max_soc=100.0,
+            soc_deviation_threshold=4.0,
+            grid_fee=0.05,
+            inverter_efficiency=1.0,
+        )
+        base.update(overrides)
+        return SocDeviationDetector(
+            SocDeviationConfig(**base), learning_engine=learning_engine
+        )
+
+    @pytest.mark.parametrize(
+        "mode,load_kw,pv_kw",
+        [
+            (BatteryMode.CHARGE, 0.8, 0.0),
+            (BatteryMode.DISCHARGE, 2.0, 0.0),
+            (BatteryMode.DISCHARGE, 0.8, 3.0),   # pv >= load: PV charges
+            (BatteryMode.HOLD, 0.8, 3.0),
+            (BatteryMode.HOLD, 0.8, 0.0),
+        ],
+    )
+    @pytest.mark.parametrize("fraction", [1.0, 0.5, 1.0 / 15.0])
+    def test_interpolation_equals_project_slot_soc(self, mode, load_kw, pv_kw, fraction):
+        slot = datetime.datetime(2026, 9, 2, 5, 0)
+        entry = ScheduleEntry(time=slot, mode=mode, reason="test")
+        detector = self._detector()
+        params = _params(discharge_rate=4.5, inverter_efficiency=1.0)
+
+        interpolated = detector._interpolate_expected_soc(
+            50.0, entry, fraction, 50.0, slot, None,
+            lambda _dt: load_kw, lambda _dt: pv_kw,
+        )
+        expected = project_slot_soc(
+            soc_start=50.0,
+            mode=mode,
+            params=params,
+            load_kw=load_kw,
+            pv_kw=pv_kw,
+            fraction=fraction,
+            export_rate=entry.export_rate,
+            rate_lookup_soc=50.0,
+        ).soc_end
+        assert interpolated == pytest.approx(expected)
+
+    def test_all_three_consumers_use_the_same_bounded_charge_rate(self):
+        """A poisoned learning file must not fan out into three different rates.
+
+        This is the exact live 0-25 %/>20 C bucket. Before the bound, the DP
+        (via ``charge_rate_utils``), the trajectory (via ``project_slot_soc``)
+        and the detector each reached a different median and produced
+        10.95 / 3.01 / 14308.71 kW for the same slot.
+        """
+        from battery_optimizer_lib import BatteryLearningEngine
+        from battery_optimizer_lib.charge_rate_utils import compute_charge_rates_per_slot
+
+        poison = [2.806, 34535.687, 44653.932, 14308.71, 5.959]
+        engine = BatteryLearningEngine(
+            battery_capacity_kwh=CAPACITY,
+            nominal_charge_rate_kw=4.5,
+            log_func=lambda *a, **k: None,
+        )
+        engine.stats.charge_rates_by_soc["0-25"] = list(poison)
+        engine.stats.charge_rates_by_soc_temp["0-25"] = {">20": list(poison)}
+
+        bound = engine.max_plausible_rate_kw
+
+        # 1. DP path
+        slot = datetime.datetime(2026, 9, 2, 5, 0)
+        slots = [
+            PricePoint(time=slot + datetime.timedelta(minutes=15 * i), price=0.05)
+            for i in range(4)
+        ]
+        dp_rates = compute_charge_rates_per_slot(
+            slots, [1.0] * 4, 15, 10.0, 21.9,
+            engine.get_charge_rate_for_soc,
+            battery_capacity=CAPACITY, efficiency=0.95, max_soc=100.0,
+            project_temp=lambda t, _s, _d, _p: t,
+        )
+        assert all(r <= bound for r in dp_rates)
+        # The first slot is the one the DP scores at the current SOC/temperature.
+        assert dp_rates[0] == engine.get_charge_rate_for_soc(10.0, 21.9)
+
+        # 2. Expected-SOC trajectory path
+        params = _params(charge_rate=4.5, efficiency=0.95)
+        trajectory = project_slot_soc(
+            soc_start=10.0, mode=BatteryMode.CHARGE, params=params,
+            temp_start=21.9, learning_engine=engine,
+        )
+        max_gain = dp_rates[0] * 0.95 * 0.25 / CAPACITY * 100
+        assert trajectory.soc_end - 10.0 <= max_gain + 1e-6
+
+        # 3. Detector path
+        detector = self._detector(learning_engine=engine, efficiency=0.95)
+        projected = detector._project_charge_completion(
+            current_soc=10.0,
+            schedule={slot: ScheduleEntry(time=slot, mode=BatteryMode.CHARGE, reason="x")},
+            current_slot=slot,
+            fraction=0.0,
+            current_temp=21.9,
+            local_tz=None,
+        )
+        assert projected <= 100.0
+        assert projected - 10.0 <= max_gain + 1e-6

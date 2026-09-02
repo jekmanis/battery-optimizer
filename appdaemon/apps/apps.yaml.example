@@ -5,6 +5,18 @@ battery_optimizer:
   module: battery_optimizer
   class: BatteryOptimizer
 
+  # REQUIRED alongside `appdaemon: total_threads: N` in appdaemon.yaml.
+  # AppDaemon 4.5.13 defaults an app to pin_app: true, and `total_threads`
+  # does NOT change that per-app default — a pinned app with no pin_thread is
+  # dispatched to thread-0 on every callback, with a
+  # "Invalid thread ID for pinned thread ... assigning to thread 0" WARNING
+  # each time. So total_threads WITHOUT this line is worse than the default.
+  # With it, callbacks round-robin across the worker threads; the app
+  # serializes its own state with one internal lock and drops it only around
+  # the blocking set_wit_mode write.
+  # Rollback lever: pin_app: true + pin_thread: 2 (must be < total_threads).
+  pin_app: false
+
   # ==========================================================================
   # Home Assistant Connection (required for built-in Nord Pool integration)
   # ==========================================================================
@@ -82,6 +94,17 @@ battery_optimizer:
   battery_charge_sensor: "sensor.growatt_battery_battery_charge_today"
   battery_discharge_sensor: "sensor.growatt_battery_battery_discharge_today"
   use_inverter_energy_sensors: true
+
+  # --- Cost source attribution ---
+  # The inverter's charge counter does not say WHERE the kWh came from. A
+  # charge measured while HOLD/DISCHARGE is commanded is normally surplus PV,
+  # but it is only PV if the sun is up: an hour before sunrise the tail of a
+  # still-running grid_charge command was booked as PV at 0.0253 EUR/kWh.
+  # Charging counts as PV only above this measured PV power ...
+  cost_pv_attribution_min_w: 100
+  # ... and stays attributed to the grid for this long after a grid_charge
+  # command is superseded by another mode (the counters lag the command).
+  cost_grid_charge_grace_seconds: 120
 
   # ==========================================================================
   # Device Control
@@ -223,7 +246,11 @@ battery_optimizer:
   # A shortfall is measured on COMPLETED slots using the average of
   # pv_sample_seconds samples (slot energy), never a single instantaneous read.
   pv_reactive_threshold: 0.5          # recalc when measured/forecast < this
-  pv_reactive_min_forecast_w: 200     # ignore slots forecast below this
+  # Gates BOTH the shortfall check and the sliding bias window. Keep it above
+  # the sunrise/sunset ramp: two dawn slots forecast at 292 W that measured 0 W
+  # were enough to slam the whole-horizon bias onto the 0.20 clamp. Below the
+  # site's baseline load the forecast error cannot change a DP decision anyway.
+  pv_reactive_min_forecast_w: 600     # ignore slots forecast below this
   # The streak is reset once a recalculation fires, so persistent cloud cover
   # costs at most one recalculation per pv_reactive_consecutive_slots slots.
   pv_reactive_consecutive_slots: 2    # required consecutive shortfall slots
@@ -251,6 +278,18 @@ battery_optimizer:
   # If actual SOC differs from expected by more than this, recalculate
   soc_deviation_threshold: 4
 
+  # An "(until depleted)" EXPORT/DISCHARGE slot is PLANNED to end at min_soc.
+  # Reaching min_soc within this margin of the planned end SOC therefore only
+  # applies the safety HOLD; it does not pay for a depletion re-optimization.
+  planned_depletion_margin_percent: 1.0
+
+  # A recalculation applies the current slot itself, and the slot timer used to
+  # re-apply the identical entry seconds later (another blocking set_wit_mode).
+  # The TIMER call is skipped when the same slot was applied this recently;
+  # internal calls (recalc, override resume, manual "Auto") always execute.
+  # 0 disables.
+  execute_dedupe_seconds: 60
+
   # Decision transparency logging (0=minimal, 1=summary, 2=verbose, 3=max decision details)
   # Level 1: Log charge calculation breakdown and recalculation triggers
   # Level 2: Also log candidate charge slots, arbitrage analysis
@@ -263,16 +302,38 @@ battery_optimizer:
   # every second of this timeout blocks every other callback of this app. A
   # client-side timeout is NOT a lost command — verify-after-set covers it — so
   # a short window is the safe choice. Also give AppDaemon more than one thread
-  # (appdaemon.yaml -> appdaemon: total_threads: 4).
+  # (appdaemon.yaml -> appdaemon: total_threads: 4) AND set `pin_app: false`
+  # on this app (see the top of this file) — total_threads alone still pins
+  # every callback to thread-0.
   set_wit_mode_timeout_seconds: 15
 
-  # Verify-after-set. The integration recomputes its Inverter Mode sensor on
-  # each coordinator poll (~30-60s), so the sensor LAGS a write. If the log
-  # shows many "mode mismatch ... resending once" lines that all recover on the
-  # re-check (sensor.battery_inverter_control_health -> resend_recovered_count),
-  # raise verify_delay_seconds rather than chasing the inverter.
+  # Verification source. "registers" reads the VPP control registers back
+  # (30407-30410, 30200-30201) via growatt_modbus/get_register_data — the only
+  # source on this installation known to reflect the active override.
+  # "mode_sensor" compares sensor.growatt_inverter_mode, which the integration
+  # froze at "Passthrough" after a single transient read failure, producing
+  # 73/73 false mismatches and 36 useless blocking resends in 9 h on 2026-09-02.
+  # "none" disables it; "auto" picks registers whenever device_id is set.
+  verify_source: registers
+
+  # Master switch: false schedules no check at all, whatever verify_source says.
+  verify_enabled: true
   verify_delay_seconds: 90       # first check after a mode is sent
   verify_recheck_seconds: 60     # the single re-check after a resend
+
+  # Reading sensor.battery_inverter_control_health to judge a source:
+  #   resend_recovered_count ~ resend_count, persistent_mismatch_count 0
+  #     -> the source merely LAGS the write: raise verify_delay_seconds.
+  #   resend_recovered_count 0, persistent_mismatch_count ~ mismatch_count/2,
+  #   and the battery visibly obeys the schedule
+  #     -> the source does not track the override: switch verify_source.
+
+  # Integration "Inverter Mode" sensor. Only used by verify_source: mode_sensor
+  # (and for plain monitoring). Empty is the default: no entity is guessed,
+  # because a guessed one produced the 73/73 false mismatches above. The entity
+  # id follows the config entry name, e.g. sensor.growatt_inverter_mode or
+  # sensor.growatt_wit_inverter_mode.
+  inverter_mode_sensor: ""
 
   # Warn when one of this app's callbacks blocks the thread for longer than this
   # (AppDaemon's own "Excessive time spent in callback" limit is 10s).

@@ -140,7 +140,7 @@ compared to the forecast snapshot taken for that slot:
   a slot average during morning/evening ramps or passing clouds; the previous
   implementation produced 43 recalculations in 33 hours of production logs.
 - A slot counts as a shortfall when `measured/forecast < pv_reactive_threshold`
-  (0.5), the forecast exceeds `pv_reactive_min_forecast_w` (200W) and at least
+  (0.5), the forecast exceeds `pv_reactive_min_forecast_w` (600W) and at least
   `pv_reactive_min_samples` (3) samples were collected.
 - A full recalculation requires `pv_reactive_consecutive_slots` (2) consecutive
   shortfall slots. Recalculation starts from actual SOC, so the DP adjusts the
@@ -183,7 +183,7 @@ The `enable_self_consumption` and `self_consumption_min_pv_kw` config fields hav
 
 Cloud-safe mode selection is always active. Configurable thresholds:
 - `pv_reactive_threshold`: Fraction below which measured PV triggers recalc (default: 0.5 = 50%)
-- `pv_reactive_min_forecast_w`: Minimum forecast (W) to check PV shortfall (default: 200W)
+- `pv_reactive_min_forecast_w`: Minimum forecast (W) to check PV shortfall (default: 600W)
 - `pv_reactive_consecutive_slots`: Consecutive shortfall slots before a full recalc (default: 2)
 - `pv_reactive_min_samples`: Minimum samples in a slot before its mean is trusted (default: 3)
 - `pv_sample_seconds`: PV power sampling interval (default: 60, clamped to one slot)

@@ -23,6 +23,12 @@ TERMINAL_VALUE_ZERO_NOTICE = (
 )
 
 
+# Accepted values for `verify_source`. Anything else falls back to "auto"
+# during validation — an unknown value must never quietly turn verification off
+# or quietly select the mode sensor.
+VERIFY_SOURCES = ("auto", "registers", "mode_sensor", "none")
+
+
 @dataclass
 class BatteryOptimizerConfig:
     """
@@ -58,6 +64,23 @@ class BatteryOptimizerConfig:
     load_power_sensor: str = ""
 
     # =========================================================================
+    # Battery cost source attribution
+    # =========================================================================
+    # Charging measured while HOLD/DISCHARGE is commanded is normally surplus
+    # PV. It is only PV if the sun is actually up: at 05:15 on 2026-09-02, five
+    # seconds after a CHARGE -> HOLD transition, the tail of a still-running
+    # 20-minute grid_charge command was booked "[inverter, pv]" at 0.0253
+    # EUR/kWh and pulled the basis 0.1261 -> 0.1199. Measured PV must clear
+    # this floor before a charge may be attributed to PV.
+    cost_pv_attribution_min_w: float = 100.0
+    # A grid_charge command runs for slot_minutes + direct_control_buffer_minutes
+    # at the inverter, so it can still be charging after the app has moved on to
+    # the next slot's mode. Measured charging stays attributed to the grid while
+    # that command is in force, plus this grace period after a different mode
+    # supersedes it (the charge counter lags the command).
+    cost_grid_charge_grace_seconds: int = 120
+
+    # =========================================================================
     # Device Control
     # =========================================================================
     device_id: str = ""  # Empty = dry-run mode (no inverter control)
@@ -84,6 +107,25 @@ class BatteryOptimizerConfig:
     # the AppDaemon callback thread: every second here blocks every other
     # callback of this app. Keep it just above the handler's normal duration.
     set_wit_mode_timeout_seconds: int = 15
+    # Master switch for verify-after-set. Off means no check is scheduled at
+    # all, whatever `verify_source` says.
+    verify_enabled: bool = True
+    # Which source answers "did the mode take?".
+    #   "registers"   read 30407-30410 / 30200-30201 back through
+    #                 growatt_modbus/get_register_data. RECOMMENDED.
+    #   "mode_sensor" compare sensor.growatt_inverter_mode (inverter_mode_sensor).
+    #                 Only correct where that entity is not frozen by the
+    #                 integration's never-cleared _failed_optional_holding_addrs
+    #                 blacklist — on 2026-09-01T03:46:34Z one transient read
+    #                 failure froze it at "Passthrough" indefinitely, and the
+    #                 2026-09-02 log then carried 73/73 false mismatches, each
+    #                 costing a blocking ~10 s resend plus a re-check on the
+    #                 single AppDaemon thread.
+    #   "none"        no verification.
+    #   "auto"        registers when device_id is set, otherwise none. It
+    #                 deliberately never falls back to the mode sensor: that
+    #                 choice must be explicit.
+    verify_source: str = "auto"
 
     # =========================================================================
     # Battery Parameters
@@ -126,7 +168,16 @@ class BatteryOptimizerConfig:
     pv_forecast_sensor: str = ""  # Optional external PV forecast sensor (e.g., Solcast)
     pv_forecast_unit: str = "W"  # Unit of pv_forecast_sensor: "W" or "kW"
     pv_reactive_threshold: float = 0.5  # Recalc if actual PV < this fraction of forecast
-    pv_reactive_min_forecast_w: float = 200.0  # Only check PV shortfall when forecast > this (W)
+    # Gate for BOTH the reactive shortfall check and the sliding bias window
+    # (`PvBiasConfig.min_forecast_kw`). Sunrise/sunset ramp slots must stay out
+    # of it: on 2026-09-02 two dawn slots forecast at 292 W measured 0 W and
+    # their ratio-0.0 pair alone slammed the horizon bias onto the 0.20 clamp.
+    # A few minutes of ramp-timing error is a ~100 % relative error there while
+    # being economically meaningless — below the site's baseline load the DP's
+    # net load `max(0, load - pv)` barely moves. 600 W is above the ramp and
+    # roughly one baseline house load, yet still ~12 % of a 5 kW array's peak,
+    # so genuine daytime cloud events are unaffected.
+    pv_reactive_min_forecast_w: float = 600.0  # Only check PV shortfall when forecast > this (W)
     # A shortfall is measured on COMPLETED slots from the mean of many samples
     # (i.e. slot energy), never from a single instantaneous reading.
     pv_reactive_consecutive_slots: int = 2  # Consecutive shortfall slots before a full recalc
@@ -136,9 +187,15 @@ class BatteryOptimizerConfig:
     # monitoring AND set_wit_mode verify-after-set. The entity id depends on the
     # config entry name (slugified "<entry> Inverter Mode"): e.g.
     # sensor.growatt_inverter_mode (entry "Growatt") or
-    # sensor.growatt_wit_inverter_mode (entry "Growatt WIT"). When empty,
-    # DirectControl falls back to sensor.growatt_inverter_mode; set this
-    # explicitly if your entry is named differently.
+    # sensor.growatt_wit_inverter_mode (entry "Growatt WIT").
+    #
+    # EMPTY DISABLES VERIFICATION — there is no fallback entity any more. The
+    # old default guessed sensor.growatt_inverter_mode, which on the reference
+    # installation reports the inverter's base work mode, not the active
+    # override: 73/73 verifications logged a 'Passthrough' mismatch while the
+    # battery followed every command, each one paying for a blocking resend.
+    # Only set this to an entity you have confirmed reflects the ACTIVE
+    # override.
 
     # =========================================================================
     # PV Forecast Service (Solcast / Forecast.Solar)
@@ -208,6 +265,23 @@ class BatteryOptimizerConfig:
     default_pv_threshold: float = 500.0  # W
     soc_deviation_threshold: float = 10.0  # % deviation to trigger recalc
     soc_shortfall_recalc_threshold: float = 3.0  # % SOC shortfall to trigger pre-execution recalc
+    # Reaching min_soc is only "unexpected" when the plan did not ask for it.
+    # An "(until depleted)" EXPORT/DISCHARGE slot ends AT min_soc by design, so
+    # a planned end SOC within this margin of min_soc suppresses the depletion
+    # re-optimization (the safety HOLD is still applied).
+    planned_depletion_margin_percent: float = 1.0
+
+    # =========================================================================
+    # Execution
+    # =========================================================================
+    # A recalculation applies the current slot itself; the quarter-hour timer
+    # then fired seconds later and applied the identical entry again (production
+    # 2026-09-02 07:30:06 -> 07:30:12). DirectControl's duplicate suppression
+    # absorbed it, but each repeat is another blocking set_wit_mode on the
+    # single AppDaemon thread. The TIMER call is skipped when the same slot was
+    # already applied this recently; internal calls (recalc, override resume,
+    # manual "Auto") are never skipped. 0 disables.
+    execute_dedupe_seconds: int = 60
 
     # =========================================================================
     # Pricing
@@ -221,6 +295,17 @@ class BatteryOptimizerConfig:
     # None derives a terminal value from the median forecast import price. A
     # numeric value is an explicit EUR/kWh value for energy left in the battery.
     terminal_energy_value_eur_kwh: Optional[float] = None
+    # Set by from_args() when it has already emitted TERMINAL_VALUE_ZERO_NOTICE,
+    # so log_summary() does not repeat the same 600-character paragraph 4 ms
+    # later during the SAME initialization (production 2026-09-02 01:59:31.084
+    # and .088). CLAUDE.md requires the mode to be STATED once at config load —
+    # once, not twice. A config built directly (tests, embedders) still gets the
+    # notice from log_summary, because nothing announced it earlier.
+    # init=False: not a configuration knob, and it must never appear in
+    # from_args()'s keyword list.
+    terminal_zero_notice_emitted: bool = field(
+        default=False, init=False, repr=False, compare=False
+    )
 
     # =========================================================================
     # HA Entities for Dynamic Config
@@ -279,7 +364,20 @@ class BatteryOptimizerConfig:
         # Clamp load_quantile to valid range
         self.load_quantile = min(1.0, max(0.0, self.load_quantile))
 
+        # Execution / cost attribution guards
+        self.execute_dedupe_seconds = max(
+            0, min(int(self.execute_dedupe_seconds), self.slot_minutes * 30)
+        )
+        self.planned_depletion_margin_percent = max(
+            0.0, float(self.planned_depletion_margin_percent)
+        )
+        self.cost_pv_attribution_min_w = max(0.0, float(self.cost_pv_attribution_min_w))
+        self.cost_grid_charge_grace_seconds = max(
+            0, int(self.cost_grid_charge_grace_seconds)
+        )
+
         # Reactive PV shortfall detection
+        self.pv_reactive_min_forecast_w = max(0.0, float(self.pv_reactive_min_forecast_w))
         self.pv_reactive_consecutive_slots = max(1, int(self.pv_reactive_consecutive_slots))
         self.pv_reactive_min_samples = max(1, int(self.pv_reactive_min_samples))
         # A sample interval longer than a slot could never produce a usable mean
@@ -338,6 +436,13 @@ class BatteryOptimizerConfig:
         self.set_wit_mode_timeout_seconds = max(
             5, min(120, int(self.set_wit_mode_timeout_seconds))
         )
+        # An unrecognised verify_source must not silently disable verification
+        # (nor silently pick the mode sensor). Fall back to "auto", which reads
+        # the registers whenever a device_id exists.
+        source = str(self.verify_source or "auto").strip().lower()
+        if source not in VERIFY_SOURCES:
+            source = "auto"
+        self.verify_source = source
         self.callback_warn_seconds = max(1.0, min(60.0, float(self.callback_warn_seconds)))
 
         # Compute derived values
@@ -390,6 +495,7 @@ class BatteryOptimizerConfig:
         if load_observation_minutes <= 0 or 1440 % load_observation_minutes != 0:
             log_warn(f"Invalid load_observation_minutes={load_observation_minutes}, falling back to 15")
 
+        terminal_zero_notice_emitted = False
         terminal_value_raw = args.get("terminal_energy_value_eur_kwh", "auto")
         if terminal_value_raw is None or str(terminal_value_raw).strip().lower() == "auto":
             terminal_energy_value = None
@@ -397,8 +503,12 @@ class BatteryOptimizerConfig:
             terminal_energy_value = max(0.0, float(terminal_value_raw))
             if terminal_energy_value == 0.0:
                 log_info(TERMINAL_VALUE_ZERO_NOTICE)
+                # Only a notice that was actually PRINTED suppresses the one in
+                # log_summary. With no logger nothing was stated, so the summary
+                # must still state it.
+                terminal_zero_notice_emitted = log_func is not None
 
-        return cls(
+        config = cls(
             # Nord Pool
             nordpool_config_entry=args.get("nordpool_config_entry", ""),
             nordpool_area=args.get("nordpool_area", "LV"),
@@ -416,6 +526,12 @@ class BatteryOptimizerConfig:
             battery_charge_sensor=args.get("battery_charge_sensor", "sensor.growatt_battery_charge_today"),
             battery_discharge_sensor=args.get("battery_discharge_sensor", "sensor.growatt_battery_discharge_today"),
             use_inverter_energy_sensors=args.get("use_inverter_energy_sensors", True),
+            cost_pv_attribution_min_w=float(
+                args.get("cost_pv_attribution_min_w", 100.0)
+            ),
+            cost_grid_charge_grace_seconds=int(
+                args.get("cost_grid_charge_grace_seconds", 120)
+            ),
             load_power_sensor=args.get("load_power_sensor", ""),
 
             # Device Control
@@ -426,6 +542,8 @@ class BatteryOptimizerConfig:
             default_power_percent=int(args.get("default_power_percent", 100)),
             verify_delay_seconds=int(args.get("verify_delay_seconds", 90)),
             verify_recheck_seconds=int(args.get("verify_recheck_seconds", 60)),
+            verify_enabled=bool(args.get("verify_enabled", True)),
+            verify_source=str(args.get("verify_source", "auto")).strip().lower(),
             set_wit_mode_timeout_seconds=int(
                 args.get("set_wit_mode_timeout_seconds", 15)
             ),
@@ -469,7 +587,7 @@ class BatteryOptimizerConfig:
             pv_forecast_sensor=args.get("pv_forecast_sensor", ""),
             pv_forecast_unit=args.get("pv_forecast_unit", "W"),
             pv_reactive_threshold=float(args.get("pv_reactive_threshold", 0.5)),
-            pv_reactive_min_forecast_w=float(args.get("pv_reactive_min_forecast_w", 200.0)),
+            pv_reactive_min_forecast_w=float(args.get("pv_reactive_min_forecast_w", 600.0)),
             pv_reactive_consecutive_slots=max(
                 1, int(args.get("pv_reactive_consecutive_slots", 2))
             ),
@@ -528,6 +646,10 @@ class BatteryOptimizerConfig:
             default_pv_threshold=float(args.get("pv_threshold_w", 500)),
             soc_deviation_threshold=float(args.get("soc_deviation_threshold", 10)),
             soc_shortfall_recalc_threshold=float(args.get("soc_shortfall_recalc_threshold", 3.0)),
+            planned_depletion_margin_percent=float(
+                args.get("planned_depletion_margin_percent", 1.0)
+            ),
+            execute_dedupe_seconds=int(args.get("execute_dedupe_seconds", 60)),
 
             # Pricing
             grid_fee=float(args.get("grid_fee_eur_kwh", 0.052)),
@@ -560,6 +682,33 @@ class BatteryOptimizerConfig:
             decision_log_level=int(args.get("decision_log_level", 1)),
             callback_warn_seconds=float(args.get("callback_warn_seconds", 10.0)),
         )
+        config.terminal_zero_notice_emitted = terminal_zero_notice_emitted
+        return config
+
+    def _verification_summary(self) -> str:
+        """How verify-after-set will actually behave, in one clause.
+
+        Named for the SOURCE, not just on/off: the 2026-09-02 log showed 73
+        mismatches with no way to tell from the startup lines WHAT was being
+        compared. "registers" and "mode_sensor" fail in completely different
+        ways, so the log has to say which one is armed.
+        """
+        if not self.verify_enabled:
+            return " - verification DISABLED"
+        source = self.verify_source
+        if source == "none":
+            return " - verification DISABLED"
+        if source == "mode_sensor":
+            if not self.inverter_mode_sensor:
+                return " - verification DISABLED (no inverter_mode_sensor)"
+            return f" - verification via {self.inverter_mode_sensor}"
+        if source == "registers" or (source == "auto" and self.device_id):
+            return (
+                " - verification via registers 30407-30410/30200-30201"
+                if self.device_id
+                else " - verification DISABLED (dry run, no device_id)"
+            )
+        return " - verification DISABLED (dry run, no device_id)"
 
     def log_summary(self, log_func, warn_func=None) -> None:
         """Log a summary of the configuration.
@@ -592,6 +741,8 @@ class BatteryOptimizerConfig:
             f"verify after {self.verify_delay_seconds}s, "
             f"re-check {self.verify_recheck_seconds}s after a resend; "
             f"slow-callback warning at {self.callback_warn_seconds:.0f}s"
+            f"; verification source={self.verify_source}"
+            f"{self._verification_summary()}"
         )
         log_func(f"Loaded grid_fee: {self.grid_fee} EUR/kWh")
         if self.terminal_energy_value_eur_kwh is None:
@@ -600,7 +751,16 @@ class BatteryOptimizerConfig:
                 "import price, discharge conversion and wear)"
             )
         elif self.terminal_energy_value_eur_kwh == 0.0:
-            log_func(TERMINAL_VALUE_ZERO_NOTICE)
+            # STATED once per initialization, not twice: from_args() already
+            # emitted it a few milliseconds ago when it parsed the value.
+            if self.terminal_zero_notice_emitted:
+                log_func(
+                    "Terminal energy value: 0 EUR/kWh (no-salvage mode, see the "
+                    "notice above)"
+                )
+            else:
+                log_func(TERMINAL_VALUE_ZERO_NOTICE)
+                self.terminal_zero_notice_emitted = True
         else:
             log_func(
                 f"Terminal energy value: "
@@ -629,7 +789,16 @@ class BatteryOptimizerConfig:
             f"reactive: threshold={self.pv_reactive_threshold}, "
             f"consecutive_slots={self.pv_reactive_consecutive_slots}, "
             f"min_samples={self.pv_reactive_min_samples}, "
+            f"min_forecast={self.pv_reactive_min_forecast_w:.0f}W, "
             f"sample_every={self.pv_sample_seconds}s"
+        )
+        log_func(
+            f"Cost attribution: charging counts as PV only above "
+            f"{self.cost_pv_attribution_min_w:.0f}W measured PV; a grid_charge "
+            f"command keeps grid attribution for "
+            f"{self.cost_grid_charge_grace_seconds}s after it is superseded. "
+            f"Slot re-execution deduped within {self.execute_dedupe_seconds}s; "
+            f"planned depletion margin {self.planned_depletion_margin_percent:.1f}%"
         )
         if self.ambient_weather_entity:
             ambient_source = f"weather forecast ({self.ambient_weather_entity})"

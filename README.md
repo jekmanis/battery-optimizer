@@ -276,15 +276,28 @@ uv run pytest tests/ --cov=appdaemon/apps --cov-report=term-missing
 
   The sensor is created with `set_state`, so it disappears after an HA restart until the app republishes it — alert on trends, don't rely on its history.
 
-- **AppDaemon threads — "Excessive time spent in callback (limit=10.0s)":** `set_wit_mode` is a **synchronous, blocking** service call on the AppDaemon callback thread. With the default single thread, one slow inverter write stalls schedule execution, the SOC listener and PV sampling alike (33 h of production logs: 70 overruns of 10–34 s, all on `thread-0`). Give this app more threads:
+- **AppDaemon threads — "Excessive time spent in callback (limit=10.0s)":** `set_wit_mode` is a **synchronous, blocking** service call on the AppDaemon callback thread. With the default single thread, one slow inverter write stalls schedule execution, the SOC listener and PV sampling alike (33 h of production logs: 70 overruns of 10–34 s, all on `thread-0`). Two settings are needed, not one:
 
   ```yaml
   # appdaemon.yaml
   appdaemon:
     total_threads: 4
+    thread_duration_warning_threshold: 25   # optional; a set_wit_mode write is legitimately ~15 s
   ```
 
-  (or pin the app with `pin_thread`). The app also measures its own callbacks and warns above `callback_warn_seconds`, naming the offending callback and repeating the `total_threads` advice after three overruns.
+  ```yaml
+  # apps.yaml
+  battery_optimizer:
+    pin_app: false        # REQUIRED alongside total_threads
+  ```
+
+  `total_threads` alone is **worse than the default**: in AppDaemon 4.5.13 an app's `pin_app` still defaults to `true`, so every callback is dispatched to thread-0 anyway — now with a `WARNING ... Invalid thread ID for pinned thread in app: battery_optimizer - assigning to thread 0` on *every* dispatch. `pin_app: false` is what lets the scheduler round-robin this app across the worker threads.
+
+  With round-robin dispatch the app's callbacks genuinely run concurrently, so the orchestrator serializes them itself: `_timed_callback` runs every callback under one app-wide re-entrant lock (`battery_optimizer_lib/callback_lock.py`), and the only region that drops it is the blocking `set_wit_mode` write in `_apply_mode_tracked`. That is the whole point — other callbacks keep running while the inverter write is in flight.
+
+  Rollback without touching `appdaemon.yaml`: set `pin_app: true` and `pin_thread: 2` (must be `< total_threads`) on the app. Do **not** set `pin_threads` in `appdaemon.yaml` — `total_threads` forces it to 0.
+
+  The app also measures its own callbacks (lock wait included) and warns above `callback_warn_seconds`, naming the offending callback and repeating the `total_threads` + `pin_app` advice after three overruns.
 
 ---
 

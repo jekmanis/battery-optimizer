@@ -162,6 +162,12 @@ via the `growatt_modbus/set_wit_mode` HA service (no raw register writes):
   2. after `verify_recheck_seconds` (default 60): match → INFO "recovered after resend"; mismatch → **ERROR** and stop (the next slot retries).
 
   The re-check exists to separate a lagging HA modbus sensor from an inverter that genuinely drops the override; without it the 30 logged mismatches carried no evidence either way. `DirectControl.get_diagnostics()` exposes the counters (`mismatch_count`, `resend_count`, `resend_recovered_count`, `resend_failed_count`, `persistent_mismatch_count`, `unverifiable_count`) on `sensor.battery_inverter_control_health` and as an attribute of `sensor.battery_optimizer`. A new `apply_mode` supersedes any pending verification timer.
+- Lock order is **app lock → `DirectControl._io_lock` → `DirectControl._state_lock`**,
+  never the reverse: nothing may acquire the app lock while holding a
+  DirectControl lock. That is why the app drops its lock around
+  `apply_mode_with_outcome`/`release_control`, and why `_verify_mode` reports
+  its duration to `record_external_callback_duration` (which takes the app
+  lock) only after both DirectControl locks are released.
 - Dry-run mode: `device_id: ""` in apps.yaml logs commands without sending them
 
 ### Battery Cost Tracking
@@ -230,21 +236,75 @@ observed production, which would otherwise make the ratio read ~1.0.
 
 ### Runtime constraints
 
-**This app needs more than one AppDaemon thread.** `set_wit_mode` is a
-synchronous, blocking service call made from a callback, so on the default
-single thread one slow inverter write stalls schedule execution, the SOC
-listener and PV sampling alike (production: 70 × "Excessive time spent in
-callback (limit=10.0s)" at 10–34 s, all on `thread-0`). Set
-`appdaemon: total_threads: 4` in `appdaemon.yaml` (or pin the app). The app
-instruments its own callbacks via the `_timed_callback` decorator and
-`_record_callback_duration()`, warning above `callback_warn_seconds` and
-repeating the `total_threads` advice once after three overruns. The decorator
-must keep `functools.wraps` + `*args/**kwargs`: AppDaemon calls these
-positionally (`execute_scheduled_mode(kwargs, force=True)`) and the orchestrator
-is not unit-tested.
+**This app needs more than one AppDaemon thread, and `total_threads` alone
+is not enough.** `set_wit_mode` is a synchronous, blocking service call made
+from a callback, so on the default single thread one slow inverter write stalls
+schedule execution, the SOC listener and PV sampling alike (production: 70 ×
+"Excessive time spent in callback (limit=10.0s)" at 10–34 s, all on
+`thread-0`). Two settings are required (AppDaemon 4.5.13):
+
+```yaml
+# appdaemon.yaml
+appdaemon:
+  total_threads: 4
+  thread_duration_warning_threshold: 25   # optional; a set_wit_mode write is legitimately ~15 s
+```
+```yaml
+# apps.yaml (LIVE file — hand-edit; it holds the HA token)
+battery_optimizer:
+  pin_app: false
+```
+
+`total_threads` clears the GLOBAL `pin_apps` flag only
+(`models/config/appdaemon.py` `model_post_init`), while `app_should_be_pinned`
+reads `cfg.pin_app or self.pin_apps` and `models/config/app.py` defaults
+`pin_app: True`. A pinned app with `pin_thread = None` hits `select_q`'s
+`"Invalid thread ID for pinned thread in app: ... - assigning to thread 0"`
+WARNING **on every dispatch** and still runs everything on thread-0 — so
+`total_threads` without `pin_app: false` is strictly worse than the default.
+With both set, dispatch is round-robin and this app's callbacks genuinely run
+**concurrently**. Do not set `pin_threads` (forced to 0). Rollback lever
+without touching `appdaemon.yaml`: `pin_app: true` + `pin_thread: 2` (must be
+`< total_threads`). Startup check: expect `Starting apps with 4 worker threads,
+with None reserved for pinned apps`, and NO "Invalid thread ID for pinned
+thread" line for `battery_optimizer`.
+
+**Concurrency is handled by one app-wide lock, not by an async rewrite.**
+`initialize`'s first statement is `self._lock = CallbackLock(log_func=self.log)`
+(`battery_optimizer_lib/callback_lock.py`), and the rest of `initialize` runs
+under it. Every registered callback carries `@_timed_callback`, which is the
+complete chokepoint: its body runs under that lock, so schedule rebuilds, slot
+execution, SOC/energy listeners, PV sampling and the trackers keep the
+single-threaded semantics the app was written against. The one deliberate
+escape hatch is the blocking inverter write: `_apply_mode_tracked` wraps
+*only* `apply_mode_with_outcome(entry)` in `with self._lock.unlocked():` (same
+for `release_control()` in `_on_enabled_change`). A nested call
+(`full_optimize` / `_recalculate_remaining_schedule` → `execute_scheduled_mode`,
+depth 2) intentionally does NOT release — the outer frame is mid-rebuild of
+`self.schedule` — and must not be deferred via `run_in` (that passes a kwargs
+dict, which flips the `kwargs is not None` branch of the execute dedupe).
+`record_external_callback_duration` takes the lock itself because DirectControl
+calls it from another worker thread. The four JSON save sites rely on the app
+lock for their `open(..., "w")` truncation window.
+
+The app instruments its own callbacks via `_timed_callback` and
+`_record_callback_duration()` — `time.monotonic()` is sampled outside the
+acquire so lock wait counts as thread occupancy — warning above
+`callback_warn_seconds` and repeating the `total_threads` + `pin_app` advice
+once after three overruns. The decorator must keep `functools.wraps` +
+`*args/**kwargs`: AppDaemon calls these positionally
+(`execute_scheduled_mode(kwargs, force=True)`) and the orchestrator is not
+unit-tested (`tests/test_callback_instrumentation.py` guards the wiring with
+source-scanning tests instead).
 
 Asynchronous I/O is explicitly out of scope — the mitigation is a shorter
-timeout plus more threads, not a rewrite.
+timeout, more threads plus the app lock, not a rewrite.
+
+The 2026-09-02 production log predates this: it was produced by commit 86a2ffb
+imported from a backup directory the deploy script had placed *inside* `apps/`
+(AppDaemon rglobs `app_dir` and `sys.path.insert(0)`s every subdirectory
+containing `.py` files), not by the files in `apps/` — which is why its log
+wording does not match master.
 
 ### Scheduled Tasks
 - **13:15 daily**: Full optimization (after Nord Pool prices publish)
@@ -278,6 +338,27 @@ TypeError: record_discharging() got an unexpected keyword argument 'battery_temp
 from a tree whose files were all individually correct. Copying a *single*
 file while running is safe (one reload, no window).
 
+**Backups must never live under `apps/`.** AppDaemon discovers apps with
+`app_dir.rglob("*.py")` and does `sys.path.insert(0, <dir>)` for every
+directory below `apps/` that holds `.py` files and has no `__init__.py`, so
+such a directory sits at the *front* of `sys.path` and wins every
+`import battery_optimizer` / `import battery_optimizer_lib`. On 2026-09-02
+`deploy.ps1` wrote `apps/backup-20260902-015911/` and the add-on then ran the
+*previous* commit while SHA256 verification of `apps/` passed — the files in
+`apps/` were correct, the wrong ones were imported from the sibling directory.
+The only symptoms were an old log wording and a health sensor missing the
+attributes the new commit added. Backups therefore go to
+`<share-root>/backups/battery_optimizer/`, and nothing but
+`battery_optimizer.py`, `battery_optimizer_lib/` and `hello.py` may hold `.py`
+under `apps/`.
+
+**SHA256 proves the bytes on the share; it does not prove AppDaemon imported
+them.** Every deploy must end with a positive check that the *running* code is
+the new one: `initialize` logs `Battery Optimizer version <APP_VERSION>:
+orchestrator=<path> lib=<path>`, and `sensor.battery_optimizer` carries the
+same as `app_version` / `code_paths`. Both paths must point into `apps/`
+itself. Bump `APP_VERSION` in `battery_optimizer.py` with behaviour changes.
+
 Procedure:
 
 1. Back up `battery_optimizer.py` + `battery_optimizer_lib/` on the share.
@@ -292,10 +373,16 @@ does not cover the orchestrator, so a config or wiring break only shows up here.
 `scripts/deploy.ps1` automates exactly that procedure (Windows PowerShell 5.1):
 git-clean check plus the commit/branch it will deploy, `pytest`, `py_compile`,
 `scripts/smoke_config.py` against a temp copy of the LIVE `apps.yaml` (deleted
-immediately — the share's `apps.yaml` is only ever read), a timestamped
-`backup-<ts>/` on the share keeping the 5 newest, stop → copy (pruning `.py`
-files the repo no longer has) → `__pycache__` cleanup → SHA256 verification →
-start. Start with `-DryRun`, which runs every check and prints the planned copy
+immediately — the share's `apps.yaml` is only ever read), a pre-flight scan
+that aborts on anything under `apps/` AppDaemon would import besides our own
+files (`-MoveStrayBackups` relocates legacy `backup-*` directories instead of
+aborting), a timestamped `<share-root>/backups/battery_optimizer/backup-<ts>/`
+keeping the 5 newest, stop → copy (pruning `.py` files the repo no longer has)
+→ `__pycache__` cleanup → SHA256 verification → mtime stamping (`Copy-Item`
+preserves the source time, which would make the share's timestamps describe
+the git checkout) → start → a best-effort post-deploy read of the add-on log
+for "Initializing Battery Optimizer", import errors and the worker-thread
+count. Start with `-DryRun`, which runs every check and prints the planned copy
 list while writing nothing; `-Restore <backup-dir>` rolls a deploy back through
 the same stop/copy/start dance. Add-on stop/start goes through HA's Supervisor
 proxy when `-HaToken` is given, otherwise the script pauses for you to do it in

@@ -10,24 +10,56 @@
     module against its old peers. This script therefore always: backs up, stops
     the add-on, copies, cleans __pycache__, verifies SHA256, and starts again.
 
+    NOTHING that contains *.py may live under the apps directory except
+    battery_optimizer.py, battery_optimizer_lib\ and the explicitly allowed
+    extra apps (-AllowedApps, default hello.py). AppDaemon 4.5 discovers apps
+    with app_dir.rglob("*.py") and does sys.path.insert(0, <dir>) for EVERY
+    subdirectory that holds .py files and has no __init__.py, so such a
+    directory lands at the FRONT of sys.path and shadows the real package.
+    That is exactly what a backup directory inside apps\ did on 2026-09-02:
+    apps\backup-20260902-015911\ won the import race and AppDaemon ran the
+    PREVIOUS commit while SHA256 verification of apps\ passed. Backups
+    therefore live OUTSIDE the apps directory, in
+    <share-root>\backups\battery_optimizer\.
+
     apps.yaml on the share is LIVE (it holds the HA long-lived token) and is
     NEVER written by this script. It is only read - copied to a temp file for
     the smoke test and deleted straight after.
 
     Order of operations:
       1. preflight   - git clean check + commit/branch, share reachable
-      2. tests       - uv run pytest tests/ -q      (skip with -SkipTests)
-      3. compile     - uv run python -m py_compile on every deployed file
-      4. smoke test  - scripts\smoke_config.py against the LIVE apps.yaml copy
-      5. backup      - <share>\backup-<yyyyMMdd-HHmmss>\ (keeps 5 newest)
-      6. stop        - Supervisor API via the HA proxy, or a manual pause
-      7. copy        - orchestrator + every *.py of the lib, prune stale *.py
-      8. pycache     - remove every __pycache__ under the share apps dir
-      9. verify      - SHA256 repo vs share, fail loudly on any mismatch
-     10. start       - add-on back up, then tail the log
+      2. strays      - no shadowing *.py / directories under the apps dir
+      3. tests       - uv run pytest tests/ -q      (skip with -SkipTests)
+      4. compile     - uv run python -m py_compile on every deployed file
+      5. smoke test  - scripts\smoke_config.py against the LIVE apps.yaml copy
+      6. backup      - <share-root>\backups\battery_optimizer\backup-<ts>\
+                       (keeps 5 newest) + last-deploy.txt
+      7. stop        - Supervisor API via the HA proxy, or a manual pause
+      8. copy        - orchestrator + every *.py of the lib, prune stale *.py
+      9. pycache     - remove every __pycache__ under the share apps dir
+     10. verify      - SHA256 repo vs share, fail loudly on any mismatch
+     11. touch       - stamp the copied files with the deploy time
+     12. start       - add-on back up
+     13. postcheck   - best-effort: read the add-on log back and confirm the
+                       app initialized without an import error
 
 .PARAMETER Share
     UNC path of the AppDaemon apps directory on the HA machine.
+
+.PARAMETER BackupRoot
+    Where backup-<ts> directories are written. Default:
+    <parent of -Share>\backups\battery_optimizer. It MUST NOT be inside the
+    apps directory - see the shadowing note above; the script refuses such a
+    value.
+
+.PARAMETER AllowedApps
+    File names of other AppDaemon apps that legitimately live directly in the
+    apps directory. Default: hello.py. Anything else with a .py extension
+    aborts the deploy.
+
+.PARAMETER MoveStrayBackups
+    When the stray scan finds backup-* directories inside the apps directory,
+    MOVE them to -BackupRoot instead of aborting. They are never deleted.
 
 .PARAMETER DryRun
     Run every read-only check (git, tests, compile, smoke test, planning) and
@@ -58,12 +90,21 @@
     Never prompt. Only valid together with -HaToken.
 
 .PARAMETER Restore
-    Path of a backup-<timestamp> directory created by this script. Stops the
-    add-on, copies the backup back over the share, cleans __pycache__, starts
-    the add-on again. Skips git/tests/smoke-test entirely.
+    Path of a backup-<timestamp> directory created by this script, in either
+    the new location (<share-root>\backups\battery_optimizer\) or an old
+    in-apps one. Stops the add-on, copies the backup back over the share,
+    evacuates any backup directory still sitting inside apps\, cleans
+    __pycache__, starts the add-on again. Skips git/tests/smoke-test entirely.
 
 .PARAMETER KeepBackups
     How many backup-* directories to keep (default 5, oldest pruned).
+
+.PARAMETER SkipPostCheck
+    Do not read the add-on log back after starting it.
+
+.PARAMETER PostCheckTimeoutSeconds
+    How long to poll the add-on log for the "Initializing Battery Optimizer"
+    line (default 90).
 
 .EXAMPLE
     pwsh> .\scripts\deploy.ps1 -DryRun
@@ -74,7 +115,11 @@
     Unattended deploy.
 
 .EXAMPLE
-    pwsh> .\scripts\deploy.ps1 -Restore '\\192.168.33.167\addon_configs\a0d7b954_appdaemon\apps\backup-20260902-181500'
+    pwsh> .\scripts\deploy.ps1 -MoveStrayBackups -HaToken $env:HA_TOKEN -NoPause
+    Evacuate legacy backup-* directories out of apps\ first, then deploy.
+
+.EXAMPLE
+    pwsh> .\scripts\deploy.ps1 -Restore '\\192.168.33.167\addon_configs\a0d7b954_appdaemon\backups\battery_optimizer\backup-20260902-181500'
     Roll back to a previous deploy.
 
 .NOTES
@@ -84,15 +129,20 @@
 [CmdletBinding()]
 param(
     [string]$Share = '\\192.168.33.167\addon_configs\a0d7b954_appdaemon\apps',
+    [string]$BackupRoot = '',
     [switch]$DryRun,
     [switch]$SkipTests,
     [switch]$AllowDirty,
+    [string[]]$AllowedApps = @('hello.py'),
+    [switch]$MoveStrayBackups,
     [string]$HaToken = '',
     [string]$HaUrl = 'http://192.168.33.167:8123',
     [string]$AddonSlug = 'a0d7b954_appdaemon',
     [switch]$NoPause,
     [string]$Restore = '',
-    [int]$KeepBackups = 5
+    [int]$KeepBackups = 5,
+    [switch]$SkipPostCheck,
+    [int]$PostCheckTimeoutSeconds = 90
 )
 
 $ErrorActionPreference = 'Stop'
@@ -103,6 +153,18 @@ $RepoOrchestrator = Join-Path $RepoRoot 'appdaemon\apps\battery_optimizer.py'
 $RepoLib          = Join-Path $RepoRoot 'appdaemon\apps\battery_optimizer_lib'
 $SmokeScript      = Join-Path $PSScriptRoot 'smoke_config.py'
 $BackupNamePattern = '^backup-\d{8}-\d{6}$'
+# Anything starting with backup- is treated as a stray backup that may be moved
+# out of apps\ with -MoveStrayBackups (the old manual names are not timestamped).
+$StrayBackupPattern = '^backup[-_.]'
+
+# Backups must live OUTSIDE the apps directory: AppDaemon rglob()s app_dir for
+# *.py and sys.path.insert(0, ...)s every __init__.py-less directory it finds
+# one in, so a backup under apps\ shadows the package that was just deployed.
+if ($BackupRoot -eq '') {
+    $ShareRoot  = Split-Path -Parent $Share.TrimEnd('\')
+    $BackupRoot = Join-Path (Join-Path $ShareRoot 'backups') 'battery_optimizer'
+}
+$LastDeployFile = Join-Path $BackupRoot 'last-deploy.txt'
 
 # ---------------------------------------------------------------------------
 # Console helpers
@@ -234,6 +296,129 @@ function Start-Addon {
 }
 
 # ---------------------------------------------------------------------------
+# Post-deploy health check (best effort - never fails the deploy)
+# ---------------------------------------------------------------------------
+
+function Get-AddonLogLines {
+    param([int]$Lines = 200)
+    $uri = ('{0}/api/hassio/addons/{1}/logs?lines={2}' -f $HaUrl.TrimEnd('/'), $AddonSlug, $Lines)
+    $headers = @{ 'Authorization' = ('Bearer ' + $HaToken); 'Accept' = 'text/plain' }
+    $response = Invoke-WebRequest -Uri $uri -Method Get -Headers $headers -TimeoutSec 30 -UseBasicParsing
+    $text = [string]$response.Content
+    $esc = [char]27
+    $text = $text -replace ($esc + '\[[0-9;?]*[A-Za-z]'), ''
+    return @($text -split "`r?`n")
+}
+
+function Get-NewLogLines {
+    <#
+      Which lines are new since $Anchor? Timestamp formats differ between
+      AppDaemon, the add-on wrapper and s6, so anchor on the literal last line
+      captured before the start instead of parsing dates: find its LAST
+      occurrence and return everything after it.
+    #>
+    param([string[]]$Lines, [string]$Anchor)
+    if ($Anchor -eq '') { return @($Lines) }
+    $index = -1
+    for ($i = $Lines.Count - 1; $i -ge 0; $i--) {
+        if ($Lines[$i] -eq $Anchor) { $index = $i; break }
+    }
+    if ($index -lt 0) { return @($Lines) }
+    if ($index -ge ($Lines.Count - 1)) { return @() }
+    return @($Lines[($index + 1)..($Lines.Count - 1)])
+}
+
+function Get-LogAnchor {
+    param([int]$Lines = 200)
+    try {
+        $log = Get-AddonLogLines -Lines $Lines
+    } catch {
+        return ''
+    }
+    for ($i = $log.Count - 1; $i -ge 0; $i--) {
+        if ($log[$i].Trim() -ne '') { return $log[$i] }
+    }
+    return ''
+}
+
+function Invoke-PostDeployCheck {
+    <#
+      SHA256 verification proves the bytes on the share are right. It does NOT
+      prove AppDaemon imported them - a shadowing directory (or a stale
+      __pycache__) can make it run something else entirely. So read the log
+      back and require the app to say it started.
+    #>
+    param([string]$Anchor, [int]$TimeoutSeconds = 90)
+
+    if ($HaToken -eq '') {
+        Write-Warn2 "no -HaToken: cannot read the add-on log back. Check the HA UI (Settings > Add-ons > AppDaemon > Log) for 'Initializing Battery Optimizer' and any traceback."
+        return
+    }
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $initLine = ''
+    $threadLine = ''
+    $errorLines = @()
+    $lastFailure = ''
+
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $log = Get-AddonLogLines -Lines 400
+        } catch {
+            $lastFailure = $_.Exception.Message
+            Start-Sleep -Seconds 5
+            continue
+        }
+        $lastFailure = ''
+        $new = Get-NewLogLines -Lines $log -Anchor $Anchor
+
+        foreach ($line in $new) {
+            if ($line -match 'Initializing Battery Optimizer') { $initLine = $line }
+            if ($line -match 'Starting apps with\s+(\d+)\s+worker threads?') { $threadLine = $line }
+            if ($line -match 'ModuleNotFoundError|ImportError|Traceback \(most recent call last\)|Unexpected error loading|SyntaxError') {
+                if ($errorLines -notcontains $line) { $errorLines += $line }
+            }
+        }
+        if ($initLine -ne '' -or $errorLines.Count -gt 0) { break }
+        Write-Info "waiting for 'Initializing Battery Optimizer' in the add-on log ..."
+        Start-Sleep -Seconds 5
+    }
+
+    if ($lastFailure -ne '') {
+        Write-Warn2 ("could not read the add-on log (" + $lastFailure + ") - check it manually in the HA UI")
+        return
+    }
+
+    if ($threadLine -ne '') {
+        Write-Info ("AppDaemon: " + $threadLine.Trim())
+        if ($threadLine -match 'Starting apps with\s+(\d+)\s+worker threads?') {
+            $threads = [int]$Matches[1]
+            if ($threads -lt 2) {
+                Write-Warn2 ("AppDaemon is running " + $threads + " worker thread(s). This app makes blocking " +
+                             "set_wit_mode calls from callbacks; set appdaemon: total_threads: 4 in appdaemon.yaml.")
+            }
+        }
+    }
+
+    if ($errorLines.Count -gt 0) {
+        Write-Host ''
+        Write-Host ("    Import/startup errors in the add-on log after the restart:") -ForegroundColor Red
+        foreach ($line in $errorLines) { Write-Host ("      " + $line.Trim()) -ForegroundColor Red }
+        Write-Warn2 "the deploy finished but the app did NOT start cleanly - inspect the log and consider -Restore."
+        return
+    }
+
+    if ($initLine -eq '') {
+        Write-Warn2 ("no 'Initializing Battery Optimizer' line within " + $TimeoutSeconds +
+                     "s. The app may just be slow, but if the log is silent check for a shadowing " +
+                     "directory under apps\ or a stale __pycache__.")
+        return
+    }
+
+    Write-Ok ("app initialized after the restart: " + $initLine.Trim())
+}
+
+# ---------------------------------------------------------------------------
 # File helpers
 # ---------------------------------------------------------------------------
 
@@ -292,6 +477,165 @@ function Test-SameHash {
     return ($ha -eq $hb)
 }
 
+function Test-PathInside {
+    # $Candidate is $Root itself or below it (string compare; the share is UNC
+    # and both sides come from the same parameters, so no resolution needed).
+    param([string]$Root, [string]$Candidate)
+    $r = $Root.TrimEnd('\')
+    $c = $Candidate.TrimEnd('\')
+    if ($c -ieq $r) { return $true }
+    return $c.StartsWith($r + '\', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Set-DeployTimestamp {
+    # Copy-Item preserves LastWriteTime, so a freshly deployed file keeps the
+    # repo checkout's mtime and both AppDaemon's change detection and a human
+    # `ls -l` on the share report a time that has nothing to do with the
+    # deploy. Stamp them once, after the SHA256 verification.
+    param([string[]]$Paths, [datetime]$When)
+    $touched = 0
+    foreach ($path in $Paths) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        try {
+            (Get-Item -LiteralPath $path).LastWriteTime = $When
+            $touched = $touched + 1
+        } catch {
+            Write-Warn2 ("could not stamp " + $path + ": " + $_.Exception.Message)
+        }
+    }
+    return $touched
+}
+
+# ---------------------------------------------------------------------------
+# Stray-app scan: nothing but our own files may hold *.py under apps\
+# ---------------------------------------------------------------------------
+
+function Get-StrayApps {
+    <#
+      AppDaemon 4.5 app discovery (app_management.py):
+        - app_dir.rglob("*.py")                       -> every .py is a module
+        - sys.path.insert(0, <dir>) for each directory containing .py files
+          that has no __init__.py                     -> FRONT of sys.path
+      So a directory under apps\ holding a copy of battery_optimizer.py or
+      battery_optimizer_lib\ shadows the deployed one. Return every such path.
+    #>
+    param([string]$AppsDir, [string[]]$Allowed)
+
+    $allowSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    [void]$allowSet.Add('battery_optimizer.py')
+    foreach ($name in $Allowed) {
+        if ($null -ne $name -and $name -ne '') { [void]$allowSet.Add($name) }
+    }
+
+    $strayFiles = @()
+    $strayDirs = @()
+
+    $topLevel = @(Get-ChildItem -Path $AppsDir -File -Filter '*.py' -ErrorAction SilentlyContinue)
+    foreach ($file in $topLevel) {
+        if (-not $allowSet.Contains($file.Name)) { $strayFiles += $file }
+    }
+
+    $subDirs = @(Get-ChildItem -Path $AppsDir -Directory -ErrorAction SilentlyContinue)
+    foreach ($dir in $subDirs) {
+        if ($dir.Name -ieq 'battery_optimizer_lib') { continue }
+        if ($dir.Name -ieq '__pycache__') { continue }
+        $py = @(Get-ChildItem -Path $dir.FullName -Recurse -File -Filter '*.py' -ErrorAction SilentlyContinue)
+        if ($py.Count -gt 0) {
+            $strayDirs += [pscustomobject]@{
+                Directory = $dir
+                PyCount   = $py.Count
+                IsBackup  = ($dir.Name -match $StrayBackupPattern)
+            }
+        }
+    }
+
+    return [pscustomobject]@{ Files = @($strayFiles); Directories = @($strayDirs) }
+}
+
+function Move-StrayBackupDir {
+    param([System.IO.DirectoryInfo]$Directory)
+    $target = Join-Path $BackupRoot $Directory.Name
+    if (Test-Path -LiteralPath $target) {
+        $target = $target + '-moved-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+    }
+    if ($DryRun) {
+        Write-Plan ("move " + $Directory.FullName + " -> " + $target + " (never deleted)")
+        return $target
+    }
+    if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) {
+        New-Item -ItemType Directory -Path $BackupRoot -Force | Out-Null
+    }
+    Move-Item -LiteralPath $Directory.FullName -Destination $target -Force
+    Write-Ok ("moved out of apps\: " + $Directory.Name + " -> " + $target)
+    return $target
+}
+
+function Invoke-StrayScan {
+    <#
+      Runs in -DryRun too: a shadowing directory makes the whole deploy a lie,
+      so the rehearsal must surface it as loudly as the real run.
+    #>
+    param([string]$AppsDir, [switch]$Quiet)
+
+    $stray = Get-StrayApps -AppsDir $AppsDir -Allowed $AllowedApps
+
+    if ($stray.Files.Count -eq 0 -and $stray.Directories.Count -eq 0) {
+        if (-not $Quiet) {
+            Write-Ok ("nothing shadows the app: only battery_optimizer.py, battery_optimizer_lib\ and " +
+                      ($AllowedApps -join ', ') + " hold *.py under apps\")
+        }
+        return
+    }
+
+    Write-Host ''
+    Write-Host "    AppDaemon imports *.py from ANYWHERE under the apps directory." -ForegroundColor Yellow
+    Write-Host "    Every directory with .py files and no __init__.py is prepended to sys.path," -ForegroundColor Yellow
+    Write-Host "    so these shadow the files this script is about to deploy:" -ForegroundColor Yellow
+
+    foreach ($file in $stray.Files) {
+        Write-Host ("      FILE  " + $file.FullName) -ForegroundColor Red
+    }
+    foreach ($entry in $stray.Directories) {
+        $tag = 'DIR '
+        if ($entry.IsBackup) { $tag = 'BACKUP' }
+        Write-Host ("      " + $tag + "  " + $entry.Directory.FullName +
+                    "  (" + $entry.PyCount + " *.py)") -ForegroundColor Red
+    }
+
+    $backupDirs = @($stray.Directories | Where-Object { $_.IsBackup })
+    $otherDirs  = @($stray.Directories | Where-Object { -not $_.IsBackup })
+
+    if ($MoveStrayBackups -and $backupDirs.Count -gt 0) {
+        Write-Host ''
+        Write-Info "-MoveStrayBackups: evacuating backup directories (moved, never deleted)"
+        foreach ($entry in $backupDirs) { Move-StrayBackupDir -Directory $entry.Directory | Out-Null }
+    }
+
+    $blocking = @()
+    foreach ($file in $stray.Files) { $blocking += $file.FullName }
+    foreach ($entry in $otherDirs) { $blocking += $entry.Directory.FullName }
+    if (-not $MoveStrayBackups) {
+        foreach ($entry in $backupDirs) { $blocking += $entry.Directory.FullName }
+    }
+
+    if ($blocking.Count -gt 0) {
+        Write-Host ''
+        Fail ("the apps directory contains " + $blocking.Count + " path(s) AppDaemon will import from, " +
+              "shadowing the deployed code (this is how apps\backup-20260902-015911 made the add-on run " +
+              "the PREVIOUS commit while SHA256 verification passed). Move or delete them by hand, " +
+              "pass -MoveStrayBackups to relocate backup-* directories to " + $BackupRoot + ", " +
+              "or allow a legitimate extra app with -AllowedApps.")
+    }
+
+    if (-not $DryRun) {
+        $after = Get-StrayApps -AppsDir $AppsDir -Allowed $AllowedApps
+        if ($after.Files.Count -gt 0 -or $after.Directories.Count -gt 0) {
+            Fail "stray *.py paths still present under the apps directory after the move - aborting."
+        }
+        Write-Ok "apps directory is clean: nothing shadows battery_optimizer / battery_optimizer_lib"
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Restore mode
 # ---------------------------------------------------------------------------
@@ -304,7 +648,19 @@ function Invoke-Restore {
 
     Write-Step "Validate backup directory"
     if (-not (Test-Path -LiteralPath $BackupDir -PathType Container)) {
-        Fail ("backup directory not found: " + $BackupDir)
+        # Accept a bare backup-<ts> name, resolved against the backup root.
+        $candidate = Join-Path $BackupRoot $BackupDir
+        if (Test-Path -LiteralPath $candidate -PathType Container) {
+            Write-Info ("resolved '" + $BackupDir + "' to " + $candidate)
+            $BackupDir = $candidate
+        } else {
+            Fail ("backup directory not found: " + $BackupDir)
+        }
+    }
+    if (Test-PathInside -Root $Share -Candidate $BackupDir) {
+        Write-Warn2 ("this backup lives INSIDE the apps directory (" + $BackupDir + ").")
+        Write-Warn2 "AppDaemon imports *.py from there, so it has been shadowing the deployed code."
+        Write-Warn2 ("it will be moved to " + $BackupRoot + " once the restore copy is done.")
     }
     $backupOrchestrator = Join-Path $BackupDir 'battery_optimizer.py'
     $backupLib = Join-Path $BackupDir 'battery_optimizer_lib'
@@ -373,11 +729,37 @@ function Invoke-Restore {
         }
     }
 
+    Write-Step "Evacuate any backup directory left inside apps\"
+    # A rollback that leaves a backup-* directory under apps\ hands the add-on
+    # a second copy of the package at the FRONT of sys.path, which is the bug
+    # this whole rework exists to prevent.
+    $strayAfter = Get-StrayApps -AppsDir $Share -Allowed $AllowedApps
+    $backupDirsAfter = @($strayAfter.Directories | Where-Object { $_.IsBackup })
+    $otherAfter = @($strayAfter.Directories | Where-Object { -not $_.IsBackup })
+    if ($backupDirsAfter.Count -eq 0) {
+        Write-Ok "no backup directory inside the apps directory"
+    } else {
+        foreach ($entry in $backupDirsAfter) { Move-StrayBackupDir -Directory $entry.Directory | Out-Null }
+    }
+    foreach ($entry in $otherAfter) {
+        Write-Warn2 ("directory with *.py under apps\ that AppDaemon will import from: " + $entry.Directory.FullName)
+    }
+    foreach ($file in $strayAfter.Files) {
+        Write-Warn2 ("unexpected *.py directly under apps\: " + $file.FullName)
+    }
+
     Write-Step "Remove __pycache__ on the share"
     Remove-PyCache -Root $Share
 
     Write-Step "Start the add-on"
+    $anchor = ''
+    if (-not $DryRun -and $HaToken -ne '' -and -not $SkipPostCheck) { $anchor = Get-LogAnchor }
     Start-Addon
+
+    if (-not $DryRun -and -not $SkipPostCheck) {
+        Write-Step "Post-restore check (best effort)"
+        Invoke-PostDeployCheck -Anchor $anchor -TimeoutSeconds $PostCheckTimeoutSeconds
+    }
 
     Write-Host ''
     Write-Host 'RESTORE COMPLETE.' -ForegroundColor Green
@@ -434,8 +816,13 @@ function Invoke-Deploy {
     Write-Ok ("live apps.yaml present (read-only to this script): " + $shareAppsYaml)
     if (-not (Test-Path -LiteralPath $RepoOrchestrator)) { Fail ("missing " + $RepoOrchestrator) }
     if (-not (Test-Path -LiteralPath $RepoLib -PathType Container)) { Fail ("missing " + $RepoLib) }
+    Write-Info ("backups: " + $BackupRoot)
 
-    # -- 3. tests ------------------------------------------------------------
+    # -- 3. preflight: nothing under apps\ may shadow the deployed package ---
+    Write-Step "Preflight: no shadowing *.py under the apps directory"
+    Invoke-StrayScan -AppsDir $Share
+
+    # -- 4. tests ------------------------------------------------------------
     Write-Step "Unit tests"
     if ($SkipTests) {
         Write-Warn2 "-SkipTests given: pytest NOT run."
@@ -450,7 +837,7 @@ function Invoke-Deploy {
         Write-Ok "pytest passed"
     }
 
-    # -- 4. compile ----------------------------------------------------------
+    # -- 5. compile ----------------------------------------------------------
     Write-Step "Byte-compile the files that will be deployed"
     $repoLibFiles = @(Get-RepoLibFiles)
     if ($repoLibFiles.Count -eq 0) { Fail "no *.py found in battery_optimizer_lib" }
@@ -465,7 +852,7 @@ function Invoke-Deploy {
     }
     Write-Ok ("compiled battery_optimizer.py + " + $repoLibFiles.Count + " library modules")
 
-    # -- 5. smoke test against the LIVE apps.yaml ----------------------------
+    # -- 6. smoke test against the LIVE apps.yaml ----------------------------
     Write-Step "Smoke test against the LIVE apps.yaml"
     if (-not (Test-Path -LiteralPath $SmokeScript)) { Fail ("missing " + $SmokeScript) }
     $tempYaml = Join-Path $env:TEMP ('battery-optimizer-smoke-' + [guid]::NewGuid().ToString('N') + '.yaml')
@@ -489,7 +876,7 @@ function Invoke-Deploy {
     }
     Write-Ok "the live apps.yaml loads with this code"
 
-    # -- 6. plan the copy ----------------------------------------------------
+    # -- 7. plan the copy ----------------------------------------------------
     Write-Step "Plan"
     $shareOrchestrator = Join-Path $Share 'battery_optimizer.py'
     $shareLib = Join-Path $Share 'battery_optimizer_lib'
@@ -538,12 +925,23 @@ function Invoke-Deploy {
         Write-Ok "no stale *.py on the share"
     }
 
-    # -- 7. backup -----------------------------------------------------------
-    Write-Step "Backup the current share state"
+    # -- 8. backup -----------------------------------------------------------
+    Write-Step "Backup the current share state (OUTSIDE the apps directory)"
     $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $backupDir = Join-Path $Share ('backup-' + $timestamp)
+    $backupDir = Join-Path $BackupRoot ('backup-' + $timestamp)
+    Write-Info ("backup root: " + $BackupRoot)
+    $commitLines = @(
+        ('deployed-commit : ' + $commit),
+        ('short           : ' + $shortCommit),
+        ('branch          : ' + $branch),
+        ('deployed-at     : ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss K')),
+        ('deployed-by     : ' + $env:USERNAME + '@' + $env:COMPUTERNAME),
+        ('dirty-tree      : ' + ($dirty.Count -gt 0)),
+        ('backup-of       : ' + $Share)
+    )
     if ($DryRun) {
         Write-Plan ("create " + $backupDir + " with battery_optimizer.py + battery_optimizer_lib\ + deployed-commit.txt")
+        Write-Plan ("write " + $LastDeployFile)
     } else {
         New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
         if (Test-Path -LiteralPath $shareOrchestrator) {
@@ -558,20 +956,12 @@ function Invoke-Deploy {
         } else {
             Write-Warn2 "share has no battery_optimizer_lib\ to back up (first deploy?)"
         }
-        $commitLines = @(
-            ('deployed-commit : ' + $commit),
-            ('short           : ' + $shortCommit),
-            ('branch          : ' + $branch),
-            ('deployed-at     : ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss K')),
-            ('deployed-by     : ' + $env:USERNAME + '@' + $env:COMPUTERNAME),
-            ('dirty-tree      : ' + ($dirty.Count -gt 0))
-        )
         Set-Content -LiteralPath (Join-Path $backupDir 'deployed-commit.txt') -Value $commitLines -Encoding utf8
         Write-Ok ("backup created: " + $backupDir)
     }
 
     # prune old backups
-    $existingBackups = @(Get-ChildItem -Path $Share -Directory -ErrorAction SilentlyContinue |
+    $existingBackups = @(Get-ChildItem -Path $BackupRoot -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match $BackupNamePattern } |
         Sort-Object Name -Descending)
     if ($DryRun) {
@@ -598,13 +988,13 @@ function Invoke-Deploy {
     # -------- everything below touches the running add-on --------------------
     $stopped = $false
     try {
-        # -- 8. stop ---------------------------------------------------------
+        # -- 9. stop ---------------------------------------------------------
         Write-Step "Stop the AppDaemon add-on"
         Write-Info "AppDaemon hot-reloads on every .py write; a multi-file copy into a running add-on can import a new module against its old peers."
         Stop-Addon
         $stopped = $true
 
-        # -- 9. copy ---------------------------------------------------------
+        # -- 10. copy ---------------------------------------------------------
         Write-Step "Copy"
         foreach ($item in $plannedCopies) {
             if ($DryRun) {
@@ -623,11 +1013,11 @@ function Invoke-Deploy {
             }
         }
 
-        # -- 10. pycache -----------------------------------------------------
+        # -- 11. pycache -----------------------------------------------------
         Write-Step "Remove __pycache__ on the share"
         Remove-PyCache -Root $Share
 
-        # -- 11. verify ------------------------------------------------------
+        # -- 12. verify ------------------------------------------------------
         Write-Step "Verify (SHA256 repo vs share)"
         if ($DryRun) {
             Write-Plan ("verify SHA256 of " + $plannedCopies.Count + " file(s)")
@@ -648,9 +1038,37 @@ function Invoke-Deploy {
             Write-Ok ("deployed commit " + $shortCommit + " (" + $branch + "); recorded in " + (Join-Path $backupDir 'deployed-commit.txt'))
         }
 
-        # -- 12. start -------------------------------------------------------
+        # -- 13. stamp the deploy time ---------------------------------------
+        Write-Step "Stamp the deployed files with the deploy time"
+        Write-Info "Copy-Item preserves the source LastWriteTime, which would make the share's mtimes describe the git checkout instead of the deploy."
+        if ($DryRun) {
+            Write-Plan ("set LastWriteTime = now on " + $plannedCopies.Count + " deployed file(s) and write " + $LastDeployFile)
+        } else {
+            $now = Get-Date
+            $destinations = @()
+            foreach ($item in $plannedCopies) { $destinations += $item.Destination }
+            $touched = Set-DeployTimestamp -Paths $destinations -When $now
+            Write-Ok ($touched.ToString() + " file(s) stamped " + $now.ToString('yyyy-MM-dd HH:mm:ss'))
+            $lastDeployLines = @($commitLines + @(('backup          : ' + $backupDir)))
+            Set-Content -LiteralPath $LastDeployFile -Value $lastDeployLines -Encoding utf8
+            Write-Ok ("wrote " + $LastDeployFile)
+        }
+
+        # -- 14. start -------------------------------------------------------
         Write-Step "Start the AppDaemon add-on"
+        $logAnchor = ''
+        if (-not $DryRun -and $HaToken -ne '' -and -not $SkipPostCheck) { $logAnchor = Get-LogAnchor }
         Start-Addon
+
+        # -- 15. post-deploy check (best effort) ------------------------------
+        if (-not $DryRun -and -not $SkipPostCheck) {
+            Write-Step "Post-deploy check: did the app actually start?"
+            Invoke-PostDeployCheck -Anchor $logAnchor -TimeoutSeconds $PostCheckTimeoutSeconds
+        } elseif ($DryRun) {
+            Write-Step "Post-deploy check: did the app actually start?"
+            Write-Plan ("poll the add-on log for up to " + $PostCheckTimeoutSeconds +
+                        "s for 'Initializing Battery Optimizer', import errors and the worker-thread count")
+        }
     } catch {
         Write-Host ''
         Write-Host '################ DEPLOY FAILED ################' -ForegroundColor Red
@@ -678,6 +1096,10 @@ function Invoke-Deploy {
         Write-Host '  ModuleNotFoundError   (a module was imported against stale peers)' -ForegroundColor Yellow
         Write-Host '  TypeError             (a signature changed but a caller did not)' -ForegroundColor Yellow
         Write-Host 'HA UI: Settings > Add-ons > AppDaemon > Log.' -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host 'SHA256 proves the bytes on the share; it does NOT prove AppDaemon imported them.' -ForegroundColor Yellow
+        Write-Host 'Confirm the running code is the new one, e.g. sensor.battery_inverter_control_health' -ForegroundColor Yellow
+        Write-Host 'must expose the attributes this commit adds.' -ForegroundColor Yellow
         Write-Host ('Roll back with: .\scripts\deploy.ps1 -Restore "' + $backupDir + '"') -ForegroundColor Yellow
     }
 }
@@ -688,6 +1110,13 @@ function Invoke-Deploy {
 
 if ($NoPause -and $HaToken -eq '') {
     Write-Host "-NoPause requires -HaToken (without a token the add-on must be stopped/started by hand)." -ForegroundColor Red
+    exit 2
+}
+
+if (Test-PathInside -Root $Share -Candidate $BackupRoot) {
+    Write-Host ("-BackupRoot must NOT be inside the apps directory: " + $BackupRoot) -ForegroundColor Red
+    Write-Host ("AppDaemon rglob()s " + $Share + " for *.py and prepends every __init__.py-less directory") -ForegroundColor Red
+    Write-Host ("holding one to sys.path, so a backup there shadows the code you just deployed.") -ForegroundColor Red
     exit 2
 }
 

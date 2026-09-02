@@ -119,7 +119,9 @@ def main() -> int:
     print(f"Bound:  {bound:.2f} kW "
           f"({engine.max_rate_factor:.1f}x nominal "
           f"{max(args.charge_rate, args.discharge_rate or 0):.2f} kW)")
-    print(f"Floor:  {engine.min_observation_minutes:.2f} min per observation")
+    print(f"Floor:  {engine.min_observation_minutes:.2f} min per observation, "
+          f"or {2 * engine.counter_resolution_kwh:.2f} kWh "
+          f"(2x counter resolution) at any duration")
 
     after_soc = {k: list(v) for k, v in engine.stats.charge_rates_by_soc.items()}
     after_soc_temp = {

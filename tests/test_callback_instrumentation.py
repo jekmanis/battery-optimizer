@@ -621,7 +621,7 @@ def test_the_inverter_write_runs_inside_an_unlocked_region():
     ), "only the blocking inverter call may run unlocked"
     # Accounting must be back under the lock.
     assert "self._update_control_health_sensor()" in body
-    assert "self._note_applied_mode(entry)" in body
+    assert "self._note_applied_mode(entry, outcome)" in body
 
 
 def test_every_blocking_inverter_call_is_unlocked_and_in_an_allowed_frame():

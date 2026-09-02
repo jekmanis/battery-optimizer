@@ -44,6 +44,17 @@ class FakeOutcomeTracker:
         self.starts.append(kwargs)
 
 
+class _FakeDirectControl:
+    """Only what `_on_enabled_change` touches."""
+
+    def __init__(self, app):
+        self._app = app
+
+    def release_control(self):
+        self._app.released = True
+        return True
+
+
 class ExecOptimizer(bo.BatteryOptimizer):
     """Minimal stand-in: no AppDaemon initialize(), just the execution path."""
 
@@ -68,6 +79,8 @@ class ExecOptimizer(bo.BatteryOptimizer):
         self._grid_charge_active_until = None
         self._last_depletion_recalc_time = None
         self.run_in_calls = []
+        self.released = False
+        self._direct_control = _FakeDirectControl(self)
 
     # --- AppDaemon surface -------------------------------------------------
     def log(self, message, level="INFO"):
@@ -129,6 +142,14 @@ class ExecOptimizer(bo.BatteryOptimizer):
 
 def _slot(hour, minute=0):
     return datetime.datetime(2026, 9, 2, hour, minute, tzinfo=TZ)
+
+
+def _note(app, slot, mode, outcome=None):
+    """`_note_applied_mode` with the default outcome of a real transmission."""
+    app._note_applied_mode(
+        _entry(slot, mode),
+        outcome if outcome is not None else bo.ApplyOutcome.SENT,
+    )
 
 
 def _entry(slot, mode=BatteryMode.HOLD, reason="dp_optimal"):
@@ -333,7 +354,7 @@ class TestGridChargeWindow:
     def test_a_charge_command_opens_a_slot_plus_buffer_window(self):
         app = ExecOptimizer(now=_slot(5, 0))
 
-        app._note_applied_mode(_entry(_slot(5, 0), BatteryMode.CHARGE))
+        _note(app, _slot(5, 0), BatteryMode.CHARGE)
 
         # slot_minutes 15 + direct_control_buffer_minutes 5 = 20 minutes
         assert app._grid_charge_active_until == _slot(5, 20)
@@ -342,20 +363,20 @@ class TestGridChargeWindow:
     def test_the_window_survives_the_transition_to_hold(self):
         """The exact production case: HOLD at 05:15, charge measured 05:15:10."""
         app = ExecOptimizer(now=_slot(5, 0))
-        app._note_applied_mode(_entry(_slot(5, 0), BatteryMode.CHARGE))
+        _note(app, _slot(5, 0), BatteryMode.CHARGE)
 
         app._now = _slot(5, 15)
-        app._note_applied_mode(_entry(_slot(5, 15), BatteryMode.HOLD))
+        _note(app, _slot(5, 15), BatteryMode.HOLD)
 
         app._now = _slot(5, 15) + datetime.timedelta(seconds=10)
         assert app._grid_charge_active() is True
 
     def test_the_grace_period_bounds_it_after_a_supersede(self):
         app = ExecOptimizer(now=_slot(5, 0), cost_grid_charge_grace_seconds=120)
-        app._note_applied_mode(_entry(_slot(5, 0), BatteryMode.CHARGE))
+        _note(app, _slot(5, 0), BatteryMode.CHARGE)
 
         app._now = _slot(5, 15)
-        app._note_applied_mode(_entry(_slot(5, 15), BatteryMode.HOLD))
+        _note(app, _slot(5, 15), BatteryMode.HOLD)
 
         assert app._grid_charge_active_until == _slot(5, 17)
         app._now = _slot(5, 18)
@@ -363,27 +384,113 @@ class TestGridChargeWindow:
 
     def test_the_grace_never_extends_beyond_the_original_command(self):
         app = ExecOptimizer(now=_slot(5, 0), cost_grid_charge_grace_seconds=3600)
-        app._note_applied_mode(_entry(_slot(5, 0), BatteryMode.CHARGE))
+        _note(app, _slot(5, 0), BatteryMode.CHARGE)
 
         app._now = _slot(5, 15)
-        app._note_applied_mode(_entry(_slot(5, 15), BatteryMode.HOLD))
+        _note(app, _slot(5, 15), BatteryMode.HOLD)
 
         assert app._grid_charge_active_until == _slot(5, 20)
 
     def test_a_hold_with_no_prior_charge_opens_nothing(self):
         app = ExecOptimizer(now=_slot(5, 0))
 
-        app._note_applied_mode(_entry(_slot(5, 0), BatteryMode.HOLD))
+        _note(app, _slot(5, 0), BatteryMode.HOLD)
 
         assert app._grid_charge_active_until is None
 
     def test_the_window_expires_on_its_own(self):
         app = ExecOptimizer(now=_slot(5, 0))
-        app._note_applied_mode(_entry(_slot(5, 0), BatteryMode.CHARGE))
+        _note(app, _slot(5, 0), BatteryMode.CHARGE)
 
         app._now = _slot(5, 21)
 
         assert app._grid_charge_active() is False
+
+
+class TestOnlyATransmittedCommandOpensTheWindow:
+    """The window claims the inverter IS grid-charging; only a real send may.
+
+    `apply_mode` returns True for three outcomes the inverter never
+    acknowledged, and two of them transmitted nothing at all.
+    """
+
+    def test_a_duplicate_charge_does_not_slide_the_window_forward(self):
+        app = ExecOptimizer(now=_slot(5, 0))
+        _note(app, _slot(5, 0), BatteryMode.CHARGE)
+        assert app._grid_charge_active_until == _slot(5, 20)
+
+        # The same CHARGE re-applied 15 min later; DirectControl suppressed it,
+        # so the ORIGINAL command's expiry is still the true one.
+        app._now = _slot(5, 15)
+        _note(app, _slot(5, 15), BatteryMode.CHARGE,
+              bo.ApplyOutcome.SKIPPED_DUPLICATE)
+
+        assert app._grid_charge_active_until == _slot(5, 20)
+        app._now = _slot(5, 21)
+        assert app._grid_charge_active() is False
+
+    def test_a_dry_run_charge_opens_no_window_at_all(self):
+        app = ExecOptimizer(now=_slot(5, 0))
+
+        _note(app, _slot(5, 0), BatteryMode.CHARGE, bo.ApplyOutcome.DRY_RUN)
+
+        assert app._grid_charge_active_until is None
+        assert app._grid_charge_active() is False
+
+    def test_an_unconfirmed_timeout_still_opens_one(self):
+        """The request was already on the wire when the client stopped waiting."""
+        app = ExecOptimizer(now=_slot(5, 0))
+
+        _note(app, _slot(5, 0), BatteryMode.CHARGE,
+              bo.ApplyOutcome.UNCONFIRMED_TIMEOUT)
+
+        assert app._grid_charge_active_until == _slot(5, 20)
+
+    def test_a_duplicate_hold_still_bounds_an_open_window(self):
+        """Superseding is about the app's mode, not about the send."""
+        app = ExecOptimizer(now=_slot(5, 0), cost_grid_charge_grace_seconds=120)
+        _note(app, _slot(5, 0), BatteryMode.CHARGE)
+
+        app._now = _slot(5, 15)
+        _note(app, _slot(5, 15), BatteryMode.HOLD,
+              bo.ApplyOutcome.SKIPPED_DUPLICATE)
+
+        assert app._grid_charge_active_until == _slot(5, 17)
+
+    def test_shrinking_twice_never_extends(self):
+        app = ExecOptimizer(now=_slot(5, 0), cost_grid_charge_grace_seconds=120)
+        _note(app, _slot(5, 0), BatteryMode.CHARGE)
+
+        app._now = _slot(5, 15)
+        app._shrink_grid_charge_window()
+        app._now = _slot(5, 16)
+        app._shrink_grid_charge_window()
+
+        assert app._grid_charge_active_until == _slot(5, 17)
+
+
+class TestReleaseControlEndsTheWindow:
+    """Disabling the optimizer hands the inverter back to passthrough."""
+
+    def test_release_shrinks_the_window_like_a_supersede(self):
+        app = ExecOptimizer(now=_slot(5, 0), cost_grid_charge_grace_seconds=120)
+        _note(app, _slot(5, 0), BatteryMode.CHARGE)
+
+        app._now = _slot(5, 5)
+        app._on_enabled_change("input_boolean.x", "state", "on", "off", {})
+
+        assert app.released is True
+        assert app._grid_charge_active_until == _slot(5, 7)
+        app._now = _slot(5, 8)
+        assert app._grid_charge_active() is False
+
+    def test_release_with_no_open_window_is_a_no_op(self):
+        app = ExecOptimizer(now=_slot(5, 0))
+
+        app._on_enabled_change("input_boolean.x", "state", "on", "off", {})
+
+        assert app.released is True
+        assert app._grid_charge_active_until is None
 
 
 # ---------------------------------------------------------------------------

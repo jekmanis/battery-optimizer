@@ -100,10 +100,10 @@ Two lines of defence, both derived from the same constants in
 `learning_engine.py`:
 
 1. **At ingest.** `record_charging` / `record_discharging` reject an observation
-   whose interval is shorter than `min_observation_minutes` (default
-   `MIN_OBSERVATION_MINUTES = 1.0`) or whose implied rate exceeds
-   `max_plausible_rate_kw = max(charge_rate, discharge_rate) * max_rate_factor`
-   (default `DEFAULT_MAX_RATE_FACTOR = 2.0`). Rejections are logged
+   that cannot resolve a rate (`observation_is_resolvable`, below) or whose
+   implied rate exceeds `max_plausible_rate_kw = max(charge_rate,
+   discharge_rate, effective_export_discharge_rate) * max_rate_factor` (default
+   `DEFAULT_MAX_RATE_FACTOR = 2.0`). Rejections are logged
    (`Learning: rejected implausible …`) and counted in
    `get_learning_summary()["rejected_observations"]`.
 2. **At read.** `_plausible_rates` filters every median window *before* the
@@ -112,14 +112,32 @@ Two lines of defence, both derived from the same constants in
    guards existed is neutralised in memory on load and written back clean on the
    next save.
 
-**Why 2x nominal.** The reference installation is configured at 4.5 kW and its
-observation history has a hard physical ceiling at ~6.8 kW (the inverter's
-warm-battery rate, 1.5x nominal). A 1.5x bound would clip that genuine cluster;
-2x keeps it and still rejects everything a 15-minute slot cannot deliver.
+**Why 2x nominal, over all three powers.** The reference installation is
+configured at 4.5 kW and its observation history has a hard physical ceiling at
+~6.8 kW (the inverter's warm-battery rate, 1.5x nominal). A 1.5x bound would
+clip that genuine cluster; 2x keeps it and still rejects everything a 15-minute
+slot cannot deliver. The maximum is taken over the charge rate, the load
+discharge rate **and** `effective_export_discharge_rate`: an export slot runs at
+the export rate, routinely the largest of the three, so leaving it out would
+reject the very samples the DP plans an export around.
 
-**Why a 1-minute floor.** The inverter energy counters move in 0.1 kWh steps and
-the SOC sensor in 1% (0.143 kWh) steps, so below a minute the quotient is
-quantization noise, not a rate.
+**Why the floor is quantization-aware, not wall-time.**
+`observation_is_resolvable(energy, duration)` accepts a sample when EITHER the
+measured energy spans at least two counter ticks (`2 *
+counter_resolution_kwh`, default `2 * 0.1 = 0.2` kWh) OR the interval is at
+least `min_observation_minutes` (`MIN_OBSERVATION_MINUTES = 0.25`, i.e. 15 s, an
+absolute floor). Anything else is one tick of granularity divided by a number,
+not a rate.
+
+The earlier flat 1-minute floor was wrong in the same direction the 2x bound was
+tuned against. `cost_tracker` re-stamps `_last_sig_soc_time` after **every**
+accepted event, so a genuine interval lasts only as long as the counter needs to
+advance one 0.1 kWh tick — `0.1 / P` hours, under a minute for any `P` above
+6 kW. The 1-minute floor therefore rejected exactly the 6.77-6.82 kW warm-pack
+cluster it was meant to protect. The production defect it was introduced for
+(0.1 kWh over 44 ms, ~9000 kW) fails the quantization gate anyway, and
+`is_plausible_rate` remains the guard that catches a multi-tick delta over a
+millisecond interval.
 
 **What this cost in production (2026-09-02).** `cost_tracker` derived an
 observation's duration from `_last_sig_soc_time`, which the SOC listener
@@ -458,7 +476,7 @@ order.
 | # | Condition | Source | Cost applied |
 |---|---|---|---|
 | 1 | commanded mode is CHARGE | `grid` | `grid_landed_cost` (conservative if PV also contributed) |
-| 2 | a `grid_charge` command is still in force at the inverter | `grid-command` | `grid_landed_cost` |
+| 2 | a `grid_charge` command is still in force at the inverter **and** measured PV is below `cost_pv_attribution_min_w` (or unreadable) | `grid-command` | `grid_landed_cost` |
 | 3 | HOLD / DISCHARGE and measured PV >= `cost_pv_attribution_min_w` | `pv` | `pv_opportunity_cost` (discharge-to-load still accepts surplus PV into the battery) |
 | 4 | HOLD / DISCHARGE and measured PV below the floor | `no-pv-grid` | `grid_landed_cost` |
 | 5 | HOLD / DISCHARGE and no PV reading available at all | `pv` | `pv_opportunity_cost` (legacy behaviour; no PV provider injected) |
@@ -476,6 +494,13 @@ Rule 2 keeps grid attribution for the remainder of that command plus
 counters lag the command); rule 4 is the backstop for any other night-time
 charge. Both guards fail *toward* the grid cost, which is the conservative
 direction: it never books unpaid-for energy at a lower cost than it had.
+
+**Measured PV outranks the command window.** The window is a *time* bound on a
+command that has already been superseded, not evidence about the kWh being
+measured now, so rule 2 is conditional on the PV floor rather than sitting
+unconditionally ahead of rule 3. Without that condition a midday CHARGE -> HOLD
+transition booked genuine 4 kW PV charging at the grid price for the whole grace
+period — the same error as the pre-dawn case, in the opposite direction.
 
 `cost_pv_attribution_min_w` (default 100 W) is the PV floor. The PV reading and
 the grid-charge window are injected into `BatteryCostTracker`

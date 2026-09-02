@@ -32,6 +32,13 @@ Invariants
    schedule to another worker thread.  In that case the region degrades to
    "run the blocking call with the lock held" — today's behaviour, and correct.
 
+   Depth >= 2 is a DESIGNED path, not a defect.  `full_optimize` /
+   `_recalculate_remaining_schedule` / `on_manual_mode_change` all call
+   `execute_scheduled_mode` -> `_apply_mode_tracked` from inside their own
+   guarded callback, so every scheduled inverter write that follows a rebuild
+   arrives here at depth 2.  It is reported once at DEBUG for traceability and
+   never raises, not even under `strict=True`.
+
 3. **Lock order: app lock -> DirectControl._io_lock -> DirectControl._state_lock.**
    Never acquire the app lock while holding either DirectControl lock.  In
    particular, DirectControl's verification path must report its callback
@@ -41,16 +48,23 @@ Invariants
    body can never leave the app lock dropped; the exception propagates with the
    lock held exactly as it was on entry.
 
-Degrade, don't raise
---------------------
-This lock runs inside a home-automation control loop that drives a battery
-inverter.  A misuse of `unlocked()` (nested region, or a call made without
-holding the lock at all) is a programming error, but raising in production
-would abort a callback that may be the one holding the battery in a safe mode.
-So the default is to log ONCE at ERROR — repeated logging would itself become
-the spam problem — and continue with the lock held, which is always the
-conservative choice.  `strict=True` turns the same conditions into
-`RuntimeError` and exists for tests only.
+Two different depths, two different verdicts
+--------------------------------------------
+`unlocked()` outside `depth == 1` used to be reported as one condition
+("misuse"), which conflated a real bug with the app's normal control flow:
+
+* **`depth == 0`** — `unlocked()` was called without holding the app lock at
+  all.  That is a programming error (an un-guarded callback, or a call from a
+  thread that never entered the lock): the body runs completely unprotected.
+  Logged ONCE at ERROR — repeated logging would itself become the spam problem
+  — and, under `strict=True`, raised.  Production still degrades rather than
+  raising: aborting the callback could be aborting the one holding the battery
+  in a safe mode.
+* **`depth >= 2`** — the designed nested path (invariant 2).  Keeping the lock
+  is the *correct* outcome, so this is not a misuse at all: it is logged ONCE at
+  DEBUG for traceability and NEVER raises, `strict=True` included.  A strict
+  test double must not explode merely because the app did what it was designed
+  to do.
 """
 
 from __future__ import annotations
@@ -67,8 +81,10 @@ class CallbackLock:
         log_func: Optional ``log(msg, level=...)`` callable.  The signature is
             AppDaemon's ``self.log``, so ``CallbackLock(log_func=self.log)``
             works directly.  ``None`` silences the diagnostics.
-        strict: When True, misuse of :meth:`unlocked` raises ``RuntimeError``
-            instead of logging and degrading.  Tests only — never in production.
+        strict: When True, a ``depth == 0`` :meth:`unlocked` call raises
+            ``RuntimeError`` instead of logging and degrading.  Tests only —
+            never in production.  It deliberately does NOT affect the nested
+            (``depth >= 2``) path, which is designed behaviour.
 
     The app creates exactly one instance, so "log once per instance" is "log
     once per process" in practice.
@@ -79,8 +95,8 @@ class CallbackLock:
         self._local = threading.local()
         self._log_func = log_func
         self._strict = bool(strict)
-        # One-shot diagnostics: separate flags so a nested region and a
-        # not-held region each get to speak once.
+        # One-shot diagnostics: separate flags so the (designed) nested region
+        # and the (buggy) not-held region each get to speak once.
         self._logged_nested = False
         self._logged_not_held = False
         # Guards the two one-shot flags (they are cross-thread, and the whole
@@ -155,6 +171,11 @@ class CallbackLock:
         re-acquired in a ``finally``.  At any other depth the lock is kept (see
         the module docstring, invariant 2): the body still runs, but serialized
         as it is today.
+
+        The two "any other depth" cases are NOT the same thing.  ``depth >= 2``
+        is the designed nested path and only gets a one-shot DEBUG line;
+        ``depth == 0`` means the body ran with no protection at all and is a
+        genuine programming error.
         """
         depth = self.depth
 
@@ -169,31 +190,43 @@ class CallbackLock:
             return
 
         if depth == 0:
-            self._misuse(
-                "CallbackLock.unlocked() called without holding the app lock "
-                "(depth=0) - this is a programming error; running the blocking "
-                "call unprotected"
-            )
+            self._not_held()
         else:
-            self._misuse(
-                "CallbackLock: nested unlocked region - running the blocking "
-                "call under the app lock (depth={})".format(depth)
-            )
+            self._nested(depth)
         yield
 
-    def _misuse(self, message: str) -> None:
+    def _not_held(self) -> None:
+        """`unlocked()` without the lock: a real bug, reported once at ERROR."""
+        message = (
+            "CallbackLock.unlocked() called without holding the app lock "
+            "(depth=0) - this is a programming error; running the blocking "
+            "call unprotected"
+        )
         if self._strict:
             raise RuntimeError(message)
-        # `depth == 0` and `depth >= 2` are distinct bugs; let each log once.
-        nested = "nested" in message
         with self._diag_lock:
-            if nested:
-                if self._logged_nested:
-                    return
-                self._logged_nested = True
-            else:
-                if self._logged_not_held:
-                    return
-                self._logged_not_held = True
+            if self._logged_not_held:
+                return
+            self._logged_not_held = True
         if self._log_func is not None:
             self._log_func(message, level="ERROR")
+
+    def _nested(self, depth: int) -> None:
+        """`unlocked()` inside another guarded frame: designed, reported at DEBUG.
+
+        Never raises — not even under ``strict`` — because keeping the lock IS
+        the specified behaviour here (invariant 2).  `full_optimize`,
+        `_recalculate_remaining_schedule` and `on_manual_mode_change` all reach
+        the inverter write through `execute_scheduled_mode`, so this fires on
+        ordinary days.
+        """
+        with self._diag_lock:
+            if self._logged_nested:
+                return
+            self._logged_nested = True
+        if self._log_func is not None:
+            self._log_func(
+                "CallbackLock: nested unlocked region (depth={}): blocking call "
+                "runs under the app lock by design".format(depth),
+                level="DEBUG",
+            )

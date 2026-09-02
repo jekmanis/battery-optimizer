@@ -398,10 +398,19 @@ class BatteryCostTracker:
         between "not commanded to grid-charge" and "therefore PV":
 
         1. a grid_charge command still in force at the inverter keeps grid
-           attribution regardless of what mode the app has moved on to;
+           attribution — but only while the PV floor is NOT cleared;
         2. PV attribution requires measured PV above
            ``pv_attribution_min_w``. With no PV there is no foregone export
            revenue, so the conservative grid cost applies instead.
+
+        Measured PV outranks the command window, and the ordering matters. The
+        window is a *time* bound on a command that has been superseded, not
+        evidence about the current kWh: a midday CHARGE -> HOLD transition
+        leaves the window open for `cost_grid_charge_grace_seconds`, and with
+        the window checked first, genuine 4 kW PV charging two minutes later was
+        booked at the grid price. Both guards still fail toward the grid cost
+        whenever the sun cannot account for the energy, which is the
+        conservative direction.
 
         When no PV provider is injected the legacy mode-only attribution is
         kept, so an installation without a usable PV sensor is unchanged.
@@ -413,10 +422,15 @@ class BatteryCostTracker:
             # unmetered PV contribution makes this a conservative estimate.
             return self._grid_landed_cost(spot_price), "grid"
 
-        if self._grid_charge_in_force():
+        pv_w = self._measured_pv_w()
+        pv_is_producing = (
+            pv_w is not None and pv_w >= self._config.pv_attribution_min_w
+        )
+
+        if self._grid_charge_in_force() and not pv_is_producing:
             # The inverter is still executing a grid_charge command issued for
-            # an earlier slot; the app's current mode says nothing about where
-            # these kWh came from.
+            # an earlier slot and nothing else could have supplied these kWh;
+            # the app's current mode says nothing about where they came from.
             return self._grid_landed_cost(spot_price), "grid-command"
 
         if self._current_mode in (BatteryMode.HOLD, BatteryMode.DISCHARGE):
@@ -424,12 +438,11 @@ class BatteryCostTracker:
             # the battery.  A measured charge while either non-grid-charging
             # mode is active is therefore valued at foregone export revenue —
             # but only if the sun is actually producing.
-            pv_w = self._measured_pv_w()
             if pv_w is None:
                 # No PV sensor wired in (or momentarily unavailable): keep the
                 # historical attribution rather than inventing a grid charge.
                 return self._pv_opportunity_cost(spot_price), "pv"
-            if pv_w >= self._config.pv_attribution_min_w:
+            if pv_is_producing:
                 return self._pv_opportunity_cost(spot_price), "pv"
             return self._grid_landed_cost(spot_price), "no-pv-grid"
 

@@ -29,6 +29,25 @@ TERMINAL_VALUE_ZERO_NOTICE = (
 VERIFY_SOURCES = ("auto", "registers", "mode_sensor", "none")
 
 
+def _arg(args: dict, key: str, default):
+    """``args.get`` that treats a *present but empty* YAML key as absent.
+
+    YAML maps a bare ``verify_source:`` (or a commented-out value) to ``None``,
+    not to a missing key, so ``args.get("verify_source", "auto")`` returns
+    ``None``. The old call chains then turned that into silence rather than a
+    default: ``str(None).strip().lower()`` is ``"none"``, which is a VALID
+    ``verify_source`` meaning "never verify", and ``bool(None)`` is ``False``,
+    which is the master switch off. A blank line in apps.yaml disabled
+    verification with no warning anywhere.
+
+    Numeric knobs fail loudly instead (``float(None)`` raises), but they are
+    routed through here too so a blank key behaves the same everywhere: it means
+    "use the default".
+    """
+    value = args.get(key, default)
+    return default if value is None else value
+
+
 @dataclass
 class BatteryOptimizerConfig:
     """
@@ -183,19 +202,35 @@ class BatteryOptimizerConfig:
     pv_reactive_consecutive_slots: int = 2  # Consecutive shortfall slots before a full recalc
     pv_reactive_min_samples: int = 3  # Min samples in a slot before its mean is trusted
     pv_sample_seconds: int = 60  # PV power sampling interval (s)
-    inverter_mode_sensor: str = ""  # Integration "Inverter Mode" sensor. Used for
-    # monitoring AND set_wit_mode verify-after-set. The entity id depends on the
-    # config entry name (slugified "<entry> Inverter Mode"): e.g.
-    # sensor.growatt_inverter_mode (entry "Growatt") or
+    inverter_mode_sensor: str = ""  # Integration "Inverter Mode" sensor. The
+    # entity id depends on the config entry name (slugified "<entry> Inverter
+    # Mode"): e.g. sensor.growatt_inverter_mode (entry "Growatt") or
     # sensor.growatt_wit_inverter_mode (entry "Growatt WIT").
     #
-    # EMPTY DISABLES VERIFICATION — there is no fallback entity any more. The
-    # old default guessed sensor.growatt_inverter_mode, which on the reference
-    # installation reports the inverter's base work mode, not the active
-    # override: 73/73 verifications logged a 'Passthrough' mismatch while the
-    # battery followed every command, each one paying for a blocking resend.
-    # Only set this to an entity you have confirmed reflects the ACTIVE
-    # override.
+    # TWO INDEPENDENT CONSUMERS, and only one of them is verification:
+    #
+    #   1. MODE-COMPLIANCE HISTORY. The orchestrator's `_get_inverter_mode`
+    #      reads this entity and passes it to
+    #      `SlotOutcomeTracker.record_slot_end(actual_mode=...)`, which is the
+    #      only record of what the inverter actually did per slot. Leaving this
+    #      empty silently loses that history — `mode_compliance` degrades to
+    #      "unknown" for every slot — even when verification is working
+    #      perfectly through the registers.
+    #   2. VERIFY-AFTER-SET, but ONLY when `verify_source: mode_sensor` is
+    #      selected. `verify_source` decides the verification strategy; this
+    #      entity does not. With `verify_source: registers` (the recommendation,
+    #      and what `auto` picks whenever device_id is set) verification never
+    #      touches this sensor, so setting it costs nothing and buys the
+    #      compliance history.
+    #
+    # Empty disables BOTH: there is no fallback entity any more. The old default
+    # guessed sensor.growatt_inverter_mode and fed it to a mode-sensor
+    # verification that was not opt-in, which on the reference installation
+    # reported the inverter's base work mode rather than the active override:
+    # 73/73 verifications logged a 'Passthrough' mismatch while the battery
+    # followed every command, each one paying for a blocking resend. That was a
+    # defect of the verification default, not of the entity — keep the entity
+    # set for monitoring and leave verification on the registers.
 
     # =========================================================================
     # PV Forecast Service (Solcast / Forecast.Solar)
@@ -525,12 +560,14 @@ class BatteryOptimizerConfig:
             battery_temp_sensor=args.get("battery_temp_sensor", ""),
             battery_charge_sensor=args.get("battery_charge_sensor", "sensor.growatt_battery_charge_today"),
             battery_discharge_sensor=args.get("battery_discharge_sensor", "sensor.growatt_battery_discharge_today"),
-            use_inverter_energy_sensors=args.get("use_inverter_energy_sensors", True),
+            use_inverter_energy_sensors=bool(
+                _arg(args, "use_inverter_energy_sensors", True)
+            ),
             cost_pv_attribution_min_w=float(
-                args.get("cost_pv_attribution_min_w", 100.0)
+                _arg(args, "cost_pv_attribution_min_w", 100.0)
             ),
             cost_grid_charge_grace_seconds=int(
-                args.get("cost_grid_charge_grace_seconds", 120)
+                _arg(args, "cost_grid_charge_grace_seconds", 120)
             ),
             load_power_sensor=args.get("load_power_sensor", ""),
 
@@ -540,12 +577,15 @@ class BatteryOptimizerConfig:
             # Direct Control
             direct_control_buffer_minutes=int(args.get("direct_control_buffer_minutes", 5)),
             default_power_percent=int(args.get("default_power_percent", 100)),
-            verify_delay_seconds=int(args.get("verify_delay_seconds", 90)),
-            verify_recheck_seconds=int(args.get("verify_recheck_seconds", 60)),
-            verify_enabled=bool(args.get("verify_enabled", True)),
-            verify_source=str(args.get("verify_source", "auto")).strip().lower(),
+            verify_delay_seconds=int(_arg(args, "verify_delay_seconds", 90)),
+            verify_recheck_seconds=int(_arg(args, "verify_recheck_seconds", 60)),
+            # A blank `verify_enabled:` must mean "default on", not off, and a
+            # blank `verify_source:` must mean "auto", not the literal "none"
+            # that str(None) produces. See `_arg`.
+            verify_enabled=bool(_arg(args, "verify_enabled", True)),
+            verify_source=str(_arg(args, "verify_source", "auto")).strip().lower(),
             set_wit_mode_timeout_seconds=int(
-                args.get("set_wit_mode_timeout_seconds", 15)
+                _arg(args, "set_wit_mode_timeout_seconds", 15)
             ),
 
             # Battery Parameters
@@ -587,13 +627,15 @@ class BatteryOptimizerConfig:
             pv_forecast_sensor=args.get("pv_forecast_sensor", ""),
             pv_forecast_unit=args.get("pv_forecast_unit", "W"),
             pv_reactive_threshold=float(args.get("pv_reactive_threshold", 0.5)),
-            pv_reactive_min_forecast_w=float(args.get("pv_reactive_min_forecast_w", 600.0)),
+            pv_reactive_min_forecast_w=float(
+                _arg(args, "pv_reactive_min_forecast_w", 600.0)
+            ),
             pv_reactive_consecutive_slots=max(
                 1, int(args.get("pv_reactive_consecutive_slots", 2))
             ),
             pv_reactive_min_samples=max(1, int(args.get("pv_reactive_min_samples", 3))),
             pv_sample_seconds=int(args.get("pv_sample_seconds", 60)),
-            inverter_mode_sensor=args.get("inverter_mode_sensor", ""),
+            inverter_mode_sensor=_arg(args, "inverter_mode_sensor", ""),
 
             # PV Forecast Service
             solcast_today_entity=args.get("solcast_today_entity", ""),
@@ -647,9 +689,9 @@ class BatteryOptimizerConfig:
             soc_deviation_threshold=float(args.get("soc_deviation_threshold", 10)),
             soc_shortfall_recalc_threshold=float(args.get("soc_shortfall_recalc_threshold", 3.0)),
             planned_depletion_margin_percent=float(
-                args.get("planned_depletion_margin_percent", 1.0)
+                _arg(args, "planned_depletion_margin_percent", 1.0)
             ),
-            execute_dedupe_seconds=int(args.get("execute_dedupe_seconds", 60)),
+            execute_dedupe_seconds=int(_arg(args, "execute_dedupe_seconds", 60)),
 
             # Pricing
             grid_fee=float(args.get("grid_fee_eur_kwh", 0.052)),
@@ -680,7 +722,7 @@ class BatteryOptimizerConfig:
 
             # Logging
             decision_log_level=int(args.get("decision_log_level", 1)),
-            callback_warn_seconds=float(args.get("callback_warn_seconds", 10.0)),
+            callback_warn_seconds=float(_arg(args, "callback_warn_seconds", 10.0)),
         )
         config.terminal_zero_notice_emitted = terminal_zero_notice_emitted
         return config

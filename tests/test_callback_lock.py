@@ -30,7 +30,10 @@ class LogRecorder:
             self.entries.append((level, msg))
 
     def errors(self):
-        return [msg for level, msg in self.entries if level == "ERROR"]
+        return self.at_level("ERROR")
+
+    def at_level(self, level):
+        return [msg for lvl, msg in self.entries if lvl == level]
 
 
 def _acquire_from_other_thread(lock, timeout):
@@ -243,7 +246,14 @@ def test_unlocked_at_depth_one_releases_the_lock():
 # ---------------------------------------------------------------------------
 
 
-def test_unlocked_at_depth_two_keeps_the_lock_and_logs_once():
+def test_unlocked_at_depth_two_keeps_the_lock_and_logs_once_at_debug():
+    """Depth >= 2 is the DESIGNED path, not a misuse.
+
+    `full_optimize` / `_recalculate_remaining_schedule` /
+    `on_manual_mode_change` all reach `_apply_mode_tracked` through
+    `execute_scheduled_mode`, so this happens on ordinary days. It must not be
+    reported at ERROR alongside a genuine depth-0 bug.
+    """
     recorder = LogRecorder()
     lock = CallbackLock(log_func=recorder)
 
@@ -256,22 +266,39 @@ def test_unlocked_at_depth_two_keeps_the_lock_and_logs_once():
                 assert _acquire_from_other_thread(lock, 0.1) is False
             assert lock.depth == 2
 
-    errors = recorder.errors()
-    assert len(errors) == 1, errors
-    assert "nested unlocked region" in errors[0]
-    assert "depth=2" in errors[0]
+    assert recorder.errors() == []
+    debugs = recorder.at_level("DEBUG")
+    assert len(debugs) == 1, recorder.entries
+    assert "nested unlocked region" in debugs[0]
+    assert "depth=2" in debugs[0]
+    assert "by design" in debugs[0]
     assert lock.depth == 0
 
 
-def test_unlocked_at_depth_two_raises_under_strict():
+def test_unlocked_at_depth_two_logs_only_once_across_many_regions():
+    recorder = LogRecorder()
+    lock = CallbackLock(log_func=recorder)
+
+    for _ in range(5):
+        with lock:
+            with lock:
+                with lock.unlocked():
+                    pass
+
+    assert len(recorder.at_level("DEBUG")) == 1
+    assert recorder.errors() == []
+
+
+def test_unlocked_at_depth_two_never_raises_even_under_strict():
+    """Strict exists to catch bugs; the nested path is not one."""
     lock = CallbackLock(strict=True)
+    ran = []
     with lock:
         with lock:
-            with pytest.raises(RuntimeError) as exc:
-                with lock.unlocked():
-                    pytest.fail("body must not run under strict")
-            assert "nested unlocked region" in str(exc.value)
+            with lock.unlocked():
+                ran.append(lock.depth)
             assert lock.depth == 2
+    assert ran == [2], "the body must still run under strict"
     assert lock.depth == 0
 
 
@@ -393,24 +420,26 @@ def test_nested_unlocked_logs_only_once_across_repeated_calls():
                 with lock.unlocked():
                     pass
 
-    assert len(recorder.errors()) == 1, recorder.errors()
+    assert len(recorder.at_level("DEBUG")) == 1, recorder.entries
+    assert recorder.errors() == []
 
-    # Deeper nesting is the same class of bug -> still silent afterwards.
+    # Deeper nesting is the same designed path -> still silent afterwards.
     with lock:
         with lock:
             with lock:
                 with lock.unlocked():
                     pass
-    assert len(recorder.errors()) == 1, recorder.errors()
+    assert len(recorder.at_level("DEBUG")) == 1, recorder.entries
 
-    # A different misuse (depth 0) gets its own single message.
+    # The depth-0 bug has its own one-shot budget, on its own level.
     with lock.unlocked():
         pass
     with lock.unlocked():
         pass
     errors = recorder.errors()
-    assert len(errors) == 2, errors
-    assert "depth=0" in errors[1]
+    assert len(errors) == 1, errors
+    assert "depth=0" in errors[0]
+    assert len(recorder.at_level("DEBUG")) == 1
 
     # Fresh instance starts with a fresh budget.
     recorder2 = LogRecorder()
@@ -419,7 +448,7 @@ def test_nested_unlocked_logs_only_once_across_repeated_calls():
         with lock2:
             with lock2.unlocked():
                 pass
-    assert len(recorder2.errors()) == 1
+    assert len(recorder2.at_level("DEBUG")) == 1
 
 
 def test_nested_unlocked_logs_once_under_concurrency():
@@ -442,7 +471,8 @@ def test_nested_unlocked_logs_once_under_concurrency():
         t.join(timeout=JOIN_TIMEOUT)
         assert not t.is_alive()
 
-    assert len(recorder.errors()) == 1, recorder.errors()
+    assert len(recorder.at_level("DEBUG")) == 1, recorder.entries
+    assert recorder.errors() == []
 
 
 def test_no_log_func_is_safe():

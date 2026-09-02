@@ -173,6 +173,30 @@ SET_WIT_MODE_TIMEOUT_SECONDS = 15
 UNCONFIRMED_AD_STATUSES = ("TIMEOUT", "TERMINATING")
 
 
+def _ad_status_of(response) -> Optional[str]:
+    """Upper-cased ``ad_status`` from a service response, top level or nested.
+
+    AppDaemon stamps ``ad_status`` onto the envelope it returns, but WHERE it
+    lands depends on the AD version and on whether the service declared a
+    response: it can sit at the top level or one level down under ``result``.
+    Both service calls in this module must look in both places, and they used
+    to disagree — ``_call_set_wit_mode`` checked the nested copy,
+    ``RegisterVerifier._read_block`` only the top-level one. A nested TIMEOUT
+    therefore fell through the read path into the ordinary payload parsing,
+    where a missing ``values`` key made it indistinguishable from a clean read
+    that simply returned nothing.
+
+    Returns None when there is no ``ad_status`` string anywhere.
+    """
+    if not isinstance(response, dict):
+        return None
+    status = response.get("ad_status")
+    if not isinstance(status, str):
+        inner = response.get("result")
+        status = inner.get("ad_status") if isinstance(inner, dict) else None
+    return status.upper() if isinstance(status, str) else None
+
+
 class ApplyOutcome(enum.Enum):
     """What actually happened to one ``apply_mode`` command.
 
@@ -460,6 +484,10 @@ class RegisterVerifier:
         self.app = app
         self.device_id = device_id
         self.timeout = int(timeout)
+        # Why the last read failed, so an UNVERIFIABLE verdict can SAY whether
+        # the read timed out, was refused, or came back malformed. Every caller
+        # runs under DirectControl's _io_lock, so a plain attribute is enough.
+        self._last_read_error: Optional[str] = None
 
     @property
     def source(self) -> str:
@@ -493,6 +521,7 @@ class RegisterVerifier:
                 hass_timeout=self.timeout,
             )
         except Exception as e:
+            self._last_read_error = f"{type(e).__name__}: {e}"
             self.app.log(
                 f"DirectControl: register read {start_address}+{count} "
                 f"failed: {e}",
@@ -501,26 +530,36 @@ class RegisterVerifier:
             return None
 
         if result is None:
+            self._last_read_error = "no response from the AppDaemon HASS plugin"
             return None
 
-        if isinstance(result, dict):
-            ad_status = result.get("ad_status")
-            if (isinstance(ad_status, str)
-                    and ad_status.upper() in UNCONFIRMED_AD_STATUSES):
-                return None
+        # Same envelope handling as _call_set_wit_mode: ad_status can sit at the
+        # top level or nested under "result", and either way it means "we
+        # stopped waiting", not "the read came back empty".
+        ad_status = _ad_status_of(result)
+        if ad_status in UNCONFIRMED_AD_STATUSES:
+            self._last_read_error = (
+                f"AppDaemon ad_status={ad_status} after {self.timeout}s "
+                f"(read timeout, not a mismatch)"
+            )
+            return None
 
         payload = self._service_payload(result)
         if payload is None:
+            self._last_read_error = "no {'values': [...]} payload in the response"
             return None
         if payload.get("success") is False:
+            self._last_read_error = str(payload.get("error") or "success=False")
             return None
 
         values = payload.get("values")
         if not isinstance(values, (list, tuple)) or len(values) < count:
+            self._last_read_error = f"short or missing values list: {values!r}"
             return None
         try:
             return [int(v) for v in values[:count]]
         except (TypeError, ValueError):
+            self._last_read_error = f"non-integer register values: {values!r}"
             return None
 
     @staticmethod
@@ -540,6 +579,13 @@ class RegisterVerifier:
             if found is not None:
                 return found
         return None
+
+    def _read_failure_detail(self, start_address: int, count: int) -> str:
+        """Name the block AND why it could not be read."""
+        detail = f"could not read holding {start_address}+{count}"
+        if self._last_read_error:
+            detail = f"{detail}: {self._last_read_error}"
+        return detail
 
     # -- verdict ------------------------------------------------------------
 
@@ -564,8 +610,7 @@ class RegisterVerifier:
             return VerificationOutcome(
                 result=VerificationResult.UNVERIFIABLE,
                 source=self.source,
-                detail=(f"could not read holding {REG_BLOCK_CONTROL[0]}"
-                        f"+{REG_BLOCK_CONTROL[1]}"),
+                detail=self._read_failure_detail(*REG_BLOCK_CONTROL),
             )
 
         export = self._read_block(*REG_BLOCK_EXPORT)
@@ -573,8 +618,7 @@ class RegisterVerifier:
             return VerificationOutcome(
                 result=VerificationResult.UNVERIFIABLE,
                 source=self.source,
-                detail=(f"could not read holding {REG_BLOCK_EXPORT[0]}"
-                        f"+{REG_BLOCK_EXPORT[1]}"),
+                detail=self._read_failure_detail(*REG_BLOCK_EXPORT),
             )
 
         observed_regs = {
@@ -1175,9 +1219,8 @@ class DirectControl:
             inner = result.get("result")
             inner = inner if isinstance(inner, dict) else {}
 
-            ad_status = result.get("ad_status", inner.get("ad_status"))
-            if (isinstance(ad_status, str)
-                    and ad_status.upper() in UNCONFIRMED_AD_STATUSES):
+            ad_status = _ad_status_of(result)
+            if ad_status in UNCONFIRMED_AD_STATUSES:
                 self._last_service_error = (
                     f"AppDaemon ad_status={ad_status} after "
                     f"{self._set_mode_timeout}s"

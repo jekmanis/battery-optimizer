@@ -163,15 +163,50 @@ class TestGridChargeStillInForce:
         assert source == "grid-command"
         assert cost == pytest.approx(_grid_cost())
 
-    def test_the_window_beats_a_sunny_pv_reading(self):
-        """A commanded grid charge is evidence; simultaneous PV is not."""
-        tracker, _ = _make_tracker(pv_w=3000.0, grid_charge_active=True)
-        tracker._current_mode = BatteryMode.DISCHARGE
+    def test_measured_pv_beats_the_window(self):
+        """The window is a TIME bound on a superseded command, not evidence.
+
+        Two minutes after a midday CHARGE -> HOLD transition the window is
+        still open, but 4 kW of measured PV is what is actually charging the
+        battery. Booking that at the grid price overstated the basis exactly as
+        badly as the pre-dawn case understated it.
+        """
+        tracker, _ = _make_tracker(pv_w=4000.0, grid_charge_active=True)
+        tracker._current_mode = BatteryMode.HOLD
+
+        cost, source = tracker._observed_charge_cost(SPOT)
+
+        assert source == "pv"
+        assert cost == pytest.approx(_pv_cost())
+
+    def test_the_window_holds_when_the_sun_is_down(self):
+        """Same window, PV 0 W: nothing but the grid can explain the energy."""
+        tracker, _ = _make_tracker(pv_w=0.0, grid_charge_active=True)
+        tracker._current_mode = BatteryMode.HOLD
 
         cost, source = tracker._observed_charge_cost(SPOT)
 
         assert source == "grid-command"
         assert cost == pytest.approx(_grid_cost())
+
+    def test_the_window_holds_below_the_pv_floor(self):
+        tracker, _ = _make_tracker(
+            pv_w=99.0, grid_charge_active=True, pv_attribution_min_w=100.0
+        )
+        tracker._current_mode = BatteryMode.DISCHARGE
+
+        _cost, source = tracker._observed_charge_cost(SPOT)
+
+        assert source == "grid-command"
+
+    def test_the_window_holds_when_no_pv_reading_exists(self):
+        """No PV provider injected: the window is the only evidence left."""
+        tracker, _ = _make_tracker(grid_charge_active=True)
+        tracker._current_mode = BatteryMode.DISCHARGE
+
+        _cost, source = tracker._observed_charge_cost(SPOT)
+
+        assert source == "grid-command"
 
     def test_once_the_window_expires_pv_attribution_resumes(self):
         tracker, state = _make_tracker(pv_w=3000.0, grid_charge_active=True)

@@ -48,12 +48,23 @@ MAX_THERMAL_SAMPLES = 300
 # cluster.
 DEFAULT_MAX_RATE_FACTOR = 2.0
 
-# Shortest interval that can carry a meaningful rate. The inverter energy
-# counters have 0.1 kWh granularity and the SOC sensor 1% (0.143 kWh), so a
-# sub-minute interval turns one counter tick into a five-digit kW "observation".
-# Production 2026-09-02: two callbacks 10-40 ms apart produced 34535 kW and
-# 44653 kW samples that poisoned the 0-25%/>20C bucket (median 14308.71 kW).
-MIN_OBSERVATION_MINUTES = 1.0
+# Quantization step of the energy source an observation is measured from. The
+# inverter energy counters move in 0.1 kWh; the SOC sensor's 1% is coarser
+# (0.143 kWh) but its samples are gated the same way.
+DEFAULT_COUNTER_RESOLUTION_KWH = 0.1
+
+# Absolute wall-time floor for an observation, used ONLY when the measured
+# energy is too small to resolve a rate on its own (see
+# ``_observation_is_resolvable``). 0.25 min = 15 s.
+#
+# It was 1.0 min, and that was wrong in a way the 2x rate bound was explicitly
+# tuned against: ``cost_tracker`` re-stamps ``_last_sig_soc_time`` after EVERY
+# accepted event, so a genuine interval is however long it takes the counter to
+# advance one 0.1 kWh tick — 0.1/P hours, i.e. under a minute for any P above
+# 6 kW. A 1-minute floor therefore rejected exactly the 6.77-6.82 kW warm-pack
+# cluster the bound exists to keep, while a 0.1 kWh / 44 ms sample (~9000 kW) is
+# caught by ``is_plausible_rate`` regardless of any wall-time rule.
+MIN_OBSERVATION_MINUTES = 0.25
 
 # Absolute ceiling for the self-heating coefficient k2 (C per kWh through the
 # pack). Measured on the reference pack: 21.9C -> 25.8C while storing 1.716 kWh
@@ -123,14 +134,18 @@ class BatteryLearningEngine:
         default_cooling_rate_per_min: float = DEFAULT_COOLING_RATE_PER_MIN,
         default_heating_c_per_kwh: float = DEFAULT_HEATING_C_PER_KWH,
         nominal_discharge_rate_kw: Optional[float] = None,
+        nominal_export_rate_kw: Optional[float] = None,
         max_rate_factor: float = DEFAULT_MAX_RATE_FACTOR,
         min_observation_minutes: float = MIN_OBSERVATION_MINUTES,
+        counter_resolution_kwh: float = DEFAULT_COUNTER_RESOLUTION_KWH,
     ):
         self.default_cooling_rate_per_min = default_cooling_rate_per_min
         self.default_heating_c_per_kwh = default_heating_c_per_kwh
         self.nominal_discharge_rate = nominal_discharge_rate_kw
+        self.nominal_export_rate = nominal_export_rate_kw
         self.max_rate_factor = max(1.0, float(max_rate_factor))
         self.min_observation_minutes = max(0.0, float(min_observation_minutes))
+        self.counter_resolution_kwh = max(0.0, float(counter_resolution_kwh))
         self._rejected_observations = 0
         self._thermal_samples_since_calibration = 0
         self.battery_capacity = battery_capacity_kwh
@@ -176,10 +191,18 @@ class BatteryLearningEngine:
         bigger battery does not need a different constant. Consumers must NOT
         re-derive their own bound — they call
         :meth:`get_charge_rate_for_soc`, which applies this one.
+
+        All THREE configured powers feed the maximum. The export discharge rate
+        (``config.effective_export_discharge_rate``) is the one the inverter
+        actually runs during a ``discharge_to_grid`` / ``max_export`` slot, and
+        it is routinely the largest of the three: judging those genuine samples
+        against the (smaller) load-discharge rate would reject the very slots
+        the DP plans the export around.
         """
         nominal = max(
             float(self.nominal_charge_rate or 0.0),
             float(self.nominal_discharge_rate or 0.0),
+            float(self.nominal_export_rate or 0.0),
         )
         if nominal <= 0:
             nominal = 4.5
@@ -194,6 +217,47 @@ class BatteryLearningEngine:
         except (TypeError, ValueError):
             return False
         return math.isfinite(rate) and 0.0 < rate <= self.max_plausible_rate_kw
+
+    def observation_is_resolvable(
+        self, energy_kwh: float, duration_minutes: float
+    ) -> Optional[str]:
+        """Can this (energy, duration) pair carry a rate at all?
+
+        Returns ``None`` when the sample is resolvable, otherwise the reason it
+        is not (ready for :meth:`_reject_observation`).
+
+        The question is quantization, not wall time. A sample resolves a rate
+        when EITHER
+
+        * the measured energy spans at least two counter ticks
+          (``2 * counter_resolution_kwh``), so the quotient is dominated by real
+          energy rather than by one tick of granularity — no matter how short
+          the interval; OR
+        * the interval is at least ``min_observation_minutes``, the absolute
+          floor below which even a multi-tick delta is not worth trusting.
+
+        A pure wall-time floor was wrong here: ``cost_tracker`` re-stamps the
+        interval start after every accepted event, so at 6.8 kW the counter
+        ticks 0.1 kWh every 53 s and a 1-minute floor rejected the real
+        warm-pack cluster. The five-digit production samples (0.1 kWh over
+        10-40 ms) fail BOTH conditions, and even if a bigger delta passed this
+        gate, ``is_plausible_rate`` still stands behind it.
+        """
+        try:
+            energy = float(energy_kwh)
+            duration = float(duration_minutes)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return "non-numeric energy/duration"
+        if duration >= self.min_observation_minutes:
+            return None
+        min_energy = 2.0 * self.counter_resolution_kwh
+        if min_energy > 0 and energy >= min_energy:
+            return None
+        return (
+            f"duration {duration:.4f} min < {self.min_observation_minutes:.2f} min "
+            f"and energy {energy:.3f} kWh < {min_energy:.3f} kWh "
+            f"(2x counter resolution)"
+        )
 
     def clamp_learned_rate(self, rate_kw: Optional[float]) -> Optional[float]:
         """Clamp a learned rate to the plausibility bound (None stays None)."""
@@ -303,19 +367,6 @@ class BatteryLearningEngine:
         if duration_minutes <= 0 or soc_end <= soc_start:
             return
 
-        # A sub-minute interval cannot carry a rate: the energy counters move in
-        # 0.1 kWh steps and the SOC sensor in 1% steps, so the quotient is pure
-        # quantization noise. Rejecting it here is the FIRST of the two lines of
-        # defence; ``get_charge_rate_for_soc`` is the second (it also protects
-        # against a file poisoned before this guard existed).
-        if duration_minutes < self.min_observation_minutes:
-            self._reject_observation(
-                "charge",
-                f"duration {duration_minutes:.4f} min < {self.min_observation_minutes:.2f} min",
-                f"{soc_start:.1f}%->{soc_end:.1f}%",
-            )
-            return
-
         # Use measured energy if available, otherwise calculate from SOC
         if energy_to_battery_kwh is not None and energy_to_battery_kwh > 0:
             energy_added = energy_to_battery_kwh
@@ -323,6 +374,20 @@ class BatteryLearningEngine:
         else:
             energy_added = (soc_end - soc_start) / 100 * self.battery_capacity
             energy_source = "soc"
+
+        # A sample that resolves neither in energy nor in time cannot carry a
+        # rate: the quotient is pure quantization noise. Rejecting it here is
+        # the FIRST of the two lines of defence; ``get_charge_rate_for_soc`` is
+        # the second (it also protects against a file poisoned before this
+        # guard existed).
+        unresolvable = self.observation_is_resolvable(energy_added, duration_minutes)
+        if unresolvable is not None:
+            self._reject_observation(
+                "charge",
+                unresolvable,
+                f"{soc_start:.1f}%->{soc_end:.1f}% [{energy_source}]",
+            )
+            return
 
         # Calculate observed charge rate
         charge_rate = energy_added / (duration_minutes / 60)
@@ -436,24 +501,27 @@ class BatteryLearningEngine:
         if duration_minutes <= 0 or soc_start <= soc_end:
             return
 
-        # Same two guards as record_charging: the discharge path shares the
-        # duration source (``cost_tracker._last_sig_soc_time``) and feeds the
-        # SAME pooled thermal regression, so a corrupted |P_bat| here poisons
-        # k1/k2 exactly as a corrupted charge sample would.
-        if duration_minutes < self.min_observation_minutes:
-            self._reject_observation(
-                "discharge",
-                f"duration {duration_minutes:.4f} min < {self.min_observation_minutes:.2f} min",
-                f"{soc_start:.1f}%->{soc_end:.1f}%",
-            )
-            return
-
         # Use measured energy if available, otherwise calculate from SOC
         if energy_delivered_kwh is not None and energy_delivered_kwh > 0:
             energy_source = "inverter"
         else:
             energy_delivered_kwh = (soc_start - soc_end) / 100 * self.battery_capacity
             energy_source = "soc"
+
+        # Same two guards as record_charging: the discharge path shares the
+        # duration source (``cost_tracker._last_sig_soc_time``) and feeds the
+        # SAME pooled thermal regression, so a corrupted |P_bat| here poisons
+        # k1/k2 exactly as a corrupted charge sample would.
+        unresolvable = self.observation_is_resolvable(
+            energy_delivered_kwh, duration_minutes
+        )
+        if unresolvable is not None:
+            self._reject_observation(
+                "discharge",
+                unresolvable,
+                f"{soc_start:.1f}%->{soc_end:.1f}% [{energy_source}]",
+            )
+            return
 
         # Calculate observed discharge rate
         discharge_rate = energy_delivered_kwh / (duration_minutes / 60)

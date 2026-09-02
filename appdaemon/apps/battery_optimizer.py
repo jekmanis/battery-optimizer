@@ -83,7 +83,7 @@ from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
 # published on sensor.battery_optimizer, so a deploy can be PROVEN to be
 # running: on 2026-09-02 the add-on silently imported the previous commit out
 # of a backup directory inside apps/ while SHA256 verification of apps/ passed.
-APP_VERSION = "2026-09-02"
+APP_VERSION = "2026-09-02b"
 
 
 def _code_paths() -> Tuple[str, str]:
@@ -246,6 +246,11 @@ class BatteryOptimizer(hass.Hass):
                 # without it a 5.9 kW discharge installation was judged against the
                 # 4.5 kW charge rate.
                 nominal_discharge_rate_kw=self.config.discharge_rate,
+                # Export slots run at the export discharge rate, which is
+                # normally the LARGEST of the three configured powers; without
+                # it a genuine max_export sample is judged against the smaller
+                # load-discharge rate and thrown away.
+                nominal_export_rate_kw=self.config.effective_export_discharge_rate,
                 nominal_efficiency=self.config.efficiency,
                 min_soc=self.config.default_min_soc,
                 max_soc=self.config.default_max_soc,
@@ -460,17 +465,29 @@ class BatteryOptimizer(hass.Hass):
                 self.listen_state(self._on_energy_sensor_change, self.config.battery_discharge_sensor)
                 self.log(f"Listening to energy sensors: {self.config.battery_charge_sensor}, {self.config.battery_discharge_sensor}")
 
-            # Run initial SOC check on startup (listener only fires on changes)
+            # Initialize SOC tracking state on startup (the listener only fires
+            # on changes).
             startup_soc = self._get_current_soc()
-            if startup_soc is not None:
-                self._check_soc_boundaries(startup_soc)
-                # Initialize tracking state if not already set
-                if self._last_soc is None:
-                    self._process_soc_change_event(startup_soc)
+            if startup_soc is not None and self._last_soc is None:
+                self._process_soc_change_event(startup_soc)
 
             # Create sensor for exposing schedule
             self._update_schedule_sensor()
             self._update_control_health_sensor()
+
+            # Initial safety boundary check LAST, after every sensor is
+            # published. It is the only statement in `initialize` that can reach
+            # `_apply_mode_tracked` -> `CallbackLock.unlocked()`, and
+            # `initialize` runs at depth 1 — so that call WOULD genuinely drop
+            # the app lock mid-initialize, with the listeners and timers
+            # registered above already live. Today the path is unreachable
+            # (`current_mode` is HOLD at startup; both boundary branches require
+            # CHARGE or DISCHARGE), but "unreachable" should not be the only
+            # thing keeping it safe. Running it here means a released lock
+            # exposes a fully built app. Keep listener/timer registration above
+            # this call, and keep this call last.
+            if startup_soc is not None:
+                self._check_soc_boundaries(startup_soc)
 
             self.log("Battery Optimizer initialized successfully")
 
@@ -526,27 +543,66 @@ class BatteryOptimizer(hass.Hass):
         now, until_cmp = normalize_tz_pair(self.datetime(), until)
         return now < until_cmp
 
-    def _note_applied_mode(self, entry: ScheduleEntry) -> None:
-        """Track how long the command just sent stays in force at the inverter."""
-        now = self.datetime()
+    def _shrink_grid_charge_window(self) -> None:
+        """Clip an open grid-charge window to a short grace period from now.
+
+        Used whenever the grid charge stops being what the inverter executes:
+        another mode superseded it, or `release_control()` handed the inverter
+        back. The energy counters lag the command, so the window is trimmed to
+        `cost_grid_charge_grace_seconds` rather than closed outright — and never
+        extended past where the original command was going to end anyway.
+        """
         # getattr: _apply_mode_tracked is exercised by test doubles that build
         # only the health counters, and cost attribution must never be the
         # reason an inverter command is not sent.
         active_until = getattr(self, "_grid_charge_active_until", None)
+        if active_until is None:
+            return
+        grace = self.datetime() + datetime.timedelta(
+            seconds=self.config.cost_grid_charge_grace_seconds
+        )
+        grace, current = normalize_tz_pair(grace, active_until)
+        self._grid_charge_active_until = min(grace, current)
+
+    def _note_applied_mode(
+        self, entry: ScheduleEntry, outcome: ApplyOutcome
+    ) -> None:
+        """Track how long the command just sent stays in force at the inverter.
+
+        The OUTCOME decides, not the entry. A window is a claim about what the
+        inverter is executing right now, so only a command that actually went
+        out on the wire may open or extend one:
+
+        * ``SENT`` / ``UNCONFIRMED_TIMEOUT`` — transmitted (the timeout is
+          client-side; the request was already on the wire), so a CHARGE stamps
+          a fresh `slot_minutes + direct_control_buffer_minutes` window.
+        * ``SKIPPED_DUPLICATE`` — nothing was transmitted. The *original* send
+          opened the window and its expiry is the true one; re-stamping here
+          would slide the window forward every slot the same CHARGE repeats and
+          keep attributing PV charging to the grid long after the command ended.
+        * ``DRY_RUN`` — `device_id: ""`, no inverter at all. Opening a window
+          would make the cost tracker book PV as grid on an installation that
+          never sent a command.
+
+        Superseding is judged the other way round: once the app has moved to a
+        non-CHARGE mode the grid charge is over regardless of how that command
+        fared, so the window is trimmed for every outcome that reaches here.
+        """
         if entry.mode == BatteryMode.CHARGE:
+            if outcome not in (
+                ApplyOutcome.SENT,
+                ApplyOutcome.UNCONFIRMED_TIMEOUT,
+            ):
+                return
             duration = (
                 self.config.slot_minutes + self.config.direct_control_buffer_minutes
             )
-            self._grid_charge_active_until = now + datetime.timedelta(minutes=duration)
-        elif active_until is not None:
-            # A different mode supersedes the grid charge at the inverter, but
-            # the energy counters lag the command — keep grid attribution for a
-            # short grace period, never longer than the original window.
-            grace = now + datetime.timedelta(
-                seconds=self.config.cost_grid_charge_grace_seconds
+            self._grid_charge_active_until = self.datetime() + datetime.timedelta(
+                minutes=duration
             )
-            grace, current = normalize_tz_pair(grace, active_until)
-            self._grid_charge_active_until = min(grace, current)
+            return
+
+        self._shrink_grid_charge_window()
 
     def _record_callback_duration(self, name: str, seconds: float) -> None:
         """Warn about a callback that blocked the AppDaemon worker thread."""
@@ -1802,10 +1858,10 @@ class BatteryOptimizer(hass.Hass):
             outcome = self._direct_control.apply_mode_with_outcome(entry)
 
         if outcome is not ApplyOutcome.FAILED:
-            # Anything the inverter may be acting on (including an unconfirmed
-            # timeout and a suppressed duplicate, which means the SAME command
-            # is still running) moves the grid-charge window.
-            self._note_applied_mode(entry)
+            # The outcome, not the entry, decides what happens to the
+            # grid-charge window: a duplicate must not re-extend it and a dry
+            # run must not open one. See _note_applied_mode.
+            self._note_applied_mode(entry, outcome)
 
         if outcome is ApplyOutcome.FAILED:
             self._apply_failure_count += 1
@@ -2221,6 +2277,11 @@ class BatteryOptimizer(hass.Hass):
             # as `_apply_mode_tracked` - drop the app lock around it only.
             with self._lock.unlocked():
                 self._direct_control.release_control()
+            # Handing the inverter back to passthrough ends any grid charge just
+            # as a superseding mode does. Without this the window kept running
+            # to its full slot+buffer expiry with the optimizer disabled, so a
+            # sunny disabled-app charge was booked at the grid price.
+            self._shrink_grid_charge_window()
         elif new == "on" and old == "off":
             self.log("Optimizer re-enabled — resuming scheduled operation")
             self.execute_scheduled_mode(None)

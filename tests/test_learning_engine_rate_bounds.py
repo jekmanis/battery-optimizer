@@ -76,7 +76,8 @@ class TestPlausibilityBound:
 class TestRecordChargingGuards:
     def test_sub_minute_duration_is_rejected(self):
         engine = _engine()
-        # 0.1 kWh over 40 ms — the exact production shape.
+        # 0.1 kWh over 40 ms — the exact production shape. One counter tick, so
+        # the energy does not resolve a rate either.
         engine.record_charging(
             soc_start=10.0,
             soc_end=11.0,
@@ -91,7 +92,7 @@ class TestRecordChargingGuards:
         engine = _engine(min_observation_minutes=5.0)
         engine.record_charging(soc_start=50.0, soc_end=51.0, duration_minutes=3.0)
         assert engine.stats.charge_rates_by_soc == {}
-        assert MIN_OBSERVATION_MINUTES == 1.0
+        assert MIN_OBSERVATION_MINUTES == 0.25
 
     def test_implausible_rate_is_rejected_even_with_a_long_duration(self):
         engine = _engine()
@@ -164,6 +165,130 @@ class TestRecordDischargingGuards:
             soc_start=50.0, soc_end=40.0, duration_minutes=15.0,
         )
         assert engine.stats.total_energy_discharged_kwh == pytest.approx(1.43)
+
+
+class TestQuantizationAwareFloor:
+    """The floor is about counter granularity, not about wall time.
+
+    ``cost_tracker`` re-stamps ``_last_sig_soc_time`` after every accepted
+    event, so a genuine interval lasts only as long as the counter needs to
+    advance one 0.1 kWh tick: 53 s at 6.8 kW. The old flat 1-minute floor
+    therefore rejected precisely the 6.77-6.82 kW warm-pack cluster the 2x rate
+    bound was tuned to keep.
+    """
+
+    def test_a_53_second_warm_pack_tick_is_accepted(self):
+        engine = _engine()          # nominal 4.5 kW -> bound 9.0 kW
+        # 0.1 kWh in 53 s = 6.79 kW, the real warm-battery rate.
+        engine.record_charging(
+            soc_start=30.0,
+            soc_end=31.0,
+            duration_minutes=53.0 / 60.0,
+            energy_to_battery_kwh=0.1,
+        )
+        assert engine.stats.charge_rates_by_soc["25-50"] == pytest.approx(
+            [6.792], rel=1e-3
+        )
+        assert engine._rejected_observations == 0
+
+    def test_the_millisecond_production_sample_is_still_rejected(self):
+        engine = _engine()
+        # 0.1 kWh over 0.04 min = 150 kW. One counter tick, so it fails the
+        # quantization gate; the rate bound stands behind it either way.
+        engine.record_charging(
+            soc_start=10.0,
+            soc_end=11.0,
+            duration_minutes=0.04,
+            energy_to_battery_kwh=0.1,
+        )
+        assert engine.stats.charge_rates_by_soc == {}
+        assert engine._rejected_observations == 1
+
+    def test_a_multi_tick_delta_over_milliseconds_dies_on_the_rate_bound(self):
+        """Passing the quantization gate is not passing verification."""
+        messages = []
+        engine = _engine(log_func=lambda msg, *a, **k: messages.append(msg))
+        # 0.2 kWh = 2 counter ticks, so the quantization gate lets it through;
+        # 0.2 kWh / 0.04 min = 300 kW must still be rejected.
+        engine.record_charging(
+            soc_start=10.0,
+            soc_end=12.0,
+            duration_minutes=0.04,
+            energy_to_battery_kwh=0.2,
+        )
+        assert engine.stats.charge_rates_by_soc == {}
+        assert engine._rejected_observations == 1
+        assert any("rate 300.00 kW" in m for m in messages)
+
+    def test_the_same_rule_applies_to_discharge(self):
+        engine = _engine(nominal_discharge_rate_kw=5.9)
+        engine.record_discharging(
+            soc_start=50.0,
+            soc_end=49.0,
+            duration_minutes=53.0 / 60.0,
+            energy_delivered_kwh=0.1,
+        )
+        assert engine.stats.total_energy_discharged_kwh == pytest.approx(0.1)
+        assert engine._rejected_observations == 0
+
+    def test_counter_resolution_is_configurable(self):
+        # A 1 kWh-granular counter needs a 2 kWh delta to resolve a rate.
+        engine = _engine(counter_resolution_kwh=1.0)
+        engine.record_charging(
+            soc_start=30.0,
+            soc_end=31.0,
+            duration_minutes=0.1,
+            energy_to_battery_kwh=0.5,
+        )
+        assert engine.stats.charge_rates_by_soc == {}
+        assert engine._rejected_observations == 1
+
+    def test_resolvability_helper_states_its_verdict(self):
+        engine = _engine()
+        assert engine.observation_is_resolvable(0.1, 1.0) is None
+        assert engine.observation_is_resolvable(0.2, 0.01) is None
+        reason = engine.observation_is_resolvable(0.1, 0.01)
+        assert reason is not None
+        assert "counter resolution" in reason
+
+
+class TestExportRateIsPartOfTheBound:
+    """Export slots run at the export discharge rate, often the largest power."""
+
+    def test_export_rate_raises_the_bound(self):
+        engine = _engine(nominal_discharge_rate_kw=5.0, nominal_export_rate_kw=8.0)
+        assert engine.max_plausible_rate_kw == pytest.approx(16.0)
+
+    def test_a_genuine_export_slot_sample_survives(self):
+        # 2.0 kWh out in 15 min = 8.0 kW: a max_export slot. Against the 5.0 kW
+        # load-discharge rate alone (bound 10.0 kW) it would still fit, but at
+        # the 1.5x warm-pack margin above it (12 kW) it would not.
+        engine = _engine(nominal_discharge_rate_kw=5.0, nominal_export_rate_kw=8.0)
+        engine.record_discharging(
+            soc_start=50.0, soc_end=36.0, duration_minutes=15.0,
+            energy_delivered_kwh=3.0,   # 12 kW
+        )
+        assert engine.stats.total_energy_discharged_kwh == pytest.approx(3.0)
+
+    def test_without_the_export_rate_the_same_sample_is_rejected(self):
+        engine = _engine(nominal_discharge_rate_kw=5.0)
+        engine.record_discharging(
+            soc_start=50.0, soc_end=36.0, duration_minutes=15.0,
+            energy_delivered_kwh=3.0,   # 12 kW > 2 x 5.0
+        )
+        assert engine.stats.total_energy_discharged_kwh == 0
+
+    def test_the_orchestrator_passes_the_effective_export_rate(self):
+        """`effective_export_discharge_rate` is the property, not the raw field."""
+        import inspect
+
+        import battery_optimizer as bo
+
+        source = inspect.getsource(bo.BatteryOptimizer.initialize)
+        assert (
+            "nominal_export_rate_kw=self.config.effective_export_discharge_rate"
+            in source
+        )
 
 
 class TestPoisonedPersistedFile:

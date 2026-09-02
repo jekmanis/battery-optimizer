@@ -1580,6 +1580,47 @@ def test_register_passthrough_mismatch_is_real_evidence():
     assert dc.get_diagnostics()["mismatch_count"] == 1
 
 
+def test_register_read_nested_ad_status_timeout_is_unverifiable():
+    """The envelope carries ad_status one level down, under "result".
+
+    `_call_set_wit_mode` already handled that shape; `_read_block` looked only
+    at the top level, so a nested TIMEOUT fell through into ordinary payload
+    parsing and became indistinguishable from a clean read that happened to
+    return nothing. Both now go through `_ad_status_of`.
+    """
+    dc, app = make_register_dc()
+    app.read_response = {"result": {"success": False, "ad_status": "TIMEOUT"}}
+
+    dc.apply_mode(hold_entry())
+    sends = len(app.service_calls)
+    app.fire_last_timer()
+
+    _assert_unverifiable_and_silent(dc, app, sends)
+
+
+def test_nested_ad_status_timeout_detail_names_the_timeout():
+    app = FakeRegisterApp()
+    app.read_response = {"result": {"success": False, "ad_status": "TIMEOUT"}}
+    verifier = RegisterVerifier(app, "dev123", timeout=15)
+
+    out = verifier("hold", {"mode": "hold"})
+
+    assert out.result is VerificationResult.UNVERIFIABLE
+    assert "TIMEOUT" in out.detail
+    assert "30407" in out.detail
+
+
+def test_ad_status_of_finds_it_at_either_depth():
+    from battery_optimizer_lib.direct_control import _ad_status_of
+
+    assert _ad_status_of({"ad_status": "timeout"}) == "TIMEOUT"
+    assert _ad_status_of({"result": {"ad_status": "TERMINATING"}}) == "TERMINATING"
+    assert _ad_status_of({"ad_status": "OK", "result": {"ad_status": "TIMEOUT"}}) == "OK"
+    assert _ad_status_of({"result": {"success": True}}) is None
+    assert _ad_status_of(None) is None
+    assert _ad_status_of("nope") is None
+
+
 def test_register_verifier_without_device_id_is_unverifiable():
     app = FakeRegisterApp()
     verifier = RegisterVerifier(app, "")

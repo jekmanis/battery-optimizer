@@ -15,6 +15,15 @@ from battery_optimizer_lib.config import (
 )
 
 
+def _example_args() -> dict:
+    """The single app block out of appdaemon/apps/apps.yaml.example."""
+    import yaml
+
+    with open("appdaemon/apps/apps.yaml.example", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    return data[list(data.keys())[0]]
+
+
 class TestPvRampGate:
     """Two dawn slots forecast at 292 W must not be able to set the bias.
 
@@ -253,16 +262,129 @@ class TestVerifySource:
         assert "via registers" in timing
 
     def test_the_example_yaml_selects_registers(self):
-        import yaml
-
-        data = yaml.safe_load(
-            open("appdaemon/apps/apps.yaml.example", encoding="utf-8")
-        )
-        args = data[list(data.keys())[0]]
-        cfg = BatteryOptimizerConfig.from_args(args)
+        cfg = BatteryOptimizerConfig.from_args(_example_args())
 
         assert cfg.verify_source == "registers"
         assert cfg.verify_enabled is True
+
+    def test_the_example_yaml_still_sets_the_mode_sensor(self):
+        """It is also the SlotOutcomeTracker's mode-compliance source.
+
+        `_get_inverter_mode` feeds `record_slot_end(actual_mode=...)`, so an
+        empty entity loses mode-compliance history for every slot even when
+        verification is happily reading the registers. Verification is selected
+        by `verify_source`, never by this entity.
+        """
+        cfg = BatteryOptimizerConfig.from_args(_example_args())
+
+        assert cfg.inverter_mode_sensor == "sensor.growatt_inverter_mode"
+        assert cfg.verify_source == "registers"
+
+
+class TestSmokeConfigKeyScannerSeesBothSpellings:
+    """`scripts/smoke_config.py` reports unknown apps.yaml keys as typos.
+
+    It scrapes the key literals out of config.py, so it has to know about
+    `_arg(args, "key", ...)` as well as `args.get("key", ...)`. When it did
+    not, every knob converted to the null-safe form was reported as a stale
+    key against a perfectly valid apps.yaml.
+    """
+
+    @staticmethod
+    def _known_keys():
+        import importlib.util
+        import pathlib
+
+        path = pathlib.Path("scripts/smoke_config.py").resolve()
+        spec = importlib.util.spec_from_file_location("_smoke_config", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.known_config_keys() | set(module.APPDAEMON_KEYS)
+
+    def test_arg_style_keys_are_recognised(self):
+        known = self._known_keys()
+
+        for key in ("verify_source", "verify_enabled", "inverter_mode_sensor",
+                    "callback_warn_seconds", "execute_dedupe_seconds"):
+            assert key in known, key
+
+    def test_the_example_yaml_has_no_unknown_keys(self):
+        known = self._known_keys()
+        unknown = {
+            k for k in _example_args()
+            if k not in known and k not in ("module", "class")
+        }
+
+        assert unknown == set(), unknown
+
+
+class TestBlankYamlKeysMeanDefault:
+    """A bare `key:` in YAML parses to None, not to a missing key.
+
+    Before `_arg`, `str(None).strip().lower()` made a blank `verify_source:`
+    the literal "none" — a VALID value meaning "never verify" — and
+    `bool(None)` made a blank `verify_enabled:` the master switch off. Both
+    disabled verification with nothing logged anywhere.
+    """
+
+    def test_blank_verify_source_is_auto_not_none(self):
+        cfg = BatteryOptimizerConfig.from_args({"verify_source": None})
+
+        assert cfg.verify_source == "auto"
+
+    def test_blank_verify_enabled_stays_on(self):
+        cfg = BatteryOptimizerConfig.from_args({"verify_enabled": None})
+
+        assert cfg.verify_enabled is True
+
+    def test_an_explicit_false_still_wins(self):
+        assert BatteryOptimizerConfig.from_args(
+            {"verify_enabled": False}
+        ).verify_enabled is False
+
+    @pytest.mark.parametrize(
+        "key, expected",
+        [
+            ("verify_delay_seconds", 90),
+            ("verify_recheck_seconds", 60),
+            ("set_wit_mode_timeout_seconds", 15),
+            ("cost_pv_attribution_min_w", 100.0),
+            ("cost_grid_charge_grace_seconds", 120),
+            ("pv_reactive_min_forecast_w", 600.0),
+            ("planned_depletion_margin_percent", 1.0),
+            ("execute_dedupe_seconds", 60),
+            ("callback_warn_seconds", 10.0),
+        ],
+    )
+    def test_blank_numeric_knobs_fall_back_to_the_default(self, key, expected):
+        """float(None) / int(None) would raise and abort the whole app."""
+        cfg = BatteryOptimizerConfig.from_args({key: None})
+
+        assert getattr(cfg, key) == expected
+
+    def test_blank_string_and_bool_knobs_fall_back_to_the_default(self):
+        cfg = BatteryOptimizerConfig.from_args(
+            {"inverter_mode_sensor": None, "use_inverter_energy_sensors": None}
+        )
+
+        assert cfg.inverter_mode_sensor == ""
+        assert cfg.use_inverter_energy_sensors is True
+
+    def test_an_all_blank_yaml_block_equals_the_defaults(self):
+        """The realistic shape: every knob present but commented out."""
+        keys = [
+            "verify_source", "verify_enabled", "verify_delay_seconds",
+            "verify_recheck_seconds", "set_wit_mode_timeout_seconds",
+            "cost_pv_attribution_min_w", "cost_grid_charge_grace_seconds",
+            "pv_reactive_min_forecast_w", "planned_depletion_margin_percent",
+            "execute_dedupe_seconds", "callback_warn_seconds",
+            "inverter_mode_sensor", "use_inverter_energy_sensors",
+        ]
+        blank = BatteryOptimizerConfig.from_args({k: None for k in keys})
+        empty = BatteryOptimizerConfig.from_args({})
+
+        for key in keys:
+            assert getattr(blank, key) == getattr(empty, key), key
 
 
 class TestTerminalNoticeIsStatedOnce:

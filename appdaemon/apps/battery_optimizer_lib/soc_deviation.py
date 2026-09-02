@@ -370,6 +370,24 @@ class SocDeviationDetector:
 
         Accounts for temperature warming during charging which can increase charge rate.
 
+        The per-slot transition is ``soc_projection.project_slot_soc`` — the ONE
+        slot-SOC model (CLAUDE.md), the same one the DP and the expected-SOC
+        trajectory use. Two consequences matter:
+
+        1. The projection is CLAMPED to ``max_soc`` at every slot. It used to
+           accumulate energy and add it in one go, so a poisoned learned rate
+           produced "projected to reach 21894.1%" and the caller's
+           ``projected_final_soc >= max_soc - 5`` guard became a tautology: the
+           catch-up recalculation could never fire during CHARGE (production
+           2026-09-02, twelve times inside a single 15-minute slot).
+        2. The charge rate comes from ``learning_engine.get_charge_rate_for_soc``
+           via the shared model, which applies the one plausibility bound, so a
+           persisted five-digit kW observation cannot reach this projection.
+
+        The rate lookup keeps using the ACTUAL SOC (not the projected one) for
+        the same reason ``_interpolate_expected_soc`` does: that is what the
+        inverter's rate really depends on right now.
+
         Args:
             current_soc: Current SOC
             schedule: Current schedule
@@ -379,46 +397,45 @@ class SocDeviationDetector:
             local_tz: Local timezone
 
         Returns:
-            Projected final SOC after all charge slots complete
+            Projected final SOC after all charge slots complete (<= max_soc)
         """
-        remaining_charge_energy = 0.0
-        projected_temp = current_temp if current_temp is not None else 15.0
-        temp_threshold = 16.0  # Temperature where charge rate typically increases
+        params = self._projection_params()
+        projected_soc = current_soc
+        projected_temp = current_temp
+        cmp_current = self._normalize_for_compare(current_slot, local_tz)
 
         for future_hour in sorted(schedule.keys()):
             # Compare with timezone handling
             cmp_future = self._normalize_for_compare(future_hour, local_tz)
-            cmp_current = self._normalize_for_compare(current_slot, local_tz)
+            if cmp_future < cmp_current:
+                continue
 
-            if cmp_future >= cmp_current:
-                future_entry = schedule.get(future_hour)
-                if future_entry and future_entry.mode == BatteryMode.CHARGE:
-                    # For current slot, only count remaining time
-                    if cmp_future == cmp_current:
-                        remaining_minutes = (1.0 - fraction) * self.config.slot_minutes
-                    else:
-                        remaining_minutes = self.config.slot_minutes
+            future_entry = schedule.get(future_hour)
+            if not future_entry or future_entry.mode != BatteryMode.CHARGE:
+                continue
 
-                    # Use warming-aware projection if learning engine available
-                    if self.learning_engine and current_temp is not None:
-                        energy, projected_temp = self.learning_engine.predict_charge_energy_with_warming(
-                            current_soc=current_soc,
-                            start_temp=projected_temp,
-                            duration_minutes=remaining_minutes,
-                            temp_threshold=temp_threshold
-                        )
-                        remaining_charge_energy += energy * self.config.efficiency
-                    else:
-                        # Fallback: use simple rate-based calculation
-                        effective_charge_rate = self.config.charge_rate
-                        if self.learning_engine:
-                            learned_rate = self.learning_engine.get_charge_rate_for_soc(current_soc, projected_temp)
-                            if learned_rate is not None and learned_rate > 0:
-                                effective_charge_rate = learned_rate
-                        remaining_charge_energy += effective_charge_rate * self.config.efficiency * (remaining_minutes / 60)
+            # For the current slot, only the remaining time is still available.
+            slot_fraction = (1.0 - fraction) if cmp_future == cmp_current else 1.0
+            if slot_fraction <= 0:
+                continue
 
-        remaining_soc_gain = (remaining_charge_energy / self.config.battery_capacity) * 100
-        return current_soc + remaining_soc_gain
+            transition = project_slot_soc(
+                soc_start=projected_soc,
+                mode=BatteryMode.CHARGE,
+                params=params,
+                fraction=slot_fraction,
+                temp_start=projected_temp,
+                learning_engine=self.learning_engine,
+                rate_lookup_soc=current_soc,
+                slot_time=future_hour,
+            )
+            projected_soc = transition.soc_end
+            projected_temp = transition.temp_end
+
+            if projected_soc >= self.config.max_soc:
+                break
+
+        return min(self.config.max_soc, projected_soc)
 
     def _calculate_extra_charge_slots(
         self,

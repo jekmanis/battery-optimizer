@@ -26,6 +26,8 @@ from battery_optimizer_lib import (
     LoadProfile,
     NordPoolPriceService,
     DirectControl,
+    # App-wide callback lock (AppDaemon multi-thread dispatch)
+    CallbackLock,
     # DP Optimizer
     DPOptimizer,
     DPOptimizerConfig,
@@ -76,6 +78,19 @@ from battery_optimizer_lib.models import ScheduleModeCounts, count_schedule_mode
 from battery_optimizer_lib.pv_profile import PvProfile
 from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
 
+# Bumped with behaviour changes. Logged at initialize together with the
+# filesystem paths the orchestrator and the library were imported from, and
+# published on sensor.battery_optimizer, so a deploy can be PROVEN to be
+# running: on 2026-09-02 the add-on silently imported the previous commit out
+# of a backup directory inside apps/ while SHA256 verification of apps/ passed.
+APP_VERSION = "2026-09-02b"
+
+
+def _code_paths() -> Tuple[str, str]:
+    """(orchestrator file, library package file) actually imported."""
+    import battery_optimizer_lib as _lib
+    return __file__, getattr(_lib, "__file__", "?")
+
 
 def _timed_callback(func):
     """Measure a callback's wall time and warn when it hogs the thread.
@@ -89,12 +104,32 @@ def _timed_callback(func):
     functools.wraps + *args/**kwargs is mandatory: AppDaemon inspects and calls
     these with positional args (`execute_scheduled_mode(kwargs, force=True)`),
     and the signature must survive untouched.
+
+    It is ALSO the app's thread-safety chokepoint. With `total_threads` > 1 and
+    `pin_app: false`, AppDaemon round-robins this app's callbacks across worker
+    threads, so a schedule rebuild and a slot execution can run concurrently.
+    Every registered callback carries this decorator, so running its body under
+    the single app-wide `CallbackLock` restores the single-threaded semantics
+    the app was written against — with exactly one deliberate escape hatch, the
+    blocking `set_wit_mode` write in `_apply_mode_tracked`.
+
+    `time.monotonic()` is sampled OUTSIDE the acquire on purpose: waiting for
+    the app lock is time this callback spent hogging its AppDaemon thread and
+    must show up in the overrun accounting.
+
+    `getattr(self, "_lock", None)` keeps the decorator usable by test doubles
+    that never ran `initialize()`; in the app the lock always exists, because
+    it is the first statement of `initialize`.
     """
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
         started = time.monotonic()
+        lock = getattr(self, "_lock", None)
         try:
-            return func(self, *args, **kwargs)
+            if lock is None:
+                return func(self, *args, **kwargs)
+            with lock:
+                return func(self, *args, **kwargs)
         finally:
             try:
                 self._record_callback_duration(
@@ -121,281 +156,340 @@ class BatteryOptimizer(hass.Hass):
 
     def initialize(self):
         """Initialize the battery optimizer"""
-        self.log("Initializing Battery Optimizer")
+        # FIRST statement, before anything else can be dispatched: the one
+        # app-wide callback lock. `_timed_callback` looks it up with getattr,
+        # so any callback AppDaemon fires while `initialize` is still running
+        # (the startup SOC check below, the `run_in(full_optimize, 1)` armed
+        # from `_init_battery_cost`) is already serialized against this frame.
+        self._lock = CallbackLock(log_func=self.log)
 
-        # Load configuration
-        self._load_config()
+        # The rest of construction runs under the lock: on a multi-threaded
+        # AppDaemon the startup safety check and the deferred first optimize
+        # can otherwise overlap the tail of this method and read half-built
+        # state.
+        with self._lock:
+            self.log("Initializing Battery Optimizer")
+            orchestrator_path, lib_path = _code_paths()
+            self.log(
+                f"Battery Optimizer version {APP_VERSION}: orchestrator={orchestrator_path} "
+                f"lib={lib_path}"
+            )
 
-        # Sensor reader for HA state access
-        self._sensors = SensorReader(self.get_state, self.log)
+            # Load configuration
+            self._load_config()
 
-        # Internal state
-        self.current_mode: BatteryMode = BatteryMode.HOLD
-        self.schedule: Dict[datetime.datetime, ScheduleEntry] = {}
-        self.last_optimization: Optional[datetime.datetime] = None
-        self.expected_soc_schedule: Dict[datetime.datetime, float] = {}
-        self.expected_temp_schedule: Dict[datetime.datetime, float] = {}
-        # Wall-clock instant the expected SOC trajectory starts from. The first
-        # entry of expected_soc_schedule describes THIS instant, not the slot
-        # boundary, whenever the trajectory was built mid-slot.
-        self._expected_soc_anchor: Optional[datetime.datetime] = None
-        self._last_nonzero_load_w: Optional[float] = None
-        self._previous_schedule_from_sensor: Optional[Dict[datetime.datetime, BatteryMode]] = None
-        # Sliding PV forecast bias multiplier applied to the remaining horizon.
-        self._pv_bias_factor: float = 1.0
+            # Sensor reader for HA state access
+            self._sensors = SensorReader(self.get_state, self.log)
 
-        # Inverter-control health counters (exposed on a diagnostics sensor).
-        self._apply_failure_count: int = 0
-        self._consecutive_apply_failures: int = 0
-        self._apply_success_count: int = 0
-        # A command that timed out client-side was NEVER confirmed: it must not
-        # count as a success, and a run of them is exactly the hung-modbus case.
-        self._apply_unconfirmed_count: int = 0
-        self._consecutive_apply_unconfirmed: int = 0
-        # Neutral outcomes — nothing was transmitted, so they say nothing about
-        # inverter health either way.
-        self._apply_duplicate_count: int = 0
-        self._apply_dry_run_count: int = 0
-        self._callback_overrun_count: int = 0
-        self._slowest_callback: Optional[Tuple[str, float]] = None
-        self._threads_hint_logged: bool = False
-        self._last_terminal_warning_time: Optional[datetime.datetime] = None
+            # Internal state
+            self.current_mode: BatteryMode = BatteryMode.HOLD
+            self.schedule: Dict[datetime.datetime, ScheduleEntry] = {}
+            self.last_optimization: Optional[datetime.datetime] = None
+            self.expected_soc_schedule: Dict[datetime.datetime, float] = {}
+            self.expected_temp_schedule: Dict[datetime.datetime, float] = {}
+            # Wall-clock instant the expected SOC trajectory starts from. The first
+            # entry of expected_soc_schedule describes THIS instant, not the slot
+            # boundary, whenever the trajectory was built mid-slot.
+            self._expected_soc_anchor: Optional[datetime.datetime] = None
+            self._last_nonzero_load_w: Optional[float] = None
+            self._previous_schedule_from_sensor: Optional[Dict[datetime.datetime, BatteryMode]] = None
+            # Sliding PV forecast bias multiplier applied to the remaining horizon.
+            self._pv_bias_factor: float = 1.0
 
-        # Decision context tracking (for transparency logging and sensor exposure)
-        self._last_recalc_trigger: str = "startup"  # "startup", "daily_13:15", "soc_deviation", "manual", "battery_depleted"
-        self._last_recalc_time: Optional[datetime.datetime] = None
-        self._last_depletion_recalc_time: Optional[datetime.datetime] = None
-        self._last_soc_deviation: Optional[float] = None  # Deviation that triggered recalculation
-        self._last_min_charge_slots: int = 0  # Min charge slots from last calculation
-        # Mode census of the last schedule as it will execute (post cloud-safe
-        # conversion), not the DP's pre-conversion counts.
-        self._last_schedule_counts: ScheduleModeCounts = ScheduleModeCounts()
-        self._last_charge_slots: List[Dict] = []  # Selected charge slots with prices
-        self._last_projected_costs: Dict[datetime.datetime, float] = {}  # Projected battery cost evolution
-        self._last_dp_soc_trajectory: Dict[datetime.datetime, Tuple[float, float]] = {}  # DP's SOC trajectory (start, end) per slot
-        self._last_dp_temp_trajectory: Dict[datetime.datetime, Tuple[Optional[float], Optional[float]]] = {}  # DP's temp trajectory
+            # Inverter-control health counters (exposed on a diagnostics sensor).
+            self._apply_failure_count: int = 0
+            self._consecutive_apply_failures: int = 0
+            self._apply_success_count: int = 0
+            # A command that timed out client-side was NEVER confirmed: it must not
+            # count as a success, and a run of them is exactly the hung-modbus case.
+            self._apply_unconfirmed_count: int = 0
+            self._consecutive_apply_unconfirmed: int = 0
+            # Neutral outcomes — nothing was transmitted, so they say nothing about
+            # inverter health either way.
+            self._apply_duplicate_count: int = 0
+            self._apply_dry_run_count: int = 0
+            self._callback_overrun_count: int = 0
+            self._slowest_callback: Optional[Tuple[str, float]] = None
+            self._threads_hint_logged: bool = False
+            self._last_terminal_warning_time: Optional[datetime.datetime] = None
 
-        # Self-learning engine for adaptive optimization
-        self.learning_engine = BatteryLearningEngine(
-            battery_capacity_kwh=self.config.battery_capacity,
-            nominal_charge_rate_kw=self.config.charge_rate,
-            nominal_efficiency=self.config.efficiency,
-            min_soc=self.config.default_min_soc,
-            max_soc=self.config.default_max_soc,
-            log_func=self.log,
-        )
-        self._init_learning_engine()
+            # Wall-clock instant a grid_charge command stops being in force at the
+            # inverter. A set_wit_mode override runs for slot_minutes +
+            # direct_control_buffer_minutes, so it can still be charging after the
+            # app has already moved on to the next slot's mode — which is how a
+            # pre-dawn grid charge got booked as PV (see _grid_charge_active).
+            self._grid_charge_active_until: Optional[datetime.datetime] = None
+            # Slot most recently applied, and when — used to drop the redundant
+            # timer execution that follows a recalculation by a few seconds.
+            self._last_executed_slot: Optional[datetime.datetime] = None
+            self._last_executed_monotonic: Optional[float] = None
 
-        # Ambient temperature: weather forecast -> outdoor sensor -> diurnal
-        # profile around the learned battery minimum. Never a single constant
-        # for the whole horizon.
-        self._ambient_service = AmbientTemperatureService(
-            config=AmbientServiceConfig.from_main_config(self.config),
-            get_state_func=self.get_state,
-            call_service_func=self.call_service,
-            get_datetime_func=self.datetime,
-            get_timezone_func=self._get_local_timezone,
-            log_func=self.log,
-            min_temp_provider=self._estimated_ambient_min_temp,
-        )
+            # Decision context tracking (for transparency logging and sensor exposure)
+            self._last_recalc_trigger: str = "startup"  # "startup", "daily_13:15", "soc_deviation", "manual", "battery_depleted"
+            self._last_recalc_time: Optional[datetime.datetime] = None
+            self._last_depletion_recalc_time: Optional[datetime.datetime] = None
+            self._last_soc_deviation: Optional[float] = None  # Deviation that triggered recalculation
+            self._last_min_charge_slots: int = 0  # Min charge slots from last calculation
+            # Mode census of the last schedule as it will execute (post cloud-safe
+            # conversion), not the DP's pre-conversion counts.
+            self._last_schedule_counts: ScheduleModeCounts = ScheduleModeCounts()
+            self._last_charge_slots: List[Dict] = []  # Selected charge slots with prices
+            self._last_projected_costs: Dict[datetime.datetime, float] = {}  # Projected battery cost evolution
+            self._last_dp_soc_trajectory: Dict[datetime.datetime, Tuple[float, float]] = {}  # DP's SOC trajectory (start, end) per slot
+            self._last_dp_temp_trajectory: Dict[datetime.datetime, Tuple[Optional[float], Optional[float]]] = {}  # DP's temp trajectory
 
-        # One thermal model for the DP trajectory, the expected-SOC trajectory,
-        # the schedule log and the charge-rate pre-computation.
-        self._temp_projector = TemperatureProjector(
-            learning_engine=self.learning_engine,
-            ambient_provider=self._ambient_service,
-            log_func=self.log,
-            default_cooling_rate=self.config.thermal_default_cooling_rate_per_min,
-            default_heating_c_per_kwh=self.config.thermal_default_heating_c_per_kwh,
-        )
+            # Self-learning engine for adaptive optimization
+            self.learning_engine = BatteryLearningEngine(
+                battery_capacity_kwh=self.config.battery_capacity,
+                nominal_charge_rate_kw=self.config.charge_rate,
+                # Feeds the shared plausibility bound max(charge, discharge) * 2:
+                # without it a 5.9 kW discharge installation was judged against the
+                # 4.5 kW charge rate.
+                nominal_discharge_rate_kw=self.config.discharge_rate,
+                # Export slots run at the export discharge rate, which is
+                # normally the LARGEST of the three configured powers; without
+                # it a genuine max_export sample is judged against the smaller
+                # load-discharge rate and thrown away.
+                nominal_export_rate_kw=self.config.effective_export_discharge_rate,
+                nominal_efficiency=self.config.efficiency,
+                min_soc=self.config.default_min_soc,
+                max_soc=self.config.default_max_soc,
+                log_func=self.log,
+            )
+            self._init_learning_engine()
 
-        # Load profile for probabilistic scheduling
-        self.load_profile = LoadProfile(
-            slot_minutes=self.config.slot_minutes,
-            default_load_w=self.config.base_consumption,
-            max_samples=self.config.load_profile_max_samples,
-            min_samples=self.config.load_profile_min_samples,
-            log_func=self.log,
-        )
-        self._init_load_profile()
+            # Ambient temperature: weather forecast -> outdoor sensor -> diurnal
+            # profile around the learned battery minimum. Never a single constant
+            # for the whole horizon.
+            self._ambient_service = AmbientTemperatureService(
+                config=AmbientServiceConfig.from_main_config(self.config),
+                get_state_func=self.get_state,
+                call_service_func=self.call_service,
+                get_datetime_func=self.datetime,
+                get_timezone_func=self._get_local_timezone,
+                log_func=self.log,
+                min_temp_provider=self._estimated_ambient_min_temp,
+            )
 
-        # Prediction accuracy tracker
-        self.prediction_tracker = LoadPredictionTracker(
-            slot_minutes=self.config.slot_minutes,
-            log_func=self.log,
-        )
-        self._init_prediction_tracker()
+            # One thermal model for the DP trajectory, the expected-SOC trajectory,
+            # the schedule log and the charge-rate pre-computation.
+            self._temp_projector = TemperatureProjector(
+                learning_engine=self.learning_engine,
+                ambient_provider=self._ambient_service,
+                log_func=self.log,
+                default_cooling_rate=self.config.thermal_default_cooling_rate_per_min,
+                default_heating_c_per_kwh=self.config.thermal_default_heating_c_per_kwh,
+            )
 
-        # PV production profile for self-consumption planning
-        self.pv_profile = PvProfile(
-            slot_minutes=self.config.slot_minutes,
-            default_pv_w=0.0,
-            max_samples=self.config.pv_profile_max_samples,
-            min_samples=self.config.pv_profile_min_samples,
-            log_func=self.log,
-        )
-        self._init_pv_profile()
-
-        # PV forecast service (Solcast / Forecast.Solar)
-        self._pv_forecast_service = PvForecastService(
-            config=PvForecastServiceConfig.from_main_config(self.config),
-            get_state_func=self.get_state,
-            get_datetime_func=self.datetime,
-            get_timezone_func=self._get_local_timezone,
-            log_func=self.log,
-        )
-
-        # Sliding PV forecast bias tracker (slot-energy sampling + bias factor)
-        self._pv_bias = PvBiasTracker(
-            config=PvBiasConfig.from_main_config(self.config),
-            align_to_slot_func=self._align_to_slot,
-            log_func=self.log,
-        )
-
-        # Slot outcome tracker for prediction monitoring
-        self._outcome_tracker = SlotOutcomeTracker(
-            slot_minutes=self.config.slot_minutes,
-            log_func=self.log,
-        )
-
-        # Direct inverter control via set_wit_mode service
-        self._direct_control = DirectControl(self, self.config)
-
-        # Nord Pool price service for fetching electricity prices
-        self._price_service = NordPoolPriceService(
-            nordpool_config_entry=self.config.nordpool_config_entry,
-            nordpool_area=self.config.nordpool_area,
-            nordpool_sensor=self.config.nordpool_sensor,
-            ha_url=self.config.ha_url,
-            ha_token=self.config.ha_token,
-            tomorrow_prices_hour=self.config.tomorrow_prices_hour,
-            slot_minutes=self.config.slot_minutes,
-            get_state_func=self.get_state,
-            call_service_func=self.call_service,
-            get_datetime_func=self.datetime,
-            get_date_func=self.date,
-            get_timezone_func=self._get_local_timezone,
-            log_func=self.log,
-        )
-
-        # Schedule formatter for logging and sensor updates
-        self._schedule_formatter = ScheduleFormatter(
-            config=ScheduleFormatterConfig(
+            # Load profile for probabilistic scheduling
+            self.load_profile = LoadProfile(
                 slot_minutes=self.config.slot_minutes,
-                slot_hours=self.config.slot_hours,
-                battery_capacity=self.config.battery_capacity,
-                charge_rate=self.config.charge_rate,
-                discharge_rate=self.config.discharge_rate,
-                export_discharge_rate=self.config.export_discharge_rate,
-                efficiency=self.config.efficiency,
-                battery_wear_cost=self.config.battery_wear_cost,
-                decision_log_level=self.config.decision_log_level,
-                inverter_efficiency=self.config.inverter_efficiency,
-            ),
-            log_func=self.log,
-            learning_engine=self.learning_engine,
-            temp_projector=self._temp_projector,
-        )
+                default_load_w=self.config.base_consumption,
+                max_samples=self.config.load_profile_max_samples,
+                min_samples=self.config.load_profile_min_samples,
+                log_func=self.log,
+            )
+            self._init_load_profile()
 
-        # Battery cost tracker (must be after learning engine and price service)
-        self._cost_tracker = BatteryCostTracker(
-            config=BatteryCostConfig.from_main_config(self.config),
-            get_state_func=self.get_state,
-            call_service_func=self.call_service,
-            get_datetime_func=self.datetime,
-            get_timezone_func=self._get_local_timezone,
-            align_to_slot_func=self._align_to_slot,
-            get_min_soc_func=lambda: self.min_soc,
-            get_max_soc_func=lambda: self.max_soc,
-            get_current_soc_func=self._get_current_soc,
-            get_battery_temp_func=self._get_battery_temp,
-            learning_engine=self.learning_engine,
-            get_cached_prices_func=lambda: self._price_service.cached_prices,
-            save_learning_data_func=self._save_learning_data,
-            update_learning_sensor_func=self._update_learning_sensor,
-            log_func=self.log,
-            get_ambient_temp_func=lambda: self._ambient_service.predict_c(self.datetime()),
-        )
-        self._init_battery_cost()
+            # Prediction accuracy tracker
+            self.prediction_tracker = LoadPredictionTracker(
+                slot_minutes=self.config.slot_minutes,
+                log_func=self.log,
+            )
+            self._init_prediction_tracker()
 
-        # Restore previous schedule from sensor (for continuity on restart)
-        self._restore_previous_schedule_from_sensor()
+            # PV production profile for self-consumption planning
+            self.pv_profile = PvProfile(
+                slot_minutes=self.config.slot_minutes,
+                default_pv_w=0.0,
+                max_samples=self.config.pv_profile_max_samples,
+                min_samples=self.config.pv_profile_min_samples,
+                log_func=self.log,
+            )
+            self._init_pv_profile()
 
-        # Full re-optimization after Nord Pool publishes tomorrow's prices
-        # Uses configured hour (default 14 for EET = 13 CET) plus 15 minutes buffer
-        optimize_hour = self.config.tomorrow_prices_hour
-        self.run_daily(self.full_optimize, datetime.time(optimize_hour, 15))
+            # PV forecast service (Solcast / Forecast.Solar)
+            self._pv_forecast_service = PvForecastService(
+                config=PvForecastServiceConfig.from_main_config(self.config),
+                get_state_func=self.get_state,
+                get_datetime_func=self.datetime,
+                get_timezone_func=self._get_local_timezone,
+                log_func=self.log,
+            )
 
-        # Startup optimization is triggered from _init_battery_cost() after battery cost is loaded
-        # (either immediately if HA available, or after homeassistant_start event)
+            # Sliding PV forecast bias tracker (slot-energy sampling + bias factor)
+            self._pv_bias = PvBiasTracker(
+                config=PvBiasConfig.from_main_config(self.config),
+                align_to_slot_func=self._align_to_slot,
+                log_func=self.log,
+            )
 
-        # Adaptive re-evaluation (can be more frequent than schedule slots)
-        self.run_every(
-            self.adaptive_optimize,
-            self._next_interval_time(self.config.adaptive_recalc_minutes),
-            self.config.adaptive_recalc_minutes * 60
-        )
+            # Slot outcome tracker for prediction monitoring
+            self._outcome_tracker = SlotOutcomeTracker(
+                slot_minutes=self.config.slot_minutes,
+                log_func=self.log,
+            )
 
-        # Schedule execution every slot (hourly if slot_minutes=60)
-        self.run_every(self.execute_scheduled_mode, self._next_slot_time(), self.config.slot_minutes * 60)
+            # Direct inverter control via set_wit_mode service
+            self._direct_control = DirectControl(
+                self, self.config, verify_enabled=self.config.verify_enabled
+            )
 
-        # Sample PV power frequently so a slot's shortfall is judged on its
-        # ENERGY (mean of many samples), not one boundary reading.
-        self.run_every(
-            self._sample_pv,
-            self.datetime() + datetime.timedelta(seconds=10),
-            self.config.pv_sample_seconds,
-        )
+            # Nord Pool price service for fetching electricity prices
+            self._price_service = NordPoolPriceService(
+                nordpool_config_entry=self.config.nordpool_config_entry,
+                nordpool_area=self.config.nordpool_area,
+                nordpool_sensor=self.config.nordpool_sensor,
+                ha_url=self.config.ha_url,
+                ha_token=self.config.ha_token,
+                tomorrow_prices_hour=self.config.tomorrow_prices_hour,
+                slot_minutes=self.config.slot_minutes,
+                get_state_func=self.get_state,
+                call_service_func=self.call_service,
+                get_datetime_func=self.datetime,
+                get_date_func=self.date,
+                get_timezone_func=self._get_local_timezone,
+                log_func=self.log,
+            )
 
-        # Sample battery temperature on a TIMER. Before this, observations only
-        # arrived from SOC-change and mode-transition events, so the rolling
-        # window could span a few hours instead of the assumed two days and
-        # could never contain a diurnal minimum.
-        self.run_every(
-            self._record_ambient_observation,
-            self.datetime() + datetime.timedelta(seconds=20),
-            self.config.slot_minutes * 60,
-        )
+            # Schedule formatter for logging and sensor updates
+            self._schedule_formatter = ScheduleFormatter(
+                config=ScheduleFormatterConfig(
+                    slot_minutes=self.config.slot_minutes,
+                    slot_hours=self.config.slot_hours,
+                    battery_capacity=self.config.battery_capacity,
+                    charge_rate=self.config.charge_rate,
+                    discharge_rate=self.config.discharge_rate,
+                    export_discharge_rate=self.config.export_discharge_rate,
+                    efficiency=self.config.efficiency,
+                    battery_wear_cost=self.config.battery_wear_cost,
+                    decision_log_level=self.config.decision_log_level,
+                    inverter_efficiency=self.config.inverter_efficiency,
+                ),
+                log_func=self.log,
+                learning_engine=self.learning_engine,
+                temp_projector=self._temp_projector,
+            )
 
-        # Record load observations (can be more frequent than schedule slots)
-        self.run_every(
-            self.record_load_observation,
-            self._next_interval_time(self.config.load_observation_minutes),
-            self.config.load_observation_minutes * 60
-        )
+            # Battery cost tracker (must be after learning engine and price service)
+            self._cost_tracker = BatteryCostTracker(
+                config=BatteryCostConfig.from_main_config(self.config),
+                get_state_func=self.get_state,
+                call_service_func=self.call_service,
+                get_datetime_func=self.datetime,
+                get_timezone_func=self._get_local_timezone,
+                align_to_slot_func=self._align_to_slot,
+                get_min_soc_func=lambda: self.min_soc,
+                get_max_soc_func=lambda: self.max_soc,
+                get_current_soc_func=self._get_current_soc,
+                get_battery_temp_func=self._get_battery_temp,
+                learning_engine=self.learning_engine,
+                get_cached_prices_func=lambda: self._price_service.cached_prices,
+                # Reached only from guarded (@_timed_callback) listeners, so
+                # this save also runs under the app lock - see
+                # _save_learning_data.
+                save_learning_data_func=self._save_learning_data,
+                update_learning_sensor_func=self._update_learning_sensor,
+                log_func=self.log,
+                get_ambient_temp_func=lambda: self._ambient_service.predict_c(self.datetime()),
+                # Attribution guards: measured charging is only PV when the sun is
+                # actually producing, and never while a grid_charge command is
+                # still in force at the inverter.
+                get_pv_power_w_func=self._get_pv_power_optional,
+                grid_charge_active_func=self._grid_charge_active,
+            )
+            self._init_battery_cost()
 
-        # Listen for optimizer enable/disable
-        if self.config.enabled_entity:
-            self.listen_state(self._on_enabled_change, self.config.enabled_entity)
+            # Restore previous schedule from sensor (for continuity on restart)
+            self._restore_previous_schedule_from_sensor()
 
-        # Listen for manual override changes
-        if self.config.override_entity:
-            self.listen_state(self.on_override_change, self.config.override_entity)
-        if self.config.manual_mode_entity:
-            self.listen_state(self.on_manual_mode_change, self.config.manual_mode_entity)
+            # Full re-optimization after Nord Pool publishes tomorrow's prices
+            # Uses configured hour (default 14 for EET = 13 CET) plus 15 minutes buffer
+            optimize_hour = self.config.tomorrow_prices_hour
+            self.run_daily(self.full_optimize, datetime.time(optimize_hour, 15))
 
-        # Listen to SOC changes for instant response (replaces polling-based checks)
-        self.listen_state(self._on_soc_change, self.config.soc_sensor)
+            # Startup optimization is triggered from _init_battery_cost() after battery cost is loaded
+            # (either immediately if HA available, or after homeassistant_start event)
 
-        # Listen to inverter energy sensors (primary trigger when available)
-        if self.config.use_inverter_energy_sensors:
-            self.listen_state(self._on_energy_sensor_change, self.config.battery_charge_sensor)
-            self.listen_state(self._on_energy_sensor_change, self.config.battery_discharge_sensor)
-            self.log(f"Listening to energy sensors: {self.config.battery_charge_sensor}, {self.config.battery_discharge_sensor}")
+            # Adaptive re-evaluation (can be more frequent than schedule slots)
+            self.run_every(
+                self.adaptive_optimize,
+                self._next_interval_time(self.config.adaptive_recalc_minutes),
+                self.config.adaptive_recalc_minutes * 60
+            )
 
-        # Run initial SOC check on startup (listener only fires on changes)
-        startup_soc = self._get_current_soc()
-        if startup_soc is not None:
-            self._check_soc_boundaries(startup_soc)
-            # Initialize tracking state if not already set
-            if self._last_soc is None:
+            # Schedule execution every slot (hourly if slot_minutes=60)
+            self.run_every(self.execute_scheduled_mode, self._next_slot_time(), self.config.slot_minutes * 60)
+
+            # Sample PV power frequently so a slot's shortfall is judged on its
+            # ENERGY (mean of many samples), not one boundary reading.
+            self.run_every(
+                self._sample_pv,
+                self.datetime() + datetime.timedelta(seconds=10),
+                self.config.pv_sample_seconds,
+            )
+
+            # Sample battery temperature on a TIMER. Before this, observations only
+            # arrived from SOC-change and mode-transition events, so the rolling
+            # window could span a few hours instead of the assumed two days and
+            # could never contain a diurnal minimum.
+            self.run_every(
+                self._record_ambient_observation,
+                self.datetime() + datetime.timedelta(seconds=20),
+                self.config.slot_minutes * 60,
+            )
+
+            # Record load observations (can be more frequent than schedule slots)
+            self.run_every(
+                self.record_load_observation,
+                self._next_interval_time(self.config.load_observation_minutes),
+                self.config.load_observation_minutes * 60
+            )
+
+            # Listen for optimizer enable/disable
+            if self.config.enabled_entity:
+                self.listen_state(self._on_enabled_change, self.config.enabled_entity)
+
+            # Listen for manual override changes
+            if self.config.override_entity:
+                self.listen_state(self.on_override_change, self.config.override_entity)
+            if self.config.manual_mode_entity:
+                self.listen_state(self.on_manual_mode_change, self.config.manual_mode_entity)
+
+            # Listen to SOC changes for instant response (replaces polling-based checks)
+            self.listen_state(self._on_soc_change, self.config.soc_sensor)
+
+            # Listen to inverter energy sensors (primary trigger when available)
+            if self.config.use_inverter_energy_sensors:
+                self.listen_state(self._on_energy_sensor_change, self.config.battery_charge_sensor)
+                self.listen_state(self._on_energy_sensor_change, self.config.battery_discharge_sensor)
+                self.log(f"Listening to energy sensors: {self.config.battery_charge_sensor}, {self.config.battery_discharge_sensor}")
+
+            # Initialize SOC tracking state on startup (the listener only fires
+            # on changes).
+            startup_soc = self._get_current_soc()
+            if startup_soc is not None and self._last_soc is None:
                 self._process_soc_change_event(startup_soc)
 
-        # Create sensor for exposing schedule
-        self._update_schedule_sensor()
-        self._update_control_health_sensor()
+            # Create sensor for exposing schedule
+            self._update_schedule_sensor()
+            self._update_control_health_sensor()
 
-        self.log("Battery Optimizer initialized successfully")
+            # Initial safety boundary check LAST, after every sensor is
+            # published. It is the only statement in `initialize` that can reach
+            # `_apply_mode_tracked` -> `CallbackLock.unlocked()`, and
+            # `initialize` runs at depth 1 — so that call WOULD genuinely drop
+            # the app lock mid-initialize, with the listeners and timers
+            # registered above already live. Today the path is unreachable
+            # (`current_mode` is HOLD at startup; both boundary branches require
+            # CHARGE or DISCHARGE), but "unreachable" should not be the only
+            # thing keeping it safe. Running it here means a released lock
+            # exposes a fully built app. Keep listener/timer registration above
+            # this call, and keep this call last.
+            if startup_soc is not None:
+                self._check_soc_boundaries(startup_soc)
+
+            self.log("Battery Optimizer initialized successfully")
 
     def _should_warn_degenerate_terminal(self) -> bool:
         """Rate-limit the legacy terminal-value warning to once every 6 hours.
@@ -415,6 +509,101 @@ class BatteryOptimizer(hass.Hass):
         self._last_terminal_warning_time = now
         return True
 
+    def record_external_callback_duration(self, name: str, seconds: float) -> None:
+        """Public hook so collaborators can report their own callback duration.
+
+        ``DirectControl`` schedules its verify/re-check callbacks through
+        ``run_in`` on THIS app, so an overrun there ("Excessive time spent in
+        callback DirectControl._verify_mode ... 15.8s") is invisible to
+        ``_timed_callback``, which only wraps methods of this class. Routing
+        those durations here keeps one overrun counter, one slowest-callback
+        record and one ``total_threads`` hint for the whole app.
+
+        It is called from another AppDaemon worker thread (DirectControl's
+        verify/re-check callbacks), so it must take the app lock: the counters
+        and the one-shot ``total_threads`` hint below are plain attributes with
+        check-then-set semantics. DirectControl calls this from the ``finally``
+        of ``_verify_mode`` AFTER releasing both of its own locks, which is what
+        keeps the lock order (app lock -> _io_lock -> _state_lock) intact.
+        """
+        with self._lock:
+            self._record_callback_duration(name, seconds)
+
+    def _grid_charge_active(self) -> bool:
+        """True while a grid_charge command is still in force at the inverter.
+
+        The cost tracker uses this so a charge measured moments after the app
+        has moved on to HOLD/DISCHARGE is still attributed to the grid: a
+        set_wit_mode override runs for ``slot_minutes +
+        direct_control_buffer_minutes``, and the charge counter lags it further.
+        """
+        until = getattr(self, "_grid_charge_active_until", None)
+        if until is None:
+            return False
+        now, until_cmp = normalize_tz_pair(self.datetime(), until)
+        return now < until_cmp
+
+    def _shrink_grid_charge_window(self) -> None:
+        """Clip an open grid-charge window to a short grace period from now.
+
+        Used whenever the grid charge stops being what the inverter executes:
+        another mode superseded it, or `release_control()` handed the inverter
+        back. The energy counters lag the command, so the window is trimmed to
+        `cost_grid_charge_grace_seconds` rather than closed outright — and never
+        extended past where the original command was going to end anyway.
+        """
+        # getattr: _apply_mode_tracked is exercised by test doubles that build
+        # only the health counters, and cost attribution must never be the
+        # reason an inverter command is not sent.
+        active_until = getattr(self, "_grid_charge_active_until", None)
+        if active_until is None:
+            return
+        grace = self.datetime() + datetime.timedelta(
+            seconds=self.config.cost_grid_charge_grace_seconds
+        )
+        grace, current = normalize_tz_pair(grace, active_until)
+        self._grid_charge_active_until = min(grace, current)
+
+    def _note_applied_mode(
+        self, entry: ScheduleEntry, outcome: ApplyOutcome
+    ) -> None:
+        """Track how long the command just sent stays in force at the inverter.
+
+        The OUTCOME decides, not the entry. A window is a claim about what the
+        inverter is executing right now, so only a command that actually went
+        out on the wire may open or extend one:
+
+        * ``SENT`` / ``UNCONFIRMED_TIMEOUT`` — transmitted (the timeout is
+          client-side; the request was already on the wire), so a CHARGE stamps
+          a fresh `slot_minutes + direct_control_buffer_minutes` window.
+        * ``SKIPPED_DUPLICATE`` — nothing was transmitted. The *original* send
+          opened the window and its expiry is the true one; re-stamping here
+          would slide the window forward every slot the same CHARGE repeats and
+          keep attributing PV charging to the grid long after the command ended.
+        * ``DRY_RUN`` — `device_id: ""`, no inverter at all. Opening a window
+          would make the cost tracker book PV as grid on an installation that
+          never sent a command.
+
+        Superseding is judged the other way round: once the app has moved to a
+        non-CHARGE mode the grid charge is over regardless of how that command
+        fared, so the window is trimmed for every outcome that reaches here.
+        """
+        if entry.mode == BatteryMode.CHARGE:
+            if outcome not in (
+                ApplyOutcome.SENT,
+                ApplyOutcome.UNCONFIRMED_TIMEOUT,
+            ):
+                return
+            duration = (
+                self.config.slot_minutes + self.config.direct_control_buffer_minutes
+            )
+            self._grid_charge_active_until = self.datetime() + datetime.timedelta(
+                minutes=duration
+            )
+            return
+
+        self._shrink_grid_charge_window()
+
     def _record_callback_duration(self, name: str, seconds: float) -> None:
         """Warn about a callback that blocked the AppDaemon worker thread."""
         limit = getattr(self.config, "callback_warn_seconds", 10.0)
@@ -432,11 +621,14 @@ class BatteryOptimizer(hass.Hass):
         if self._callback_overrun_count >= 3 and not self._threads_hint_logged:
             self._threads_hint_logged = True
             self.log(
-                "Repeated slow callbacks: give this app more AppDaemon threads "
-                "(appdaemon.yaml -> appdaemon: total_threads: 4, or an app-level "
-                "pin_thread). set_wit_mode is a blocking service call; with a "
-                "single thread it stalls schedule execution, SOC listeners and "
-                "PV sampling alike.",
+                "Repeated slow callbacks: give this app more AppDaemon threads. "
+                "In appdaemon.yaml set `appdaemon: total_threads: 4` AND in "
+                "apps.yaml set `pin_app: false` on this app - total_threads "
+                "alone leaves pin_app at its default true (AppDaemon 4.5.13), "
+                "so every callback still lands on thread-0 with an 'Invalid "
+                "thread ID for pinned thread' warning. set_wit_mode is a "
+                "blocking service call; on one thread it stalls schedule "
+                "execution, SOC listeners and PV sampling alike.",
                 level="WARNING",
             )
 
@@ -1132,7 +1324,14 @@ class BatteryOptimizer(hass.Hass):
 
         self.last_optimization = self.datetime()
 
-        # Apply current slot's mode immediately
+        # Apply current slot's mode immediately. This is a NESTED callback
+        # (depth 2 under the app lock), so `_apply_mode_tracked`'s unlocked
+        # region will NOT release: the inverter write runs with this rebuild's
+        # lock held. That is deliberate - releasing here would expose the
+        # just-rebuilt schedule to another worker thread. Do NOT defer this via
+        # run_in: run_in passes a kwargs dict, which flips the
+        # `kwargs is not None` branch of the execute dedupe and makes the
+        # deferred apply skippable.
         self.execute_scheduled_mode(None)
 
         # Update sensor
@@ -1387,7 +1586,9 @@ class BatteryOptimizer(hass.Hass):
                 max_soc=self.max_soc,
             )
 
-        # Apply updated mode immediately
+        # Apply updated mode immediately. Nested (depth 2): the unlocked region
+        # in `_apply_mode_tracked` correctly keeps the lock, because this frame
+        # has just replaced the future half of `self.schedule`.
         self.execute_scheduled_mode(None)
 
         self._update_schedule_sensor()
@@ -1417,6 +1618,25 @@ class BatteryOptimizer(hass.Hass):
         elif local_tz is not None:
             now = now.replace(tzinfo=local_tz)
         current_slot = self._align_to_slot(now)
+
+        # Drop the redundant TIMER execution that trails a recalculation.
+        # `_recalculate_remaining_schedule` applies the current slot itself, and
+        # the quarter-hour timer then re-applied the identical entry seconds
+        # later (production 07:30:06 -> 07:30:12, 08:30:06 -> 08:30:15).
+        # DirectControl suppressed the duplicate, but the call still costs a
+        # blocking set_wit_mode round trip on the single AppDaemon thread, plus
+        # a second record_slot_start/record_slot_end pair for one slot.
+        # Only the AppDaemon timer is deduped: it is the only caller that
+        # passes a kwargs dict. Every internal call (recalculation, override
+        # resume, manual "Auto", enable) passes None and always executes, so a
+        # genuine mode change is never suppressed.
+        if kwargs is not None and not force and self._recently_executed(current_slot):
+            self.log(
+                f"Skipping timer execution for {current_slot}: already applied "
+                f"{self._seconds_since_execution():.0f}s ago",
+                level="DEBUG",
+            )
+            return
 
         # Pre-execution SOC check: if actual SOC is significantly behind plan,
         # recalculate the schedule before blindly applying the planned mode.
@@ -1525,11 +1745,62 @@ class BatteryOptimizer(hass.Hass):
                     reason="safety_max_soc_pv_export",
                 )
 
+        # A DISCHARGE entry must never be (re-)applied at min SOC. The plan can
+        # legitimately schedule DISCHARGE there (a cloud-safe slot where PV is
+        # expected to cover the load), but after a depletion the safety HOLD
+        # from _check_soc_boundaries is the state that must stand: on
+        # 2026-09-02 the depletion re-optimization re-executed the old 06:45
+        # DISCHARGE entry at 06:54:05 with SOC at 10.0 %, overriding the safety
+        # HOLD sent three minutes earlier without re-checking depletion. The
+        # SOC listener could not correct it either — at min SOC the SOC stops
+        # changing, so no further boundary check fires. HOLD accepts PV surplus
+        # exactly like discharge_to_load does, so nothing is lost.
+        if (entry.mode == BatteryMode.DISCHARGE
+                and current_soc is not None
+                and current_soc <= self.min_soc):
+            self.log(
+                f"Overriding DISCHARGE->HOLD at min SOC ({current_soc}%) "
+                f"- battery depleted, nothing to discharge"
+            )
+            entry = ScheduleEntry(
+                time=entry.time,
+                mode=BatteryMode.HOLD,
+                reason="safety_min_soc",
+            )
+
         # Track mode transition for cost tracking / learning
         self._handle_mode_transition(entry.mode)
 
         # Send command to inverter
-        self._apply_mode_tracked(entry)
+        applied = self._apply_mode_tracked(entry)
+
+        # Only a command the inverter may be acting on suppresses the timer
+        # re-execution; a CONFIRMED failure must stay retryable.
+        if applied:
+            self._last_executed_slot = current_slot
+            self._last_executed_monotonic = time.monotonic()
+
+    def _seconds_since_execution(self) -> float:
+        """Seconds since the last successfully applied slot (inf if none)."""
+        if self._last_executed_monotonic is None:
+            return float("inf")
+        return time.monotonic() - self._last_executed_monotonic
+
+    def _recently_executed(self, current_slot: datetime.datetime) -> bool:
+        """True when *current_slot* was already applied within the dedupe window.
+
+        Uses ``time.monotonic()`` rather than ``self.datetime()``: this is a
+        "how long ago did we do that" question and must not be affected by a
+        DST step or a clock correction.
+        """
+        window = getattr(self.config, "execute_dedupe_seconds", 0)
+        if window <= 0 or self._last_executed_slot is None:
+            return False
+        if not datetimes_match_slot(
+            self._last_executed_slot, current_slot, self._get_local_timezone()
+        ):
+            return False
+        return self._seconds_since_execution() < window
 
     def _apply_mode_tracked(self, entry: ScheduleEntry) -> bool:
         """Send one mode command and account for its outcome.
@@ -1568,7 +1839,29 @@ class BatteryOptimizer(hass.Hass):
             returns True because DirectControl recorded it as sent and
             verify-after-set is what resolves it.
         """
-        outcome = self._direct_control.apply_mode_with_outcome(entry)
+        # THE ONE UNLOCKED REGION IN THIS APP. `set_wit_mode` is a synchronous
+        # modbus write that legitimately takes up to ~15 s; holding the app lock
+        # across it would serialize every other callback behind one inverter
+        # write, which is exactly the single-thread stall multi-threading is
+        # meant to fix. Only this one expression runs unlocked: `entry` is a
+        # local, `current_mode` was already committed by
+        # `_handle_mode_transition` before we got here, DirectControl guards its
+        # own state, and everything below re-acquires the lock before touching
+        # app state.
+        #
+        # At depth >= 2 (a nested call from `full_optimize` /
+        # `_recalculate_remaining_schedule` -> `execute_scheduled_mode`)
+        # `unlocked()` deliberately does NOT release: the outer frame is
+        # mid-rebuild of `self.schedule`, so the write runs under the lock -
+        # today's behaviour, and correct.
+        with self._lock.unlocked():
+            outcome = self._direct_control.apply_mode_with_outcome(entry)
+
+        if outcome is not ApplyOutcome.FAILED:
+            # The outcome, not the entry, decides what happens to the
+            # grid-charge window: a duplicate must not re-extend it and a dry
+            # run must not open one. See _note_applied_mode.
+            self._note_applied_mode(entry, outcome)
 
         if outcome is ApplyOutcome.FAILED:
             self._apply_failure_count += 1
@@ -1681,7 +1974,22 @@ class BatteryOptimizer(hass.Hass):
             )
             self._handle_mode_transition(BatteryMode.HOLD)
             self._apply_mode_tracked(entry)
-            # Schedule re-optimization to find charging opportunities
+            # Schedule re-optimization to find charging opportunities — but
+            # only when the depletion was NOT the plan. An "(until depleted)"
+            # EXPORT/DISCHARGE slot ends AT min_soc by design: on 2026-09-02 the
+            # DP planned "EXPORT (until depleted) -> 10.0%" at 06:45, the
+            # battery hit 10.0 % as planned at 06:51, and the safety net then
+            # paid for a full 17 s re-optimization of a state the schedule had
+            # asked for. The safety HOLD still fires (the inverter's discharge
+            # cutoff is the real protection); only the recalculation is skipped.
+            if self._depletion_was_planned(now):
+                self.log(
+                    "Depletion at min SOC was planned for this slot "
+                    "(scheduled end SOC is min_soc) - applying safety HOLD "
+                    "without re-optimizing",
+                    level="DEBUG",
+                )
+                return True
             if (self._last_depletion_recalc_time is None or
                     (now - self._last_depletion_recalc_time).total_seconds() > 1800):
                 self._last_depletion_recalc_time = now
@@ -1721,8 +2029,38 @@ class BatteryOptimizer(hass.Hass):
 
         return False
 
+    def _depletion_was_planned(self, now: datetime.datetime) -> bool:
+        """True when the executing slot was already scheduled to end at min SOC.
+
+        The expected-SOC trajectory records the SOC at the START of each slot,
+        so the planned END of the current slot is the value stored for the NEXT
+        slot. When that is min_soc (within
+        ``planned_depletion_margin_percent``), reaching min_soc is the plan
+        executing correctly, not a deviation worth replanning for.
+
+        Returns False whenever the answer is unknown (no trajectory, or the
+        horizon ends here), preserving the previous "always re-optimize"
+        behaviour for genuinely unexplained depletion.
+        """
+        if not self.expected_soc_schedule:
+            return False
+        local_tz = self._get_local_timezone()
+        current_slot = self._align_to_slot(now)
+        next_slot = slot_offset(current_slot, self.config.slot_minutes, 1, local_tz)
+        planned_end = lookup_by_time(self.expected_soc_schedule, next_slot, local_tz)
+        if planned_end is None:
+            return False
+        return planned_end <= self.min_soc + self.config.planned_depletion_margin_percent
+
+    @_timed_callback
     def _on_depletion_recalc(self, kwargs=None):
-        """Re-optimize after battery depletion to find charging opportunities."""
+        """Re-optimize after battery depletion to find charging opportunities.
+
+        Decorated: this is a ``run_in`` callback like any other, and its 17.0 s
+        overrun on 2026-09-02 was invisible to the app's own instrumentation —
+        only AppDaemon's generic "Excessive time spent in callback" line
+        recorded it.
+        """
         current_soc = self._get_current_soc()
         if current_soc is None:
             return
@@ -1930,15 +2268,25 @@ class BatteryOptimizer(hass.Hass):
     # Enable/Disable and Manual Override Handling
     # =========================================================================
 
+    @_timed_callback
     def _on_enabled_change(self, entity, attribute, old, new, kwargs):
         """Handle optimizer enable/disable toggle."""
         if new == "off":
             self.log("Optimizer disabled — releasing inverter overrides")
-            self._direct_control.release_control()
+            # Second (and last) blocking inverter call in this file; same rule
+            # as `_apply_mode_tracked` - drop the app lock around it only.
+            with self._lock.unlocked():
+                self._direct_control.release_control()
+            # Handing the inverter back to passthrough ends any grid charge just
+            # as a superseding mode does. Without this the window kept running
+            # to its full slot+buffer expiry with the optimizer disabled, so a
+            # sunny disabled-app charge was booked at the grid price.
+            self._shrink_grid_charge_window()
         elif new == "on" and old == "off":
             self.log("Optimizer re-enabled — resuming scheduled operation")
             self.execute_scheduled_mode(None)
 
+    @_timed_callback
     def on_override_change(self, entity, attribute, old, new, kwargs):
         """Handle manual override toggle"""
         if new == "on":
@@ -1950,6 +2298,7 @@ class BatteryOptimizer(hass.Hass):
             self.log("Manual override deactivated, resuming schedule")
             self.execute_scheduled_mode(None)
 
+    @_timed_callback
     def on_manual_mode_change(self, entity, attribute, old, new, kwargs):
         """Handle manual mode selection change"""
         if self._is_override_active():
@@ -2056,6 +2405,7 @@ class BatteryOptimizer(hass.Hass):
         self.log("Scheduling startup optimization")
         self.run_in(self.full_optimize, 1)
 
+    @_timed_callback
     def _on_ha_start(self, event_name, data, kwargs):
         """HA started - load state and begin optimization"""
         self._cost_tracker.load_from_ha()
@@ -2154,6 +2504,9 @@ class BatteryOptimizer(hass.Hass):
 
     def _save_pv_profile(self):
         """Save PV profile to persistent storage."""
+        # Runs under the app lock (every caller is a @_timed_callback frame):
+        # `open(..., "w")` truncates, so two concurrent saves would leave a
+        # half-written file. Never call this from inside an unlocked region.
         if self.config.pv_profile_file:
             try:
                 with open(self.config.pv_profile_file, "w", encoding="utf-8") as fh:
@@ -2270,6 +2623,9 @@ class BatteryOptimizer(hass.Hass):
 
     def _save_load_profile(self):
         """Persist load profile to Home Assistant entity"""
+        # Runs under the app lock (every caller is a @_timed_callback frame):
+        # `open(..., "w")` truncates, so two concurrent saves would leave a
+        # half-written file. Never call this from inside an unlocked region.
         json_data = self.load_profile.to_json()
 
         # Prefer file-based persistence if configured
@@ -2319,6 +2675,9 @@ class BatteryOptimizer(hass.Hass):
 
     def _save_prediction_tracker(self):
         """Persist prediction tracker to file."""
+        # Runs under the app lock (every caller is a @_timed_callback frame):
+        # `open(..., "w")` truncates, so two concurrent saves would leave a
+        # half-written file. Never call this from inside an unlocked region.
         if not self.config.prediction_tracker_file:
             return
         try:
@@ -2355,6 +2714,7 @@ class BatteryOptimizer(hass.Hass):
         except Exception as e:
             self.log(f"Could not update prediction accuracy sensor: {e}", level="DEBUG")
 
+    @_timed_callback
     def record_load_observation(self, kwargs=None):
         """Record current house load into the statistical load profile."""
         if not self.config.load_power_sensor:
@@ -2391,6 +2751,9 @@ class BatteryOptimizer(hass.Hass):
 
     def _save_learning_data(self):
         """Persist learning data to file"""
+        # Runs under the app lock (every caller is a @_timed_callback frame):
+        # `open(..., "w")` truncates, so two concurrent saves would leave a
+        # half-written file. Never call this from inside an unlocked region.
         if not self.config.learning_data_file:
             return
         try:
@@ -2803,6 +3166,9 @@ class BatteryOptimizer(hass.Hass):
                     "prediction_accuracy": self._outcome_tracker.get_accuracy_stats(),
                     # Inverter control health (verify-after-set counters)
                     "inverter_control_health": self._direct_control.get_diagnostics(),
+                    # Deploy proof: which code is actually running (see APP_VERSION)
+                    "app_version": APP_VERSION,
+                    "code_paths": dict(zip(("orchestrator", "lib"), _code_paths())),
                     "friendly_name": "Battery Optimizer"
                 }
             )

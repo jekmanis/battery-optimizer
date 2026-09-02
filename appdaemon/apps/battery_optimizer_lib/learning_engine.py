@@ -29,6 +29,87 @@ TEMP_OBSERVATION_WINDOW = 192
 MIN_THERMAL_SAMPLES = 20
 MAX_THERMAL_SAMPLES = 300
 
+# ---------------------------------------------------------------------------
+# Learned-rate plausibility bounds — THE one sanity bound
+# ---------------------------------------------------------------------------
+# Every consumer of a learned battery power (the DP through
+# ``charge_rate_utils``, the expected-SOC trajectory through
+# ``soc_projection._effective_charge_rate``, the deviation detector through
+# ``_project_charge_completion`` / ``_calculate_extra_charge_slots``) reaches it
+# via :meth:`BatteryLearningEngine.get_charge_rate_for_soc`. The bound therefore
+# lives HERE and nowhere else — three ad-hoc clamps in three consumers is
+# exactly the drift CLAUDE.md's "one model" rule exists to prevent.
+#
+# Why 2x nominal: the reference installation is configured at 4.5 kW nominal and
+# the observation history contains a hard physical ceiling around 6.8 kW
+# (1.5x nominal) — the inverter's warm-battery rate. 2x leaves headroom for a
+# faster pack than configured while rejecting everything above what a 15-minute
+# slot can physically deliver. A tighter 1.5x would clip the genuine 6.77-6.82 kW
+# cluster.
+DEFAULT_MAX_RATE_FACTOR = 2.0
+
+# Quantization step of the energy source an observation is measured from. The
+# inverter energy counters move in 0.1 kWh; the SOC sensor's 1% is coarser
+# (0.143 kWh) but its samples are gated the same way.
+DEFAULT_COUNTER_RESOLUTION_KWH = 0.1
+
+# Absolute wall-time floor for an observation, used ONLY when the measured
+# energy is too small to resolve a rate on its own (see
+# ``_observation_is_resolvable``). 0.25 min = 15 s.
+#
+# It was 1.0 min, and that was wrong in a way the 2x rate bound was explicitly
+# tuned against: ``cost_tracker`` re-stamps ``_last_sig_soc_time`` after EVERY
+# accepted event, so a genuine interval is however long it takes the counter to
+# advance one 0.1 kWh tick — 0.1/P hours, i.e. under a minute for any P above
+# 6 kW. A 1-minute floor therefore rejected exactly the 6.77-6.82 kW warm-pack
+# cluster the bound exists to keep, while a 0.1 kWh / 44 ms sample (~9000 kW) is
+# caught by ``is_plausible_rate`` regardless of any wall-time rule.
+MIN_OBSERVATION_MINUTES = 0.25
+
+# Absolute ceiling for the self-heating coefficient k2 (C per kWh through the
+# pack). Measured on the reference pack: 21.9C -> 25.8C while storing 1.716 kWh
+# over one 15-minute slot = 2.27 C/kWh, so the previous 2.0 ceiling was itself
+# binding on real data. 3.0 keeps a genuinely hot pack representable while still
+# rejecting a fit driven by corrupted power figures.
+MAX_HEATING_C_PER_KWH = 3.0
+
+# Bounds for the relaxation coefficient k1 (per minute).
+MIN_COOLING_RATE_PER_MIN = 0.001
+MAX_COOLING_RATE_PER_MIN = 0.1
+
+
+def _clamp_k1(k1: float) -> float:
+    """Clamp the relaxation coefficient to its physical range."""
+    return min(MAX_COOLING_RATE_PER_MIN, max(MIN_COOLING_RATE_PER_MIN, k1))
+
+
+def _clamp_k2(k2: float) -> float:
+    """Clamp the self-heating coefficient to its physical range."""
+    return min(MAX_HEATING_C_PER_KWH, max(0.0, k2))
+
+
+def thermal_coeffs_are_sane(coeffs: Optional[Dict]) -> bool:
+    """Whether a persisted ``thermal_coeffs`` dict is inside the model's bounds.
+
+    A fit produced from corrupted power figures lands outside these bounds (or
+    carries a non-finite value); such a fit is discarded on load and the engine
+    falls back to the bootstrap/default chain rather than feeding the DP a
+    temperature model it can never satisfy.
+    """
+    if not coeffs:
+        return False
+    try:
+        k1 = float(coeffs.get("k1"))
+        k2 = float(coeffs.get("k2"))
+        n = float(coeffs.get("n", 0))
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(k1) and math.isfinite(k2) and math.isfinite(n)):
+        return False
+    if not (MIN_COOLING_RATE_PER_MIN <= k1 <= MAX_COOLING_RATE_PER_MIN):
+        return False
+    return 0.0 <= k2 <= MAX_HEATING_C_PER_KWH
+
 
 class BatteryLearningEngine:
     """
@@ -52,9 +133,20 @@ class BatteryLearningEngine:
         temp_ranges: Optional[List[int]] = None,
         default_cooling_rate_per_min: float = DEFAULT_COOLING_RATE_PER_MIN,
         default_heating_c_per_kwh: float = DEFAULT_HEATING_C_PER_KWH,
+        nominal_discharge_rate_kw: Optional[float] = None,
+        nominal_export_rate_kw: Optional[float] = None,
+        max_rate_factor: float = DEFAULT_MAX_RATE_FACTOR,
+        min_observation_minutes: float = MIN_OBSERVATION_MINUTES,
+        counter_resolution_kwh: float = DEFAULT_COUNTER_RESOLUTION_KWH,
     ):
         self.default_cooling_rate_per_min = default_cooling_rate_per_min
         self.default_heating_c_per_kwh = default_heating_c_per_kwh
+        self.nominal_discharge_rate = nominal_discharge_rate_kw
+        self.nominal_export_rate = nominal_export_rate_kw
+        self.max_rate_factor = max(1.0, float(max_rate_factor))
+        self.min_observation_minutes = max(0.0, float(min_observation_minutes))
+        self.counter_resolution_kwh = max(0.0, float(counter_resolution_kwh))
+        self._rejected_observations = 0
         self._thermal_samples_since_calibration = 0
         self.battery_capacity = battery_capacity_kwh
         self.nominal_charge_rate = nominal_charge_rate_kw
@@ -86,6 +178,117 @@ class BatteryLearningEngine:
             "75-90": 1.0,   # Will be learned
             "90-100": 1.0,  # Will be learned
         }
+
+    # ------------------------------------------------------------------
+    # The one plausibility bound on a learned battery power
+    # ------------------------------------------------------------------
+
+    @property
+    def max_plausible_rate_kw(self) -> float:
+        """Upper bound (kW) for any learned charge/discharge rate.
+
+        Derived from the configured nominal rates, so an installation with a
+        bigger battery does not need a different constant. Consumers must NOT
+        re-derive their own bound — they call
+        :meth:`get_charge_rate_for_soc`, which applies this one.
+
+        All THREE configured powers feed the maximum. The export discharge rate
+        (``config.effective_export_discharge_rate``) is the one the inverter
+        actually runs during a ``discharge_to_grid`` / ``max_export`` slot, and
+        it is routinely the largest of the three: judging those genuine samples
+        against the (smaller) load-discharge rate would reject the very slots
+        the DP plans the export around.
+        """
+        nominal = max(
+            float(self.nominal_charge_rate or 0.0),
+            float(self.nominal_discharge_rate or 0.0),
+            float(self.nominal_export_rate or 0.0),
+        )
+        if nominal <= 0:
+            nominal = 4.5
+        return nominal * self.max_rate_factor
+
+    def is_plausible_rate(self, rate_kw: Optional[float]) -> bool:
+        """Whether ``rate_kw`` could physically have been produced by the pack."""
+        if rate_kw is None:
+            return False
+        try:
+            rate = float(rate_kw)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(rate) and 0.0 < rate <= self.max_plausible_rate_kw
+
+    def observation_is_resolvable(
+        self, energy_kwh: float, duration_minutes: float
+    ) -> Optional[str]:
+        """Can this (energy, duration) pair carry a rate at all?
+
+        Returns ``None`` when the sample is resolvable, otherwise the reason it
+        is not (ready for :meth:`_reject_observation`).
+
+        The question is quantization, not wall time. A sample resolves a rate
+        when EITHER
+
+        * the measured energy spans at least two counter ticks
+          (``2 * counter_resolution_kwh``), so the quotient is dominated by real
+          energy rather than by one tick of granularity — no matter how short
+          the interval; OR
+        * the interval is at least ``min_observation_minutes``, the absolute
+          floor below which even a multi-tick delta is not worth trusting.
+
+        A pure wall-time floor was wrong here: ``cost_tracker`` re-stamps the
+        interval start after every accepted event, so at 6.8 kW the counter
+        ticks 0.1 kWh every 53 s and a 1-minute floor rejected the real
+        warm-pack cluster. The five-digit production samples (0.1 kWh over
+        10-40 ms) fail BOTH conditions, and even if a bigger delta passed this
+        gate, ``is_plausible_rate`` still stands behind it.
+        """
+        try:
+            energy = float(energy_kwh)
+            duration = float(duration_minutes)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return "non-numeric energy/duration"
+        if duration >= self.min_observation_minutes:
+            return None
+        min_energy = 2.0 * self.counter_resolution_kwh
+        if min_energy > 0 and energy >= min_energy:
+            return None
+        return (
+            f"duration {duration:.4f} min < {self.min_observation_minutes:.2f} min "
+            f"and energy {energy:.3f} kWh < {min_energy:.3f} kWh "
+            f"(2x counter resolution)"
+        )
+
+    def clamp_learned_rate(self, rate_kw: Optional[float]) -> Optional[float]:
+        """Clamp a learned rate to the plausibility bound (None stays None)."""
+        if rate_kw is None:
+            return None
+        try:
+            rate = float(rate_kw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(rate) or rate <= 0:
+            return None
+        return min(rate, self.max_plausible_rate_kw)
+
+    def _plausible_rates(self, rates: Optional[List[float]]) -> List[float]:
+        """Observations that pass the bound, most recent last.
+
+        Applied BEFORE the ``[-10:]`` window so a burst of corrupted samples
+        cannot push every usable observation out of the median window — which
+        is precisely what happened to the live 0-25%/>20C bucket, where five
+        millisecond-duration samples left a median of 14308.71 kW.
+        """
+        if not rates:
+            return []
+        return [float(r) for r in rates if self.is_plausible_rate(r)]
+
+    def _reject_observation(self, kind: str, reason: str, detail: str) -> None:
+        """Log a dropped learning observation (INFO: it is operationally useful)."""
+        self._rejected_observations += 1
+        self.log(
+            f"Learning: rejected implausible {kind} observation ({reason}): {detail}"
+        )
 
     def _get_soc_range(self, soc: float) -> str:
         """Get the SOC range bucket for a given SOC."""
@@ -172,8 +375,32 @@ class BatteryLearningEngine:
             energy_added = (soc_end - soc_start) / 100 * self.battery_capacity
             energy_source = "soc"
 
+        # A sample that resolves neither in energy nor in time cannot carry a
+        # rate: the quotient is pure quantization noise. Rejecting it here is
+        # the FIRST of the two lines of defence; ``get_charge_rate_for_soc`` is
+        # the second (it also protects against a file poisoned before this
+        # guard existed).
+        unresolvable = self.observation_is_resolvable(energy_added, duration_minutes)
+        if unresolvable is not None:
+            self._reject_observation(
+                "charge",
+                unresolvable,
+                f"{soc_start:.1f}%->{soc_end:.1f}% [{energy_source}]",
+            )
+            return
+
         # Calculate observed charge rate
         charge_rate = energy_added / (duration_minutes / 60)
+
+        if not self.is_plausible_rate(charge_rate):
+            self._reject_observation(
+                "charge",
+                f"rate {charge_rate:.2f} kW > {self.max_plausible_rate_kw:.2f} kW "
+                f"({self.max_rate_factor:.1f}x nominal)",
+                f"{soc_start:.1f}%->{soc_end:.1f}% ({energy_added:.3f} kWh "
+                f"[{energy_source}]) in {duration_minutes:.3f}min",
+            )
+            return
 
         # Calculate efficiency if grid energy known
         if energy_from_grid_kwh and energy_from_grid_kwh > 0:
@@ -281,8 +508,33 @@ class BatteryLearningEngine:
             energy_delivered_kwh = (soc_start - soc_end) / 100 * self.battery_capacity
             energy_source = "soc"
 
+        # Same two guards as record_charging: the discharge path shares the
+        # duration source (``cost_tracker._last_sig_soc_time``) and feeds the
+        # SAME pooled thermal regression, so a corrupted |P_bat| here poisons
+        # k1/k2 exactly as a corrupted charge sample would.
+        unresolvable = self.observation_is_resolvable(
+            energy_delivered_kwh, duration_minutes
+        )
+        if unresolvable is not None:
+            self._reject_observation(
+                "discharge",
+                unresolvable,
+                f"{soc_start:.1f}%->{soc_end:.1f}% [{energy_source}]",
+            )
+            return
+
         # Calculate observed discharge rate
         discharge_rate = energy_delivered_kwh / (duration_minutes / 60)
+
+        if not self.is_plausible_rate(discharge_rate):
+            self._reject_observation(
+                "discharge",
+                f"rate {discharge_rate:.2f} kW > {self.max_plausible_rate_kw:.2f} kW "
+                f"({self.max_rate_factor:.1f}x nominal)",
+                f"{soc_start:.1f}%->{soc_end:.1f}% ({energy_delivered_kwh:.3f} kWh "
+                f"[{energy_source}]) in {duration_minutes:.3f}min",
+            )
+            return
 
         # Update totals
         self.stats.total_energy_discharged_kwh += energy_delivered_kwh
@@ -374,13 +626,16 @@ class BatteryLearningEngine:
         """
         if temp_start is None or temp_end is None:
             return False
-        if duration_minutes is None or duration_minutes < 1.0:
+        if duration_minutes is None or duration_minutes < max(1.0, self.min_observation_minutes):
             return False
         if avg_power_kw is None:
             return False
 
         power = abs(float(avg_power_kw))
-        if power >= 20.0:
+        # |P_bat| is the k2 regressor, so an implausible power does not merely
+        # add noise: it drags the whole pooled fit. Use the SAME bound the
+        # charge-rate consumers use rather than a second magic constant.
+        if power > self.max_plausible_rate_kw:
             return False
         if abs(float(temp_end) - float(temp_start)) >= 20.0:
             return False
@@ -471,8 +726,8 @@ class BatteryLearningEngine:
         k1 = (b1 * s22 - b2 * s12) / det
         k2 = (b2 * s11 - b1 * s12) / det * 60.0  # C per kWh through the battery
 
-        k1 = min(0.1, max(0.001, k1))
-        k2 = min(2.0, max(0.0, k2))
+        k1 = _clamp_k1(k1)
+        k2 = _clamp_k2(k2)
 
         refined = self._refine_thermal_coefficients(points, k1, k2)
         if refined is None:
@@ -538,8 +793,8 @@ class BatteryLearningEngine:
             scale = 1.0
             improved = False
             for _ in range(20):
-                cand1 = min(0.1, max(0.001, k1 + scale * step1))
-                cand2 = min(2.0, max(0.0, k2 + scale * step2))
+                cand1 = _clamp_k1(k1 + scale * step1)
+                cand2 = _clamp_k2(k2 + scale * step2)
                 cand_sse = self._thermal_sse(points, cand1, cand2)
                 if cand_sse <= sse:
                     converged = (
@@ -556,6 +811,66 @@ class BatteryLearningEngine:
                 break
 
         return k1, k2
+
+    def reset_thermal_calibration(self, drop_samples: bool = True) -> None:
+        """Discard the fitted ``k1``/``k2`` (and optionally the raw samples).
+
+        Used when a persisted fit is known to have been built from corrupted
+        power figures: the engine falls back to the warming-rate bootstrap and
+        the configured defaults, then re-bootstraps from freshly recorded
+        samples. ``load_from_json`` calls it automatically for a fit outside
+        :func:`thermal_coeffs_are_sane`.
+        """
+        self.stats.thermal_coeffs = {}
+        if drop_samples:
+            self.stats.thermal_samples = []
+        self._thermal_samples_since_calibration = 0
+
+    def sanitize_stats(self) -> Dict[str, int]:
+        """Drop persisted observations that fail the plausibility bounds.
+
+        Returns a dict of removal counts. Called on every load so that a file
+        poisoned before the ingest guards existed (production 2026-09-02) is
+        neutralised in memory immediately and written back clean on the next
+        save — the offline cleanup script uses the SAME rule.
+        """
+        removed = {"charge_rates": 0, "thermal_samples": 0, "thermal_coeffs": 0}
+
+        for soc_range, rates in list(self.stats.charge_rates_by_soc.items()):
+            keep = self._plausible_rates(rates)
+            removed["charge_rates"] += len(rates) - len(keep)
+            self.stats.charge_rates_by_soc[soc_range] = keep
+
+        for soc_range, temp_data in list(self.stats.charge_rates_by_soc_temp.items()):
+            for temp_range, rates in list(temp_data.items()):
+                keep = self._plausible_rates(rates)
+                removed["charge_rates"] += len(rates) - len(keep)
+                temp_data[temp_range] = keep
+
+        kept_samples = []
+        for sample in self.stats.thermal_samples:
+            if len(sample) < 5:
+                removed["thermal_samples"] += 1
+                continue
+            _t0, _t1, dt_min, power, _ambient = sample[:5]
+            if (
+                dt_min is None
+                or dt_min < max(1.0, self.min_observation_minutes)
+                or power is None
+                or abs(float(power)) > self.max_plausible_rate_kw
+            ):
+                removed["thermal_samples"] += 1
+                continue
+            kept_samples.append(sample)
+        self.stats.thermal_samples = kept_samples
+
+        if self.stats.thermal_coeffs and not thermal_coeffs_are_sane(
+            self.stats.thermal_coeffs
+        ):
+            removed["thermal_coeffs"] = 1
+            self.stats.thermal_coeffs = {}
+
+        return removed
 
     def get_heating_coefficient(
         self, default: Optional[float] = None
@@ -581,7 +896,7 @@ class BatteryLearningEngine:
         if all_rates and self.nominal_charge_rate > 0:
             median_c_per_min = statistics.median(all_rates)
             bootstrap = median_c_per_min / self.nominal_charge_rate * 60.0
-            return min(2.0, max(0.0, bootstrap))
+            return _clamp_k2(bootstrap)
 
         return default
 
@@ -701,10 +1016,19 @@ class BatteryLearningEngine:
         """
         Get predicted charge rate for a given SOC level and optional temperature.
         Uses learned data with fallback chain:
-        1. Exact SOC+temp match (>=3 observations) -> median of last 10
+        1. Exact SOC+temp match (>=3 plausible observations) -> median of last 10
         2. SOC match, aggregate all temps
         3. SOC-only data (when temperature unavailable)
         4. Nominal rate
+
+        THIS IS THE ONE GATE every consumer of a learned charge rate passes
+        through — the DP (via ``charge_rate_utils``), the expected-SOC
+        trajectory (via ``soc_projection._effective_charge_rate``) and the SOC
+        deviation detector. Implausible observations are filtered out of every
+        median (see :meth:`_plausible_rates`) and the result is clamped to
+        :attr:`max_plausible_rate_kw`, so a persisted file poisoned before the
+        ingest guards existed cannot leak a five-digit kW rate into any of them.
+        Consumers must NOT add their own clamp.
 
         Args:
             soc: Current state of charge (%)
@@ -722,25 +1046,35 @@ class BatteryLearningEngine:
             # Check for exact SOC+temp match
             if soc_range in self.stats.charge_rates_by_soc_temp:
                 temp_data = self.stats.charge_rates_by_soc_temp[soc_range]
-                if temp_range in temp_data and len(temp_data[temp_range]) >= 3:
-                    return statistics.median(temp_data[temp_range][-10:])
+                exact = self._plausible_rates(temp_data.get(temp_range))
+                if len(exact) >= 3:
+                    return self._bounded_median(exact[-10:], soc_range)
 
                 # Fallback 2: Aggregate all temps for this SOC range
                 all_rates = []
                 for rates in temp_data.values():
-                    all_rates.extend(rates[-10:])  # Last 10 from each temp bucket
+                    # Last 10 usable observations from each temp bucket
+                    all_rates.extend(self._plausible_rates(rates)[-10:])
                 if len(all_rates) >= 3:
-                    return statistics.median(all_rates)
+                    return self._bounded_median(all_rates, soc_range)
 
         # Fallback 3: Use SOC-only data (when temperature unavailable)
         if soc_range in self.stats.charge_rates_by_soc:
-            observations = self.stats.charge_rates_by_soc[soc_range]
+            observations = self._plausible_rates(self.stats.charge_rates_by_soc[soc_range])
             if len(observations) >= 3:
-                return statistics.median(observations[-10:])
+                return self._bounded_median(observations[-10:], soc_range)
 
         # Fallback 4: Use configured nominal charge rate
         multiplier = self.soc_charge_multipliers.get(soc_range, 1.0)
         return self.nominal_charge_rate * multiplier
+
+    def _bounded_median(self, rates: List[float], soc_range: str) -> float:
+        """Median of already-filtered observations, clamped as a last resort."""
+        clamped = self.clamp_learned_rate(statistics.median(rates))
+        if clamped is None:
+            multiplier = self.soc_charge_multipliers.get(soc_range, 1.0)
+            return self.nominal_charge_rate * multiplier
+        return clamped
 
     def get_warming_rate(self, starting_temp: float) -> Optional[float]:
         """
@@ -965,10 +1299,13 @@ class BatteryLearningEngine:
         )
 
         # Build temperature-aware rates summary with per-bucket confidence
+        # The reported medians must be the ones the DP actually sees, so they go
+        # through the same plausibility filter as get_charge_rate_for_soc.
         temp_aware_rates = {}
         for soc_range, temp_data in self.stats.charge_rates_by_soc_temp.items():
             temp_aware_rates[soc_range] = {}
-            for temp_range, rates in temp_data.items():
+            for temp_range, raw_rates in temp_data.items():
+                rates = self._plausible_rates(raw_rates)
                 if rates:
                     count = len(rates)
                     # Confidence: 0.7 base + up to 0.3 based on count (max at 10 obs)
@@ -981,7 +1318,8 @@ class BatteryLearningEngine:
 
         # Build SOC-only rates with confidence
         soc_charge_rates = {}
-        for soc_range, rates in self.stats.charge_rates_by_soc.items():
+        for soc_range, raw_rates in self.stats.charge_rates_by_soc.items():
+            rates = self._plausible_rates(raw_rates)
             if rates:
                 count = len(rates)
                 # Confidence: 0.3 base + up to 0.2 based on count (max at 10 obs)
@@ -993,7 +1331,9 @@ class BatteryLearningEngine:
                 }
 
         # Calculate total observations across all buckets
-        total_observations = sum(len(v) for v in self.stats.charge_rates_by_soc.values())
+        total_observations = sum(
+            len(self._plausible_rates(v)) for v in self.stats.charge_rates_by_soc.values()
+        )
 
         # Build warming rates summary
         warming_rates_summary = {}
@@ -1033,6 +1373,8 @@ class BatteryLearningEngine:
             "thermal_samples": len(self.stats.thermal_samples),
             "thermal_k1_per_min": round(self.get_cooling_rate_estimate(estimated_ambient), 4),
             "thermal_k2_c_per_kwh": round(self.get_heating_coefficient(), 3),
+            "rejected_observations": self._rejected_observations,
+            "max_plausible_rate_kw": round(self.max_plausible_rate_kw, 2),
             "thermal_calibrated": bool(
                 self.stats.thermal_coeffs
                 and self.stats.thermal_coeffs.get("n", 0) >= MIN_THERMAL_SAMPLES
@@ -1057,6 +1399,15 @@ class BatteryLearningEngine:
                 self.learned_efficiency = data.get("learned_efficiency", self.nominal_efficiency)
                 if "stats" in data:
                     self.stats = LearningStats.from_dict(data["stats"])
+                    removed = self.sanitize_stats()
+                    if any(removed.values()):
+                        self.log(
+                            "Learning: dropped implausible persisted data on load "
+                            f"({removed['charge_rates']} charge-rate observations "
+                            f"> {self.max_plausible_rate_kw:.2f} kW, "
+                            f"{removed['thermal_samples']} thermal samples, "
+                            f"{removed['thermal_coeffs']} thermal fits)"
+                        )
                 return True
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             self.log(f"Could not load learning data: {e}")

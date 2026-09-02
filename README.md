@@ -264,7 +264,7 @@ uv run pytest tests/ --cov=appdaemon/apps --cov-report=term-missing
 - **`set_wit_mode` not found:** you're on the stock Growatt integration — install the [WIT fork](https://github.com/jekmanis/Growatt_ModbusTCP).
 - **`set_wit_mode` timeouts:** many sequential VPP register writes on a busy Modbus link can exceed AppDaemon's default 10 s service window. The optimizer sets that per-call window from `set_wit_mode_timeout_seconds` (**default 15 s**) and inspects the service response. If AppDaemon still times out client-side (returns `None`), the mode is treated as *unconfirmed* (logged at WARNING) rather than silently assumed applied — verify-after-set covers that case, which is why a short timeout is safe and a long one is not (it blocks every other callback). A confirmed failure (the service raised) is logged at ERROR and is **not** recorded as sent, so it is retried on the next slot instead of being masked by duplicate suppression.
 
-- **Mode mismatches / "resending once":** `verify_delay_seconds` (default 90 s) after every mode change — including `passthrough` — DirectControl reads the integration's **Inverter Mode** sensor (`sensor.growatt_inverter_mode` by default, overridable via `inverter_mode_sensor`). On a genuine mismatch it resends once and then re-checks **exactly once** after `verify_recheck_seconds` (default 60 s). If that second read still disagrees, the app logs an **ERROR** ("persistent mode mismatch after resend") and stops — never a third send, never a loop; the next slot retries normally.
+- **Mode mismatches / "resending once":** `verify_delay_seconds` (default 90 s) after every mode change — including `passthrough` — DirectControl consults the source selected by `verify_source` (`auto` → the holding registers 30407-30410 / 30200-30201 whenever `device_id` is set; `mode_sensor` → the `inverter_mode_sensor` entity; `none` → no check). No entity is guessed: `auto` never falls back to the mode sensor. On a genuine mismatch it resends once and then re-checks **exactly once** after `verify_recheck_seconds` (default 60 s). If that second read still disagrees, the app logs an **ERROR** ("persistent mode mismatch after resend") and stops — never a third send, never a loop; the next slot retries normally.
 
   Counters live on `sensor.battery_inverter_control_health` (and as the `inverter_control_health` attribute of `sensor.battery_optimizer`). Use them to tell the two causes apart:
 
@@ -276,15 +276,28 @@ uv run pytest tests/ --cov=appdaemon/apps --cov-report=term-missing
 
   The sensor is created with `set_state`, so it disappears after an HA restart until the app republishes it — alert on trends, don't rely on its history.
 
-- **AppDaemon threads — "Excessive time spent in callback (limit=10.0s)":** `set_wit_mode` is a **synchronous, blocking** service call on the AppDaemon callback thread. With the default single thread, one slow inverter write stalls schedule execution, the SOC listener and PV sampling alike (33 h of production logs: 70 overruns of 10–34 s, all on `thread-0`). Give this app more threads:
+- **AppDaemon threads — "Excessive time spent in callback (limit=10.0s)":** `set_wit_mode` is a **synchronous, blocking** service call on the AppDaemon callback thread. With the default single thread, one slow inverter write stalls schedule execution, the SOC listener and PV sampling alike (33 h of production logs: 70 overruns of 10–34 s, all on `thread-0`). Two settings are needed, not one:
 
   ```yaml
   # appdaemon.yaml
   appdaemon:
     total_threads: 4
+    thread_duration_warning_threshold: 25   # optional; a set_wit_mode write is legitimately ~15 s
   ```
 
-  (or pin the app with `pin_thread`). The app also measures its own callbacks and warns above `callback_warn_seconds`, naming the offending callback and repeating the `total_threads` advice after three overruns.
+  ```yaml
+  # apps.yaml
+  battery_optimizer:
+    pin_app: false        # REQUIRED alongside total_threads
+  ```
+
+  `total_threads` alone is **worse than the default**: in AppDaemon 4.5.13 an app's `pin_app` still defaults to `true`, so every callback is dispatched to thread-0 anyway — now with a `WARNING ... Invalid thread ID for pinned thread in app: battery_optimizer - assigning to thread 0` on *every* dispatch. `pin_app: false` is what lets the scheduler round-robin this app across the worker threads.
+
+  With round-robin dispatch the app's callbacks genuinely run concurrently, so the orchestrator serializes them itself: `_timed_callback` runs every callback under one app-wide re-entrant lock (`battery_optimizer_lib/callback_lock.py`), and the only region that drops it is the blocking `set_wit_mode` write in `_apply_mode_tracked`. That is the whole point — other callbacks keep running while the inverter write is in flight.
+
+  Rollback without touching `appdaemon.yaml`: set `pin_app: true` and `pin_thread: 2` (must be `< total_threads`) on the app. Do **not** set `pin_threads` in `appdaemon.yaml` — `total_threads` forces it to 0.
+
+  The app also measures its own callbacks (lock wait included) and warns above `callback_warn_seconds`, naming the offending callback and repeating the `total_threads` + `pin_app` advice after three overruns.
 
 ---
 

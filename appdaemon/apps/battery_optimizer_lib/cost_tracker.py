@@ -51,6 +51,10 @@ class BatteryCostConfig:
     # Default fallback landed cost per stored DC kWh when HA entity unavailable
     default_cost: float = 0.10  # EUR/kWh
 
+    # Source attribution guards (see _observed_charge_cost)
+    pv_attribution_min_w: float = 100.0
+    grid_charge_grace_seconds: int = 120
+
     @property
     def effective_export_discharge_rate(self) -> float:
         """Discharge rate during grid export (kW). Falls back to discharge_rate if not set."""
@@ -77,6 +81,10 @@ class BatteryCostConfig:
             inverter_efficiency=cfg.inverter_efficiency,
             import_price_multiplier=getattr(cfg, "import_price_multiplier", 1.0),
             battery_wear_cost=cfg.battery_wear_cost,
+            pv_attribution_min_w=getattr(cfg, "cost_pv_attribution_min_w", 100.0),
+            grid_charge_grace_seconds=getattr(
+                cfg, "cost_grid_charge_grace_seconds", 120
+            ),
         )
 
 
@@ -122,9 +130,20 @@ class BatteryCostTracker:
         # summer is ~the current battery temperature — so nearly every cooling
         # observation was discarded and no cooling rate was ever learned.
         get_ambient_temp_func: Optional[Callable[[], Optional[float]]] = None,
+        # Measured PV power in WATTS right now, or None when the sensor is
+        # unavailable. Injected (not read off the app) so the attribution rule
+        # stays unit-testable. Without it the tracker keeps the legacy
+        # mode-only attribution.
+        get_pv_power_w_func: Optional[Callable[[], Optional[float]]] = None,
+        # True while a grid_charge command sent to the inverter is still in
+        # force (or inside its post-supersede grace period). The orchestrator
+        # knows what DirectControl last sent and when.
+        grid_charge_active_func: Optional[Callable[[], bool]] = None,
     ):
         self._config = config
         self._get_ambient_temp = get_ambient_temp_func
+        self._get_pv_power_w = get_pv_power_w_func
+        self._grid_charge_active = grid_charge_active_func
         self._get_state = get_state_func
         self._call_service = call_service_func
         self._get_datetime = get_datetime_func
@@ -300,9 +319,27 @@ class BatteryCostTracker:
         if abs(self._stored_energy_kwh - soc_energy_before) < 1e-9:
             return
 
+        # Spell out the in-transit term. Two consecutive resyncs at the same
+        # SOC read as a contradiction otherwise: a plain SOC observation
+        # anchors to "SOC now" (0.100 -> 0.143 kWh from SOC 11.0%) while the
+        # energy-delta path anchors to the state BEFORE the delta
+        # (0.143 -> 0.043 kWh from the same SOC 11.0%). Both are correct; only
+        # the message hid the 0.100 kWh that separates them.
+        if energy_in_transit_kwh > 0:
+            transit = (
+                f" less the {energy_in_transit_kwh:.3f} kWh charged in this event"
+            )
+        elif energy_in_transit_kwh < 0:
+            transit = (
+                f" plus the {-energy_in_transit_kwh:.3f} kWh "
+                f"discharged in this event"
+            )
+        else:
+            transit = ""
         self._log(
             f"Resyncing stored-energy accumulator {self._stored_energy_kwh:.3f} "
-            f"-> {soc_energy_before:.3f} kWh from SOC {current_soc:.1f}% "
+            f"-> {soc_energy_before:.3f} kWh (SOC {current_soc:.1f}% = "
+            f"{soc_energy_now:.3f} kWh{transit}) "
             f"({'depleted' if depleted else 'drift'})"
         )
         self._stored_energy_kwh = soc_energy_before
@@ -326,19 +363,89 @@ class BatteryCostTracker:
         )
         return sell_price / max(1e-9, self._config.efficiency)
 
+    def _measured_pv_w(self) -> Optional[float]:
+        """Current PV power in W, or None when it cannot be established."""
+        if self._get_pv_power_w is None:
+            return None
+        try:
+            value = self._get_pv_power_w()
+        except Exception:  # pragma: no cover - defensive
+            return None
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return None
+
+    def _grid_charge_in_force(self) -> bool:
+        """True while a grid_charge command sent to the inverter is still live."""
+        if self._grid_charge_active is None:
+            return False
+        try:
+            return bool(self._grid_charge_active())
+        except Exception:  # pragma: no cover - defensive
+            return False
+
     def _observed_charge_cost(self, spot_price: float) -> Tuple[float, str]:
-        """Attribute measured charging only when the active mode establishes it."""
+        """Attribute measured charging to a source that could physically supply it.
+
+        The mode alone is not evidence. On 2026-09-02 the app sent
+        ``grid_charge duration=20min`` at 05:00:05, transitioned to HOLD at
+        05:15:05, and five seconds later — an hour before sunrise — booked the
+        tail of that still-running grid charge as ``[inverter, pv]`` at 0.0253
+        EUR/kWh, dragging the basis 0.1261 -> 0.1199. Two guards now stand
+        between "not commanded to grid-charge" and "therefore PV":
+
+        1. a grid_charge command still in force at the inverter keeps grid
+           attribution — but only while the PV floor is NOT cleared;
+        2. PV attribution requires measured PV above
+           ``pv_attribution_min_w``. With no PV there is no foregone export
+           revenue, so the conservative grid cost applies instead.
+
+        Measured PV outranks the command window, and the ordering matters. The
+        window is a *time* bound on a command that has been superseded, not
+        evidence about the current kWh: a midday CHARGE -> HOLD transition
+        leaves the window open for `cost_grid_charge_grace_seconds`, and with
+        the window checked first, genuine 4 kW PV charging two minutes later was
+        booked at the grid price. Both guards still fail toward the grid cost
+        whenever the sun cannot account for the energy, which is the
+        conservative direction.
+
+        When no PV provider is injected the legacy mode-only attribution is
+        kept, so an installation without a usable PV sensor is unchanged.
+        """
         from .models import BatteryMode
 
         if self._current_mode == BatteryMode.CHARGE:
             # CHARGE is explicitly commanded grid charging. Any simultaneous,
             # unmetered PV contribution makes this a conservative estimate.
             return self._grid_landed_cost(spot_price), "grid"
+
+        pv_w = self._measured_pv_w()
+        pv_is_producing = (
+            pv_w is not None and pv_w >= self._config.pv_attribution_min_w
+        )
+
+        if self._grid_charge_in_force() and not pv_is_producing:
+            # The inverter is still executing a grid_charge command issued for
+            # an earlier slot and nothing else could have supplied these kWh;
+            # the app's current mode says nothing about where they came from.
+            return self._grid_landed_cost(spot_price), "grid-command"
+
         if self._current_mode in (BatteryMode.HOLD, BatteryMode.DISCHARGE):
             # Growatt's discharge-to-load mode still accepts surplus PV into
             # the battery.  A measured charge while either non-grid-charging
-            # mode is active is therefore valued at foregone export revenue.
-            return self._pv_opportunity_cost(spot_price), "pv"
+            # mode is active is therefore valued at foregone export revenue —
+            # but only if the sun is actually producing.
+            if pv_w is None:
+                # No PV sensor wired in (or momentarily unavailable): keep the
+                # historical attribution rather than inventing a grid charge.
+                return self._pv_opportunity_cost(spot_price), "pv"
+            if pv_is_producing:
+                return self._pv_opportunity_cost(spot_price), "pv"
+            return self._grid_landed_cost(spot_price), "no-pv-grid"
+
         # Before the first mode callback the source is unknowable. Use the
         # conservative grid attribution so the landed-cost average never mixes
         # in an AC-side raw spot price.
@@ -574,6 +681,18 @@ class BatteryCostTracker:
         """
         current_slot = self._align_to_slot(now)
 
+        # The learning observation's baseline is the `_last_sig_*` triple —
+        # SOC, time and temperature TOGETHER. `_last_soc` is the SOC-delta
+        # tracker and is advanced by the SOC listener, which HA delivers ~40 ms
+        # BEFORE this callback; pairing that SOC with `_last_sig_soc_time`'s
+        # duration produced observations with `soc_start == soc_end` over a
+        # 44-millisecond window.
+        baseline_soc = (
+            self._last_sig_soc
+            if self._last_sig_soc is not None
+            else (self._last_soc if self._last_soc is not None else current_soc)
+        )
+
         # Calculate duration since last significant event
         if self._last_sig_soc_time:
             last_time = self._last_sig_soc_time
@@ -625,7 +744,7 @@ class BatteryCostTracker:
             # trips learning_engine.record_charging's `soc_end <= soc_start`
             # early return — the observation was silently dropped.
             self._learning_engine.record_charging(
-                soc_start=self._last_soc if self._last_soc is not None else current_soc,
+                soc_start=baseline_soc,
                 soc_end=current_soc,
                 duration_minutes=duration_minutes,
                 energy_from_grid_kwh=(
@@ -653,7 +772,7 @@ class BatteryCostTracker:
                 )
 
             self._learning_engine.record_discharging(
-                soc_start=self._last_soc if self._last_soc is not None else current_soc,
+                soc_start=baseline_soc,
                 soc_end=current_soc,
                 duration_minutes=duration_minutes,
                 energy_delivered_kwh=energy_kwh,
@@ -720,9 +839,15 @@ class BatteryCostTracker:
             self._resync_stored_energy(current_soc)
             self._last_soc = current_soc
             self._last_soc_time = now
-            self._last_sig_soc = current_soc
-            self._last_sig_soc_time = now
-            self._last_sig_temp = self._get_battery_temp()
+            # `_last_sig_*` is deliberately NOT re-stamped here. When the
+            # inverter energy sensors are the authority, that triple is the
+            # BASELINE of the learning observation and is owned by
+            # `_process_energy_change`. HA delivers the SOC change first: on
+            # 2026-09-02 the SOC listener ran at 05:02:13.724 and the energy
+            # callback 44 ms later at 05:02:13.768. Re-stamping here reset the
+            # baseline in that gap, so `record_charging` saw a 44-millisecond
+            # duration and `soc_start == soc_end` — the live learning file
+            # holds observations at 34 535 kW and 44 653 kW because of it.
             self._last_price_slot = current_slot
             return
 

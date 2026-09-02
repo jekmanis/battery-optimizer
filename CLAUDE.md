@@ -157,11 +157,24 @@ via the `growatt_modbus/set_wit_mode` HA service (no raw register writes):
 - Duplicate commands within half a slot are skipped; `release_control()` reverts to `passthrough`
 - Reliability: each call passes `hass_timeout=config.set_wit_mode_timeout_seconds` (default **15**) and inspects the service response. A raised/`success=False` result is a confirmed failure (ERROR, returns False, last-sent NOT recorded so it retries next slot). A `None` result is an unconfirmed client-side timeout (WARNING, last-sent recorded to avoid schedule spam). The timeout is short *because* the None path is safe: verify-after-set catches a genuinely lost command, whereas a long timeout blocks every other callback of this app.
 - Health accounting reads `apply_mode_with_outcome`'s `ApplyOutcome`, never the boolean: `apply_mode` returns True for three outcomes the inverter never acknowledged (`DRY_RUN`, `SKIPPED_DUPLICATE`, `UNCONFIRMED_TIMEOUT`), so only `SENT` resets `_consecutive_apply_failures`, an unconfirmed timeout escalates to the same ERROR after 3 in a row (the hung-modbus case), and a duplicate skip or dry run is neutral.
-- Verify-after-set is a **bounded two-step ladder**, max 2 checks and 2 sends per `apply_mode` — never a resend loop:
-  1. after `verify_delay_seconds` (default 90) the Inverter Mode sensor (`sensor.growatt_inverter_mode` default, or `inverter_mode_sensor`) is read; a genuine mismatch → WARNING + resend once (bypassing duplicate suppression) + schedule check 2;
+- **Verification is opt-in and pluggable — a `Verifier` strategy, not one hard-wired sensor.** `verify_enabled` (default true) is the master switch; `verify_source` picks the strategy: `registers` / `mode_sensor` / `none` / `auto` (the default: registers whenever `device_id` is set, otherwise none — it deliberately never falls back to the mode sensor).
+  - `RegisterVerifier` (recommended) reads holding 30407-30410 and 30200-30201 back through `growatt_modbus/get_register_data` (the schema field is **`start_address`**, not `address`). Expectations are derived from the params that were actually sent, so the check is against the command, not against a label: 30410 accepts `{2, 1}` (the handler writes either for an enabled AC charge), 30408 (duration, which does not count down) is informational only, and **any unclean read — exception, `None`, `ad_status` TIMEOUT/TERMINATING at either envelope depth, `success: False`, a short `values` list — is UNVERIFIABLE, never a MISMATCH.**
+  - `ModeSensorVerifier` compares `inverter_mode_sensor` and is only correct while the integration's never-cleared `_failed_optional_holding_addrs` blacklist has not frozen that entity. On 2026-09-01T03:46:34Z one transient read failure froze it at "Passthrough" indefinitely; the 2026-09-02 log then carried 73/73 false mismatches, each paying for a blocking resend on the single AppDaemon thread. Empty `inverter_mode_sensor` disables it — no entity is ever guessed.
+  - A `passthrough` match is recorded **non-probative** (`VerificationOutcome.probative=False`): a sensor that ignores overrides entirely reads "Passthrough" too, so counting it as verified would manufacture evidence.
+  - `hass_timeout` expiry does not raise and does not return None: AppDaemon 4.5.13 stamps `ad_status: TIMEOUT` on the response, which is classified `UNCONFIRMED_TIMEOUT`, not `FAILED`. `_ad_status_of()` is the one helper both the `set_wit_mode` call and the register read use, because the stamp lands at the top level on some AD versions and under `result` on others.
+  - **Physical plausibility is NOT a verification strategy.** Do not add one: on 2026-09-02 a discharge command at -100 % measured -39.7 W because SOC was 12 % against a 10 % cutoff. Correct behaviour, and indistinguishable from a dropped override.
+- The ladder itself is a **bounded two-step ladder**, max 2 checks and 2 sends per `apply_mode` — never a resend loop:
+  1. after `verify_delay_seconds` (default 90) the configured source is consulted; a genuine mismatch → WARNING (naming the source and the raw value) + resend once (bypassing duplicate suppression) + schedule check 2;
   2. after `verify_recheck_seconds` (default 60): match → INFO "recovered after resend"; mismatch → **ERROR** and stop (the next slot retries).
 
-  The re-check exists to separate a lagging HA modbus sensor from an inverter that genuinely drops the override; without it the 30 logged mismatches carried no evidence either way. `DirectControl.get_diagnostics()` exposes the counters (`mismatch_count`, `resend_count`, `resend_recovered_count`, `resend_failed_count`, `persistent_mismatch_count`, `unverifiable_count`) on `sensor.battery_inverter_control_health` and as an attribute of `sensor.battery_optimizer`. A new `apply_mode` supersedes any pending verification timer.
+  The re-check exists to separate a lagging source from an inverter that genuinely drops the override; without it the 30 logged mismatches carried no evidence either way. `DirectControl.get_diagnostics()` exposes the counters (`mismatch_count`, `resend_count`, `resend_recovered_count`, `resend_failed_count`, `persistent_mismatch_count`, `unverifiable_count`) on `sensor.battery_inverter_control_health` and as an attribute of `sensor.battery_optimizer`. A new `apply_mode` supersedes any pending verification timer.
+- `inverter_mode_sensor` has a **second, independent consumer**: `_get_inverter_mode` feeds `SlotOutcomeTracker.record_slot_end(actual_mode=...)`, the only per-slot record of mode compliance. Leaving it empty loses that history even when `verify_source: registers` is verifying perfectly, so keep it set (`sensor.growatt_inverter_mode`) for monitoring and let the registers verify.
+- Lock order is **app lock → `DirectControl._io_lock` → `DirectControl._state_lock`**,
+  never the reverse: nothing may acquire the app lock while holding a
+  DirectControl lock. That is why the app drops its lock around
+  `apply_mode_with_outcome`/`release_control`, and why `_verify_mode` reports
+  its duration to `record_external_callback_duration` (which takes the app
+  lock) only after both DirectControl locks are released.
 - Dry-run mode: `device_id: ""` in apps.yaml logs commands without sending them
 
 ### Battery Cost Tracking
@@ -230,21 +243,75 @@ observed production, which would otherwise make the ratio read ~1.0.
 
 ### Runtime constraints
 
-**This app needs more than one AppDaemon thread.** `set_wit_mode` is a
-synchronous, blocking service call made from a callback, so on the default
-single thread one slow inverter write stalls schedule execution, the SOC
-listener and PV sampling alike (production: 70 × "Excessive time spent in
-callback (limit=10.0s)" at 10–34 s, all on `thread-0`). Set
-`appdaemon: total_threads: 4` in `appdaemon.yaml` (or pin the app). The app
-instruments its own callbacks via the `_timed_callback` decorator and
-`_record_callback_duration()`, warning above `callback_warn_seconds` and
-repeating the `total_threads` advice once after three overruns. The decorator
-must keep `functools.wraps` + `*args/**kwargs`: AppDaemon calls these
-positionally (`execute_scheduled_mode(kwargs, force=True)`) and the orchestrator
-is not unit-tested.
+**This app needs more than one AppDaemon thread, and `total_threads` alone
+is not enough.** `set_wit_mode` is a synchronous, blocking service call made
+from a callback, so on the default single thread one slow inverter write stalls
+schedule execution, the SOC listener and PV sampling alike (production: 70 ×
+"Excessive time spent in callback (limit=10.0s)" at 10–34 s, all on
+`thread-0`). Two settings are required (AppDaemon 4.5.13):
+
+```yaml
+# appdaemon.yaml
+appdaemon:
+  total_threads: 4
+  thread_duration_warning_threshold: 25   # optional; a set_wit_mode write is legitimately ~15 s
+```
+```yaml
+# apps.yaml (LIVE file — hand-edit; it holds the HA token)
+battery_optimizer:
+  pin_app: false
+```
+
+`total_threads` clears the GLOBAL `pin_apps` flag only
+(`models/config/appdaemon.py` `model_post_init`), while `app_should_be_pinned`
+reads `cfg.pin_app or self.pin_apps` and `models/config/app.py` defaults
+`pin_app: True`. A pinned app with `pin_thread = None` hits `select_q`'s
+`"Invalid thread ID for pinned thread in app: ... - assigning to thread 0"`
+WARNING **on every dispatch** and still runs everything on thread-0 — so
+`total_threads` without `pin_app: false` is strictly worse than the default.
+With both set, dispatch is round-robin and this app's callbacks genuinely run
+**concurrently**. Do not set `pin_threads` (forced to 0). Rollback lever
+without touching `appdaemon.yaml`: `pin_app: true` + `pin_thread: 2` (must be
+`< total_threads`). Startup check: expect `Starting apps with 4 worker threads,
+with None reserved for pinned apps`, and NO "Invalid thread ID for pinned
+thread" line for `battery_optimizer`.
+
+**Concurrency is handled by one app-wide lock, not by an async rewrite.**
+`initialize`'s first statement is `self._lock = CallbackLock(log_func=self.log)`
+(`battery_optimizer_lib/callback_lock.py`), and the rest of `initialize` runs
+under it. Every registered callback carries `@_timed_callback`, which is the
+complete chokepoint: its body runs under that lock, so schedule rebuilds, slot
+execution, SOC/energy listeners, PV sampling and the trackers keep the
+single-threaded semantics the app was written against. The one deliberate
+escape hatch is the blocking inverter write: `_apply_mode_tracked` wraps
+*only* `apply_mode_with_outcome(entry)` in `with self._lock.unlocked():` (same
+for `release_control()` in `_on_enabled_change`). A nested call
+(`full_optimize` / `_recalculate_remaining_schedule` → `execute_scheduled_mode`,
+depth 2) intentionally does NOT release — the outer frame is mid-rebuild of
+`self.schedule` — and must not be deferred via `run_in` (that passes a kwargs
+dict, which flips the `kwargs is not None` branch of the execute dedupe).
+`record_external_callback_duration` takes the lock itself because DirectControl
+calls it from another worker thread. The four JSON save sites rely on the app
+lock for their `open(..., "w")` truncation window.
+
+The app instruments its own callbacks via `_timed_callback` and
+`_record_callback_duration()` — `time.monotonic()` is sampled outside the
+acquire so lock wait counts as thread occupancy — warning above
+`callback_warn_seconds` and repeating the `total_threads` + `pin_app` advice
+once after three overruns. The decorator must keep `functools.wraps` +
+`*args/**kwargs`: AppDaemon calls these positionally
+(`execute_scheduled_mode(kwargs, force=True)`) and the orchestrator is not
+unit-tested (`tests/test_callback_instrumentation.py` guards the wiring with
+source-scanning tests instead).
 
 Asynchronous I/O is explicitly out of scope — the mitigation is a shorter
-timeout plus more threads, not a rewrite.
+timeout, more threads plus the app lock, not a rewrite.
+
+The 2026-09-02 production log predates this: it was produced by commit 86a2ffb
+imported from a backup directory the deploy script had placed *inside* `apps/`
+(AppDaemon rglobs `app_dir` and `sys.path.insert(0)`s every subdirectory
+containing `.py` files), not by the files in `apps/` — which is why its log
+wording does not match master.
 
 ### Scheduled Tasks
 - **13:15 daily**: Full optimization (after Nord Pool prices publish)
@@ -278,6 +345,27 @@ TypeError: record_discharging() got an unexpected keyword argument 'battery_temp
 from a tree whose files were all individually correct. Copying a *single*
 file while running is safe (one reload, no window).
 
+**Backups must never live under `apps/`.** AppDaemon discovers apps with
+`app_dir.rglob("*.py")` and does `sys.path.insert(0, <dir>)` for every
+directory below `apps/` that holds `.py` files and has no `__init__.py`, so
+such a directory sits at the *front* of `sys.path` and wins every
+`import battery_optimizer` / `import battery_optimizer_lib`. On 2026-09-02
+`deploy.ps1` wrote `apps/backup-20260902-015911/` and the add-on then ran the
+*previous* commit while SHA256 verification of `apps/` passed — the files in
+`apps/` were correct, the wrong ones were imported from the sibling directory.
+The only symptoms were an old log wording and a health sensor missing the
+attributes the new commit added. Backups therefore go to
+`<share-root>/backups/battery_optimizer/`, and nothing but
+`battery_optimizer.py`, `battery_optimizer_lib/` and `hello.py` may hold `.py`
+under `apps/`.
+
+**SHA256 proves the bytes on the share; it does not prove AppDaemon imported
+them.** Every deploy must end with a positive check that the *running* code is
+the new one: `initialize` logs `Battery Optimizer version <APP_VERSION>:
+orchestrator=<path> lib=<path>`, and `sensor.battery_optimizer` carries the
+same as `app_version` / `code_paths`. Both paths must point into `apps/`
+itself. Bump `APP_VERSION` in `battery_optimizer.py` with behaviour changes.
+
 Procedure:
 
 1. Back up `battery_optimizer.py` + `battery_optimizer_lib/` on the share.
@@ -292,10 +380,16 @@ does not cover the orchestrator, so a config or wiring break only shows up here.
 `scripts/deploy.ps1` automates exactly that procedure (Windows PowerShell 5.1):
 git-clean check plus the commit/branch it will deploy, `pytest`, `py_compile`,
 `scripts/smoke_config.py` against a temp copy of the LIVE `apps.yaml` (deleted
-immediately — the share's `apps.yaml` is only ever read), a timestamped
-`backup-<ts>/` on the share keeping the 5 newest, stop → copy (pruning `.py`
-files the repo no longer has) → `__pycache__` cleanup → SHA256 verification →
-start. Start with `-DryRun`, which runs every check and prints the planned copy
+immediately — the share's `apps.yaml` is only ever read), a pre-flight scan
+that aborts on anything under `apps/` AppDaemon would import besides our own
+files (`-MoveStrayBackups` relocates legacy `backup-*` directories instead of
+aborting), a timestamped `<share-root>/backups/battery_optimizer/backup-<ts>/`
+keeping the 5 newest, stop → copy (pruning `.py` files the repo no longer has)
+→ `__pycache__` cleanup → SHA256 verification → mtime stamping (`Copy-Item`
+preserves the source time, which would make the share's timestamps describe
+the git checkout) → start → a best-effort post-deploy read of the add-on log
+for "Initializing Battery Optimizer", import errors and the worker-thread
+count. Start with `-DryRun`, which runs every check and prints the planned copy
 list while writing nothing; `-Restore <backup-dir>` rolls a deploy back through
 the same stop/copy/start dance. Add-on stop/start goes through HA's Supervisor
 proxy when `-HaToken` is given, otherwise the script pauses for you to do it in

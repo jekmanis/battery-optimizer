@@ -70,12 +70,21 @@ def fail(message, exc=None):
 
 
 def known_config_keys():
-    """Every ``args.get("...")`` literal read by BatteryOptimizerConfig."""
+    """Every apps.yaml key BatteryOptimizerConfig actually reads.
+
+    Two spellings, and BOTH must be matched or a real key gets reported as a
+    typo: ``args.get("key", default)`` and the null-safe
+    ``_arg(args, "key", default)`` (a bare ``key:`` in YAML is None, not a
+    missing key — see config._arg).
+    """
     try:
         source = CONFIG_PY.read_text(encoding="utf-8")
     except OSError:
         return set()
-    return set(re.findall(r"""args\.get\(\s*["']([A-Za-z0-9_]+)["']""", source))
+    return (
+        set(re.findall(r"""args\.get\(\s*["']([A-Za-z0-9_]+)["']""", source))
+        | set(re.findall(r"""_arg\(\s*args\s*,\s*["']([A-Za-z0-9_]+)["']""", source))
+    )
 
 
 def main(argv=None):
@@ -211,10 +220,13 @@ def main(argv=None):
              pv_cfg.pv_forecast_cache_minutes, pv_cfg.failure_retry_minutes))
 
     print("")
-    print("Direct control: device_id=%s (%s), inverter_mode_sensor='%s'"
+    print("Direct control: device_id=%s (%s), verify_source=%s, "
+          "inverter_mode_sensor='%s'"
           % ("<set>" if cfg.device_id else "<empty>",
              "live" if cfg.device_id else "DRY-RUN",
-             cfg.inverter_mode_sensor or "(default sensor.growatt_inverter_mode)"))
+             cfg.verify_source,
+             cfg.inverter_mode_sensor
+             or "(empty - no mode-compliance history)"))
 
     # --- 5. keys the current code does not read ---------------------------
     known = known_config_keys()

@@ -116,6 +116,44 @@ def test_decorator_records_duration_and_propagates_return_and_errors():
     assert all(seconds >= 0 for _n, seconds in calls)
 
 
+def test_duration_is_recorded_while_the_app_lock_is_still_held():
+    """The overrun counters are check-then-set state shared across threads.
+
+    `_record_callback_duration` mutates `_callback_overrun_count`,
+    `_slowest_callback` and `_threads_hint_logged`; with `pin_app: false`
+    AppDaemon runs this app's callbacks concurrently, so recording after the
+    `with lock:` block exited raced every other callback.
+    """
+    depths = []
+
+    class Probe:
+        config = bo.BatteryOptimizerConfig()
+
+        def __init__(self):
+            self._lock = CallbackLock()
+
+        def _record_callback_duration(self, name, seconds):
+            depths.append((self._lock.locked_by_me, self._lock.depth))
+
+        @bo._timed_callback
+        def work(self):
+            return "ok"
+
+        @bo._timed_callback
+        def boom(self):
+            raise ValueError("nope")
+
+    probe = Probe()
+    assert probe.work() == "ok"
+    with pytest.raises(ValueError):
+        probe.boom()
+
+    # Held on the success path AND on the exception path.
+    assert depths == [(True, 1), (True, 1)]
+    # ...and released again once the wrapper returned.
+    assert probe._lock.depth == 0
+
+
 # ---------------------------------------------------------------------------
 # Overrun accounting
 # ---------------------------------------------------------------------------

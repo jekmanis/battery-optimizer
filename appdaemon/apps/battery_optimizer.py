@@ -83,7 +83,7 @@ from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
 # published on sensor.battery_optimizer, so a deploy can be PROVEN to be
 # running: on 2026-09-02 the add-on silently imported the previous commit out
 # of a backup directory inside apps/ while SHA256 verification of apps/ passed.
-APP_VERSION = "2026-09-02b"
+APP_VERSION = "2026-09-02c"
 
 
 def _code_paths() -> Tuple[str, str]:
@@ -117,6 +117,15 @@ def _timed_callback(func):
     the app lock is time this callback spent hogging its AppDaemon thread and
     must show up in the overrun accounting.
 
+    The duration is RECORDED under the same lock, from a nested try/finally
+    inside the `with lock:` block (the lock is re-entrant, so nesting is free).
+    `_record_callback_duration` mutates `_callback_overrun_count`,
+    `_slowest_callback` and `_threads_hint_logged` — plain attributes read and
+    then written (check-then-set) from every worker thread — so recording after
+    the lock was released would lose overruns and could emit the one-shot
+    `total_threads` hint more than once. `record_external_callback_duration`
+    takes the app lock for exactly the same reason.
+
     `getattr(self, "_lock", None)` keeps the decorator usable by test doubles
     that never ran `initialize()`; in the app the lock always exists, because
     it is the first statement of `initialize`.
@@ -125,18 +134,25 @@ def _timed_callback(func):
     def wrapper(self, *args, **kwargs):
         started = time.monotonic()
         lock = getattr(self, "_lock", None)
-        try:
-            if lock is None:
-                return func(self, *args, **kwargs)
-            with lock:
-                return func(self, *args, **kwargs)
-        finally:
+
+        def _record():
             try:
                 self._record_callback_duration(
                     func.__name__, time.monotonic() - started
                 )
             except Exception:
                 pass
+
+        if lock is None:
+            try:
+                return func(self, *args, **kwargs)
+            finally:
+                _record()
+        with lock:
+            try:
+                return func(self, *args, **kwargs)
+            finally:
+                _record()
     return wrapper
 
 
@@ -2038,9 +2054,27 @@ class BatteryOptimizer(hass.Hass):
         ``planned_depletion_margin_percent``), reaching min_soc is the plan
         executing correctly, not a deviation worth replanning for.
 
-        Returns False whenever the answer is unknown (no trajectory, or the
-        horizon ends here), preserving the previous "always re-optimize"
-        behaviour for genuinely unexplained depletion.
+        A low planned END is not sufficient on its own. The trajectory can
+        already be sitting just above min_soc while the plan expects the slot to
+        *rise* — a cloud-safe DISCHARGE slot whose PV surplus charges the pack,
+        e.g. planned start 10.5 %, planned end 11.0 % with a 1.0 % margin. When
+        the PV then fails to appear and the battery really does hit min_soc, the
+        forecast the schedule rests on has been invalidated and the
+        re-optimization must run. So the plan must also have expected a
+        non-rising slot: ``planned_end <= planned_start``.
+
+        The comparison is ``<=``, not ``<``: a second consecutive
+        "(until depleted)" slot is flat at min_soc (10 % -> 10 %), which is
+        planned depletion and must NOT trigger a recalculation.
+
+        The caller (`_check_soc_boundaries`) already requires the running mode
+        to be DISCHARGE, and the cloud-safe conversion rewrites `entry.mode` to
+        DISCHARGE, so re-checking the schedule entry's mode here would add
+        nothing.
+
+        Returns False whenever the answer is unknown (no trajectory, no entry
+        for the current slot, or the horizon ends here), preserving the previous
+        "always re-optimize" behaviour for genuinely unexplained depletion.
         """
         if not self.expected_soc_schedule:
             return False
@@ -2049,6 +2083,13 @@ class BatteryOptimizer(hass.Hass):
         next_slot = slot_offset(current_slot, self.config.slot_minutes, 1, local_tz)
         planned_end = lookup_by_time(self.expected_soc_schedule, next_slot, local_tz)
         if planned_end is None:
+            return False
+        planned_start = lookup_by_time(
+            self.expected_soc_schedule, current_slot, local_tz
+        )
+        if planned_start is None:
+            return False
+        if planned_end > planned_start:
             return False
         return planned_end <= self.min_soc + self.config.planned_depletion_margin_percent
 
@@ -2270,18 +2311,30 @@ class BatteryOptimizer(hass.Hass):
 
     @_timed_callback
     def _on_enabled_change(self, entity, attribute, old, new, kwargs):
-        """Handle optimizer enable/disable toggle."""
+        """Handle optimizer enable/disable toggle.
+
+        Disabling releases the inverter overrides, and closes the grid-charge
+        cost-attribution window only if that release was actually accepted.
+        """
         if new == "off":
             self.log("Optimizer disabled — releasing inverter overrides")
             # Second (and last) blocking inverter call in this file; same rule
             # as `_apply_mode_tracked` - drop the app lock around it only.
             with self._lock.unlocked():
-                self._direct_control.release_control()
+                released = self._direct_control.release_control()
             # Handing the inverter back to passthrough ends any grid charge just
             # as a superseding mode does. Without this the window kept running
             # to its full slot+buffer expiry with the optimizer disabled, so a
             # sunny disabled-app charge was booked at the grid price.
-            self._shrink_grid_charge_window()
+            #
+            # Only on a release the inverter accepted, though. `release_control`
+            # returns False on a CONFIRMED service failure (it has already
+            # logged the ERROR), which means the grid_charge override is still
+            # executing at the inverter until its normal expiry. Shrinking the
+            # window there would misattribute the charging that follows as PV /
+            # uncommanded grid energy, so the window keeps its original expiry.
+            if released:
+                self._shrink_grid_charge_window()
         elif new == "on" and old == "off":
             self.log("Optimizer re-enabled — resuming scheduled operation")
             self.execute_scheduled_mode(None)

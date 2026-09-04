@@ -49,10 +49,13 @@ class _FakeDirectControl:
 
     def __init__(self, app):
         self._app = app
+        # The real `release_control` returns False on a CONFIRMED service
+        # failure: the override is still running at the inverter.
+        self.release_result = True
 
     def release_control(self):
         self._app.released = True
-        return True
+        return self.release_result
 
 
 class ExecOptimizer(bo.BatteryOptimizer):
@@ -245,13 +248,13 @@ class TestTimerDedupe:
 # ---------------------------------------------------------------------------
 
 class TestPlannedDepletion:
-    def _app(self, planned_end_soc=None, **kw):
+    def _app(self, planned_end_soc=None, planned_start_soc=15.0, **kw):
         app = ExecOptimizer(now=_slot(6, 51), soc=10.0, **kw)
         app.current_mode = BatteryMode.DISCHARGE
         app.schedule = {_slot(6, 45): _entry(_slot(6, 45), BatteryMode.DISCHARGE)}
         if planned_end_soc is not None:
             app.expected_soc_schedule = {
-                _slot(6, 45): 15.0,
+                _slot(6, 45): planned_start_soc,
                 _slot(7, 0): planned_end_soc,
             }
         return app
@@ -293,6 +296,35 @@ class TestPlannedDepletion:
         """No entry for the next slot: the answer is unknown, so re-optimize."""
         app = self._app(planned_end_soc=10.0)
         del app.expected_soc_schedule[_slot(7, 0)]
+
+        app._check_soc_boundaries(10.0)
+
+        assert len(app.run_in_calls) == 1
+
+    def test_a_planned_rise_near_min_soc_still_re_optimizes(self):
+        """The cloud-safe DISCHARGE slot whose PV surplus was supposed to charge.
+
+        Planned 10.5 % -> 11.0 % sits inside the 1.0 % margin, so the end-only
+        test called it "planned". But the plan expected the pack to GAIN charge
+        this slot; the battery reaching min_soc instead means the PV forecast
+        the schedule rests on is wrong, and the schedule must be rebuilt.
+        """
+        app = self._app(planned_start_soc=10.5, planned_end_soc=11.0)
+
+        assert app._check_soc_boundaries(10.0) is True
+        assert len(app.run_in_calls) == 1
+
+    def test_flat_at_min_soc_is_still_planned_depletion(self):
+        """A second consecutive "(until depleted)" slot: 10 % -> 10 %."""
+        app = self._app(planned_start_soc=10.0, planned_end_soc=10.0)
+
+        assert app._check_soc_boundaries(10.0) is True
+        assert app.run_in_calls == []
+
+    def test_a_missing_current_slot_falls_back_to_the_old_behaviour(self):
+        """End known, start unknown: the answer is unknown, so re-optimize."""
+        app = self._app(planned_end_soc=10.0)
+        del app.expected_soc_schedule[_slot(6, 45)]
 
         app._check_soc_boundaries(10.0)
 
@@ -483,6 +515,24 @@ class TestReleaseControlEndsTheWindow:
         assert app._grid_charge_active_until == _slot(5, 7)
         app._now = _slot(5, 8)
         assert app._grid_charge_active() is False
+
+    def test_a_failed_release_keeps_the_window(self):
+        """A confirmed release failure leaves the grid charge running.
+
+        `release_control` returned False, so the inverter is still executing the
+        grid_charge override to its normal expiry. Shrinking the window would
+        book the charging that follows as PV / uncommanded grid energy.
+        """
+        app = ExecOptimizer(now=_slot(5, 0), cost_grid_charge_grace_seconds=120)
+        app._direct_control.release_result = False
+        _note(app, _slot(5, 0), BatteryMode.CHARGE)
+
+        app._now = _slot(5, 5)
+        app._on_enabled_change("input_boolean.x", "state", "on", "off", {})
+
+        assert app.released is True
+        assert app._grid_charge_active_until == _slot(5, 20)
+        assert app._grid_charge_active() is True
 
     def test_release_with_no_open_window_is_a_no_op(self):
         app = ExecOptimizer(now=_slot(5, 0))

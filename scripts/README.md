@@ -15,8 +15,11 @@ Windows PowerShell 5.1 compatible (no `&&`/`||`, no ternary, no `??`).
 # real deploy, pausing twice so you stop/start the add-on in the HA UI
 .\scripts\deploy.ps1
 
-# real deploy, unattended (stop/start via HA's Supervisor proxy)
+# real deploy, unattended (stop/start via HA's Supervisor proxy - ADMIN token)
 .\scripts\deploy.ps1 -HaToken $env:HA_TOKEN -NoPause
+
+# real deploy, unattended with a NON-ADMIN token (hassio.addon_stop/start)
+.\scripts\deploy.ps1 -HaToken $env:HA_TOKEN -NoPause -AddonApi service
 
 # one-off: evacuate legacy backup-* directories out of apps\ first
 .\scripts\deploy.ps1 -MoveStrayBackups -HaToken $env:HA_TOKEN -NoPause
@@ -24,6 +27,46 @@ Windows PowerShell 5.1 compatible (no `&&`/`||`, no ternary, no `??`).
 # roll back
 .\scripts\deploy.ps1 -Restore '\\192.168.33.167\addon_configs\a0d7b954_appdaemon\backups\battery_optimizer\backup-20260902-015714'
 ```
+
+### `-AddonApi`: the Supervisor proxy is admin-only
+
+HA's Supervisor proxy (`/api/hassio/...`, used for `stop`, `start`, `info` and
+the add-on log) is **admin-only**. A long-lived token belonging to a *non-admin*
+user is rejected there with HTTP 401 even though it is perfectly valid for the
+rest of the REST API (`/api/states`, `/api/services`). If the only token you
+have is a non-admin one, the default `-AddonApi proxy` cannot run unattended,
+and omitting `-HaToken` drops the script into `Read-Host`, which throws outright
+in a non-interactive host.
+
+`-AddonApi service` is the way out. It stops/starts the add-on with the HA
+services `hassio.addon_stop` / `hassio.addon_start`
+(`POST <HaUrl>/api/services/hassio/addon_<action>` with body
+`{"addon": "<slug>"}`), which **any** authenticated user may call. Two things
+then have to be inferred rather than queried, because both endpoints are behind
+the same admin-only proxy:
+
+* **add-on state** — a TCP connect to AppDaemon's own HTTP server on the HA
+  machine (`-AppDaemonPort`, default `5050`), which listens exactly while the
+  add-on runs: port refuses = `stopped`, port accepts = `started`. Same polling
+  shape as the proxy path (3 s interval, 60 s timeout, hard fail on expiry), and
+  the script logs which signal it is using.
+* **post-deploy check** — the add-on log cannot be read, so the script warns
+  about that and instead polls
+  `GET <HaUrl>/api/states/sensor.battery_optimizer` for up to
+  `-PostCheckTimeoutSeconds` until `attributes.app_version` equals the
+  `APP_VERSION` string in the repo's `appdaemon\apps\battery_optimizer.py`, then
+  prints `attributes.code_paths`. This is the *better* half of the check anyway
+  — it is the one that catches a shadowing directory — and it now runs as an
+  extra line in `proxy` mode too. Still best effort: it never fails the deploy.
+
+```powershell
+.\scripts\deploy.ps1 -HaToken $env:HA_TOKEN -NoPause -AddonApi service
+```
+
+In service mode `$env:HA_TOKEN` may be the **non-admin** token already sitting
+in the live `apps.yaml` on the share as `ha_token` — the app uses it for exactly
+these APIs. `-AddonApi service` without `-HaToken` is an error (no token, no
+service call); `-DryRun` warns instead of aborting so a rehearsal still runs.
 
 ### Nothing but the app may hold `*.py` under `apps\`
 
@@ -85,7 +128,9 @@ Steps, in order:
    never enumerated for pruning.
 8. **stop** — `POST <HaUrl>/api/hassio/addons/<slug>/stop` with the HA
    long-lived token as Bearer (HA proxies it to the Supervisor), then polls
-   `GET .../info` until `state = stopped`, 60 s timeout. Without `-HaToken` the
+   `GET .../info` until `state = stopped`, 60 s timeout. With
+   `-AddonApi service` it posts `hassio.addon_stop` instead and polls the
+   AppDaemon port until it refuses connections. Without `-HaToken` the
    script prints what to do in the HA UI and waits for Enter.
 9. **copy** — `battery_optimizer.py` plus every `*.py` under
    `battery_optimizer_lib\` (never `__pycache__`, `.pyc` or tests), then
@@ -115,6 +160,12 @@ Steps, in order:
       `N < 2` — this app makes blocking `set_wit_mode` calls from callbacks and
       needs `appdaemon: total_threads: 4` in `appdaemon.yaml`.
 
+    In **both** API modes it then polls
+    `GET /api/states/sensor.battery_optimizer` until `attributes.app_version`
+    matches `APP_VERSION` in the repo's `battery_optimizer.py` and prints
+    `attributes.code_paths`. With `-AddonApi service` this replaces the log
+    read entirely (the log endpoint is admin-only) and the script says so.
+
     It never fails the deploy: the HA API may be unreachable from the deploying
     machine, and a warning is the right outcome there.
 
@@ -142,9 +193,11 @@ a `finally` block (the script warns loudly if the delete fails).
 | `-AllowDirty` | off | allow deploying an uncommitted tree |
 | `-AllowedApps` | `hello.py` | other AppDaemon apps allowed to sit directly in `apps\` |
 | `-MoveStrayBackups` | off | move `backup-*` directories out of `apps\` instead of aborting |
-| `-HaToken` | *empty* | HA long-lived token; enables API stop/start and the post-deploy log check |
+| `-HaToken` | *empty* | HA long-lived token; enables API stop/start and the post-deploy checks. Required by `-NoPause` and by `-AddonApi service` |
 | `-HaUrl` | `http://192.168.33.167:8123` | HA base URL (the Supervisor proxy is under `/api/hassio`) |
 | `-AddonSlug` | `a0d7b954_appdaemon` | add-on slug |
+| `-AddonApi` | `proxy` | `proxy` = admin-only Supervisor proxy; `service` = `hassio.addon_stop`/`addon_start` + AppDaemon-port probe (works with a non-admin token) |
+| `-AppDaemonPort` | `5050` | AppDaemon's HTTP port, used as the add-on up/down signal in `-AddonApi service` |
 | `-NoPause` | off | never prompt; requires `-HaToken` |
 | `-Restore` | *empty* | path (or bare name) of a `backup-<ts>` directory to roll back to; old in-`apps\` paths accepted |
 | `-KeepBackups` | `5` | how many `backup-*` directories to keep in the backup root |

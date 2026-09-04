@@ -34,8 +34,8 @@
       5. smoke test  - scripts\smoke_config.py against the LIVE apps.yaml copy
       6. backup      - <share-root>\backups\battery_optimizer\backup-<ts>\
                        (keeps 5 newest) + last-deploy.txt
-      7. stop        - Supervisor API via the HA proxy, the hassio.addon_stop
-                       service (-AddonApi service), or a manual pause
+      7. stop        - the hassio.addon_stop service (default), HA's Supervisor
+                       proxy (-AddonApi proxy, legacy), or a manual pause
       8. copy        - orchestrator + every *.py of the lib, prune stale *.py
       9. pycache     - remove every __pycache__ under the share apps dir
      10. verify      - SHA256 repo vs share, fail loudly on any mismatch
@@ -77,8 +77,14 @@
 
 .PARAMETER HaToken
     Long-lived Home Assistant access token. When given, the add-on is stopped
-    and started through the API selected by -AddonApi. Without a token the
-    script pauses and asks you to do it in the HA UI.
+    and started through the API selected by -AddonApi, and the post-deploy
+    check reads the add-on log and sensor.battery_optimizer back. Without a
+    token the script pauses and asks you to do it in the HA UI.
+
+    The default -AddonApi service and both post-deploy reads work with ANY
+    authenticated user's token - admin rights are not needed. On this machine
+    the token is in $env:HA_TOKEN (a user environment variable, also kept in
+    ~\.ha_token).
 
 .PARAMETER HaUrl
     Base URL of Home Assistant (the Supervisor proxy lives under /api/hassio).
@@ -89,28 +95,33 @@
 .PARAMETER AddonApi
     Which API stops/starts the add-on.
 
-      proxy   (default) POST <HaUrl>/api/hassio/addons/<slug>/stop|start and
-              poll GET .../info for the state. This is HA's Supervisor proxy
-              and it is ADMIN-ONLY: a long-lived token belonging to a
-              non-admin user is rejected with HTTP 401 there even though the
-              very same token works for /api/states and /api/services.
-
-      service POST <HaUrl>/api/services/hassio/addon_stop|addon_start with the
-              body {"addon": "<slug>"}. Any authenticated user may call a
-              service, so this works with a non-admin token. The add-on state
+      service (default) POST <HaUrl>/api/services/hassio/addon_stop|addon_start
+              with the body {"addon": "<slug>"}. Any authenticated user may
+              call a service, so this needs no admin rights. The add-on state
               cannot be queried this way, so it is inferred from AppDaemon's
               own HTTP server (-AppDaemonPort), which listens exactly while
               the add-on runs: port refused = stopped, port accepts = started.
-              The add-on log endpoint is admin-only too, so the post-deploy
-              check falls back to reading sensor.battery_optimizer and
-              comparing its app_version attribute with APP_VERSION in the
-              repo's battery_optimizer.py.
 
-    -AddonApi service requires -HaToken (no token, no service call).
+      proxy   LEGACY, for older HA versions. POST
+              <HaUrl>/api/hassio/addons/<slug>/stop|start and poll
+              GET .../info for the state. On current HA (2026.8) the REST
+              Supervisor proxy no longer forwards add-on info/start/stop for
+              ANY token - admin included: GET /api/hassio/addons/<slug>/info
+              answers HTTP 401. The proxy only forwards a small allowlist
+              (logs, ingress, backup upload/download); add-on control moved to
+              the admin-only websocket command supervisor/api, which this
+              script deliberately does not implement.
+
+    The add-on LOG endpoint (GET /api/hassio/addons/<slug>/logs) is on that
+    allowlist and answers 200 for an admin and a non-admin token alike, so the
+    post-deploy log check runs in BOTH modes.
+
+    -AddonApi service requires -HaToken (no token, no service call); pass no
+    -AddonApi at all and no -HaToken to stop/start the add-on by hand instead.
 
 .PARAMETER AppDaemonPort
     TCP port of AppDaemon's own HTTP server on the HA machine, used as the
-    add-on up/down signal in -AddonApi service mode. Default 5050.
+    add-on up/down signal in the default -AddonApi service mode. Default 5050.
 
 .PARAMETER NoPause
     Never prompt. Only valid together with -HaToken.
@@ -138,13 +149,15 @@
 
 .EXAMPLE
     pwsh> .\scripts\deploy.ps1 -HaToken $env:HA_TOKEN -NoPause
-    Unattended deploy (admin token, Supervisor proxy).
+    Unattended deploy. Stop/start through hassio.addon_stop /
+    hassio.addon_start, add-on state probed on the AppDaemon port, then the
+    add-on log and sensor.battery_optimizer are read back. Any authenticated
+    user's token works; on this machine $env:HA_TOKEN is already set.
 
 .EXAMPLE
-    pwsh> .\scripts\deploy.ps1 -HaToken $env:HA_TOKEN -NoPause -AddonApi service
-    Unattended deploy with a NON-ADMIN token: stop/start through
-    hassio.addon_stop / hassio.addon_start, add-on state probed on the
-    AppDaemon port, running version confirmed via sensor.battery_optimizer.
+    pwsh> .\scripts\deploy.ps1 -HaToken $env:HA_TOKEN -NoPause -AddonApi proxy
+    Same, but stop/start through HA's Supervisor proxy. Only for HA versions
+    old enough to still forward add-on start/stop there.
 
 .EXAMPLE
     pwsh> .\scripts\deploy.ps1 -MoveStrayBackups -HaToken $env:HA_TOKEN -NoPause
@@ -171,7 +184,7 @@ param(
     [string]$HaUrl = 'http://192.168.33.167:8123',
     [string]$AddonSlug = 'a0d7b954_appdaemon',
     [ValidateSet('proxy', 'service')]
-    [string]$AddonApi = 'proxy',
+    [string]$AddonApi = 'service',
     [int]$AppDaemonPort = 5050,
     [switch]$NoPause,
     [string]$Restore = '',
@@ -182,6 +195,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 1.0
+
+# Was -AddonApi typed, or is this just the default? Without a token the script
+# stops/starts nothing itself (it pauses for the HA UI), so the "service needs
+# a token" guard must only fire when the mode was actually asked for.
+$AddonApiExplicit = $PSBoundParameters.ContainsKey('AddonApi')
 
 $RepoRoot        = Split-Path -Parent $PSScriptRoot
 $RepoOrchestrator = Join-Path $RepoRoot 'appdaemon\apps\battery_optimizer.py'
@@ -255,16 +273,22 @@ function Use-NativeErrorMode {
 }
 
 # ---------------------------------------------------------------------------
-# Add-on control (HA Supervisor proxy / hassio.addon_* service) / manual pause
+# Add-on control (hassio.addon_* service / legacy HA Supervisor proxy) / pause
 # ---------------------------------------------------------------------------
 #
-# HA's Supervisor proxy (/api/hassio/...) is ADMIN-ONLY. A long-lived token of
-# a NON-ADMIN user gets HTTP 401 there while remaining perfectly valid for
-# /api/states and /api/services. -AddonApi service therefore stops/starts the
-# add-on with the hassio.addon_stop / hassio.addon_start services, which any
-# authenticated user may call. The price is that neither the add-on state nor
-# the add-on log can be queried: the state comes from a TCP probe of
-# AppDaemon's own HTTP port and the version check from sensor.battery_optimizer.
+# On current HA (2026.8) the REST Supervisor proxy (/api/hassio/...) no longer
+# forwards add-on info/start/stop for ANY token: GET /api/hassio/addons/<slug>
+# /info answers HTTP 401 for an admin token too. The proxy forwards only a
+# small allowlist - logs, ingress, backup upload/download - and add-on control
+# lives on the admin-only websocket command supervisor/api, which we do not
+# implement here. So -AddonApi proxy is LEGACY (older HA versions only) and the
+# default -AddonApi service stops/starts the add-on with the hassio.addon_stop
+# / hassio.addon_start services, which any authenticated user may call.
+#
+# The price is only that the add-on STATE cannot be queried: it comes from a
+# TCP probe of AppDaemon's own HTTP port. The add-on LOG is on the proxy's
+# allowlist and reads back fine with a non-admin token, so the post-deploy log
+# check runs in both modes.
 
 function Get-AddonHeaders {
     return @{ 'Authorization' = ('Bearer ' + $HaToken); 'Content-Type' = 'application/json' }
@@ -282,11 +306,11 @@ function Get-HaHostName {
 function Get-AddonApiDescription {
     if ($AddonApi -eq 'service') {
         return ("the hassio.addon_stop/addon_start services (POST " + $HaUrl.TrimEnd('/') +
-                "/api/services/hassio/addon_<action>, works with a non-admin token), state probed on " +
+                "/api/services/hassio/addon_<action>, any authenticated user's token), state probed on " +
                 (Get-HaHostName) + ":" + $AppDaemonPort + " (AppDaemon's own HTTP server)")
     }
     return ("HA's Supervisor proxy (POST " + $HaUrl.TrimEnd('/') + "/api/hassio/addons/" + $AddonSlug +
-            "/<action>, GET .../info to poll - ADMIN token required)")
+            "/<action>, GET .../info to poll - LEGACY: current HA returns 401 there for every token)")
 }
 
 function Get-AddonState {
@@ -330,7 +354,7 @@ function Wait-AppDaemonPort {
     $wanted = 'refuses connections'
     if ($wantOpen) { $wanted = 'accepts connections' }
     Write-Info ("state signal: TCP " + $hostName + ":" + $AppDaemonPort +
-                " (the Supervisor proxy is admin-only in -AddonApi service mode); waiting until it " + $wanted)
+                " (-AddonApi service cannot query the add-on state); waiting until it " + $wanted)
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $open = $false
     while ((Get-Date) -lt $deadline) {
@@ -390,7 +414,11 @@ function Wait-AddonState {
 
 function Stop-Addon {
     if ($DryRun) {
-        Write-Plan ("stop add-on '" + $AddonSlug + "' via " + (Get-AddonApiDescription))
+        if ($HaToken -eq '') {
+            Write-Plan ("pause and ask you to STOP add-on '" + $AddonSlug + "' in the HA UI (no -HaToken given)")
+        } else {
+            Write-Plan ("stop add-on '" + $AddonSlug + "' via " + (Get-AddonApiDescription))
+        }
         return
     }
     if ($HaToken -ne '') {
@@ -407,7 +435,11 @@ function Stop-Addon {
 
 function Start-Addon {
     if ($DryRun) {
-        Write-Plan ("start add-on '" + $AddonSlug + "' via " + (Get-AddonApiDescription))
+        if ($HaToken -eq '') {
+            Write-Plan ("pause and ask you to START add-on '" + $AddonSlug + "' in the HA UI (no -HaToken given)")
+        } else {
+            Write-Plan ("start add-on '" + $AddonSlug + "' via " + (Get-AddonApiDescription))
+        }
         return
     }
     if ($HaToken -ne '') {
@@ -426,11 +458,64 @@ function Start-Addon {
 # ---------------------------------------------------------------------------
 
 function Get-AddonLogLines {
-    param([int]$Lines = 200)
-    $uri = ('{0}/api/hassio/addons/{1}/logs?lines={2}' -f $HaUrl.TrimEnd('/'), $AddonSlug, $Lines)
-    $headers = @{ 'Authorization' = ('Bearer ' + $HaToken); 'Accept' = 'text/plain' }
-    $response = Invoke-WebRequest -Uri $uri -Method Get -Headers $headers -TimeoutSec 30 -UseBasicParsing
-    $text = [string]$response.Content
+    <#
+      GET /api/hassio/addons/<slug>/logs IS forwarded by the Supervisor proxy
+      (it is on the allowlist that add-on info/start/stop is not) and answers
+      200 for an admin and a non-admin long-lived token alike - so this check
+      runs in both -AddonApi modes.
+
+      The default window is only ~100 lines and the first full optimization
+      dumps more than that immediately after startup, which scrolls the
+      "Initializing Battery Optimizer" anchor out of view. The endpoint honours
+      a journald-style `Range: entries=:-<N>:` header, but Windows PowerShell
+      5.1 refuses to put `Range` (a .NET restricted header) on an
+      Invoke-WebRequest ("must be modified using the appropriate property or
+      method") and HttpWebRequest.AddRange only emits BYTE ranges. HttpClient's
+      TryAddWithoutValidation is the way in; if anything about it fails we fall
+      back to the plain call with the default window, because the whole
+      post-deploy check is best effort.
+
+      Journal lines carry ANSI colour codes - stripped here, before any anchor
+      or pattern matching.
+    #>
+    param([int]$Lines = 400)
+    $uri = ('{0}/api/hassio/addons/{1}/logs' -f $HaUrl.TrimEnd('/'), $AddonSlug)
+    $text = ''
+    $ranged = $false
+    try {
+        Add-Type -AssemblyName System.Net.Http
+        $client = New-Object System.Net.Http.HttpClient
+        try {
+            $client.Timeout = [TimeSpan]::FromSeconds(30)
+            $request = New-Object System.Net.Http.HttpRequestMessage -ArgumentList ([System.Net.Http.HttpMethod]::Get), $uri
+            try {
+                [void]$request.Headers.TryAddWithoutValidation('Authorization', ('Bearer ' + $HaToken))
+                [void]$request.Headers.TryAddWithoutValidation('Accept', 'text/plain')
+                [void]$request.Headers.TryAddWithoutValidation('Range', ('entries=:-' + $Lines + ':'))
+                $response = $client.SendAsync($request).GetAwaiter().GetResult()
+                try {
+                    if (-not $response.IsSuccessStatusCode) {
+                        throw ('HTTP ' + [int]$response.StatusCode + ' ' + $response.ReasonPhrase)
+                    }
+                    $text = [string]$response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                    $ranged = $true
+                } finally {
+                    $response.Dispose()
+                }
+            } finally {
+                $request.Dispose()
+            }
+        } finally {
+            $client.Dispose()
+        }
+    } catch {
+        $ranged = $false
+    }
+    if (-not $ranged) {
+        $headers = @{ 'Authorization' = ('Bearer ' + $HaToken); 'Accept' = 'text/plain' }
+        $response = Invoke-WebRequest -Uri ($uri + '?lines=' + $Lines) -Method Get -Headers $headers -TimeoutSec 30 -UseBasicParsing
+        $text = [string]$response.Content
+    }
     $esc = [char]27
     $text = $text -replace ($esc + '\[[0-9;?]*[A-Za-z]'), ''
     return @($text -split "`r?`n")
@@ -508,9 +593,10 @@ function Get-OptimizerAttribute {
 
 function Invoke-RunningVersionCheck {
     <#
-      The only check that survives without the admin-only log endpoint: the
-      running app publishes APP_VERSION (and the paths it imported from) on
-      sensor.battery_optimizer. /api/states is open to any authenticated user.
+      The better half of the post-deploy check, and the one that catches a
+      shadowing directory: the running app publishes APP_VERSION (and the paths
+      it imported from) on sensor.battery_optimizer. /api/states is open to any
+      authenticated user. Runs in both -AddonApi modes, alongside the log read.
       Best effort - it never fails the deploy.
     #>
     param([int]$TimeoutSeconds = 90)
@@ -570,8 +656,8 @@ function Invoke-PostDeployCheck {
       SHA256 verification proves the bytes on the share are right. It does NOT
       prove AppDaemon imported them - a shadowing directory (or a stale
       __pycache__) can make it run something else entirely. So read the log
-      back (proxy mode only - the log endpoint is admin-only) and confirm the
-      version the app itself reports.
+      back (the log endpoint works with any token, in both -AddonApi modes) and
+      confirm the version the app itself reports.
     #>
     param([string]$Anchor, [int]$TimeoutSeconds = 90)
 
@@ -580,15 +666,7 @@ function Invoke-PostDeployCheck {
         return
     }
 
-    if ($AddonApi -eq 'service') {
-        Write-Warn2 ("-AddonApi service: the add-on log (GET /api/hassio/addons/<slug>/logs) is part of the " +
-                     "ADMIN-ONLY Supervisor proxy and cannot be read with this token. Check it in the HA UI " +
-                     "(Settings > Add-ons > AppDaemon > Log) for 'Initializing Battery Optimizer' and any " +
-                     "traceback; verifying the running version through sensor.battery_optimizer instead.")
-    } else {
-        Invoke-AddonLogCheck -Anchor $Anchor -TimeoutSeconds $TimeoutSeconds
-    }
-
+    Invoke-AddonLogCheck -Anchor $Anchor -TimeoutSeconds $TimeoutSeconds
     Invoke-RunningVersionCheck -TimeoutSeconds $TimeoutSeconds
 }
 
@@ -993,7 +1071,7 @@ function Invoke-Restore {
 
     Write-Step "Start the add-on"
     $anchor = ''
-    if (-not $DryRun -and $HaToken -ne '' -and $AddonApi -eq 'proxy' -and -not $SkipPostCheck) { $anchor = Get-LogAnchor }
+    if (-not $DryRun -and $HaToken -ne '' -and -not $SkipPostCheck) { $anchor = Get-LogAnchor }
     Start-Addon
 
     if (-not $DryRun -and -not $SkipPostCheck) {
@@ -1020,7 +1098,12 @@ function Invoke-Deploy {
     }
     Write-Info ("repo  : " + $RepoRoot)
     Write-Info ("share : " + $Share)
-    Write-Info ("addon : " + $AddonSlug + " via " + (Get-AddonApiDescription))
+    if ($HaToken -eq '') {
+        Write-Info ("addon : " + $AddonSlug + " - no -HaToken, so the script pauses for a manual stop/start" +
+                    " (-AddonApi " + $AddonApi + " would use " + (Get-AddonApiDescription) + ")")
+    } else {
+        Write-Info ("addon : " + $AddonSlug + " via " + (Get-AddonApiDescription))
+    }
 
     # -- 1. preflight: git ---------------------------------------------------
     Write-Step "Preflight: git state"
@@ -1298,7 +1381,7 @@ function Invoke-Deploy {
         # -- 14. start -------------------------------------------------------
         Write-Step "Start the AppDaemon add-on"
         $logAnchor = ''
-        if (-not $DryRun -and $HaToken -ne '' -and $AddonApi -eq 'proxy' -and -not $SkipPostCheck) { $logAnchor = Get-LogAnchor }
+        if (-not $DryRun -and $HaToken -ne '' -and -not $SkipPostCheck) { $logAnchor = Get-LogAnchor }
         Start-Addon
 
         # -- 15. post-deploy check (best effort) ------------------------------
@@ -1307,15 +1390,9 @@ function Invoke-Deploy {
             Invoke-PostDeployCheck -Anchor $logAnchor -TimeoutSeconds $PostCheckTimeoutSeconds
         } elseif ($DryRun) {
             Write-Step "Post-deploy check: did the app actually start?"
-            if ($AddonApi -eq 'service') {
-                Write-Plan ("skip the add-on log (admin-only Supervisor proxy) and instead poll " +
-                            "sensor.battery_optimizer for up to " + $PostCheckTimeoutSeconds +
-                            "s until app_version = " + (Get-RepoAppVersion))
-            } else {
-                Write-Plan ("poll the add-on log for up to " + $PostCheckTimeoutSeconds +
-                            "s for 'Initializing Battery Optimizer', import errors and the worker-thread count")
-                Write-Plan ("poll sensor.battery_optimizer until app_version = " + (Get-RepoAppVersion))
-            }
+            Write-Plan ("poll the add-on log for up to " + $PostCheckTimeoutSeconds +
+                        "s for 'Initializing Battery Optimizer', import errors and the worker-thread count")
+            Write-Plan ("poll sensor.battery_optimizer until app_version = " + (Get-RepoAppVersion))
         }
     } catch {
         Write-Host ''
@@ -1329,7 +1406,7 @@ function Invoke-Deploy {
             Write-Host ("  Restore it with:") -ForegroundColor Yellow
             $restoreCmd = ('    .\scripts\deploy.ps1 -Restore "' + $backupDir + '"')
             if ($HaToken -ne '') { $restoreCmd = $restoreCmd + ' -HaToken $env:HA_TOKEN -NoPause' }
-            if ($AddonApi -ne 'proxy') { $restoreCmd = $restoreCmd + (' -AddonApi ' + $AddonApi) }
+            if ($AddonApi -ne 'service') { $restoreCmd = $restoreCmd + (' -AddonApi ' + $AddonApi) }
             Write-Host $restoreCmd -ForegroundColor Yellow
         }
         throw
@@ -1362,7 +1439,10 @@ if ($NoPause -and $HaToken -eq '') {
     exit 2
 }
 
-if ($AddonApi -eq 'service' -and $HaToken -eq '') {
+# Only a TYPED -AddonApi service without a token is an error. Falling into the
+# default 'service' with no token is the plain manual-pause deploy, which must
+# keep working exactly as before.
+if ($AddonApiExplicit -and $AddonApi -eq 'service' -and $HaToken -eq '') {
     if ($DryRun) {
         # A rehearsal calls nothing, so let it run - but say plainly that the
         # same command without -DryRun would be refused.
@@ -1370,8 +1450,8 @@ if ($AddonApi -eq 'service' -and $HaToken -eq '') {
                      "hassio.addon_stop/addon_start needs an authenticated HA user). Continuing the rehearsal.")
     } else {
         Write-Host "-AddonApi service requires -HaToken: calling hassio.addon_stop/addon_start needs an authenticated" -ForegroundColor Red
-        Write-Host "HA user. Use the non-admin long-lived token from the live apps.yaml (ha_token), or drop -AddonApi" -ForegroundColor Red
-        Write-Host "to stop/start the add-on by hand in the HA UI." -ForegroundColor Red
+        Write-Host "HA user (any user - no admin rights needed; `$env:HA_TOKEN is set on this machine). Or drop both" -ForegroundColor Red
+        Write-Host "-AddonApi and -HaToken to stop/start the add-on by hand in the HA UI." -ForegroundColor Red
         exit 2
     }
 }

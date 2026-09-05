@@ -1358,6 +1358,23 @@ class BatteryLearningEngine:
         """
         Predict charge energy accounting for temperature warming during charging.
 
+        **DIAGNOSTIC ONLY. Not used for planning or projection.** This is the
+        legacy two-phase (cold/warm) within-slot model, and it is a SECOND
+        thermal model: it warms the pack with ``get_time_to_reach_temp`` /
+        ``predict_temp_after_duration`` rather than through
+        ``thermal_model.TemperatureProjector``, and it changes the charge rate
+        inside a slot, which the DP does not. On a 10 kWh pack at 10 % SOC with
+        one 15-minute CHARGE crossing 1 kW -> 4 kW halfway it answered 16.25 %
+        where the planner answered 12.5 %, and the expected-SOC trajectory that
+        used to call it produced SOC-shortfall events on a battery that was
+        following the plan exactly.
+
+        The one within-slot model is a constant ``charge_input_dc_kw`` at the
+        start-of-slot temperature -- ``soc_projection.project_slot_soc``,
+        ``slot_energy.simulate_slot``, ``plan_validation.replay_plan`` and
+        ``DPOptimizer`` all use it. Do not reintroduce this method into any of
+        them; see ``docs/scheduling-algorithm.md`` SS Within-slot charge model.
+
         The inverter may charge faster once the battery warms above a threshold.
         This method calculates total energy by splitting the duration into
         cold and warm periods.

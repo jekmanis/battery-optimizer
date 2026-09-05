@@ -172,19 +172,58 @@ The consequences are worth being precise about:
 - **Physics is exact.** No transition can create a joule; the initial observed
   energy is kept exactly; replaying the backtracked plan continuously reproduces
   the planner's own trajectory to floating-point precision.
-- **The merging is the approximation.** Two paths in one bucket differ by up to
-  one step and only the better-valued one survives. Ties are broken toward the
-  path holding more energy, which is a genuine dominance rule (more energy can
-  only widen later options).
+- **The merging is the approximation, and it is not a valid state reduction.**
+  Two paths in one bucket differ by up to one step and only the better-valued
+  one survives. **A higher-valued path does not dominate a lower-valued path
+  holding more energy** — the extra energy can be worth more later than the
+  value gap is worth now. The solver is therefore *not* exact for its
+  discretized model. That claim was made here and in the code; it was wrong.
 
-  **Size of that gap.** One step times the marginal value of a kWh is the
-  *per-merge* error, not the horizon bound: a discarded path can be discarded
-  again at every later slot, so the only bound proven here is the sum,
-  `n_slots * step * marginal_value`. That is loose — the errors are not
+  **The counterexample**, at the default 1 % step, pinned as a named regression
+  test (`tests/test_merge_approximation.py`): 10 kWh pack, min SOC 10 %, initial
+  10.9 %, two 15-minute slots drawing 0.2 kW at 0.10 then 1.00 EUR/kWh, unit
+  efficiencies, no fees, wear or terminal value. The solver returns
+  `DISCHARGE, DISCHARGE` costing **0.010 EUR**; exhaustive enumeration of the
+  same action space finds `HOLD, DISCHARGE` at **0.005 EUR**. Both paths land in
+  bucket 0 after slot 1 — `DISCHARGE` holding 1.04 kWh at value 0, `HOLD`
+  holding 1.09 kWh at value −0.005 — so `DISCHARGE` wins the merge and the extra
+  0.05 kWh, worth 1.00 EUR/kWh in slot 2, is discarded with the losing path. At
+  a 0.1 % step the two no longer share a bucket and the solver finds 0.005,
+  which is the evidence that what is lost is merge resolution and not
+  correctness of the transition.
+
+  **Size of the gap.** Per merge, the energy loss is less than one step (a
+  bucket is one step wide) and the value loss is at most
+  `step * marginal_value` of a kWh. Over the horizon the only bound established
+  here is the sum, `n_slots * step * marginal_value`: a discarded path can be
+  discarded again at every later slot. That is loose — the errors are not
   independent and a merged path usually rejoins — but nothing in this
-  implementation establishes anything tighter, and the honest statement is the
-  loose one. What IS exact: the solver is exact for its discretized model given
-  a temperature profile, and the physics of every transition is exact.
+  implementation proves anything tighter, and the honest statement is the loose
+  one.
+
+  Ties are broken toward the path holding more energy. *That* is a genuine
+  dominance rule (equal value, more energy can only widen later options); it
+  makes the merge deterministic and it is not the part that is approximate.
+
+  **What IS exact:** the physics of every transition, at the path's exact
+  continuous energy; replay parity, so `plan_validation.replay_plan` walking the
+  published action sequence reproduces the planner's own SOC trajectory; the SOC
+  dependence of the charge rate; and the value arithmetic of a given action
+  sequence under a given temperature profile. Not the search.
+
+  **The exact alternative, and why it is not used.** Keeping a
+  Pareto-nondominated set of `(value, energy)` labels per bucket — discarding a
+  label only when another in the same bucket has *both* at least as much value
+  and at least as much energy — is exact for the discretized model, because that
+  is the real dominance relation. It is not adopted because the label count per
+  bucket is unbounded without a cap: every distinct value that survives on the
+  energy axis is a separate label, and the DP's inner loop is already the
+  hot path (a 132-slot horizon at a 1 % step runs the whole DP once per
+  partial-first-slot candidate). A capped variant — keep the best *k* labels by
+  value, or bucket the value axis too — reintroduces an approximation with a
+  second tuning knob and no better bound than the one above. If it is ever
+  revisited, `tests/test_merge_approximation.py` is the test that must change,
+  deliberately, with the new rule's runtime measured.
 - **Energy-limited candidates pay the grid.** A discharge delivers what the pack
   has; whatever it cannot cover is charged to the grid at the import price in the
   same slot. No threshold decides whether a slot "counts" — the energy does. The
@@ -235,13 +274,14 @@ in opposite directions:
 - imaginary charging pushed SOC into a taper region, so paths that stayed low or
   discharged were denied capability they actually had.
 
-**SOC dependence is now exact.** The rate is evaluated per candidate transition,
-from that state's own energy, memoized by `(soc, slot temperature)`. When the
-rate turns out not to vary across the SOC grid — a fresh install on the nominal
-rate, or a flat learned curve — the per-slot energies are hoisted back out of
-the state loop. That is a performance hint only, and
-`tests/test_dp_rate_compatibility.py` pins that the two paths produce identical
-plans.
+**SOC dependence is exact.** The rate is evaluated per candidate transition,
+from that state's own energy, memoized by `(soc, slot temperature)`. There is no
+"the rate looks SOC-independent, hoist it out of the state loop" fast path: it
+existed, it decided from a fixed probe set, and a curve that was flat at every
+probe but tapered at a temperature the *refined* profile reached had its taper
+erased — the plan then invented 1.875 kWh in one slot with `converged=True`.
+`charge_rate_predictor` is an arbitrary callable; a finite sample of it proves
+nothing.
 
 **Temperature depends on history**, which a one-dimensional energy state cannot
 carry, so it needs an explicit design decision. The chosen one is a **bounded
@@ -252,25 +292,86 @@ solve / replay / refine**:
 | 0 | the **idle** temperature profile — the pack is only as warm as it would be with no battery activity at all, so no heat can come from an action the plan has not committed to |
 | n | the profile produced by replaying the *selected* plan through the shared `TemperatureProjector`, with warming driven by **actual** battery flow |
 
-It stops on a fixed point, on a repeated profile (oscillation), or on the pass
-budget (`MAX_RATE_REFINEMENT_PASSES = 3`, plus at most one conservative final
-solve). Two profiles count as the same when their temperatures agree within
-0.25 C **or** when they imply the same charge capability at every state of the
-DP's SOC grid — temperature only reaches the plan through the rate, and a pack
-that keeps warming inside one temperature bucket would otherwise never settle.
+**The stopping criterion is FEASIBILITY AT THE REACHED TEMPERATURE**, not a
+fixed point. After each pass, `DPOptimizer._replay_plan` walks the selected plan
+forward, looks the rate up at the temperature the pack has actually reached in
+that walk, and reports how much of the charge energy the plan credited the pack
+could not have taken — over CHARGE and over the PV absorption a HOLD or
+self-consumption DISCHARGE performs, since `simulate_slot` caps all three with
+the same `charge_input_dc_kw`. A plan is converged only when that shortfall is
+zero **and** the profile is stable.
 
-On oscillation or exhaustion it falls back to the pass-0 idle profile and solves
-once more. **Limits of that fallback, stated rather than implied:**
+A fixed point on its own was not enough, and the gap was not theoretical. The
+loop used to be gated by a sampled "is this rate curve temperature sensitive?"
+probe over three SOCs (min, mid, max) and a six-point temperature ladder. A
+learned bucket that varied only at a SOC *between* those probes skipped
+refinement entirely: a three-slot CHARGE, CHARGE, DISCHARGE plan came back
+`converged=True` after one pass, and replaying it at the temperatures it reaches
+left **0.75 kWh of the final slot's load uncovered**. Production validation
+reported nothing, because it looked the rate up at
+`planning_temp_by_slot` — the planner's own assumption. The probe is gone: with
+a temperature reading the refinement always runs; without one there is nothing
+to refine and a single solve is the whole answer.
 
-- It is conservative only where the rate is non-decreasing in temperature — the
-  physical case, and the one the learning engine's temperature buckets describe.
-  With a non-monotonic learned curve it is an approximation, not a bound, and
-  what catches that is the final replay, not this loop.
-- A fixed point is not a proof of global optimality. **The solver is exact for
-  its discretized model given a temperature profile; the profile itself is an
-  outer approximation.**
-- A conservative fallback under-charges rather than over-charges. The final
-  replay does not flag that, because it is the safe direction.
+Two profiles count as the same when their temperatures agree within 0.25 C
+**or** when they imply the same charge capability at every state of the DP's SOC
+grid — temperature only reaches the plan through the rate, and a pack that keeps
+warming inside one temperature bucket would otherwise never settle.
+
+On oscillation or exhaustion it falls back to a **conservative solve**: per
+(slot, SOC) the *minimum* rate over every temperature profile seen in this call,
+followed by one more replay. **Limits of that fallback, stated rather than
+implied:**
+
+- "Minimum over the profiles seen" is a lower bound over *those profiles only*.
+  If the conservative plan reaches a temperature none of them visited and the
+  curve dips there, it can still be short — which is why the replay after it is
+  not optional. `tests/test_thermal_feasibility_refinement.py` covers both: a
+  set of profiles that covers the reached temperatures (fallback succeeds) and
+  one that does not (it degrades).
+- If it is still short the branch **degrades**: the credited charge energy is
+  reduced to what the replayed temperature allows, the trajectory is rebuilt
+  from that walk, and it is logged at WARNING with the shortfall in kWh.
+  **Economic optimality is lost in that branch** — the actions were chosen for
+  energy the pack will not have. What survives is that nothing published credits
+  unavailable energy.
+- A fixed point is not a proof of optimality of any kind. See § Conservative
+  quantization for what the solver does and does not guarantee.
+- A conservative fallback under-charges rather than over-charges *in its
+  decisions*. What is published is the physical walk, so the trajectory is not
+  pessimistic even when the decisions are.
+
+`DPOptimizerResult` says which path produced the plan:
+`rate_refinement_branch` is one of `single_solve`, `converged`,
+`conservative_fallback`, `degraded`; `rate_refinement_shortfall_kwh` carries the
+kWh that triggered a degrade; `rate_refinement_converged`,
+`rate_refinement_fallback` and `rate_refinement_degraded` are the same
+information as booleans.
+
+**One trajectory, and it is the physical outcome.** Whatever branch chose the
+actions, what gets published is the walk of those actions at the temperatures
+they reach. In the converged branch that is identical to the DP's own energies
+by construction. In the conservative branch it is the *outcome* rather than the
+pessimistic assumption the decisions were made on — the inverter will charge at
+whatever the pack can take. This is also exactly what
+`plan_validation.replay_plan` and `BatteryOptimizer.project_schedule_trajectory`
+compute, which is why **no consumer pins a charge-rate lookup to a planning
+temperature any more**. `DPOptimizerResult.planning_temp_by_slot` survives as a
+diagnostic only.
+
+**Orchestrator validation.** `BatteryOptimizer._replay_schedule` looks the rate
+up at the temperature the replay reaches, resolved exactly as
+`soc_projection._effective_charge_rate` does it (learned rate when the engine
+has one, configured nominal otherwise). If the final, post-hedge plan still
+credits the battery with AC service it does not have,
+`_resolve_plan_shortfall` first **reverts the cloud-safe conversions on the
+affected slots** — the hedge only converts slots the DP's model cannot tell
+apart from HOLD, so a replay that disagrees indicts the conversion — and
+re-validates. If it is still short, those slots are declared energy-limited
+(which is the truth: they deliver what the pack has and the grid pays for the
+rest), the replayed trajectory is published, and it is logged at ERROR. A plan
+that credits charge energy unavailable at the replayed temperature is never
+published.
 
 Warming follows `simulate_slot`'s actual `battery_power_kw`, so a full pack
 ordered to charge — or an empty one ordered to discharge — moves nothing and
@@ -278,13 +379,55 @@ warms nothing. Imaginary power must not manufacture future charging capability.
 Forecasts are computed once and reused across every refinement pass, so a moving
 input cannot masquerade as a failure to converge.
 
-**Within-slot approximation.** The DP charges a slot at the rate implied by the
-temperature at its *start*, and the replay does the same, so the two agree
-exactly. A threshold crossed mid-slot is therefore mis-modelled by at most
-`(warm_rate - cold_rate) * slot_hours` of stored energy in that slot. The
-expected-SOC trajectory's `predict_charge_input_dc_energy` splits the slot into
-a cold and a warm phase, which is finer; the difference is bounded by the same
-quantity.
+### Within-slot charge model — one of them, in every consumer
+
+**A charge slot runs at a constant `charge_input_dc_kw`, taken from the
+temperature the slot *starts* at.** The rate does not change inside a slot;
+temperature evolves *between* slots, and only through
+`thermal_model.TemperatureProjector`. Every consumer uses that one model:
+
+| Consumer | Where |
+| --- | --- |
+| DP candidate evaluation and the partial-slot lookahead | `dp_optimizer._run_dp`, `_build_schedule` |
+| the pure physical transition | `slot_energy.simulate_slot` |
+| final-plan replay | `plan_validation.replay_plan` |
+| expected-SOC trajectory and the deviation detector | `soc_projection.project_slot_soc` |
+| projected-cost column | `cost_tracker.project_costs` |
+
+There used to be a second one. `project_slot_soc` called
+`learning_engine.predict_charge_input_dc_energy`, which split a CHARGE slot into
+a cold phase and a warm phase using the learning engine's own warming-rate model
+(`get_time_to_reach_temp`, `predict_temp_after_duration`) — a second thermal
+model, reached only on that one code path. On a 10 kWh pack at 10 % SOC with a
+single 15-minute CHARGE crossing 1 kW → 4 kW halfway, the DP answered 12.5 % and
+the projector answered 16.25 %. The published trajectory therefore disagreed
+with the plan by 3.75 SOC points on one slot, and the deviation detector raised
+SOC shortfalls against a battery that was following the planner exactly.
+
+`predict_charge_input_dc_energy` survives in the learning engine, marked
+**diagnostic only**; nothing in planning or projection calls it. Its
+`temp_threshold` argument was never an `apps.yaml` key — it was a parameter of
+`project_slot_soc` with a default of 16 °C — and it has been removed from that
+signature rather than left accepted-and-ignored.
+
+**Bound on the approximation.** Against a fine-grained reference (1-minute
+sub-stepping through the same rate curve and the same warming model) the
+constant-rate model is off by at most, per slot,
+
+```text
+(warm_rate - cold_rate) * slot_hours * efficiency          kWh stored
+(warm_rate - cold_rate) * slot_hours * efficiency / capacity * 100   SOC points
+```
+
+and it errs on the **conservative** side whenever the pack warms during the
+slot: the start-of-slot rate is the slower one, so the plan never credits energy
+a warming pack could not have taken. `tests/test_within_slot_charge_model.py`
+measures the reproduction against the sub-stepped reference and pins the bound.
+
+A finer model is possible — N sub-steps of the shared projector — but it would
+have to be *the same code path* in all five consumers above, and it would
+multiply the DP's inner loop by N. The constant rate is the cheap end of that
+trade, taken deliberately and bounded here.
 
 Two designs were rejected:
 
@@ -303,20 +446,29 @@ of five runs, without / with a partial first slot. Absolute numbers are
 machine-dependent — a reviewer measured roughly twice these on their hardware —
 so read the shape, not the digits:
 
+| Rate curve | 1 % step, before | 1 % step, after |
+| --- | --- | --- |
+| no temperature reading (single solve) | 48 / 188 ms | 45 / 179 ms |
+| SOC + temperature, converges in 1 pass | 72 / 202 ms | 66 / 198 ms |
+| a curve that forces refinement | 222 ms (4 passes) / 429 ms (2) | 274 ms (4) / 984 ms (4) |
+
+Earlier measurements on a 14.3 kWh pack, for the shape across step sizes:
+
 | Rate curve | 1 % step (91 states) | 0.5 % (181) | 0.25 % (361) |
 | --- | --- | --- | --- |
 | flat | 54 / 187 ms | 97 / 369 ms | 194 / 786 ms |
 | SOC taper | 53 / 203 ms | 100 / 403 ms | 201 / 1004 ms |
-| SOC + temperature, converges in 1 pass | 62 / 211 ms | 120 / 408 ms | 240 / 888 ms |
-| a curve that forces refinement | 207 / 772 ms (4 passes) | 211 / 773 ms (2) | 403 / 1510 ms (2) |
 
 Three things the table is there to say:
 
-- **The worst case is bounded but real.** At most
+- **The worst case is bounded, real, and it got worse.** At most
   `MAX_RATE_REFINEMENT_PASSES + 1 = 4` solves, and the partial-first-slot
-  lookahead runs the whole DP once per candidate on top of that. Around 0.8 s at
-  the reference installation's 1 % step, and past 1.5 s (2.9 s on slower
-  hardware) at 0.25 %.
+  lookahead runs the whole DP once per candidate on top of that. Requiring
+  feasibility rather than only a fixed point means a curve that used to settle
+  in two passes can now use the full budget: on the measured staircase curve
+  with a partial first slot, 429 ms became 984 ms. Converging cases are
+  unchanged, and the removed sensitivity probe pays for itself there. Around
+  1 s at the reference installation's 1 % step in the worst case.
 - **It runs under the app callback lock**, on AppDaemon's single thread, so it
   delays every other callback of this app for that long. That is the argument
   against putting temperature into the DP state, and the reason

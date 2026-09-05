@@ -1,6 +1,6 @@
 # Battery Optimizer for Growatt WIT Inverter
 
-An [AppDaemon](https://appdaemon.readthedocs.io/) application for Home Assistant that uses **Nord Pool** day‑ahead electricity prices (and optionally **Solcast** PV forecasts) to compute and execute an optimal battery **charge / hold / discharge** schedule for a Growatt **WIT** hybrid inverter.
+An [AppDaemon](https://appdaemon.readthedocs.io/) application for Home Assistant that uses **Nord Pool** day‑ahead electricity prices (and optionally **Solcast** PV forecasts) to compute and execute a low‑cost battery **charge / hold / discharge** schedule for a Growatt **WIT** hybrid inverter.
 
 It plans with dynamic programming over SOC, learns your house load and real charge rates over time, tracks the stored‑energy cost, and drives the inverter both in real time (via a `set_wit_mode` service) and autonomously (by writing the inverter's Time‑of‑Use registers so it keeps following the plan even if Home Assistant goes offline).
 
@@ -10,7 +10,7 @@ It plans with dynamic programming over SOC, learns your house load and real char
 
 ## Features
 
-- **DP price optimizer** — dynamic programming over discretised SOC finds the cost‑optimal charge/hold/discharge sequence for the next ~48 h at 15‑minute resolution.
+- **DP price optimizer** — dynamic programming over discretised SOC searches charge/hold/discharge sequences for the next ~48 h at 15‑minute resolution. The physics of every transition is exact; the search is not, because one path is kept per SOC bucket. See [what is exact and what is approximate](docs/scheduling-algorithm.md#conservative-quantization-bucket-label-plus-exact-path-energy).
 - **Self‑learning** — learns actual charge rates per SOC band and round‑trip efficiency from observed behaviour; builds a statistical, time‑of‑day **load profile**.
 - **Temperature‑aware charge rates** — predicts slower charging when the battery is cold for more accurate scheduling.
 - **PV‑aware** — uses Solcast forecasts and a live PV sensor to avoid grid‑charging when solar will cover it.

@@ -97,7 +97,7 @@ Uses **dynamic programming** with SOC state tracking:
 1. Discretize the configured SOC range using `soc_step_percent`
 2. For each time slot, evaluate HOLD/CHARGE/DISCHARGE transitions
 3. Track the best cumulative economic value for each reachable energy level
-4. Backtrack to extract optimal action sequence
+4. Backtrack to extract the best-valued action sequence the merge kept
 
 **Value calculations:**
 - Marginal import price: `(spot_price + grid_fee) * import_price_multiplier`
@@ -114,7 +114,7 @@ Uses **dynamic programming** with SOC state tracking:
 
 **One slot-energy model.** `slot_energy.simulate_slot` is the pure transition that names every flow (stored in/out, PV vs grid share of a charge, AC served, import, export, `unmet_battery_ac_kwh`). `soc_projection.project_slot_soc` delegates to it. Its `dc_energy_in_kwh`/`dc_energy_out_kwh` are what the pack ACTUALLY moved; the uncapped request lives in `requested_dc_energy_*`. Never report a request as delivered energy.
 
-**Conservative quantization.** A DP state carries a floored bucket *label* and the *exact* energy of the best path reaching it; every transition is computed from the exact energy. Nearest rounding on the grid was not zero-mean for a constant load on a constant slot length — it credited 2.8 kWh of service from a 2.0 kWh battery and published 15 % SOC for a pack its own model had emptied. Pure floor-to-grid is safe but throws away 30 % of the usable energy at 1 % steps, so it is not the answer either. Physics is now exact; what `soc_step_percent` controls is only how aggressively distinct paths are MERGED (ties broken toward more energy — a dominance rule). Energy-limited discharges deliver what the pack has and the grid pays for the rest; no threshold decides whether a slot "counts". `plan_validation.replay_plan`, called last in `find_optimal_schedule`, re-walks the FINAL action sequence and checks, before any clamping, that every slot the continuous model cannot serve in full is one the plan DECLARED energy-limited (`ScheduleEntry.energy_limited`). Accumulating the replay's own clamped flows and comparing them with the bound those flows are built to satisfy is an identity and catches nothing.
+**Conservative quantization.** A DP state carries a floored bucket *label* and the *exact* energy of the best path reaching it; every transition is computed from the exact energy. Nearest rounding on the grid was not zero-mean for a constant load on a constant slot length — it credited 2.8 kWh of service from a 2.0 kWh battery and published 15 % SOC for a pack its own model had emptied. Pure floor-to-grid is safe but throws away 30 % of the usable energy at 1 % steps, so it is not the answer either. Physics is now exact; what `soc_step_percent` controls is only how aggressively distinct paths are MERGED. **That merge is an approximation, not an exact state reduction** — keeping the highest-valued path per bucket is not a dominance rule, because a lower-valued path holding more energy can be worth more later. Tie-breaking toward more energy IS a dominance rule; the value-only merge is not. Do not write "exact for its discretized model" anywhere: `tests/test_merge_approximation.py` pins the counterexample (10 kWh, 10.9 % initial, two slots at 0.10 then 1.00 EUR/kWh — solver 0.010 EUR, enumeration 0.005 EUR) and fails if the phrase reappears in the code, the docs, CLAUDE.md or the README. Bounds: energy loss < one step per merge, value loss <= step x marginal value per merge, horizon bound `n_slots * step * marginal_value` and nothing tighter is proven. What IS exact: the physics of every transition and replay parity. Energy-limited discharges deliver what the pack has and the grid pays for the rest; no threshold decides whether a slot "counts". `plan_validation.replay_plan`, called last in `find_optimal_schedule`, re-walks the FINAL action sequence and checks, before any clamping, that every slot the continuous model cannot serve in full is one the plan DECLARED energy-limited (`ScheduleEntry.energy_limited`). Accumulating the replay's own clamped flows and comparing them with the bound those flows are built to satisfy is an identity and catches nothing.
 
 **One slot-SOC model.** The expected-SOC trajectory, the SOC deviation detector
 and the schedule log's fallback trajectory
@@ -130,6 +130,20 @@ first slot,
 discharge rate, DC-side energy moves the SOC, mid-slot anchoring) are documented
 in `docs/scheduling-algorithm.md` § SOC transitions and discretization.
 Divergence here caused a production recalculation loop, not a threshold problem.
+
+**One within-slot charge model.** A CHARGE slot runs at a *constant*
+`charge_input_dc_kw` looked up at the temperature the slot **starts** at — in
+the DP's candidate transition, in `simulate_slot`, in
+`plan_validation.replay_plan`, in `project_slot_soc` (expected SOC and the
+deviation detector) and in `cost_tracker.project_costs`. The rate never changes
+inside a slot; temperature changes only *between* slots, through
+`TemperatureProjector`. `learning_engine.predict_charge_input_dc_energy` splits
+a slot into a cold and a warm phase using a second thermal model; it is
+**diagnostic only** and must not be called from a planning or projection path.
+It was, from `project_slot_soc`, and on one 15-minute slot crossing 1 kW → 4 kW
+the DP said 12.5 % while the published trajectory said 16.25 %. The bound on the
+constant-rate approximation, and why it errs conservative, is in
+`docs/scheduling-algorithm.md` § Within-slot charge model.
 
 **One thermal model.** Battery temperature is projected only by
 `thermal_model.TemperatureProjector`, shared by the DP's rate refinement
@@ -159,12 +173,42 @@ broken:
    low-SOC paths into an imaginary taper. Temperature is handled by a **bounded
    solve/replay/refine**: pass 0 uses the *idle* profile (no heat from an
    action the plan has not committed to), each pass replays the selected plan
-   through `TemperatureProjector` with warming from **actual** battery flow,
-   and it stops on a fixed point, an oscillation, or
-   `MAX_RATE_REFINEMENT_PASSES` plus one conservative fallback solve. The
-   fallback is conservative only where the rate is non-decreasing in
-   temperature; say so rather than calling it a bound. Forecasts are fixed for
-   the whole solve so a moving input cannot look like non-convergence.
+   through `TemperatureProjector` with warming from **actual** battery flow.
+   Forecasts are fixed for the whole solve so a moving input cannot look like
+   non-convergence.
+
+   **The criterion is FEASIBILITY at the REACHED temperature, not a fixed
+   point.** After each pass the selected plan is walked forward and every
+   charging transition — CHARGE and the PV absorption a HOLD or self-consumption
+   DISCHARGE performs — is checked against `rate(soc_start, replayed_temp)`. A
+   fixed point alone let a 0.75 kWh shortfall through with `converged=True`.
+
+   **Never sample a predictor to decide whether to check.** The loop used to be
+   gated by a probe over three SOCs and a temperature ladder; a learned bucket
+   that varied only between the probes skipped refinement entirely. Same
+   reasoning as the removed SOC-independence hoist: `charge_rate_predictor` is
+   an arbitrary callable. With a temperature reading, refinement always runs.
+
+   On oscillation or budget exhaustion it solves once more on the **minimum
+   rate over every profile seen this call**, and replays again. That is a bound
+   over those profiles only; if it is still short the branch **degrades** —
+   credited charge energy is cut to what the replayed temperature allows, the
+   trajectory is rebuilt from that walk, and it is logged at WARNING with the
+   shortfall. Economic optimality is lost there; say so rather than implying
+   the fallback is always safe. `DPOptimizerResult.rate_refinement_branch`
+   names the path taken.
+
+4. **One trajectory, and it is the physical outcome.** Whatever branch chose
+   the actions, the published SOC/temperature trajectory is the forward walk of
+   those actions at the temperatures they reach. That is what
+   `plan_validation.replay_plan` and `project_schedule_trajectory` compute, so
+   **no consumer pins a charge-rate lookup to a planning temperature**.
+   `planning_temp_by_slot` is a diagnostic; pinning it made validation check
+   the planner's arithmetic against the planner's own assumption, which is the
+   other half of how that 0.75 kWh went unreported. On a post-hedge shortfall
+   the orchestrator reverts the cloud-safe conversions on the affected slots,
+   re-validates, and only then degrades (ERROR). Never publish a plan that
+   credits charge energy unavailable at the replayed temperature.
 
 The temperature trajectory in `DPOptimizerResult` is reporting-only in the sense
 that it is built by the same replay the refinement uses. Details, the `k1`/`k2`

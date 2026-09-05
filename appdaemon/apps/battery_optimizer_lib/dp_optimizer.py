@@ -1,8 +1,13 @@
 """
 Dynamic Programming optimizer for battery scheduling.
 
-Extracts the optimal charge/hold/discharge schedule using SOC-aware
-dynamic programming with temperature-aware charge rate predictions.
+Chooses a charge/hold/discharge schedule by SOC-aware dynamic programming with
+temperature-aware charge-rate predictions.
+
+What is EXACT and what is APPROXIMATE is spelled out below the imports and in
+``docs/scheduling-algorithm.md``. In one line: the physics of every transition
+is exact and the published plan is replay-feasible; the SEARCH is not, because
+one path per SOC bucket is kept and that is not a valid dominance rule.
 """
 
 import datetime
@@ -15,7 +20,7 @@ if TYPE_CHECKING:
     from .config import BatteryOptimizerConfig
 
 from .models import BatteryMode, PricePoint, ScheduleEntry
-from .slot_energy import SlotEnergyParams, simulate_slot
+from .slot_energy import ENERGY_EPS, SlotEnergyParams, simulate_slot
 from .timezone_utils import canonical_slot_key, instant_key
 
 
@@ -43,20 +48,51 @@ from .timezone_utils import canonical_slot_key, instant_key
 #   pass n  replay the selected plan through the shared TemperatureProjector
 #           (warming from ACTUAL battery flow, so a full pack ordered to charge
 #           contributes nothing), re-derive the profile, and solve again;
-#   stop    on a fixed point (profiles agree within TEMP_FIXED_POINT_C), on a
-#           repeated profile (oscillation), or on the pass budget.
+#   stop    when the plan is FEASIBLE at the temperatures the replay says it
+#           reaches AND the profile is stable; else on a repeated profile
+#           (oscillation) or on the pass budget.
 #
-# On oscillation or exhaustion it falls back to the pass-0 idle profile and
-# solves once more. Limits of that fallback, stated rather than implied:
+# THE CRITERION IS FEASIBILITY AT THE REACHED TEMPERATURE, not a fixed point.
+# `_replay_plan` walks the selected plan forward, looks the rate up at the
+# temperature the pack has actually reached in that walk, and reports how much
+# of the charge energy the plan credited the pack could not have taken. A fixed
+# point alone is not enough and never was: the loop used to be skipped entirely
+# by a sampled "is the rate temperature sensitive?" probe, and a learned bucket
+# that varied only at a SOC between the probes then planned 4 kW of charging
+# into a slot where the pack, at the temperature its own earlier CHARGE slot
+# produced, could take 1 kW -- 0.75 kWh of the next slot's load uncovered, with
+# `converged=True` and no fallback to hint at it
+# (`tests/test_thermal_feasibility_refinement.py`).
 #
-#   * It is CONSERVATIVE only where the rate is non-decreasing in temperature --
-#     the physical case, and the one the learning engine's temperature buckets
-#     describe (a cold pack charges slower). With a non-monotonic learned curve
-#     it is an approximation, not a bound, and what catches that is the final
-#     replay in `plan_validation`, not this loop.
-#   * A fixed point is not a proof of global optimality. The solver is exact for
-#     its discretized model GIVEN a temperature profile; the profile itself is
-#     an outer approximation.
+# There is deliberately no sensitivity probe any more. `charge_rate_predictor`
+# is an arbitrary callable and a finite sample of it proves nothing about the
+# temperatures the refinement will reach -- the same reasoning that removed the
+# SOC-independence hoist (see the NOTE on `_rate_for`). With a temperature
+# reading the refinement always runs, bounded by the pass budget; without one
+# there is nothing for it to refine and a single solve is the whole answer.
+#
+# On oscillation or exhaustion it falls back to a CONSERVATIVE solve: per
+# (slot, SOC) the MINIMUM rate over every temperature profile seen in this
+# call, then one more replay. Limits of that fallback, stated rather than
+# implied:
+#
+#   * "Minimum over the profiles seen" is a genuine lower bound only over those
+#     profiles. If the conservative plan reaches a temperature none of them
+#     visited and the rate curve dips there, it can still be short -- which is
+#     why the replay after it is not optional.
+#   * If it IS still short, the branch DEGRADES: the credited charge energy is
+#     reduced to what the replayed temperature actually allows and the whole
+#     trajectory is rebuilt from that walk. Economic optimality is lost in that
+#     branch -- the plan's actions were chosen for energy the pack will not
+#     have -- and it is logged at WARNING with the shortfall in kWh. What is
+#     preserved is the thing that matters: no published number credits energy
+#     the model says is unavailable.
+#   * A fixed point is not a proof of optimality of any kind. See the state
+#     representation note below for what the solver does and does not guarantee.
+#
+# `DPOptimizerResult.rate_refinement_branch` says which of the four paths
+# produced the plan: "single_solve", "converged", "conservative_fallback",
+# "degraded".
 #
 # Rejected: putting discretized temperature in the DP state. It is the clearest
 # formulation, but it multiplies the state count by the number of temperature
@@ -77,6 +113,13 @@ MAX_RATE_REFINEMENT_PASSES = 3
 # the thermal model's resolution and far finer than the learning engine's 5 C
 # temperature buckets, so it terminates without changing which bucket is used.
 TEMP_FIXED_POINT_C = 0.25
+
+# A plan is short of its own credited charge energy by more than this (kWh) or
+# it is feasible. It is a float-accumulation allowance over a few hundred
+# additions of order 1 kWh, NOT a budget for modelling error: a genuine
+# disagreement is a rate lookup landing in a different bucket, which moves
+# whole tenths of a kWh, never 1e-9.
+CHARGE_FEASIBILITY_EPS_KWH = 1e-9
 
 
 def _energy_to_index(
@@ -143,18 +186,87 @@ def _energy_to_index(
 #
 # Physics is therefore exact: no transition can create a joule, and replaying
 # the backtracked plan continuously reproduces the planner's own trajectory to
-# floating-point precision. What remains approximate is the MERGING: two paths
-# in one bucket differ by up to one step, and only the better-valued one
-# survives (ties are broken toward the one with more energy, which is a genuine
-# dominance rule). That is an approximation of the OPTIMUM, never a licence to
-# invent energy.
+# floating-point precision.
 #
-# One step times the marginal value of a kWh is the PER-MERGE error, not the
-# horizon bound: a discarded path can be discarded again at every later slot, so
-# the only bound proven here is the sum, `n_slots * step * marginal_value`. It is
-# loose -- the errors are not independent and a merged path usually rejoins --
-# but nothing here establishes anything tighter, so the loose statement is the
-# honest one.
+# ---------------------------------------------------------------------------
+# What this solver is, and is NOT
+# ---------------------------------------------------------------------------
+#
+# EXACT:
+#   * the physics of every transition -- energy in, energy out, grid import,
+#     export, unmet demand, at the path's exact continuous energy;
+#   * replay parity -- `plan_validation.replay_plan` walking the published
+#     action sequence through `slot_energy.simulate_slot` reproduces the
+#     planner's own SOC trajectory (proven by sweep in
+#     `tests/test_dp_energy_conservation.py`);
+#   * SOC dependence of the charge rate: evaluated per candidate transition;
+#   * the value arithmetic of a given action sequence under a given temperature
+#     profile.
+#
+# APPROXIMATE -- and this is a real gap, not a rounding remark:
+#
+#   THE BUCKET MERGE IS NOT AN EXACT STATE REDUCTION. Keeping one path per SOC
+#   bucket -- the highest-valued one -- is NOT a valid dominance rule. A
+#   higher-valued path does not dominate a lower-valued path that holds more
+#   energy: the extra energy can be worth more later than the value gap is
+#   worth now. This solver is therefore NOT "exact for its discretized model".
+#   That claim used to be made here and in the docs; it was wrong.
+#
+#   The counterexample is small and is pinned as a regression test
+#   (`tests/test_merge_approximation.py`). At the default 1 % step: 10 kWh pack,
+#   min SOC 10 %, initial 10.9 %, two 15-minute slots drawing 0.2 kW at 0.10
+#   then 1.00 EUR/kWh, unit efficiencies, no fees, wear or terminal value. The
+#   solver returns DISCHARGE, DISCHARGE at 0.010 EUR; exhaustive enumeration of
+#   the same action space finds HOLD, DISCHARGE at 0.005 EUR. Both slots land in
+#   the same bucket after slot 1; DISCHARGE wins there on value (it saves
+#   0.10 EUR/kWh of cheap import) and the HOLD path, which held 0.01 kWh more,
+#   is discarded -- and that 0.01 kWh was worth 1.00 EUR/kWh in slot 2.
+#
+#   Size of the gap:
+#     * per merge, ENERGY loss < one step (a bucket is one step wide);
+#     * per merge, VALUE loss <= step * marginal value of a kWh;
+#     * over the horizon, the only bound established here is the sum,
+#       `n_slots * step * marginal_value`. A discarded path can be discarded
+#       again at every later slot. That bound is loose -- the errors are not
+#       independent and a merged path usually rejoins -- but nothing in this
+#       implementation proves anything tighter, so the loose statement is the
+#       honest one.
+#
+#   Ties are broken toward the path holding more energy. THAT is a genuine
+#   dominance rule (equal value, more energy can only widen later options); it
+#   is what makes the merge deterministic, and it is not what is approximate.
+#
+#   The exact alternative -- Pareto-nondominated (value, energy) labels per
+#   bucket -- and why it is not used are described in
+#   `docs/scheduling-algorithm.md` SS Conservative quantization.
+#
+#   None of this is a licence to invent energy. The merge discards a plan; it
+#   never credits a joule the pack does not hold.
+#
+#   On top of the merge, the temperature PROFILE is an outer approximation (see
+#   the refinement note above), the within-slot charge rate is constant (see
+#   `soc_projection`), and forecasts are forecasts.
+
+
+@dataclass
+class _PlanReplay:
+    """One forward walk of a selected plan at the temperatures it reaches."""
+
+    # Start-of-slot temperature the walk produced.
+    temp_profile: List[Optional[float]]
+    # (start, end) temperature per slot.
+    temp_pairs: List[Tuple[Optional[float], Optional[float]]]
+    # End-of-slot stored energy of the WALK. Meaningful as a trajectory only
+    # when the walk was run with ``follow_plan_energy=False``.
+    energies: List[float]
+    # kWh of stored charge energy the plan credits that the reached
+    # temperatures cannot supply.
+    charge_shortfall_kwh: float
+    shortfall_by_slot: List[float]
+    # Slots where the walk could not serve the AC demand the plan assigned to
+    # the battery. This is exactly what `plan_validation` requires the plan to
+    # have DECLARED (`ScheduleEntry.energy_limited`).
+    unmet_slots: List[bool]
 
 
 @dataclass
@@ -226,9 +338,30 @@ class DPOptimizerResult:
     rate_refinement_passes: int = 1
     rate_refinement_converged: bool = True
     rate_refinement_fallback: bool = False
-    # Start-of-slot temperature the plan was BUILT with, per slot. The final
-    # replay must look rates up at these, or a conservative fallback profile
-    # would read as a trajectory disagreement.
+    rate_refinement_degraded: bool = False
+    # Which of the four paths produced this plan:
+    #   "single_solve"          no temperature reading; nothing to refine
+    #   "converged"             feasible at its replayed temperatures, profile
+    #                           stable
+    #   "conservative_fallback" oscillation or budget exhausted; solved on the
+    #                           minimum rate over every profile seen, and that
+    #                           plan IS feasible at its replayed temperatures
+    #   "degraded"              the conservative solve was still short; the
+    #                           credited charge energy has been reduced to what
+    #                           the replayed temperature allows and the
+    #                           trajectory rebuilt from that walk. Economic
+    #                           optimality is lost; no unavailable energy is
+    #                           credited.
+    rate_refinement_branch: str = "single_solve"
+    # kWh of charge energy the plan credited that the replayed temperature
+    # could not supply, at the point the degrade branch was entered. Zero on
+    # every other branch.
+    rate_refinement_shortfall_kwh: float = 0.0
+    # Start-of-slot temperatures the FINAL plan is feasible at -- the profile
+    # the last replay produced, not a pinned planning assumption. Reporting and
+    # diagnostics only: no consumer looks charge rates up at these any more.
+    # Pinning them was how validation ended up checking the planner's
+    # arithmetic against the planner's own assumption.
     planning_temp_by_slot: Dict[datetime.datetime, Optional[float]] = field(
         default_factory=dict
     )
@@ -416,23 +549,31 @@ class DPOptimizer:
         temp_profile = self._idle_temp_profile(
             slots_sorted_by_time, slot_fractions, current_temp
         )
-        idle_profile = list(temp_profile)
-        refine = self._rate_is_temperature_sensitive(current_temp)
+        # With a temperature reading the refinement ALWAYS runs. There is no
+        # sampled "is this curve temperature sensitive?" shortcut: a finite
+        # probe of an arbitrary callable proves nothing about the temperatures
+        # the refinement itself will reach, and the probe that used to be here
+        # skipped the whole loop for a curve that varied only between its
+        # sample points.
+        refine = current_temp is not None
         state_socs = (
             [e / cfg.battery_capacity * 100 for e in energy_levels]
             if cfg.battery_capacity else []
         )
         seen_profiles: List[List[Optional[float]]] = []
+        # Every profile any rate in this call was ever taken from. The
+        # conservative fallback minimises over exactly these.
+        profiles_used: List[List[Optional[float]]] = [list(temp_profile)]
         passes = 0
-        converged = True
-        fallback_used = False
+        branch = "single_solve"
+        shortfall_kwh = 0.0
+        replay = None
 
-        while True:
-            passes += 1
-            schedule, idx_trajectory, energy_trajectory, best_value = self._build_schedule(
+        def _solve(profile, rate_fns=None):
+            return self._build_schedule(
                 slots_sorted_by_time=slots_sorted_by_time,
                 load_kw=load_kw,
-                temp_profile=temp_profile,
+                temp_profile=profile,
                 slot_fractions=slot_fractions,
                 current_slot_index=current_slot_index,
                 start_energy=start_energy,
@@ -442,84 +583,121 @@ class DPOptimizer:
                 n_states=n_states,
                 energy_levels=energy_levels,
                 pv_kw=pv_kw,
+                rate_fns=rate_fns,
             )
+
+        while True:
+            passes += 1
+            schedule, idx_trajectory, energy_trajectory, best_value = _solve(temp_profile)
             if not refine:
+                branch = "single_solve"
                 break
 
-            replayed_profile, temp_pairs = self._replay_plan_temps(
-                slots_sorted_by_time,
-                slot_fractions,
-                schedule,
-                energy_trajectory,
-                start_energy,
-                current_temp,
-                load_kw,
-                pv_kw,
-                temp_profile,
+            replay = self._replay_plan(
+                slots_sorted_by_time=slots_sorted_by_time,
+                slot_fractions=slot_fractions,
+                schedule=schedule,
+                energy_trajectory=energy_trajectory,
+                start_energy=start_energy,
+                current_temp=current_temp,
+                load_kw=load_kw,
+                pv_kw=pv_kw,
             )
-            if self._profiles_agree(replayed_profile, temp_profile, state_socs):
-                temp_profile = replayed_profile
+            profiles_used.append(list(replay.temp_profile))
+            feasible = replay.charge_shortfall_kwh <= CHARGE_FEASIBILITY_EPS_KWH
+            stable = self._profiles_agree(
+                replay.temp_profile, temp_profile, state_socs
+            )
+            if feasible and stable:
+                branch = "converged"
+                temp_profile = replay.temp_profile
                 break
-            if any(self._profiles_agree(replayed_profile, p, state_socs) for p in seen_profiles) \
-                    or passes >= MAX_RATE_REFINEMENT_PASSES:
-                # Oscillating, or out of budget. Plan on the profile that
-                # assumes no heat from any action the plan has not committed
-                # to, and stop.
-                converged = False
-                fallback_used = True
-                temp_profile = idle_profile
-                passes += 1
-                schedule, idx_trajectory, energy_trajectory, best_value = self._build_schedule(
-                    slots_sorted_by_time=slots_sorted_by_time,
-                    load_kw=load_kw,
-                    temp_profile=temp_profile,
-                    slot_fractions=slot_fractions,
-                    current_slot_index=current_slot_index,
-                    start_energy=start_energy,
-                    min_energy=min_energy,
-                    max_energy=max_energy,
-                    step_kwh=step_kwh,
-                    n_states=n_states,
-                    energy_levels=energy_levels,
-                    pv_kw=pv_kw,
+
+            oscillating = any(
+                self._profiles_agree(replay.temp_profile, p, state_socs)
+                for p in seen_profiles
+            )
+            if oscillating or passes >= MAX_RATE_REFINEMENT_PASSES:
+                branch, shortfall_kwh, schedule, energy_trajectory, replay = (
+                    self._conservative_solve(
+                        solve=_solve,
+                        profiles_used=profiles_used,
+                        n_slots=n_slots,
+                        oscillating=oscillating,
+                        slots_sorted_by_time=slots_sorted_by_time,
+                        slot_fractions=slot_fractions,
+                        start_energy=start_energy,
+                        current_temp=current_temp,
+                        load_kw=load_kw,
+                        pv_kw=pv_kw,
+                    )
                 )
+                passes += 1
+                temp_profile = replay.temp_profile
                 break
+
             seen_profiles.append(list(temp_profile))
-            temp_profile = replayed_profile
+            temp_profile = replay.temp_profile
 
-        if fallback_used and self._decision_log_level >= 1:
-            self._log(
-                "Charge-rate refinement did not settle within "
-                f"{MAX_RATE_REFINEMENT_PASSES} passes; planning on the idle "
-                "temperature profile (no heat credited to actions the plan has "
-                "not committed to)."
+        # ------------------------------------------------------------------
+        # ONE trajectory, and it is the PHYSICAL OUTCOME of the action sequence
+        # ------------------------------------------------------------------
+        #
+        # Whatever branch produced the actions, what gets published is the walk
+        # of those actions at the temperatures they reach, with the rate looked
+        # up at the pack's own SOC and temperature. That is:
+        #
+        #   * identical to the DP's own energies in the "converged" branch, by
+        #     construction -- the plan is feasible there and the profile is
+        #     stable, so the walk repeats the planner's arithmetic;
+        #   * the OUTCOME, not the assumption, in the conservative branch: the
+        #     actions were chosen on deliberately pessimistic rates, and the
+        #     inverter will nevertheless charge at whatever the pack can take;
+        #   * the only honest answer in the degrade branch, where the plan
+        #     credited energy the pack cannot take.
+        #
+        # It is also exactly what `plan_validation.replay_plan` and
+        # `BatteryOptimizer.project_schedule_trajectory` compute, which is why
+        # neither needs a pinned planning temperature to agree with the plan.
+        if replay is not None:
+            replay = self._replay_plan(
+                slots_sorted_by_time=slots_sorted_by_time,
+                slot_fractions=slot_fractions,
+                schedule=schedule,
+                energy_trajectory=energy_trajectory,
+                start_energy=start_energy,
+                current_temp=current_temp,
+                load_kw=load_kw,
+                pv_kw=pv_kw,
+                follow_plan_energy=False,
             )
+            energy_trajectory = list(replay.energies)
+            temp_profile = replay.temp_profile
+            # A slot the walk cannot serve in full must SAY so, or
+            # `plan_validation` reports a plan crediting service it does not
+            # have. The plan already declares the ones the DP found.
+            for i, price_point in enumerate(slots_sorted_by_time):
+                entry = schedule.get(price_point.time)
+                if (
+                    entry is not None
+                    and i < len(replay.unmet_slots)
+                    and replay.unmet_slots[i]
+                ):
+                    entry.energy_limited = True
 
-        # Build SOC trajectory
         soc_trajectory = self._build_soc_trajectory(
             slots_sorted_by_time, energy_trajectory, start_energy
         )
 
-        # Build temperature trajectory from the FINAL plan, through the same
-        # replay the refinement uses — one thermal implementation, not two.
-        _final_profile, temp_pairs = self._replay_plan_temps(
-            slots_sorted_by_time,
-            slot_fractions,
-            schedule,
-            energy_trajectory,
-            start_energy,
-            current_temp,
-            load_kw,
-            pv_kw,
-            temp_profile,
-        )
+        # The temperature trajectory is the final replay's — one thermal
+        # implementation, and the same walk the feasibility criterion used.
         temp_trajectory = (
             {}
-            if current_temp is None
+            if current_temp is None or replay is None
             else {
-                p.time: temp_pairs[i]
+                p.time: replay.temp_pairs[i]
                 for i, p in enumerate(slots_sorted_by_time)
-                if i < len(temp_pairs)
+                if i < len(replay.temp_pairs)
             }
         )
 
@@ -543,8 +721,14 @@ class DPOptimizer:
             self_consume_slot_count=self_consume_slot_count,
             terminal_value_eur_kwh=terminal_rate,
             rate_refinement_passes=passes,
-            rate_refinement_converged=converged,
-            rate_refinement_fallback=fallback_used,
+            rate_refinement_converged=branch in ("single_solve", "converged"),
+            rate_refinement_fallback=branch in (
+                "conservative_fallback",
+                "degraded",
+            ),
+            rate_refinement_degraded=(branch == "degraded"),
+            rate_refinement_branch=branch,
+            rate_refinement_shortfall_kwh=shortfall_kwh,
             planning_temp_by_slot={
                 p.time: (temp_profile[i] if i < len(temp_profile) else None)
                 for i, p in enumerate(slots_sorted_by_time)
@@ -633,14 +817,6 @@ class DPOptimizer:
             self._rate_cache[key] = cached
         return cached
 
-    def _probe_temps(self, current_temp: Optional[float]) -> List[Optional[float]]:
-        if current_temp is None:
-            return [None]
-        return [
-            current_temp - 5, current_temp, current_temp + 5,
-            current_temp + 10, current_temp + 15, current_temp + 25,
-        ]
-
     # NOTE: there is deliberately no "is the rate SOC-independent, so hoist it
     # out of the state loop" fast path. There was one, decided from a fixed
     # probe set around the CURRENT temperature, and it was wrong in exactly the
@@ -659,26 +835,103 @@ class DPOptimizer:
     # state, memoized by `(soc, temperature)` globally and by state index within
     # a slot. Cost, measured on the 132-slot horizon at a 1 % step: 140 -> 184 ms
     # with a partial first slot. That is the price of the answer being right.
+    #
+    # The same reasoning removed the sampled "is this curve temperature
+    # sensitive?" probe that used to gate the whole refinement loop. It read the
+    # curve at three SOCs on a six-point temperature ladder around the CURRENT
+    # temperature; a learned bucket that varies only between those SOCs made it
+    # answer "no", and the plan was then built on the idle profile and never
+    # checked. See `tests/test_thermal_feasibility_refinement.py`.
 
-    def _rate_is_temperature_sensitive(self, current_temp: Optional[float]) -> bool:
-        """Whether refinement can change anything at all.
+    def _min_rate_fns(
+        self,
+        profiles: List[List[Optional[float]]],
+        n_slots: int,
+    ) -> List[Callable[[float], float]]:
+        """Per slot, ``soc -> min rate over every profile seen in this call``.
 
-        With no temperature reading, or a rate curve that ignores temperature,
-        the profile cannot affect the plan and one solve is the whole answer.
-        Probing costs a handful of lookups and saves a whole extra DP pass in
-        the common case.
+        The conservative fallback. It is a genuine lower bound over the
+        temperatures it minimises across, and nothing more: a plan built on it
+        can still be short at a temperature none of those profiles visited,
+        which is why the caller replays it again afterwards.
         """
-        if current_temp is None:
-            return False
-        cfg = self._config
-        socs = [cfg.min_soc, (cfg.min_soc + cfg.max_soc) / 2, cfg.max_soc]
-        probes = self._probe_temps(current_temp)
-        for soc in socs:
-            base = self._rate_for(soc, probes[0])
-            for temp in probes[1:]:
-                if abs(self._rate_for(soc, temp) - base) > 1e-9:
-                    return True
-        return False
+        fns: List[Callable[[float], float]] = []
+        for i in range(n_slots):
+            temps: List[Optional[float]] = []
+            for profile in profiles:
+                if i < len(profile) and profile[i] not in temps:
+                    temps.append(profile[i])
+            fns.append(self._make_min_rate_fn(tuple(temps)))
+        return fns
+
+    def _make_min_rate_fn(self, temps) -> Callable[[float], float]:
+        rate_for = self._rate_for
+
+        def _fn(soc: float) -> float:
+            return min(rate_for(soc, t) for t in temps)
+
+        return _fn
+
+    def _conservative_solve(
+        self,
+        *,
+        solve,
+        profiles_used: List[List[Optional[float]]],
+        n_slots: int,
+        oscillating: bool,
+        slots_sorted_by_time: List[PricePoint],
+        slot_fractions: List[float],
+        start_energy: float,
+        current_temp: Optional[float],
+        load_kw: List[float],
+        pv_kw: Optional[List[float]],
+    ):
+        """The fallback, and the degrade branch behind it.
+
+        Returns ``(branch, shortfall_kwh, schedule, energy_trajectory, replay)``.
+        """
+        rate_fns = self._min_rate_fns(profiles_used, n_slots)
+        idle_profile = profiles_used[0]
+        schedule, _idx, energy_trajectory, _value = solve(idle_profile, rate_fns)
+        replay = self._replay_plan(
+            slots_sorted_by_time=slots_sorted_by_time,
+            slot_fractions=slot_fractions,
+            schedule=schedule,
+            energy_trajectory=energy_trajectory,
+            start_energy=start_energy,
+            current_temp=current_temp,
+            load_kw=load_kw,
+            pv_kw=pv_kw,
+        )
+        reason = "oscillated" if oscillating else (
+            f"did not settle within {MAX_RATE_REFINEMENT_PASSES} passes"
+        )
+        shortfall = replay.charge_shortfall_kwh
+        if shortfall <= CHARGE_FEASIBILITY_EPS_KWH:
+            if self._decision_log_level >= 1:
+                self._log(
+                    f"Charge-rate refinement {reason}; planned on the minimum "
+                    "charge rate over every temperature profile seen this call. "
+                    "The result is feasible at the temperatures it reaches."
+                )
+            return "conservative_fallback", 0.0, schedule, energy_trajectory, replay
+
+        # Still short. DEGRADE. The trajectory is rebuilt from the physical
+        # walk by the common code in `optimize` (which does that in every
+        # branch); what is specific here is that the plan's ACTIONS were chosen
+        # for energy the pack will not have, so this is no longer an economic
+        # optimum and it is said out loud.
+        self._log(
+            f"Charge-rate refinement {reason}, and the conservative solve is "
+            f"still {shortfall:.3f} kWh short of the charge energy it credits "
+            "at the temperatures the plan reaches. Degrading: the published "
+            "trajectory now credits only the energy the replayed temperature "
+            "allows. The ACTIONS were chosen for energy the pack will not have, "
+            "so this plan is no longer economically optimal — it is only "
+            "physically honest.",
+            level="WARNING",
+        )
+        return "degraded", shortfall, schedule, energy_trajectory, replay
 
     def _idle_temp_profile(
         self,
@@ -723,8 +976,9 @@ class DPOptimizer:
             return self._predict_temp_after_duration(temp, duration_minutes)
         return self._predict_temp_after_idle(temp, duration_minutes)
 
-    def _replay_plan_temps(
+    def _replay_plan(
         self,
+        *,
         slots_sorted_by_time: List[PricePoint],
         slot_fractions: List[float],
         schedule: Dict[datetime.datetime, ScheduleEntry],
@@ -733,16 +987,36 @@ class DPOptimizer:
         current_temp: Optional[float],
         load_kw: List[float],
         pv_kw: Optional[List[float]],
-        planning_profile: List[Optional[float]],
-    ) -> Tuple[List[Optional[float]], List[Tuple[Optional[float], Optional[float]]]]:
-        """Temperatures the SELECTED plan actually produces.
+        follow_plan_energy: bool = True,
+    ) -> "_PlanReplay":
+        """Walk the SELECTED plan forward at the temperatures it reaches.
 
-        Warming is driven by ``simulate_slot``'s ``battery_power_kw``, i.e. the
-        energy that really moved. A full pack ordered to charge, or an empty one
-        ordered to discharge, moves nothing and warms nothing -- imaginary power
-        must not manufacture future charging capability.
+        Self-consistent and single-pass: slot i's temperature depends only on
+        slots before it, so looking the rate up at the pack's OWN evolving
+        temperature needs no iteration. This is the same walk
+        ``plan_validation.replay_plan`` and ``project_schedule_trajectory``
+        perform, which is why they agree with the planner whenever it converged.
 
-        Returns ``(start_of_slot_profile, [(start, end)] per slot)``.
+        It answers two questions at once:
+
+        * the temperature PROFILE the plan produces. Warming is driven by
+          ``simulate_slot``'s ``battery_power_kw``, i.e. the energy that really
+          moved -- a full pack ordered to charge moves nothing and warms
+          nothing;
+        * the charge SHORTFALL: per slot, how much of the stored energy the
+          PLAN credited exceeds what ``rate(soc_start, reached_temp)`` can
+          deliver. That covers CHARGE and the PV absorption a HOLD or
+          self-consumption DISCHARGE slot performs, because ``simulate_slot``
+          caps all three with the same ``charge_input_dc_kw``.
+
+        ``follow_plan_energy`` selects the anchor:
+
+        * ``True`` -- energy advances by the PLANNER's trajectory, so each
+          slot's comparison starts from the same SOC and the same headroom the
+          planner used. This is the feasibility criterion.
+        * ``False`` -- energy advances by what the walk itself achieved, so
+          ``energies`` is the physical outcome of the action sequence. This is
+          what the degrade branch republishes.
         """
         cfg = self._config
         params = SlotEnergyParams(
@@ -757,6 +1031,10 @@ class DPOptimizer:
         )
         profile: List[Optional[float]] = []
         pairs: List[Tuple[Optional[float], Optional[float]]] = []
+        energies: List[float] = []
+        shortfall_by_slot: List[float] = []
+        limited: List[bool] = []
+        total_shortfall = 0.0
         temp = current_temp
         energy = start_energy
         for i, price_point in enumerate(slots_sorted_by_time):
@@ -770,13 +1048,10 @@ class DPOptimizer:
             fraction = slot_fractions[i]
             profile.append(temp)
             soc = energy / cfg.battery_capacity * 100 if cfg.battery_capacity else 0.0
-            # The rate the plan was built with for this slot, evaluated at the
-            # path's own SOC: the replay must not silently use a different
-            # capability than the candidate transition did.
-            rate = self._rate_for(
-                soc,
-                planning_profile[i] if i < len(planning_profile) else temp,
-            )
+            # The capability the pack really has here: its own SOC, its own
+            # temperature. Looking it up at the PLANNING temperature instead is
+            # what made this check compare the planner with its own assumption.
+            rate = self._rate_for(soc, temp)
             outcome = simulate_slot(
                 stored_energy_kwh=energy,
                 mode=mode,
@@ -787,6 +1062,23 @@ class DPOptimizer:
                 fraction=fraction,
                 is_export=is_export,
             )
+
+            plan_start = (
+                start_energy
+                if i == 0
+                else (energy_trajectory[i - 1] if i - 1 < len(energy_trajectory) else energy)
+            )
+            plan_end = (
+                energy_trajectory[i]
+                if i < len(energy_trajectory)
+                else outcome.energy_end_kwh
+            )
+            planned_stored_in = max(0.0, plan_end - plan_start)
+            slot_shortfall = max(0.0, planned_stored_in - outcome.stored_dc_in_kwh)
+            shortfall_by_slot.append(slot_shortfall)
+            total_shortfall += slot_shortfall
+            limited.append(outcome.unmet_battery_ac_kwh > ENERGY_EPS)
+
             start_temp = temp
             temp = self._step_temp(
                 temp,
@@ -796,14 +1088,17 @@ class DPOptimizer:
                 is_charge=(mode == BatteryMode.CHARGE),
             )
             pairs.append((start_temp, temp))
-            # The DP's own path energy is authoritative for the SOC the plan
-            # reaches; the simulation above exists for the battery POWER.
-            energy = (
-                energy_trajectory[i]
-                if i < len(energy_trajectory)
-                else outcome.energy_end_kwh
-            )
-        return profile, pairs
+            energies.append(outcome.energy_end_kwh)
+            energy = plan_end if follow_plan_energy else outcome.energy_end_kwh
+
+        return _PlanReplay(
+            temp_profile=profile,
+            temp_pairs=pairs,
+            energies=energies,
+            charge_shortfall_kwh=total_shortfall,
+            shortfall_by_slot=shortfall_by_slot,
+            unmet_slots=limited,
+        )
 
     def _profiles_agree(
         self,
@@ -888,6 +1183,7 @@ class DPOptimizer:
         energy_levels: List[float],
         start_idx_override: Optional[int] = None,
         pv_kw_list: Optional[List[float]] = None,
+        rate_fns_list: Optional[List[Callable[[float], float]]] = None,
     ) -> Tuple[List[BatteryMode], List[bool], List[bool], float, List[int], List[float]]:
         """
         Core DP algorithm.
@@ -1000,6 +1296,13 @@ class DPOptimizer:
             slot_temp = (
                 temp_profile_list[t] if t < len(temp_profile_list) else None
             )
+            # The conservative fallback replaces the (soc, slot temperature)
+            # lookup with "the minimum rate over every profile seen this call".
+            slot_rate_fn = (
+                rate_fns_list[t]
+                if rate_fns_list is not None and t < len(rate_fns_list)
+                else None
+            )
             slot_hours_fraction = cfg.slot_hours * fraction
             net_load_kwh = net_load_kw * cfg.slot_hours * fraction
 
@@ -1043,7 +1346,11 @@ class DPOptimizer:
                 # Charge capability of THIS state, at THIS slot's temperature.
                 slot_charge_rate = rate_cache_slot.get(idx)
                 if slot_charge_rate is None:
-                    slot_charge_rate = rate_for(curr_soc, slot_temp)
+                    slot_charge_rate = (
+                        slot_rate_fn(curr_soc)
+                        if slot_rate_fn is not None
+                        else rate_for(curr_soc, slot_temp)
+                    )
                     rate_cache_slot[idx] = slot_charge_rate
                 charge_dc_kwh = slot_charge_rate * slot_hours_fraction
                 charge_energy_kwh = charge_dc_kwh * cfg.efficiency
@@ -1362,6 +1669,7 @@ class DPOptimizer:
         n_states: int,
         energy_levels: List[float],
         pv_kw: Optional[List[float]] = None,
+        rate_fns: Optional[List[Callable[[float], float]]] = None,
     ) -> Tuple[Dict[datetime.datetime, ScheduleEntry], List[int], List[float], float]:
         """
         Build schedule using DP with greedy lookahead for partial first slot.
@@ -1400,10 +1708,13 @@ class DPOptimizer:
                 start_energy / cfg.battery_capacity * 100
                 if cfg.battery_capacity else 0.0
             )
-            slot_charge_rate = self._rate_for(
-                partial_soc,
-                temp_profile[partial_index] if partial_index < len(temp_profile) else None,
-            )
+            if rate_fns is not None and partial_index < len(rate_fns):
+                slot_charge_rate = rate_fns[partial_index](partial_soc)
+            else:
+                slot_charge_rate = self._rate_for(
+                    partial_soc,
+                    temp_profile[partial_index] if partial_index < len(temp_profile) else None,
+                )
             charge_energy_kwh = slot_charge_rate * cfg.efficiency * cfg.slot_hours * fraction
             charge_dc_kwh = slot_charge_rate * cfg.slot_hours * fraction
             pv_free_charge_kwh = min(pv_surplus_kw, slot_charge_rate) * cfg.slot_hours * fraction
@@ -1414,6 +1725,9 @@ class DPOptimizer:
             slots_remaining = slots_sorted_by_time[remaining_slice]
             load_remaining = load_kw[remaining_slice]
             temp_profile_remaining = temp_profile[remaining_slice]
+            rate_fns_remaining = (
+                rate_fns[remaining_slice] if rate_fns is not None else None
+            )
             slot_fractions_remaining = slot_fractions[remaining_slice]
             pv_kw_remaining = pv_kw[remaining_slice] if pv_kw is not None else None
 
@@ -1542,6 +1856,7 @@ class DPOptimizer:
                     n_states,
                     energy_levels,
                     pv_kw_list=pv_kw_remaining,
+                    rate_fns_list=rate_fns_remaining,
                 )
                 if not slots_remaining:
                     terminal_rate = cfg.terminal_energy_value_eur_kwh
@@ -1620,6 +1935,7 @@ class DPOptimizer:
                 n_states,
                 energy_levels,
                 pv_kw_list=pv_kw,
+                rate_fns_list=rate_fns,
             )
 
         terminal_rate = self._derive_terminal_rate(slots_sorted_by_time)

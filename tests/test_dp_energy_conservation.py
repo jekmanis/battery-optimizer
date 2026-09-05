@@ -456,6 +456,11 @@ class _StubApp:
     def log(self, message, level="INFO"):
         self.messages.append((level, message))
 
+    def _replay_schedule(self, **kwargs):
+        import battery_optimizer as bo
+
+        return bo.BatteryOptimizer._replay_schedule(self, **kwargs)
+
 
 class TestFinalPlanValidationHook:
     """`find_optimal_schedule` publishes only what the shared model confirms."""

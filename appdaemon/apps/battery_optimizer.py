@@ -79,7 +79,11 @@ from battery_optimizer_lib import (
     AmbientServiceConfig,
 )
 from battery_optimizer_lib.direct_control import ApplyOutcome
-from battery_optimizer_lib.plan_validation import PlanReplay, replay_plan
+from battery_optimizer_lib.plan_validation import (
+    DEFAULT_SOC_TOLERANCE,
+    PlanReplay,
+    replay_plan,
+)
 from battery_optimizer_lib.models import ScheduleModeCounts, count_schedule_modes
 from battery_optimizer_lib.pv_profile import PvProfile
 from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
@@ -232,16 +236,8 @@ def _best_later_discharge_value(schedule):
     return best_after
 
 
-def _hold_stores_all_pv_surplus(
-    *,
-    slot_time,
-    pv_kw,
-    load_kw,
-    fraction,
-    hold_soc_trajectory,
-    config,
-) -> bool:
-    """Did the HOLD plan put every kWh of this slot's PV surplus in the pack?
+def _hold_sells_nothing(*, slot_time, pre_hedge_replay) -> bool:
+    """Does the PRE-HEDGE plan sell any of this slot's PV surplus?
 
     The second equivalence condition, and the one that is invisible from the
     energy model alone: ``discharge_to_load`` pins the export limiter to 0 %
@@ -251,22 +247,23 @@ def _hold_stores_all_pv_surplus(
     curtailed instead of sold, which changes the objective the schedule was
     chosen by.
 
-    The comparison uses the shared model's CONTINUOUS trajectory of the HOLD
-    plan rather than the DP's quantized one: one SOC step of rounding is enough
-    to hide a slot's worth of exportable PV. An unknown slot answers False —
-    the hedge is optional, the export revenue is not.
+    The number comes from ``plan_validation.replay_plan`` over the pre-hedge
+    schedule, whose charge-rate lookup is pinned to
+    ``DPOptimizerResult.planning_temp_by_slot`` — the temperatures the plan was
+    actually priced at. The previous test inferred absorption from
+    ``project_schedule_trajectory``'s SOC span, which looks the rate up at the
+    PROJECTOR's own evolving temperature: whenever the rate refinement falls
+    back to its conservative idle profile those differ by the whole of the
+    plan's warming, and a re-projection then "absorbs" surplus the DP had booked
+    as revenue. An unknown slot answers False — the hedge is optional, the
+    export revenue is not.
     """
-    span = hold_soc_trajectory.get(slot_time) if hold_soc_trajectory else None
-    if span is None:
+    if not pre_hedge_replay:
         return False
-    surplus_kwh = max(0.0, pv_kw - load_kw) * config.slot_hours * fraction
-    if surplus_kwh <= _HEDGE_ENERGY_EPS:
-        return True
-    efficiency = config.efficiency if config.efficiency > 0 else 1.0
-    start_soc, end_soc = span
-    stored_dc_kwh = max(0.0, (end_soc - start_soc) / 100.0 * config.battery_capacity)
-    absorbed_pv_kwh = stored_dc_kwh / efficiency
-    return absorbed_pv_kwh >= surplus_kwh - _HEDGE_ENERGY_EPS
+    slot_replay = pre_hedge_replay.by_slot.get(slot_time)
+    if slot_replay is None:
+        return False
+    return slot_replay.grid_export_ac_kwh <= _HEDGE_ENERGY_EPS
 
 
 def _cloud_safe_hedge(
@@ -278,7 +275,7 @@ def _cloud_safe_hedge(
     predict_load_kw,
     predict_pv_kw,
     slot_fractions_by_slot,
-    hold_soc_trajectory,
+    pre_hedge_replay,
     terminal_rate,
 ):
     """Convert the forecast-equivalent HOLD slots to DISCHARGE(to load).
@@ -324,13 +321,9 @@ def _cloud_safe_hedge(
         sell_price = max(
             0.0, price * config.export_rate_multiplier - config.grid_export_fee
         )
-        if sell_price > 0 and not _hold_stores_all_pv_surplus(
+        if sell_price > 0 and not _hold_sells_nothing(
             slot_time=slot_time,
-            pv_kw=predict_pv_kw(slot_time),
-            load_kw=predict_load_kw(slot_time),
-            fraction=slot_fractions_by_slot.get(slot_time, 1.0),
-            hold_soc_trajectory=hold_soc_trajectory,
-            config=config,
+            pre_hedge_replay=pre_hedge_replay,
         ):
             continue
 
@@ -1356,20 +1349,24 @@ class BatteryOptimizer(hass.Hass):
         prices_by_slot_map = {
             canonical_slot_key(p.time): p.price for p in slots_sorted_by_time
         }
+        planning_temp_by_slot = getattr(result, "planning_temp_by_slot", None) or {}
         converted_slots = []
         hedge_candidates = _cloud_safe_candidates(
             schedule, self._predict_load_kw, self._predict_pv_kw
         )
         if hedge_candidates:
-            # The export-equivalence test needs the HOLD plan's continuous SOC,
-            # not the DP's quantized one: one SOC step of rounding is enough to
-            # hide a slot's worth of exportable PV.
-            hold_soc_trajectory, _hold_temp_trajectory = self.project_schedule_trajectory(
-                schedule,
-                current_soc_for_calc,
+            # The export-equivalence test needs the export the DP actually
+            # PRICED, at the temperatures it priced it at — not a re-projection
+            # at whatever temperature the projector happens to reach. Same
+            # replay, same rate lookup, as _validate_final_plan.
+            pre_hedge_replay = self._replay_schedule(
+                schedule=schedule,
+                starting_soc=current_soc_for_calc,
                 starting_temp=current_temp,
                 current_slot=current_slot,
                 minutes_into_slot=minutes_into_slot,
+                prices_sorted=slots_sorted_by_time,
+                planning_temp_by_slot=planning_temp_by_slot,
             )
             converted_slots = _cloud_safe_hedge(
                 schedule,
@@ -1379,7 +1376,7 @@ class BatteryOptimizer(hass.Hass):
                 predict_load_kw=self._predict_load_kw,
                 predict_pv_kw=self._predict_pv_kw,
                 slot_fractions_by_slot=slot_fractions_by_slot,
-                hold_soc_trajectory=hold_soc_trajectory,
+                pre_hedge_replay=pre_hedge_replay,
                 terminal_rate=result.terminal_value_eur_kwh,
             )
         cloud_safe_count = len(converted_slots)
@@ -1485,6 +1482,14 @@ class BatteryOptimizer(hass.Hass):
 
         # Store trajectories for use in _log_schedule (rebuilt above if the
         # cloud-safe conversion changed the schedule).
+        # The temperatures the plan was BUILT with, kept so every later
+        # re-projection of this schedule (the expected-SOC trajectory the
+        # deviation detector runs on, the projected-cost column, the hedge's
+        # export test) looks charge rates up at the same place the DP did.
+        # One plan, one trajectory.
+        self._last_planning_temp_by_slot = getattr(
+            result, "planning_temp_by_slot", None
+        ) or {}
         self._last_dp_soc_trajectory = soc_trajectory
         self._last_dp_temp_trajectory = temp_trajectory
 
@@ -1649,6 +1654,9 @@ class BatteryOptimizer(hass.Hass):
         starting_temp: Optional[float] = None,
         current_slot: Optional[datetime.datetime] = None,
         minutes_into_slot: float = 0.0,
+        planning_temp_by_slot: Optional[
+            Dict[datetime.datetime, Optional[float]]
+        ] = None,
     ) -> Tuple[Dict[datetime.datetime, float], Dict[datetime.datetime, float]]:
         """
         Calculate expected SOC and temperature at each slot based on schedule.
@@ -1668,6 +1676,13 @@ class BatteryOptimizer(hass.Hass):
                 ``slot_fractions`` (see ``_compute_slot_fractions``). Without it
                 every slot is treated as a full slot (legacy behaviour).
             minutes_into_slot: Minutes already elapsed in ``current_slot``.
+            planning_temp_by_slot: The temperature the PLAN was built with per
+                slot (``DPOptimizerResult.planning_temp_by_slot``). Charge rates
+                are looked up at those, so this trajectory and the DP's describe
+                one plan. Without it the two diverged by 7.5 SOC points after
+                three slots on the brief's Task 4 case — the schedule log
+                printing one and this, the deviation detector's input, the
+                other.
 
         Returns:
             Tuple of (soc_trajectory, temp_trajectory) dicts keyed by slot datetime
@@ -1690,6 +1705,7 @@ class BatteryOptimizer(hass.Hass):
             starting_temp=starting_temp,
             current_slot=current_slot,
             minutes_into_slot=minutes_into_slot,
+            planning_temp_by_slot=planning_temp_by_slot,
         )
         expected_soc = {slot: pair[0] for slot, pair in soc_trajectory.items()}
         expected_temp = {
@@ -1706,11 +1722,22 @@ class BatteryOptimizer(hass.Hass):
         starting_temp: Optional[float] = None,
         current_slot: Optional[datetime.datetime] = None,
         minutes_into_slot: float = 0.0,
+        planning_temp_by_slot: Optional[
+            Dict[datetime.datetime, Optional[float]]
+        ] = None,
     ) -> Tuple[
         Dict[datetime.datetime, Tuple[float, float]],
         Dict[datetime.datetime, Tuple[Optional[float], Optional[float]]],
     ]:
         """Walk a schedule through the shared slot-SOC/thermal models.
+
+        ``planning_temp_by_slot`` pins the CHARGE-RATE lookup to the temperature
+        the plan was built with for each slot, so this trajectory describes the
+        same plan the DP chose. The pack's own temperature still evolves from
+        where it really is. Omitting it re-plans at whatever rate the projected
+        temperature implies, which is a different plan — on the brief's Task 4
+        case, where the rate refinement falls back to a conservative idle
+        profile, that was a 7.5 SOC-point divergence after three slots.
 
         Returns ``({slot: (soc_start, soc_end)}, {slot: (temp_start, temp_end)})``
         — the same shape ``DPOptimizerResult`` uses, so a schedule that was
@@ -1772,6 +1799,13 @@ class BatteryOptimizer(hass.Hass):
                 fraction=fraction,
                 export_rate=entry.export_rate,
                 temp_start=current_temp,
+                # Rates at the temperature the plan was BUILT with, when the
+                # caller knows it. One plan, one trajectory.
+                rate_lookup_temp=(
+                    (planning_temp_by_slot or {}).get(hour)
+                    if planning_temp_by_slot
+                    else None
+                ),
                 learning_engine=self.learning_engine,
                 temp_projector=temp_projector,
                 slot_time=hour,
@@ -1782,6 +1816,75 @@ class BatteryOptimizer(hass.Hass):
             current_temp = transition.temp_end
 
         return soc_trajectory, temp_trajectory
+
+    def _replay_schedule(
+        self,
+        *,
+        schedule: Dict[datetime.datetime, ScheduleEntry],
+        starting_soc: float,
+        starting_temp: Optional[float],
+        current_slot: Optional[datetime.datetime],
+        minutes_into_slot: float,
+        prices_sorted: Optional[List[PricePoint]] = None,
+        planning_temp_by_slot: Optional[
+            Dict[datetime.datetime, Optional[float]]
+        ] = None,
+        planned_soc_by_slot: Optional[Dict[datetime.datetime, float]] = None,
+        soc_tolerance: Optional[float] = None,
+    ) -> Optional["PlanReplay"]:
+        """Walk a schedule through the shared physical model.
+
+        ONE construction of the replay, used by the cloud-safe hedge's export
+        test and by the final-plan validation, so the two can never disagree
+        about what the plan does. In particular the charge-rate lookup is pinned
+        to the temperature the plan was PRICED at
+        (``DPOptimizerResult.planning_temp_by_slot``): looking it up at the
+        projector's own temperature answers a different question, and answering
+        it made the hedge curtail export revenue the DP had booked.
+
+        Returns None rather than raising: neither caller may break planning.
+        """
+        if not schedule:
+            return None
+        try:
+            dp_config = DPOptimizerConfig.from_main_config(
+                self.config, min_soc=self.min_soc, max_soc=self.max_soc
+            )
+            prices_by_slot = None
+            if prices_sorted:
+                prices_by_slot = {
+                    canonical_slot_key(p.time): p.price for p in prices_sorted
+                }
+            return replay_plan(
+                schedule=schedule,
+                config=dp_config,
+                starting_soc=starting_soc,
+                predict_load_kw=self._predict_load_kw,
+                predict_pv_kw=self._predict_pv_kw,
+                charge_rate_for=(
+                    lambda slot, soc, temp: self.learning_engine.get_charge_rate_for_soc(
+                        soc,
+                        (planning_temp_by_slot or {}).get(slot, temp),
+                    )
+                ),
+                current_slot=current_slot,
+                minutes_into_slot=minutes_into_slot,
+                starting_temp=starting_temp,
+                temp_projector=getattr(self, "_temp_projector", None),
+                prices_by_slot=prices_by_slot,
+                planned_soc_by_slot=planned_soc_by_slot,
+                soc_tolerance=(
+                    soc_tolerance
+                    if soc_tolerance is not None
+                    else DEFAULT_SOC_TOLERANCE
+                ),
+                slot_matcher=lambda slot, target: datetimes_match_slot(
+                    slot, target, self._get_local_timezone()
+                ),
+            )
+        except Exception as err:  # pragma: no cover - never break planning
+            self.log(f"Plan replay skipped: {err}", level="DEBUG")
+            return None
 
     def _validate_final_plan(
         self,
@@ -1818,48 +1921,22 @@ class BatteryOptimizer(hass.Hass):
         """
         if not schedule:
             return None
-        try:
-            dp_config = DPOptimizerConfig.from_main_config(
-                self.config, min_soc=self.min_soc, max_soc=self.max_soc
-            )
-            prices_by_slot = None
-            if prices_sorted:
-                prices_by_slot = {
-                    canonical_slot_key(p.time): p.price for p in prices_sorted
-                }
-            planned_end_soc = {
-                slot: pair[1] for slot, pair in (soc_trajectory or {}).items()
-            }
-            tolerance = max(1e-6, 0.1 * self.config.soc_step_percent)
-            replay = replay_plan(
-                schedule=schedule,
-                config=dp_config,
-                starting_soc=starting_soc,
-                predict_load_kw=self._predict_load_kw,
-                predict_pv_kw=self._predict_pv_kw,
-                # Rates are looked up at the temperature the PLAN was built
-                # with, per slot, falling back to the replay's own temperature.
-                # Using a different temperature here would turn a deliberately
-                # conservative planning profile into a reported disagreement.
-                charge_rate_for=(
-                    lambda slot, soc, temp: self.learning_engine.get_charge_rate_for_soc(
-                        soc,
-                        (planning_temp_by_slot or {}).get(slot, temp),
-                    )
-                ),
-                current_slot=current_slot,
-                minutes_into_slot=minutes_into_slot,
-                starting_temp=starting_temp,
-                temp_projector=getattr(self, "_temp_projector", None),
-                prices_by_slot=prices_by_slot,
-                planned_soc_by_slot=planned_end_soc or None,
-                soc_tolerance=tolerance,
-                slot_matcher=lambda slot, target: datetimes_match_slot(
-                    slot, target, self._get_local_timezone()
-                ),
-            )
-        except Exception as err:  # pragma: no cover - never break planning
-            self.log(f"Plan replay validation skipped: {err}", level="DEBUG")
+        planned_end_soc = {
+            slot: pair[1] for slot, pair in (soc_trajectory or {}).items()
+        }
+        tolerance = max(1e-6, 0.1 * self.config.soc_step_percent)
+        replay = self._replay_schedule(
+            schedule=schedule,
+            starting_soc=starting_soc,
+            starting_temp=starting_temp,
+            current_slot=current_slot,
+            minutes_into_slot=minutes_into_slot,
+            prices_sorted=prices_sorted,
+            planning_temp_by_slot=planning_temp_by_slot,
+            planned_soc_by_slot=planned_end_soc or None,
+            soc_tolerance=tolerance,
+        )
+        if replay is None:
             return None
 
         self._last_plan_replay = replay
@@ -1972,6 +2049,7 @@ class BatteryOptimizer(hass.Hass):
             starting_temp=current_temp,
             current_slot=current_slot,
             minutes_into_slot=minutes_into_slot,
+            planning_temp_by_slot=getattr(self, "_last_planning_temp_by_slot", None),
         )
         self._expected_soc_anchor = now
 
@@ -2243,6 +2321,7 @@ class BatteryOptimizer(hass.Hass):
             starting_temp=current_temp,
             current_slot=now_slot,
             minutes_into_slot=minutes_into_slot,
+            planning_temp_by_slot=getattr(self, "_last_planning_temp_by_slot", None),
         )
         self._expected_soc_anchor = now
 

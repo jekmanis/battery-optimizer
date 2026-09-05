@@ -259,6 +259,7 @@ from battery_optimizer import BatteryOptimizer
 # Bind the relevant methods to our mock
 MockOptimizer.calculate_expected_soc_schedule = BatteryOptimizer.calculate_expected_soc_schedule
 MockOptimizer.project_schedule_trajectory = BatteryOptimizer.project_schedule_trajectory
+MockOptimizer._replay_schedule = BatteryOptimizer._replay_schedule
 MockOptimizer.find_optimal_schedule = BatteryOptimizer.find_optimal_schedule
 MockOptimizer._ensure_current_slot_price = BatteryOptimizer._ensure_current_slot_price
 MockOptimizer._compute_slot_fractions = BatteryOptimizer._compute_slot_fractions

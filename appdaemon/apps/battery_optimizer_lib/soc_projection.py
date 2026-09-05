@@ -118,6 +118,7 @@ def project_slot_soc(
     learning_engine=None,
     temp_threshold: float = 16.0,
     rate_lookup_soc: Optional[float] = None,
+    rate_lookup_temp: Optional[float] = None,
     temp_projector=None,
     slot_time: Optional[datetime.datetime] = None,
 ) -> SocTransition:
@@ -141,6 +142,17 @@ def project_slot_soc(
         rate_lookup_soc: SOC to use for charge-rate lookups instead of
             ``soc_start``. The deviation detector passes the *actual* SOC here
             because that is what the inverter's rate really depends on.
+        rate_lookup_temp: Temperature to use for charge-rate lookups instead of
+            ``temp_start``. Consumers that are re-projecting a plan pass the
+            temperature the PLAN was built with for that slot
+            (``DPOptimizerResult.planning_temp_by_slot``). Without it the
+            re-projection charges at whatever rate its own evolving temperature
+            implies, which is a different plan: on the brief's Task 4 case,
+            where the refinement falls back to a conservative idle profile, the
+            two trajectories diverged by 7.5 SOC points after three slots -- the
+            schedule log printing one and the deviation detector running on the
+            other. The thermal projection itself still uses ``temp_start``; only
+            the rate lookup is pinned.
         temp_projector: Optional ``thermal_model.TemperatureProjector``. When
             given, the end temperature comes from the SHARED thermal model for
             every mode (relaxation toward a time-varying ambient plus
@@ -163,7 +175,11 @@ def project_slot_soc(
     pv_surplus_kw = max(0.0, pv_kw - load_kw)
 
     rate_soc = rate_lookup_soc if rate_lookup_soc is not None else soc_start
-    charge_rate = _effective_charge_rate(params, rate_soc, temp_start, learning_engine)
+    # The temperature the RATE is looked up at may be pinned to the one the plan
+    # was built with, independently of the temperature the pack is projected
+    # through. See `rate_lookup_temp` in the docstring.
+    rate_temp = rate_lookup_temp if rate_lookup_temp is not None else temp_start
+    charge_rate = _effective_charge_rate(params, rate_soc, rate_temp, learning_engine)
 
     inv_eff = params.inverter_efficiency if params.inverter_efficiency > 0 else 1.0
     temp_end = temp_start
@@ -181,13 +197,20 @@ def project_slot_soc(
         # charge_input_dc_kwh: DC energy at the battery terminal, before
         # retention. Multiplying by `efficiency` gives stored energy. (The
         # variable used to be called `energy_ac`, which it never was.)
-        charge_input_dc_kwh, temp_end = (
+        charge_input_dc_kwh, warmed_temp = (
             learning_engine.predict_charge_input_dc_energy(
                 rate_soc,
-                temp_start,
+                rate_temp,
                 duration_minutes,
                 temp_threshold=temp_threshold,
             )
+        )
+        # When the rate lookup is pinned to the plan's temperature the pack's
+        # own temperature still evolves from where it really is.
+        temp_end = (
+            warmed_temp
+            if rate_lookup_temp is None
+            else _idle_temp(learning_engine, temp_start, duration_minutes)
         )
         if duration_hours > 0:
             slot_charge_input_dc_kw = charge_input_dc_kwh / duration_hours

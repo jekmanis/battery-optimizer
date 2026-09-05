@@ -43,6 +43,7 @@ from battery_optimizer_lib import (
     BatteryCostTracker,
     BatteryCostConfig,
     BatteryOptimizerConfig,
+    DPOptimizerConfig,
     ScheduleFormatter,
     ScheduleFormatterConfig,
     TemperatureProjector,
@@ -232,6 +233,7 @@ from battery_optimizer import BatteryOptimizer  # noqa: E402
 
 HedgeOptimizer.find_optimal_schedule = BatteryOptimizer.find_optimal_schedule
 HedgeOptimizer.project_schedule_trajectory = BatteryOptimizer.project_schedule_trajectory
+HedgeOptimizer._replay_schedule = BatteryOptimizer._replay_schedule
 HedgeOptimizer._ensure_current_slot_price = BatteryOptimizer._ensure_current_slot_price
 HedgeOptimizer._compute_slot_fractions = BatteryOptimizer._compute_slot_fractions
 HedgeOptimizer._compute_charge_rates_per_slot = BatteryOptimizer._compute_charge_rates_per_slot
@@ -687,7 +689,7 @@ from battery_optimizer import (  # noqa: E402
     _best_later_discharge_value,
     _cloud_safe_candidates,
     _cloud_safe_hedge,
-    _hold_stores_all_pv_surplus,
+    _hold_sells_nothing,
 )
 
 
@@ -724,21 +726,46 @@ class TestCandidateSelection:
 
 
 class TestSurplusAbsorption:
-    """One hour, 10 kWh pack: 1 kW of surplus is 1 kWh, i.e. 10 SOC points."""
+    """One hour, 10 kWh pack: 1 kW of surplus is 1 kWh, i.e. 10 SOC points.
 
-    def _check(self, span, pv_kw=2.0, load_kw=1.0, fraction=1.0, efficiency=1.0):
-        config = HedgeOptimizer(efficiency=efficiency).config
-        return _hold_stores_all_pv_surplus(
-            slot_time=slot(0),
-            pv_kw=pv_kw,
-            load_kw=load_kw,
-            fraction=fraction,
-            hold_soc_trajectory={slot(0): span},
-            config=config,
+    The gate reads the PRE-HEDGE replay's own ``grid_export_ac_kwh``, produced
+    with the charge-rate lookup pinned to the temperatures the DP priced the
+    plan at. It used to infer absorption from ``project_schedule_trajectory``'s
+    SOC span, which looks the rate up at the projector's own evolving
+    temperature -- a different plan whenever the rate refinement falls back to
+    its conservative idle profile.
+    """
+
+    @staticmethod
+    def _replay(
+        *, soc=50.0, pv_kw=2.0, load_kw=1.0, fraction=1.0, efficiency=1.0,
+        charge_rate=4.0,
+    ):
+        from battery_optimizer_lib.plan_validation import replay_plan
+
+        opt = HedgeOptimizer(efficiency=efficiency, charge_rate=charge_rate)
+        cfg = DPOptimizerConfig.from_main_config(
+            opt.config, min_soc=opt.min_soc, max_soc=opt.max_soc
+        )
+        schedule = {slot(0): _entry(slot(0), BatteryMode.HOLD)}
+        return replay_plan(
+            schedule=schedule,
+            config=cfg,
+            starting_soc=soc,
+            predict_load_kw=lambda t: load_kw,
+            predict_pv_kw=lambda t: pv_kw,
+            charge_rate_for=lambda t, s, temp: charge_rate,
+            current_slot=slot(0) if fraction < 1.0 else None,
+            minutes_into_slot=(1.0 - fraction) * opt.config.slot_minutes,
+        )
+
+    def _check(self, **kwargs):
+        return _hold_sells_nothing(
+            slot_time=slot(0), pre_hedge_replay=self._replay(**kwargs)
         )
 
     def test_the_whole_surplus_is_stored(self):
-        assert self._check((50.0, 60.0)) is True
+        assert self._check() is True
 
     def test_a_full_pack_stores_nothing(self):
         """At max SOC the surplus can only be exported - HOLD is what allows it.
@@ -746,32 +773,37 @@ class TestSurplusAbsorption:
         The planning-side counterpart of the execution-time
         ``DISCHARGE -> HOLD at max SOC with PV > load`` override.
         """
-        assert self._check((100.0, 100.0)) is False
+        assert self._check(soc=100.0) is False
 
-    def test_just_below_the_boundary_fails(self):
-        assert self._check((50.0, 59.99)) is False
+    def test_a_rate_below_the_surplus_leaves_something_to_sell(self):
+        """0.25 kW of capability against 1 kW of surplus: 0.75 kWh is sold."""
+        assert self._check(charge_rate=0.25) is False
 
-    def test_just_above_the_boundary_passes(self):
-        assert self._check((50.0, 60.01)) is True
+    def test_a_rate_that_exactly_covers_the_surplus_sells_nothing(self):
+        assert self._check(charge_rate=1.0) is True
 
     def test_no_surplus_is_trivially_equivalent(self):
-        assert self._check((50.0, 50.0), pv_kw=1.0, load_kw=1.0) is True
+        assert self._check(pv_kw=1.0, load_kw=1.0) is True
 
-    def test_a_partial_slot_scales_the_surplus(self):
-        assert self._check((50.0, 55.0), fraction=0.5) is True
-        assert self._check((50.0, 55.0), fraction=1.0) is False
+    def test_a_partial_slot_does_not_change_the_verdict(self):
+        """Both sides are powers: shortening the slot scales them together."""
+        assert self._check(fraction=0.5, charge_rate=1.0) is True
+        assert self._check(fraction=0.5, charge_rate=0.9) is False
+        assert self._check(fraction=1.0, charge_rate=1.0) is True
+        assert self._check(fraction=1.0, charge_rate=0.9) is False
 
-    def test_storage_loss_is_taken_off_the_stored_side(self):
-        """0.8 kWh in the pack IS the whole 1 kWh surplus at 80 % retention."""
-        assert self._check((50.0, 58.0), efficiency=0.8) is True
-        assert self._check((50.0, 57.9), efficiency=0.8) is False
+    def test_storage_loss_does_not_change_what_is_sold(self):
+        """Retention shrinks what is STORED, not what the pack took in."""
+        assert self._check(efficiency=0.8, charge_rate=1.0) is True
+        assert self._check(efficiency=0.8, charge_rate=0.9) is False
 
     def test_an_unknown_slot_is_refused(self):
-        config = HedgeOptimizer().config
-        assert _hold_stores_all_pv_surplus(
-            slot_time=slot(0), pv_kw=2.0, load_kw=1.0, fraction=1.0,
-            hold_soc_trajectory={}, config=config,
+        from battery_optimizer_lib.plan_validation import PlanReplay
+
+        assert _hold_sells_nothing(
+            slot_time=slot(0), pre_hedge_replay=PlanReplay()
         ) is False
+        assert _hold_sells_nothing(slot_time=slot(0), pre_hedge_replay=None) is False
 
 
 class TestBestLaterDischargeValue:
@@ -825,9 +857,21 @@ class TestBestLaterDischargeValue:
 class TestHedgeAppliedToAFullPack:
     """The case the DP rarely reaches as HOLD, driven through the helper."""
 
-    def _hedge(self, span, **cfg_kw):
+    def _hedge(self, soc, **cfg_kw):
+        from battery_optimizer_lib.plan_validation import replay_plan
+
         opt = HedgeOptimizer(**cfg_kw)
         schedule = {slot(0): _entry(slot(0), BatteryMode.HOLD)}
+        pre_hedge_replay = replay_plan(
+            schedule=schedule,
+            config=DPOptimizerConfig.from_main_config(
+                opt.config, min_soc=opt.min_soc, max_soc=opt.max_soc
+            ),
+            starting_soc=soc,
+            predict_load_kw=lambda t: 1.0,
+            predict_pv_kw=lambda t: 2.0,
+            charge_rate_for=lambda t, s, temp: opt.config.charge_rate,
+        )
         converted = _cloud_safe_hedge(
             schedule,
             candidates=[slot(0)],
@@ -836,25 +880,140 @@ class TestHedgeAppliedToAFullPack:
             predict_load_kw=lambda t: 1.0,
             predict_pv_kw=lambda t: 2.0,
             slot_fractions_by_slot={slot(0): 1.0},
-            hold_soc_trajectory={slot(0): span},
+            pre_hedge_replay=pre_hedge_replay,
             terminal_rate=0.0,
         )
         return schedule[slot(0)], converted
 
     def test_a_full_pack_with_sellable_surplus_stays_hold(self):
         entry, converted = self._hedge(
-            (100.0, 100.0), export_rate_multiplier=1.0, grid_export_fee=0.0
+            100.0, export_rate_multiplier=1.0, grid_export_fee=0.0
         )
         assert converted == []
         assert entry.mode is BatteryMode.HOLD
         assert entry.value_basis == "kept"
 
     def test_a_full_pack_with_worthless_surplus_is_converted(self):
-        entry, converted = self._hedge((100.0, 100.0), export_rate_multiplier=0.0)
+        entry, converted = self._hedge(100.0, export_rate_multiplier=0.0)
         assert converted == [slot(0)]
         assert entry.mode is BatteryMode.DISCHARGE
         assert entry.export_rate == 0
         assert entry.value_basis == "kept (cloud-safe)"
+
+
+class TestTheExportTestUsesThePlansOwnPricedExport:
+    """The export gate must read the DP's numbers, not a re-projection.
+
+    ``_hold_stores_all_pv_surplus`` judged "HOLD stored all the surplus" from
+    ``project_schedule_trajectory``'s continuous SOC span, which looks the
+    charge rate up at the PROJECTOR's own temperature. The DP priced the slot
+    at ``planning_temp_by_slot[slot]``. When the rate refinement falls back to
+    the conservative idle profile the two differ by the whole of the plan's
+    warming, and the projection then "absorbs" surplus the DP had booked as
+    export revenue. ``discharge_to_load`` pins the export limiter to 0 %, so the
+    hedge silently curtails a sale the schedule was chosen for.
+
+    The gate now reads the pre-hedge replay's own ``grid_export_ac_kwh``,
+    produced with the same rate lookup ``_validate_final_plan`` uses.
+    """
+
+    @staticmethod
+    def _replay_with_export(exported_kwh, absorbed_soc_span=(50.0, 60.0)):
+        """A pre-hedge replay saying the slot sells ``exported_kwh``."""
+        from battery_optimizer_lib.plan_validation import PlanReplay, SlotReplay
+
+        replay = PlanReplay()
+        replay.order = [slot(0)]
+        replay.by_slot[slot(0)] = SlotReplay(
+            time=slot(0),
+            mode=BatteryMode.HOLD,
+            is_export=False,
+            fraction=1.0,
+            soc_start=absorbed_soc_span[0],
+            soc_end=absorbed_soc_span[1],
+            energy_start_kwh=absorbed_soc_span[0] / 100.0 * 10.0,
+            energy_end_kwh=absorbed_soc_span[1] / 100.0 * 10.0,
+            stored_dc_in_kwh=1.0 - exported_kwh,
+            stored_dc_out_kwh=0.0,
+            charge_input_dc_kwh=1.0 - exported_kwh,
+            grid_charge_ac_kwh=0.0,
+            battery_ac_served_kwh=0.0,
+            unmet_battery_ac_kwh=0.0,
+            grid_import_ac_kwh=0.0,
+            grid_export_ac_kwh=exported_kwh,
+            value_eur=0.0,
+        )
+        return replay
+
+    def _hedge(self, exported_kwh, **cfg_kw):
+        opt = HedgeOptimizer(export_rate_multiplier=1.0, grid_export_fee=0.0, **cfg_kw)
+        schedule = {slot(0): _entry(slot(0), BatteryMode.HOLD)}
+        converted = _cloud_safe_hedge(
+            schedule,
+            candidates=[slot(0)],
+            config=opt.config,
+            prices_by_slot={slot(0): 0.20},
+            predict_load_kw=lambda t: 1.0,
+            predict_pv_kw=lambda t: 2.0,
+            slot_fractions_by_slot={slot(0): 1.0},
+            pre_hedge_replay=self._replay_with_export(exported_kwh),
+            terminal_rate=0.0,
+        )
+        return schedule[slot(0)], converted
+
+    def test_a_slot_the_plan_sells_from_is_not_converted(self):
+        """The DP absorbed 0.25 kWh and priced 0.75 kWh of export revenue.
+
+        A re-projection at a warmer temperature would have absorbed the whole
+        1.0 kWh and called the slot equivalent to HOLD. It is not: converting
+        it curtails the sale.
+        """
+        entry, converted = self._hedge(0.75)
+        assert converted == []
+        assert entry.mode is BatteryMode.HOLD
+        assert entry.value_basis == "kept"
+
+    def test_a_slot_with_nothing_to_sell_is_still_converted(self):
+        """The gate must not degenerate into "never hedge"."""
+        entry, converted = self._hedge(0.0)
+        assert converted == [slot(0)]
+        assert entry.mode is BatteryMode.DISCHARGE
+        assert entry.export_rate == 0
+
+    def test_an_unknown_slot_is_refused(self):
+        from battery_optimizer_lib.plan_validation import PlanReplay
+
+        opt = HedgeOptimizer(export_rate_multiplier=1.0, grid_export_fee=0.0)
+        schedule = {slot(0): _entry(slot(0), BatteryMode.HOLD)}
+        converted = _cloud_safe_hedge(
+            schedule,
+            candidates=[slot(0)],
+            config=opt.config,
+            prices_by_slot={slot(0): 0.20},
+            predict_load_kw=lambda t: 1.0,
+            predict_pv_kw=lambda t: 2.0,
+            slot_fractions_by_slot={slot(0): 1.0},
+            pre_hedge_replay=PlanReplay(),
+            terminal_rate=0.0,
+        )
+        assert converted == []
+
+    def test_a_worthless_surplus_is_converted_whatever_the_replay_says(self):
+        """With no sale possible there is no export revenue to protect."""
+        opt = HedgeOptimizer(export_rate_multiplier=0.0)
+        schedule = {slot(0): _entry(slot(0), BatteryMode.HOLD)}
+        converted = _cloud_safe_hedge(
+            schedule,
+            candidates=[slot(0)],
+            config=opt.config,
+            prices_by_slot={slot(0): 0.20},
+            predict_load_kw=lambda t: 1.0,
+            predict_pv_kw=lambda t: 2.0,
+            slot_fractions_by_slot={slot(0): 1.0},
+            pre_hedge_replay=self._replay_with_export(0.75),
+            terminal_rate=0.0,
+        )
+        assert converted == [slot(0)]
 
 
 class ScheduleEntryClone:

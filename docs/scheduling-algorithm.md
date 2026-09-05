@@ -630,11 +630,22 @@ the two actions apart. `BatteryOptimizer._cloud_safe_hedge` requires all four:
    for a later slot — and no import price makes them equivalent.
 2. **Nothing the plan was going to sell gets curtailed.** `discharge_to_load`
    pins the export limiter to 0 % (see `direct_control.expected_registers`),
-   while `hold` leaves it open. So either the sell price is zero, or the HOLD
-   plan stored the whole surplus in the pack. The check reads the shared
-   model's continuous trajectory of the HOLD plan, not the DP's quantized one:
-   a single SOC step of rounding is enough to hide a slot's worth of
-   exportable PV. A full pack with a **sellable** surplus therefore never
+   while `hold` leaves it open. So either the sell price is zero, or the plan
+   was not selling anything in that slot. The check reads the **pre-hedge
+   replay's own `grid_export_ac_kwh`** (`plan_validation.replay_plan`, built by
+   `BatteryOptimizer._replay_schedule` — the same construction
+   `_validate_final_plan` uses), whose charge-rate lookup is pinned to
+   `DPOptimizerResult.planning_temp_by_slot`, i.e. the temperatures the DP
+   actually priced the slot at.
+
+   It used to infer absorption from `project_schedule_trajectory`'s SOC span
+   instead. That looks the charge rate up at the *projector's* own evolving
+   temperature, which is a different plan whenever the rate refinement falls
+   back to its conservative idle profile: on a cold pack the re-projection
+   "absorbs" a surplus the DP had booked as export revenue, the slot converts,
+   and `discharge_to_load` curtails the sale the schedule was chosen for.
+
+   A full pack with a **sellable** surplus therefore never
    converts — which is the planning side of the execution-time
    `DISCHARGE -> HOLD at max SOC with PV > load` override. (With export
    remuneration at zero there is nothing to curtail, so this condition does not

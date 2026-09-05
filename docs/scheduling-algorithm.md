@@ -192,6 +192,25 @@ The consequences are worth being precise about:
   which is the evidence that what is lost is merge resolution and not
   correctness of the transition.
 
+  **A finer grid is not reliably better.** The merge error is *not monotone* in
+  `soc_step_percent`. Measured on a 5-slot case (prices 0.6450 / 0.9446 / 0.6896
+  / 0.7114 / 0.0915 EUR/kWh, load 1.35 kW, 1 kW charge capability, initial SOC
+  14.75 % on a 10 kWh pack) the gap against exhaustive enumeration is 0.0000 EUR
+  at a 2 % step, **0.0092 EUR at 1 %**, and 0.0000 again at 0.5 %, 0.25 % and
+  0.1 %. Halving the step moved a path across a bucket boundary and lost it.
+  Neither the pinned counterexample above nor
+  `docs/dp_optimization_parameters.md`'s 0.25 % recommendation should be read as
+  "finer is safer".
+
+  **When the approximation bites.** It needs a physical limit (`min_soc` or
+  `max_soc`) truncating a transition inside the horizon, so in practice a nearly
+  empty or nearly full pack. A randomised sweep found a gap in 35 of 300 cases
+  with an initial SOC of 10-20 % (worst 0.060 EUR over five slots) and in **0 of
+  600** cases with an initial SOC of 50-95 %. The pinned example is the *mildest*
+  of its family: at an initial SOC of 10.5 % rather than 10.9 % the same two
+  slots cost 0.045 EUR of gap, and a 0.9 % step already recovers the pinned case
+  — 0.1 % is nowhere near necessary for it.
+
   **Size of the gap.** Per merge, the energy loss is less than one step (a
   bucket is one step wide) and the value loss is at most
   `step * marginal_value` of a kWh. Over the horizon the only bound established

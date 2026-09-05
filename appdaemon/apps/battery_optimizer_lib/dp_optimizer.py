@@ -238,10 +238,11 @@ def _energy_to_index(
 #   min SOC 10 %, initial 10.9 %, two 15-minute slots drawing 0.2 kW at 0.10
 #   then 1.00 EUR/kWh, unit efficiencies, no fees, wear or terminal value. The
 #   solver returns DISCHARGE, DISCHARGE at 0.010 EUR; exhaustive enumeration of
-#   the same action space finds HOLD, DISCHARGE at 0.005 EUR. Both slots land in
-#   the same bucket after slot 1; DISCHARGE wins there on value (it saves
-#   0.10 EUR/kWh of cheap import) and the HOLD path, which held 0.01 kWh more,
-#   is discarded -- and that 0.01 kWh was worth 1.00 EUR/kWh in slot 2.
+#   the same action space finds HOLD, DISCHARGE at 0.005 EUR. Both PATHS land in
+#   the same bucket after slot 1 (its 0.1 kWh span covers 1.00 to 1.10 kWh);
+#   DISCHARGE ends there holding 1.04 kWh and wins on value (it saves
+#   0.10 EUR/kWh of cheap import) and the HOLD path, which held 1.09 kWh -- 0.05
+#   kWh more -- is discarded, and that 0.05 kWh was worth 1.00 EUR/kWh in slot 2.
 #
 #   Size of the gap:
 #     * per merge, ENERGY loss < one step (a bucket is one step wide);
@@ -453,7 +454,12 @@ class DPOptimizer:
         minutes_into_slot: float = 0.0,
     ) -> DPOptimizerResult:
         """
-        Run DP optimization to find optimal schedule.
+        Run the DP and return the best schedule it finds under the discretized
+        model with bucket merging.
+
+        Not "the optimal schedule": the merge keeps one path per SOC bucket,
+        which is not a valid dominance rule (see the module header and
+        ``tests/test_merge_approximation.py``).
 
         Args:
             prices: List of price points (must include current_slot)

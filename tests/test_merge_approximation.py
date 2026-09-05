@@ -37,6 +37,7 @@ The exact alternative, and why it is not used, is in
 
 import datetime
 import itertools
+import re
 
 import pytest
 
@@ -98,7 +99,7 @@ def _optimizer(cfg):
     )
 
 
-def _cost_of(cfg, modes) -> float:
+def _cost_of(cfg, modes, initial_soc: float = INITIAL_SOC) -> float:
     """Grid cost (EUR) of one action sequence, from the shared physical model.
 
     Independent of the DP: it walks ``simulate_slot`` and prices the import at
@@ -113,7 +114,7 @@ def _cost_of(cfg, modes) -> float:
         max_soc=cfg.max_soc,
         slot_minutes=cfg.slot_minutes,
     )
-    energy = INITIAL_SOC / 100.0 * cfg.battery_capacity
+    energy = initial_soc / 100.0 * cfg.battery_capacity
     cost = 0.0
     for mode, price in zip(modes, PRICES):
         outcome = simulate_slot(
@@ -176,14 +177,21 @@ class TestTheMergeKeepsValueAndDiscardsEnergy:
     def test_the_gap_is_within_one_step_times_the_marginal_value(self):
         """The per-merge value bound the docs state: step x marginal value.
 
-        One 1 % step is 0.1 kWh; the marginal value of a stored kWh in the
-        expensive slot is 1.00 EUR/kWh. 0.005 EUR is comfortably inside 0.1.
+        The solver is CALLED. Hardcoding ``(DISCHARGE, DISCHARGE)`` here made
+        this an arithmetic identity about two constants -- it would have gone on
+        passing if the solver started returning anything at all, including the
+        plan the enumeration prefers, and the bound it claims to check is a
+        bound on the SOLVER's gap.
         """
         cfg = _config()
         best, _combo = _exhaustive_best(cfg)
-        solver = _cost_of(
-            cfg, (BatteryMode.DISCHARGE, BatteryMode.DISCHARGE)
+        result = _optimizer(cfg).optimize(
+            prices=_prices(),
+            current_slot=BASE,
+            current_soc=INITIAL_SOC,
         )
+        modes = [result.schedule[p.time].mode for p in _prices()]
+        solver = _cost_of(cfg, modes)
         step_kwh = cfg.soc_step_percent / 100.0 * cfg.battery_capacity
         marginal_value = max(PRICES)
         assert solver - best <= step_kwh * marginal_value + 1e-12
@@ -211,6 +219,11 @@ class TestTheMergeKeepsValueAndDiscardsEnergy:
         finds the 0.005 EUR plan. Nothing else changes -- which is the evidence
         that what is lost is resolution of the merge, not correctness of the
         transition.
+
+        It does NOT say that finer is always better -- see
+        ``TestTheErrorIsNotMonotoneInTheStep``. On this case a 0.9 % step is
+        already enough; 0.1 % is not the threshold, it is just a step small
+        enough to be sure.
         """
         cfg = _config()
         cfg.soc_step_percent = 0.1
@@ -222,32 +235,252 @@ class TestTheMergeKeepsValueAndDiscardsEnergy:
         modes = [result.schedule[p.time].mode for p in _prices()]
         assert _cost_of(cfg, modes) == pytest.approx(0.005, abs=1e-12)
 
+    def test_a_slightly_finer_grid_already_recovers_it(self):
+        """0.9 % is enough: the pinned example is the mildest of its family."""
+        cfg = _config()
+        cfg.soc_step_percent = 0.9
+        result = _optimizer(cfg).optimize(
+            prices=_prices(),
+            current_slot=BASE,
+            current_soc=INITIAL_SOC,
+        )
+        modes = [result.schedule[p.time].mode for p in _prices()]
+        assert _cost_of(cfg, modes) == pytest.approx(0.005, abs=1e-12)
 
-class TestTheStateMergeIsDocumentedAsApproximate:
-    """No source may claim the solver is exact for its discretized model."""
+    def test_a_lower_initial_soc_costs_more(self):
+        """Same two slots from 10.5 %: a 0.045 EUR gap, not 0.005."""
+        cfg = _config()
+        result = _optimizer(cfg).optimize(
+            prices=_prices(),
+            current_slot=BASE,
+            current_soc=10.5,
+        )
+        modes = [result.schedule[p.time].mode for p in _prices()]
+        solver = _cost_of(cfg, modes, initial_soc=10.5)
+        best = min(
+            _cost_of(cfg, combo, initial_soc=10.5)
+            for combo in itertools.product(
+                [BatteryMode.HOLD, BatteryMode.CHARGE, BatteryMode.DISCHARGE],
+                repeat=2,
+            )
+        )
+        assert solver - best == pytest.approx(0.045, abs=1e-9)
 
-    FILES = [
-        "appdaemon/apps/battery_optimizer_lib/dp_optimizer.py",
-        "docs/scheduling-algorithm.md",
-        "CLAUDE.md",
-        "README.md",
+
+# ---------------------------------------------------------------------------
+# The error is not monotone in the step
+# ---------------------------------------------------------------------------
+
+NM_PRICES = [0.6450, 0.9446, 0.6896, 0.7114, 0.0915]
+NM_LOAD_KW = 1.35
+NM_RATE_KW = 1.0
+NM_INITIAL_SOC = 14.75
+
+
+def _nm_config(step: float) -> DPOptimizerConfig:
+    cfg = _config()
+    cfg.soc_step_percent = step
+    return cfg
+
+
+def _nm_cost(cfg, modes) -> float:
+    params = SlotEnergyParams(
+        battery_capacity=cfg.battery_capacity,
+        efficiency=cfg.efficiency,
+        discharge_rate=cfg.discharge_rate,
+        inverter_efficiency=cfg.inverter_efficiency,
+        min_soc=cfg.min_soc,
+        max_soc=cfg.max_soc,
+        slot_minutes=cfg.slot_minutes,
+    )
+    energy = NM_INITIAL_SOC / 100.0 * cfg.battery_capacity
+    cost = 0.0
+    for mode, price in zip(modes, NM_PRICES):
+        outcome = simulate_slot(
+            stored_energy_kwh=energy,
+            mode=mode,
+            params=params,
+            charge_input_dc_kw=NM_RATE_KW,
+            load_kw=NM_LOAD_KW,
+            pv_kw=0.0,
+        )
+        cost += price * outcome.grid_import_ac_kwh
+        energy = outcome.energy_end_kwh
+    return cost
+
+
+def _nm_gap(step: float) -> float:
+    cfg = _nm_config(step)
+    opt = DPOptimizer(
+        config=cfg,
+        load_predictor=lambda dt: NM_LOAD_KW,
+        charge_rate_predictor=lambda soc, temp: NM_RATE_KW,
+        temp_after_charge_predictor=lambda t, m: t,
+        temp_after_idle_predictor=lambda t, m: t,
+        pv_predictor=lambda dt: 0.0,
+    )
+    points = [
+        PricePoint(time=BASE + datetime.timedelta(minutes=15 * i), price=p)
+        for i, p in enumerate(NM_PRICES)
     ]
+    result = opt.optimize(prices=points, current_slot=BASE, current_soc=NM_INITIAL_SOC)
+    modes = [result.schedule[p.time].mode for p in points]
+    solver = _nm_cost(cfg, modes)
+    best = min(
+        _nm_cost(cfg, combo)
+        for combo in itertools.product(
+            [BatteryMode.HOLD, BatteryMode.CHARGE, BatteryMode.DISCHARGE],
+            repeat=len(NM_PRICES),
+        )
+    )
+    return solver - best
 
-    @pytest.mark.parametrize("relative", FILES)
-    def test_no_exactness_claim_survives(self, relative):
-        import pathlib
 
-        root = pathlib.Path(__file__).resolve().parent.parent
-        text = (root / relative).read_text(encoding="utf-8")
-        lowered = text.lower()
-        for claim in (
-            "exact for its discretized model",
-            "globally optimal",
+class TestTheErrorIsNotMonotoneInTheStep:
+    """A finer grid usually helps and sometimes hurts.
+
+    `docs/scheduling-algorithm.md` and `docs/dp_optimization_parameters.md` both
+    used to read as if shrinking `soc_step_percent` could only improve the
+    answer, and the second recommends 0.25 % on that basis. It is not true, and
+    this is the measurement that says so.
+    """
+
+    def test_one_percent_is_worse_than_two_percent_here(self):
+        assert _nm_gap(2.0) == pytest.approx(0.0, abs=1e-9)
+        assert _nm_gap(1.0) == pytest.approx(0.0092, abs=1e-3)
+        assert _nm_gap(1.0) > _nm_gap(2.0) + 1e-9
+
+    def test_and_finer_steps_recover(self):
+        for step in (0.5, 0.25, 0.1):
+            assert _nm_gap(step) == pytest.approx(0.0, abs=1e-9), step
+
+
+# ---------------------------------------------------------------------------
+# The claim guard
+# ---------------------------------------------------------------------------
+#
+# The previous version of this guard passed any line containing "not ",
+# "never ", "no " or "is not" -- which is most English prose, and certainly any
+# sentence long enough to make an optimality claim. It also only looked at two
+# phrases in four files. It was inert: it did not object to "globally optimal",
+# "provably optimal", "Guaranteed minimum cost", "finds the cheapest schedule"
+# or "exact for the discretized model" appearing anywhere.
+#
+# This is a real guard: an explicit list of forbidden claims, matched
+# whole-phrase and case-insensitively over every source and document, with an
+# explicit allowlist of the exact places a phrase may legitimately appear
+# (a sentence that DENIES the claim, or the description of the exact
+# Pareto-label alternative that is not what this solver does).
+
+FORBIDDEN_CLAIMS = (
+    r"globally\s+optimal",
+    r"provably\s+optimal",
+    r"guaranteed\s+minimum\s+cost",
+    r"finds\s+the\s+cheapest\s+schedule",
+    r"exact\s+for\s+(?:its|the)\s+discretized\s+model",
+)
+
+# (path suffix, exact substring that must appear in the offending line).
+# Narrow on purpose: an allowlist entry is a licence for ONE sentence in ONE
+# file, and `test_every_allowance_is_still_needed` fails when one goes stale.
+ALLOWED = (
+    (
+        "appdaemon/apps/battery_optimizer_lib/dp_optimizer.py",
+        'This solver is therefore NOT "exact for its discretized model"',
+    ),
+    (
+        "docs/scheduling-algorithm.md",
+        "is exact for the discretized model, because that",
+    ),
+    (
+        "CLAUDE.md",
+        'Do not write "exact for its discretized model" anywhere',
+    ),
+)
+
+
+def _repo_root():
+    import pathlib
+
+    return pathlib.Path(__file__).resolve().parent.parent
+
+
+def _scanned_files():
+    root = _repo_root()
+    paths = []
+    for pattern in ("appdaemon/**/*.py", "docs/**/*.md"):
+        paths.extend(
+            p for p in root.glob(pattern) if "__pycache__" not in p.parts
+        )
+    paths.append(root / "README.md")
+    paths.append(root / "CLAUDE.md")
+    return sorted(set(paths))
+
+
+def _is_allowed(root, path, line) -> bool:
+    relative = path.relative_to(root).as_posix()
+    return any(
+        relative == suffix and permitted in line for suffix, permitted in ALLOWED
+    )
+
+
+class TestNoSourceClaimsAnOptimalityItDoesNotHave:
+    """The solver is an approximation; nothing may say otherwise."""
+
+    def test_no_forbidden_claim_survives_anywhere(self):
+        root = _repo_root()
+        offences = []
+        for path in _scanned_files():
+            text = path.read_text(encoding="utf-8")
+            for number, line in enumerate(text.splitlines(), start=1):
+                for pattern in FORBIDDEN_CLAIMS:
+                    if re.search(pattern, line, re.IGNORECASE) and not _is_allowed(
+                        root, path, line
+                    ):
+                        offences.append(
+                            f"{path.relative_to(root).as_posix()}:{number}: "
+                            f"{line.strip()}"
+                        )
+        assert not offences, (
+            "these lines claim an optimality the bucket merge does not have:\n"
+            + "\n".join(offences)
+        )
+
+    def test_the_guard_actually_matches_the_claims_it_lists(self):
+        """A typo in a pattern would make the guard silently vacuous."""
+        samples = {
+            r"globally\s+optimal": "the plan is globally optimal",
+            r"provably\s+optimal": "Provably optimal over the horizon",
+            r"guaranteed\s+minimum\s+cost": "Guaranteed minimum cost",
+            r"finds\s+the\s+cheapest\s+schedule": "it finds the cheapest schedule",
+            r"exact\s+for\s+(?:its|the)\s+discretized\s+model": (
+                "exact for the discretized model"
+            ),
+        }
+        assert set(samples) == set(FORBIDDEN_CLAIMS)
+        for pattern, sample in samples.items():
+            assert re.search(pattern, sample, re.IGNORECASE), pattern
+
+    def test_the_guard_covers_the_files_that_have_made_the_claim(self):
+        root = _repo_root()
+        scanned = {p.relative_to(root).as_posix() for p in _scanned_files()}
+        for required in (
+            "appdaemon/apps/battery_optimizer.py",
+            "appdaemon/apps/battery_optimizer_lib/dp_optimizer.py",
+            "appdaemon/apps/battery_optimizer_lib/schedule_formatter.py",
+            "docs/scheduling-algorithm.md",
+            "docs/dp_optimization_parameters.md",
+            "README.md",
+            "CLAUDE.md",
         ):
-            for line in lowered.splitlines():
-                if claim in line:
-                    # Only a line that explicitly denies the claim may contain it.
-                    assert any(
-                        marker in line
-                        for marker in ("not ", "never ", "no ", "is not")
-                    ), f"{relative}: {line.strip()}"
+            assert required in scanned, required
+
+    def test_every_allowance_is_still_needed(self):
+        """A stale allowlist entry is a hole nobody is watching."""
+        root = _repo_root()
+        for relative, permitted in ALLOWED:
+            text = (root / relative).read_text(encoding="utf-8")
+            assert permitted in text, (
+                f"{relative} no longer contains the sentence this allowance was "
+                f"written for; delete the allowance: {permitted!r}"
+            )

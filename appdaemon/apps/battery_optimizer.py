@@ -1,8 +1,11 @@
 """
 Battery Charge/Discharge Planning System for Growatt WIT Inverter
 
-Uses Nord Pool price forecasts to schedule optimal battery charge/hold/discharge
-periods. Implements adaptive re-optimization based on actual SOC and PV production.
+Uses Nord Pool price forecasts to schedule battery charge/hold/discharge periods
+by SOC-aware dynamic programming — the best schedule under the discretized model
+with bucket merging, which is an approximation and not a global optimum (see
+docs/scheduling-algorithm.md SS Conservative quantization). Implements adaptive
+re-optimization based on actual SOC and PV production.
 
 Author: AppDaemon Battery Optimizer
 """
@@ -349,7 +352,9 @@ class BatteryOptimizer(hass.Hass):
 
     Features:
     - Fetches prices from Nord Pool sensor (today + tomorrow after 13:00 CET)
-    - Calculates optimal charge/discharge schedule
+    - Calculates a charge/discharge schedule by SOC-aware dynamic programming:
+      the best one under the discretized model with bucket merging, which is an
+      approximation (docs/scheduling-algorithm.md SS Conservative quantization)
     - Adapts schedule every slot based on actual SOC
     - Solar-aware adjustments when PV is producing
     - Safety checks for min/max SOC

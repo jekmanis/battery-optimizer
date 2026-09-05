@@ -1083,9 +1083,6 @@ class BatteryCostTracker:
         predict_pv_func: Optional[Callable[[datetime.datetime], float]] = None,
         slot_fractions_by_slot: Optional[Dict[datetime.datetime, float]] = None,
         starting_temp: Optional[float] = None,
-        planning_temp_by_slot: Optional[
-            Dict[datetime.datetime, Optional[float]]
-        ] = None,
         learning_engine: Optional["BatteryLearningEngine"] = None,
         temp_projector=None,
     ) -> Tuple[Dict[datetime.datetime, float], float]:
@@ -1102,16 +1099,13 @@ class BatteryCostTracker:
             slot_fractions_by_slot: Optional dict mapping datetime to slot fraction (0-1)
             starting_temp: Battery temperature (C) at the projection instant, or
                 None when unknown.
-            planning_temp_by_slot: Temperatures the PLAN was built with, per
-                slot. Charge rates are looked up at those, so this column
-                describes the same plan as the SOC and deviation columns.
             learning_engine: Optional BatteryLearningEngine. Together with
-                ``starting_temp`` it makes the CHARGE slots use
-                ``predict_charge_input_dc_energy`` — the same per-slot,
-                temperature-evolving learned rate the expected-SOC trajectory
-                uses. Without both, the shared model falls back to the flat
-                ``charge_rate * efficiency * duration`` and this column would
-                disagree with the SOC/deviation columns of the same log.
+                ``starting_temp`` it makes the CHARGE slots use the learned
+                rate at the temperature each slot reaches — the same one the
+                expected-SOC trajectory uses. Without both, the shared model
+                falls back to the nominal ``charge_rate * efficiency *
+                duration`` and this column would disagree with the
+                SOC/deviation columns of the same log.
             temp_projector: Optional ``thermal_model.TemperatureProjector`` so
                 temperature evolves through the ONE thermal model in every mode
                 (see ``project_schedule_trajectory``, which this mirrors).
@@ -1194,11 +1188,6 @@ class BatteryCostTracker:
                 # passes, so the projected-cost column cannot be built from a
                 # different charge model than the SOC/deviation columns.
                 temp_start=current_temp,
-                rate_lookup_temp=(
-                    (planning_temp_by_slot or {}).get(hour)
-                    if planning_temp_by_slot
-                    else None
-                ),
                 learning_engine=learning_engine,
                 temp_projector=temp_projector,
                 slot_time=hour,

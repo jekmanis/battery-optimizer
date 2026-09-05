@@ -1438,8 +1438,7 @@ class TestRecalculateRemainingScheduleWithExtraSlots:
                 starting_soc,
                 starting_temp=None,
                 current_slot=None,
-                minutes_into_slot=0.0,
-                planning_temp_by_slot=None,
+                minutes_into_slot=0.0,
             ):
                 # Recorded so the test can assert the partial-slot context is
                 # forwarded by _recalculate_remaining_schedule.

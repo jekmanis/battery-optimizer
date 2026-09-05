@@ -131,7 +131,6 @@ def project_slot_soc(
     temp_start: Optional[float] = None,
     learning_engine=None,
     rate_lookup_soc: Optional[float] = None,
-    rate_lookup_temp: Optional[float] = None,
     temp_projector=None,
     slot_time: Optional[datetime.datetime] = None,
 ) -> SocTransition:
@@ -153,17 +152,6 @@ def project_slot_soc(
         rate_lookup_soc: SOC to use for charge-rate lookups instead of
             ``soc_start``. The deviation detector passes the *actual* SOC here
             because that is what the inverter's rate really depends on.
-        rate_lookup_temp: Temperature to use for charge-rate lookups instead of
-            ``temp_start``. Consumers that are re-projecting a plan pass the
-            temperature the PLAN was built with for that slot
-            (``DPOptimizerResult.planning_temp_by_slot``). Without it the
-            re-projection charges at whatever rate its own evolving temperature
-            implies, which is a different plan: on the brief's Task 4 case,
-            where the refinement falls back to a conservative idle profile, the
-            two trajectories diverged by 7.5 SOC points after three slots -- the
-            schedule log printing one and the deviation detector running on the
-            other. The thermal projection itself still uses ``temp_start``; only
-            the rate lookup is pinned.
         temp_projector: Optional ``thermal_model.TemperatureProjector``. When
             given, the end temperature comes from the SHARED thermal model for
             every mode (relaxation toward a time-varying ambient plus
@@ -182,11 +170,14 @@ def project_slot_soc(
     duration_minutes = params.slot_minutes * fraction
 
     rate_soc = rate_lookup_soc if rate_lookup_soc is not None else soc_start
-    # The temperature the RATE is looked up at may be pinned to the one the plan
-    # was built with, independently of the temperature the pack is projected
-    # through. See `rate_lookup_temp` in the docstring.
-    rate_temp = rate_lookup_temp if rate_lookup_temp is not None else temp_start
-    charge_rate = _effective_charge_rate(params, rate_soc, rate_temp, learning_engine)
+    # The rate is looked up at the temperature the pack has actually REACHED.
+    # It used to be pinnable to the temperature the plan was built with
+    # (`rate_lookup_temp`), which made this projection agree with the planner by
+    # assumption rather than by physics -- and made the plan validator check the
+    # planner's arithmetic against the planner's own guess. The DP now publishes
+    # the trajectory of the forward walk at the reached temperatures, which is
+    # exactly what this function computes, so the pin has nothing left to do.
+    charge_rate = _effective_charge_rate(params, rate_soc, temp_start, learning_engine)
 
     temp_end = temp_start
 

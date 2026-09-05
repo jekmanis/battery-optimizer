@@ -173,12 +173,42 @@ broken:
    low-SOC paths into an imaginary taper. Temperature is handled by a **bounded
    solve/replay/refine**: pass 0 uses the *idle* profile (no heat from an
    action the plan has not committed to), each pass replays the selected plan
-   through `TemperatureProjector` with warming from **actual** battery flow,
-   and it stops on a fixed point, an oscillation, or
-   `MAX_RATE_REFINEMENT_PASSES` plus one conservative fallback solve. The
-   fallback is conservative only where the rate is non-decreasing in
-   temperature; say so rather than calling it a bound. Forecasts are fixed for
-   the whole solve so a moving input cannot look like non-convergence.
+   through `TemperatureProjector` with warming from **actual** battery flow.
+   Forecasts are fixed for the whole solve so a moving input cannot look like
+   non-convergence.
+
+   **The criterion is FEASIBILITY at the REACHED temperature, not a fixed
+   point.** After each pass the selected plan is walked forward and every
+   charging transition — CHARGE and the PV absorption a HOLD or self-consumption
+   DISCHARGE performs — is checked against `rate(soc_start, replayed_temp)`. A
+   fixed point alone let a 0.75 kWh shortfall through with `converged=True`.
+
+   **Never sample a predictor to decide whether to check.** The loop used to be
+   gated by a probe over three SOCs and a temperature ladder; a learned bucket
+   that varied only between the probes skipped refinement entirely. Same
+   reasoning as the removed SOC-independence hoist: `charge_rate_predictor` is
+   an arbitrary callable. With a temperature reading, refinement always runs.
+
+   On oscillation or budget exhaustion it solves once more on the **minimum
+   rate over every profile seen this call**, and replays again. That is a bound
+   over those profiles only; if it is still short the branch **degrades** —
+   credited charge energy is cut to what the replayed temperature allows, the
+   trajectory is rebuilt from that walk, and it is logged at WARNING with the
+   shortfall. Economic optimality is lost there; say so rather than implying
+   the fallback is always safe. `DPOptimizerResult.rate_refinement_branch`
+   names the path taken.
+
+4. **One trajectory, and it is the physical outcome.** Whatever branch chose
+   the actions, the published SOC/temperature trajectory is the forward walk of
+   those actions at the temperatures they reach. That is what
+   `plan_validation.replay_plan` and `project_schedule_trajectory` compute, so
+   **no consumer pins a charge-rate lookup to a planning temperature**.
+   `planning_temp_by_slot` is a diagnostic; pinning it made validation check
+   the planner's arithmetic against the planner's own assumption, which is the
+   other half of how that 0.75 kWh went unreported. On a post-hedge shortfall
+   the orchestrator reverts the cloud-safe conversions on the affected slots,
+   re-validates, and only then degrades (ERROR). Never publish a plan that
+   credits charge energy unavailable at the replayed temperature.
 
 The temperature trajectory in `DPOptimizerResult` is reporting-only in the sense
 that it is built by the same replay the refinement uses. Details, the `k1`/`k2`

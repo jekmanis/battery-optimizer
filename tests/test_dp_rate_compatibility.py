@@ -139,28 +139,50 @@ class TestColdBatteryReproduction:
                 temp = temp + 15.0
             _ = soc_start
 
-    def test_the_cheap_slot_is_not_charged_at_an_imaginary_warm_rate(self):
-        """The 0.01 EUR/kWh slot cannot store 1.0 kWh from a 0 C start."""
+    def test_the_first_slot_is_charged_at_the_cold_rate(self):
+        """A 0 C pack takes 1 kW, whatever a later slot may be able to take.
+
+        The 4 kW rate has to be EARNED by the plan's own first CHARGE slot.
+        This used to assert that the 0.01 EUR/kWh second slot could not store
+        more than the cold 0.25 kWh either -- which was the conservative
+        fallback's answer, not the physical one. The pack warms itself while
+        charging, so the second slot legitimately starts at 15 C. What must
+        never happen is the FIRST slot being credited warm-pack capability.
+        """
         cfg, opt, result = self._run()
-        cheap = BASE + datetime.timedelta(minutes=15)
-        assert _planned_stored_in_kwh(result, cheap, cfg.battery_capacity) <= 0.25 + 1e-9
+        first = BASE
+        assert result.planning_temp_by_slot[first] == pytest.approx(0.0)
+        assert _planned_stored_in_kwh(result, first, cfg.battery_capacity) <= (
+            1.0 * cfg.efficiency * 0.25 + 1e-9
+        )
 
     def test_refinement_is_bounded_and_terminates(self):
         """This example oscillates; it must still stop, and stop conservatively."""
         cfg, opt, result = self._run()
         assert opt.solve_count <= cfg_max_solves()
         assert result.rate_refinement_passes >= 1
-        assert result.rate_refinement_converged in (True, False)
+        assert result.rate_refinement_branch in (
+            "converged",
+            "conservative_fallback",
+            "degraded",
+        )
 
     def test_the_fallback_does_not_credit_unavailable_charge_energy(self):
+        """Total stored energy is capped by the plan's OWN thermal history.
+
+        Slot 0 starts at 0 C and can take 1 kW; charging warms the pack 1 C per
+        minute, so slot 1 starts at 15 C and can take 4 kW. 0.25 + 1.00 kWh is
+        the most this action sequence can store, and it is a genuine cap: the
+        pre-fix planner credited 4 kW in BOTH slots.
+        """
         cfg, opt, result = self._run()
         total_planned = sum(
             _planned_stored_in_kwh(result, slot, cfg.battery_capacity)
             for slot in sorted(result.schedule.keys())
         )
-        # Two 15-minute slots at the cold 1 kW rate is the most a 0 C pack can
-        # take before the load slot arrives.
-        assert total_planned <= 0.5 + 1e-9
+        assert total_planned <= 1.25 + 1e-9
+        # ... and not by simply refusing to charge at all.
+        assert total_planned > 0.0
 
 
 def cfg_max_solves():
@@ -440,7 +462,6 @@ class TestPlanReplayAgreesWithTheTemperatureAwarePlan:
             current_slot=None,
             minutes_into_slot=0.0,
             prices_sorted=None,
-            planning_temp_by_slot=result.planning_temp_by_slot,
         )
         assert replay is not None
         assert replay.conservation_violations == []
@@ -498,7 +519,6 @@ class TestPlanReplayAgreesWithTheTemperatureAwarePlan:
             current_slot=None,
             minutes_into_slot=0.0,
             prices_sorted=None,
-            planning_temp_by_slot=result.planning_temp_by_slot,
         )
         assert replay is not None
         if hedged is not None and replay.trajectory_disagreements:
@@ -518,6 +538,14 @@ class TestOneTrajectoryPerPlan:
     brief's Task 4 case they diverged by several SOC points -- the schedule log
     printed one and the deviation detector ran on the other, while the plan
     validator's tolerance is a tenth of a grid step.
+
+    It was resolved by PINNING the re-projection's rate lookup to
+    ``planning_temp_by_slot``, which made the two agree by assumption. That is
+    gone: the DP now publishes the trajectory of the forward walk at the
+    temperatures the plan reaches, which is exactly what this re-projection
+    computes, so they agree by DERIVATION. Nothing here passes a planning
+    temperature -- if the two ever differ again, one of them is wrong about the
+    physics, which is the thing worth failing on.
     """
 
     class _Engine:
@@ -531,14 +559,13 @@ class TestOneTrajectoryPerPlan:
         def predict_temp_after_idle(temp, duration_minutes):
             return temp
 
-        @classmethod
-        def predict_charge_input_dc_energy(
-            cls, soc, start_temp, duration_minutes, temp_threshold=16.0
-        ):
-            # Flat within the slot, and charging warms the pack 1 C per minute
-            # -- the same synthetic thermal model the DP is given below.
-            rate = cls.get_charge_rate_for_soc(soc, start_temp)
-            return rate * duration_minutes / 60.0, start_temp + duration_minutes
+        @staticmethod
+        def predict_temp_after_duration(temp, duration_minutes):
+            # Charging warms the pack 1 C per minute -- the SAME synthetic
+            # thermal model the DP is given below. In production these are the
+            # same learning-engine method; a double that supplies one and not
+            # the other is a double that models a different battery.
+            return temp + duration_minutes
 
     class _App:
         def __init__(self, cfg, projector, load_fn, pv_fn):
@@ -622,7 +649,6 @@ class TestOneTrajectoryPerPlan:
             result.schedule,
             10.0,
             starting_temp=0.0,
-            planning_temp_by_slot=result.planning_temp_by_slot,
         )
         # calculate_expected_soc_schedule reports the START of each slot; the
         # DP trajectory reports (start, end). Compare starts.
@@ -643,7 +669,6 @@ class TestOneTrajectoryPerPlan:
             result.schedule,
             10.0,
             starting_temp=0.0,
-            planning_temp_by_slot=result.planning_temp_by_slot,
         )
         tolerance = 0.1 * cfg.soc_step_percent
         for slot in sorted(result.schedule.keys()):

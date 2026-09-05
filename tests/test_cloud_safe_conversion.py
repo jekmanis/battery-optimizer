@@ -904,16 +904,20 @@ class TestTheExportTestUsesThePlansOwnPricedExport:
     """The export gate must read the DP's numbers, not a re-projection.
 
     ``_hold_stores_all_pv_surplus`` judged "HOLD stored all the surplus" from
-    ``project_schedule_trajectory``'s continuous SOC span, which looks the
-    charge rate up at the PROJECTOR's own temperature. The DP priced the slot
-    at ``planning_temp_by_slot[slot]``. When the rate refinement falls back to
-    the conservative idle profile the two differ by the whole of the plan's
-    warming, and the projection then "absorbs" surplus the DP had booked as
-    export revenue. ``discharge_to_load`` pins the export limiter to 0 %, so the
-    hedge silently curtails a sale the schedule was chosen for.
+    ``project_schedule_trajectory``'s continuous SOC span -- a SECOND
+    computation of the same quantity, and one that disagreed with the DP
+    whenever the rate refinement fell back to a conservative profile. The
+    projection then "absorbed" surplus the DP had booked as export revenue, and
+    ``discharge_to_load`` pins the export limiter to 0 %, so the hedge silently
+    curtailed a sale the schedule was chosen for.
 
-    The gate now reads the pre-hedge replay's own ``grid_export_ac_kwh``,
-    produced with the same rate lookup ``_validate_final_plan`` uses.
+    The gate reads the pre-hedge replay's own ``grid_export_ac_kwh``, produced
+    by the same ``_replay_schedule`` construction ``_validate_final_plan`` uses.
+    That is still the point: one number, one source. (Both now look the rate up
+    at the temperature the replay reaches -- there is no planning-temperature
+    pin left anywhere -- so the two would agree even if the gate went back to
+    re-projecting. Reading the plan's own priced export is still the right
+    contract, and it is what this class pins.)
     """
 
     @staticmethod

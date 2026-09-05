@@ -19,7 +19,7 @@ from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 if TYPE_CHECKING:
     from .config import BatteryOptimizerConfig
 
-from .models import BatteryMode, PricePoint, ScheduleEntry
+from .models import NO_PRICE_REASON, BatteryMode, PricePoint, ScheduleEntry
 from .slot_energy import (
     ENERGY_EPS,
     SlotEnergyParams,
@@ -130,6 +130,47 @@ CHARGE_FEASIBILITY_EPS_KWH = 1e-9
 # appended and removed together with `ScheduleEntry.energy_limited`, so the log
 # text and the flag cannot disagree.
 DEPLETION_NOTE = " (until depleted)"
+
+
+# ---------------------------------------------------------------------------
+# Intervals nobody published a price for, INSIDE the horizon
+# ---------------------------------------------------------------------------
+#
+# The DP used to be handed only the intervals a source had published, so a hole
+# in the middle of the horizon did not exist for planning: the slot after it was
+# treated as following the slot before it, and the gap's PV, load, SOC and
+# temperature were never modelled. On the reference reproduction (10 kWh pack at
+# its 10 % minimum, 10:00 at 0.50 with nothing happening, 10:15 unpublished with
+# 4 kW of PV, 10:30 at 1.00 with 4 kW of load) the plan charged at 10:00 and
+# imported a kWh that the gap's own sunshine would have supplied for free.
+#
+# A missing interval is therefore a slot the horizon CONTAINS, entered with
+# ``PricePoint.price is None``:
+#
+#   * only the HOLD transition is evaluated. The action is fixed -- nothing may
+#     be chosen at a price that does not exist -- so there is no decision to
+#     make, only physics to carry;
+#   * PV absorption is modelled exactly as in any other HOLD slot (headroom,
+#     the span rate), because that is physics and needs no price;
+#   * the slot's grid IMPORT and EXPORT cash flows are left out of the
+#     objective. Import is path-independent under a fixed action -- every path
+#     through the slot draws the same net load -- so omitting it cannot change
+#     which plan wins, only the absolute value the DP reports. Export at an
+#     unknown price is valued at 0, which is the conservative direction: the
+#     plan is never talked into spending energy for revenue nobody quoted.
+#
+# The terminal-rate median is taken over PRICED slots only, for the same
+# reason: an unpriced slot has no price to be the median of.
+#
+# What the DP must NOT do is invent a number. There is no "carry the previous
+# price forward", no "use the next one": that is the failure
+# `_ensure_current_slot_price` was removed for, one slot further into the
+# horizon.
+
+
+def _is_priced(point: PricePoint) -> bool:
+    """Whether a source published a price for this interval."""
+    return point.price is not None
 
 
 def _with_depletion_note(reason: str, energy_limited: bool) -> str:
@@ -462,7 +503,12 @@ class DPOptimizer:
         ``tests/test_merge_approximation.py``).
 
         Args:
-            prices: List of price points (must include current_slot)
+            prices: The modelled horizon: one point per slot, contiguous. A
+                point whose ``price`` is ``None`` is an interval nobody
+                published — it is planned as a forced HOLD and scores no cash
+                flow (see the note above ``_is_priced``). Building that
+                sequence is the orchestrator's job; this method plans whatever
+                slots it is handed.
             current_slot: Current time slot (aligned to slot boundary)
             current_soc: Current battery state of charge (%)
             current_temp: Current battery temperature (Celsius, optional)
@@ -833,13 +879,21 @@ class DPOptimizer:
         Auto mode (config None) values it at the median avoided-import value
         over the given slots: any slot whose own discharge value falls below
         this is deliberately HELD — keeping the energy beats spending it there.
+
+        The median is taken over PRICED slots only. An interval nobody
+        published has no price to be the median of, and treating its absence as
+        a number would be the invention this whole mechanism exists to avoid.
+        With nothing priced at all there is no salvage value to derive.
         """
         cfg = self._config
         if cfg.terminal_energy_value_eur_kwh is not None:
             return cfg.terminal_energy_value_eur_kwh
+        priced = [p.price for p in slots_list if _is_priced(p)]
+        if not priced:
+            return 0.0
         median_buy = statistics.median(
-            (p.price + cfg.grid_fee) * cfg.import_price_multiplier
-            for p in slots_list
+            (price + cfg.grid_fee) * cfg.import_price_multiplier
+            for price in priced
         )
         return max(
             0.0,
@@ -1370,7 +1424,13 @@ class DPOptimizer:
 
         for t in range(n_list_slots):
             price = slots_list[t].price
-            buy_price = self._buy_price(price)
+            # An interval nobody published: the action is FIXED to HOLD and no
+            # cash flow is scored for it (see the note above `_is_priced`).
+            # Zeroing the two tariffs is exactly that — HOLD's own arithmetic
+            # below multiplies both the import and the export term by them —
+            # and the CHARGE/DISCHARGE candidates are skipped outright.
+            priced = price is not None
+            buy_price = self._buy_price(price) if priced else 0.0
             fraction = slot_fractions_list[t]
             slot_load_kw = load_kw_list[t]
             slot_pv_kw = pv_kw_list[t] if pv_kw_list is not None else 0.0
@@ -1398,7 +1458,7 @@ class DPOptimizer:
             net_load_kwh = net_load_kw * cfg.slot_hours * fraction
 
             # Export variables — NNS contract: sell price floor at 0
-            sell_price = self._sell_price(price)
+            sell_price = self._sell_price(price) if priced else 0.0
             export_discharge_kwh = cfg.effective_export_discharge_rate * cfg.slot_hours * fraction
             dc_export_discharge_kwh = export_discharge_kwh / inv_eff
             load_kwh = slot_load_kw * cfg.slot_hours * fraction
@@ -1499,7 +1559,7 @@ class DPOptimizer:
 
                 # CHARGE (grid_charge): only when grid is actually needed to supplement PV
                 # When PV surplus fully covers charge rate, HOLD already handles it
-                if charge_energy_kwh > 0 and pv_free_charge_kwh < charge_dc_kwh - 1e-6:
+                if priced and charge_energy_kwh > 0 and pv_free_charge_kwh < charge_dc_kwh - 1e-6:
                     # Headroom truncates the stored energy; the terminal energy
                     # and the grid share follow from what was actually stored.
                     actual_charge_energy = min(charge_energy_kwh, headroom)
@@ -1529,7 +1589,7 @@ class DPOptimizer:
                 # DISCHARGE (self-consumption)
                 # Battery provides DC energy; inverter converts to AC to serve load.
                 # dc_discharge_kwh = AC load / inverter_eff (battery works harder).
-                if dc_discharge_kwh > 0:
+                if priced and dc_discharge_kwh > 0:
                     discharge_attempted = True
                     if available > 1e-9:
                         # A candidate delivers what the pack HAS. When that is
@@ -1573,7 +1633,7 @@ class DPOptimizer:
 
                 # DISCHARGE_EXPORT (full rate discharge with grid export)
                 # SOC transition uses DC energy; export revenue uses AC output.
-                if sell_price > 0 and exported_kwh_full > 0 and available > 1e-9:
+                if priced and sell_price > 0 and exported_kwh_full > 0 and available > 1e-9:
                     actual_dc_export = min(dc_export_discharge_kwh, available)
                     is_partial_export = actual_dc_export < dc_export_discharge_kwh - 1e-9
                     ac_from_battery = actual_dc_export * inv_eff
@@ -1622,7 +1682,8 @@ class DPOptimizer:
                 dp_trace_slots.append((slots_list[t].time, price, slot_trace))
 
             if deep_trace_this_slot:
-                self._log(f"[DeepTrace] After slot {t} ({slots_list[t].time.strftime('%H:%M')} @ {price:.4f}):")
+                price_label = f"{price:.4f}" if priced else "unpriced"
+                self._log(f"[DeepTrace] After slot {t} ({slots_list[t].time.strftime('%H:%M')} @ {price_label}):")
                 active_states = [
                     (i, next_dp[i], next_prev_action[i])
                     for i in range(n_states)
@@ -1724,7 +1785,11 @@ class DPOptimizer:
             for slot_hour, slot_price, traces in dp_trace_slots:
                 slot_idx = next((i for i, h in enumerate(slots_list) if h.time == slot_hour), -1)
                 chosen_action = actions[slot_idx] if 0 <= slot_idx < len(actions) else None
-                self._log(f"\n{slot_hour.strftime('%Y-%m-%d %H:%M')} @ {slot_price:.4f} EUR/kWh -> {chosen_action.name if chosen_action else '?'}")
+                price_label = (
+                    f"{slot_price:.4f} EUR/kWh" if slot_price is not None
+                    else "no published price"
+                )
+                self._log(f"\n{slot_hour.strftime('%Y-%m-%d %H:%M')} @ {price_label} -> {chosen_action.name if chosen_action else '?'}")
 
                 relevant_traces = [t for t in traces if t["from_val"] > -1e10]
                 if relevant_traces:
@@ -1799,7 +1864,13 @@ class DPOptimizer:
         if has_partial:
             price_point = slots_sorted_by_time[partial_index]
             price = price_point.price
-            buy_price = self._buy_price(price)
+            # Same rule as `_run_dp`: an unpriced interval offers only HOLD and
+            # scores no cash flow. The orchestrator normally resolves an
+            # unpriced CURRENT interval before the solve, so this is the guard
+            # that keeps the two mechanisms from contradicting each other if it
+            # ever hands one through.
+            partial_priced = price is not None
+            buy_price = self._buy_price(price) if partial_priced else 0.0
             fraction = slot_fractions[partial_index]
             slot_load_kw = load_kw[partial_index]
             slot_pv_kw = pv_kw[partial_index] if pv_kw is not None else 0.0
@@ -1860,7 +1931,7 @@ class DPOptimizer:
             available = max(0.0, start_energy - min_energy)
 
             # HOLD — no grid charge; PV covers load, surplus charges battery for free
-            sell_price = self._sell_price(price)
+            sell_price = self._sell_price(price) if partial_priced else 0.0
             hold_pv_charge_kw = min(pv_surplus_kw, slot_charge_rate)
             hold_pv_energy = hold_pv_charge_kw * cfg.efficiency * cfg.slot_hours * fraction
             hold_actual_stored = min(hold_pv_energy, headroom)
@@ -1879,7 +1950,7 @@ class DPOptimizer:
             ))
 
             # CHARGE (grid_charge): only when grid is actually needed to supplement PV
-            if charge_energy_kwh > 0 and pv_free_charge_kwh < charge_dc_kwh - 1e-6:
+            if partial_priced and charge_energy_kwh > 0 and pv_free_charge_kwh < charge_dc_kwh - 1e-6:
                 actual_charge_energy = min(charge_energy_kwh, headroom)
                 actual_charge_dc = actual_charge_energy / cfg.efficiency
                 grid_charge_dc = max(0.0, actual_charge_dc - pv_free_charge_kwh)
@@ -1896,7 +1967,7 @@ class DPOptimizer:
                     ))
 
             # DISCHARGE (self-consumption)
-            if dc_discharge_kwh > 0 and available > 1e-9:
+            if partial_priced and dc_discharge_kwh > 0 and available > 1e-9:
                 actual_dc_kwh = min(dc_discharge_kwh, available)
                 is_partial_candidate = actual_dc_kwh < dc_discharge_kwh - 1e-9
                 ac_served = actual_dc_kwh * inv_eff
@@ -1917,7 +1988,7 @@ class DPOptimizer:
             pv_kwh_slot = slot_pv_kw * cfg.slot_hours * fraction
             exported_kwh = max(0.0, export_discharge_kwh + pv_kwh_slot - load_kwh_slot)
 
-            if sell_price > 0 and exported_kwh > 0 and available > 1e-9:
+            if partial_priced and sell_price > 0 and exported_kwh > 0 and available > 1e-9:
                 actual_dc_export = min(dc_export_discharge_kwh, available)
                 is_partial_export_candidate = (
                     actual_dc_export < dc_export_discharge_kwh - 1e-9
@@ -1979,10 +2050,14 @@ class DPOptimizer:
                 if not slots_remaining:
                     terminal_rate = cfg.terminal_energy_value_eur_kwh
                     if terminal_rate is None:
+                        # Auto mode with a one-slot horizon: the only price
+                        # there is. Without one there is nothing to derive a
+                        # salvage value from, and 0 is what `_derive_terminal_
+                        # rate` answers in that case too.
                         terminal_rate = max(
                             0.0,
                             buy_price * cfg.inverter_efficiency - cfg.battery_wear_cost,
-                        )
+                        ) if partial_priced else 0.0
                     future_val = terminal_rate * max(0.0, new_energy - min_energy)
                 total_val = immediate_val + future_val
                 label = action.name + ("[EXP]" if is_export else "")
@@ -2063,6 +2138,27 @@ class DPOptimizer:
             hour = price_point.time
             price = price_point.price
             pv = pv_kw[t] if pv_kw is not None else 0.0
+            if price is None:
+                # A forced HOLD across an interval nobody published. It is an
+                # ENTRY, not an absence: the plan advanced the pack across it
+                # (absorbing PV), so the SOC trajectory, the final replay, the
+                # mode census and the projected-cost column all have to see it.
+                #
+                # No provenance and no marginal value, on purpose. The reason
+                # is the one `execute_scheduled_mode` already recognises, so
+                # when this slot becomes current it applies HOLD, reports
+                # `current_slot_entry: fallback` and keeps the price retry
+                # armed - and the execution guard refuses to send it as
+                # anything else, because it can show no published price.
+                schedule_local[hour] = ScheduleEntry(
+                    time=hour,
+                    mode=BatteryMode.HOLD,
+                    reason=NO_PRICE_REASON,
+                    marginal_value_eur_kwh=None,
+                    value_basis=None,
+                    energy_limited=False,
+                )
+                continue
             reason = f"{price:.4f} EUR/kWh load~{lk:.2f}kW"
             if pv > 0:
                 reason += f" pv~{pv:.2f}kW"

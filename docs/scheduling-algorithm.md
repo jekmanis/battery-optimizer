@@ -1257,6 +1257,63 @@ An unusable verdict arms **one** pending retry with a bounded backoff
 - While waiting, a slot with no entry stays `HOLD`. Recovery never invents a
   price and never forces charging to paper over missing data.
 
+### A missing interval INSIDE the horizon
+
+Coverage question 2 fails on its own too: the interval the app is living in is
+published, and one further out is not. The DP used to be handed only the
+intervals a source had published, so a hole in the middle of the horizon did
+not exist for planning at all - the slot after it was treated as following the
+slot before it, and the gap's PV, load, SOC and temperature were never
+modelled. The final replay skipped it for the same reason and reported success.
+
+The reproduction: a 10 kWh pack at its 10 % minimum with unit efficiencies;
+10:00 published at 0.50 with no load and no PV; 10:15 **not** published, with
+4 kW of forecast PV; 10:30 published at 1.00 with 4 kW of forecast load. Both
+planning paths charged at 10:00 and imported a kWh for nothing - holding
+through the gap stores exactly the kWh 10:30 needs, from the sun, for free. And
+`_validate_final_plan` agreed with the plan, because it walked the same two
+slots; its SOC from 10:30 onwards was ten points low.
+
+What happens instead:
+
+- **The modelled horizon is a contiguous slot sequence** from the first
+  interval the DP is given to the LAST PRICED one (`modeled_horizon`). It is
+  not extended past that: a gap at the *end* of the horizon is the horizon
+  ending, and modelling beyond it would invent slots as well as prices.
+- **An unpriced slot enters the DP with `price=None`** and is a **forced
+  HOLD**:
+  - only the HOLD transition is evaluated - nothing may be chosen at a price
+    that does not exist, so there is no decision to make, only physics to
+    carry;
+  - PV absorption is modelled exactly as in any other HOLD slot (headroom, the
+    span rate). That is physics and needs no price;
+  - the slot's grid import and export cash flows are **omitted from the
+    objective**. Import is path-independent under a fixed action - every path
+    through the slot draws the same net load - so omitting it cannot change
+    which plan wins, only the absolute value the DP reports. Export at an
+    unknown price is valued at 0, which is the conservative direction: the plan
+    is never talked into spending energy for revenue nobody quoted.
+- **The terminal-rate median uses priced slots only.** An interval nobody
+  published has no price to be the median of.
+- **The schedule carries a `HOLD` entry** with reason `no_price`, no price
+  provenance and no `marginal_value_eur_kwh`. It is an entry rather than an
+  absence for the same reason the unpriced *current* slot is one: the plan
+  advanced the pack across the interval, so the SOC trajectory, the
+  partial-slot lookahead, `_replay_plan`, `plan_validation.replay_plan`, the
+  mode census and the projected-cost column all have to see it.
+- **It executes as HOLD and nothing else.** When the gap becomes the current
+  slot, `_is_no_price_fallback` recognises the entry, `execute_scheduled_mode`
+  applies `HOLD/no_price`, the diagnostics report `current_slot_entry:
+  fallback` and the retry stays armed. The entry can show no published price,
+  so the provenance guard refuses to send it as anything else.
+- **The cloud-safe hedge skips it.** The hedge has to establish that the
+  avoided import beats wear and the value of keeping the kWh, and there is no
+  price to establish it with.
+
+The horizon monitor is unaffected and still judges the FETCHED snapshot, not
+the modelled one: it reports `gap`, and the bounded retry is armed on every
+planning path, even though the current interval is perfectly well priced.
+
 ### The current interval when nobody published a price for it
 
 Coverage question 1 above can fail on its own: the horizon is otherwise fine,
@@ -1356,6 +1413,43 @@ fetching: a price fetch is a blocking REST call on the shared AppDaemon worker
 thread, and the retry is what pays that cost. Only when the snapshot is unusable
 - or when it is fine but the current slot has no entry, i.e. the plan ran out -
 does the adaptive pass act.
+
+### What counts as coverage
+
+A price covers the interval its source published and nothing else.
+`NordPoolPriceService._normalize_prices` maps each record onto the slot grid
+inside its own `[start, end)`: a coarser interval expands, finer ones
+aggregate, and a slot that no interval covers *completely* is simply not
+emitted. It is a gap, and everything downstream is built to see one.
+
+The width is **never inferred from the spacing between timestamps.** That was
+the whole mechanism: the minimum gap between the records that survived was
+taken as the source resolution and every point was expanded by that factor.
+Spacing cannot distinguish "these are 30-minute intervals" from "these are
+15-minute intervals and the record between them is missing", and both parsers
+were throwing away the explicit `end` that would have settled it
+(`{start, end, price}` from `nordpool.get_price_indices_for_date`,
+`{start, end, value}` from the HACS `raw_today` / `raw_tomorrow` attributes).
+
+A reply containing only 10:00-10:15 at 0.01 EUR/kWh and 10:30-10:45 at 1.00
+was therefore expanded into four quarter hours. At 10:17 the monitor reported
+`has_current=True` for an interval nobody published, and the planner sent
+CHARGE for it carrying `price_source="market"` — the provenance marker exists
+precisely to make that impossible, and it was stamped on a manufactured price.
+
+The rules, in full:
+
+- `PricePoint.end` carries the source's own end. Both parsers now set it.
+- A point with **no** `end` covers exactly one `slot_minutes` slot.
+- The simple sensor list (`today` / `tomorrow`, bare numbers) is the one
+  exception: it has no ends, but the format's own resolution is explicit —
+  24 values for a local day are hourly, 96 are quarter-hours, and the list is
+  the whole day by construction. Each value is given that step as its end.
+- Overlapping records are resolved by publication order, not by summing
+  minutes: a later interval contributes only what an earlier one did not
+  already cover. Summing raw overlaps would let two intervals that both start
+  *inside* a slot add up to its width and mark it covered when its first
+  minutes never were.
 
 ### Retained intervals
 

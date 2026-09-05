@@ -24,6 +24,29 @@ class PricePoint:
     time: datetime.datetime
     price: float
 
+    end: Optional[datetime.datetime] = None
+    # EXCLUSIVE end of the interval this price covers, as the SOURCE published
+    # it. Both fetch paths carry one (`{start, end, price}` from
+    # `nordpool.get_price_indices_for_date`, `{start, end, value}` from the
+    # HACS `raw_today` / `raw_tomorrow` attributes) and both used to discard
+    # it, leaving `NordPoolPriceService._normalize_prices` to infer the
+    # interval width from the minimum SPACING between the timestamps that
+    # survived - and then expand every point by that factor. A reply holding
+    # only 10:00-10:15 and 10:30-10:45 was thereby "expanded" into four
+    # quarter hours, publishing 10:15 at the 10:00 price. Spacing is not
+    # coverage: it cannot tell a 30-minute interval from a 15-minute one with
+    # the next record missing.
+    #
+    # `None` means the source stated no end, and then the point covers exactly
+    # ONE `slot_minutes` slot. It is deliberately optional and last, so the
+    # many `PricePoint(time, price)` call sites (the DP's canonicalization,
+    # every fixture) keep working - none of them describe a source reply.
+
+    @property
+    def has_declared_end(self) -> bool:
+        """Whether the source stated how far this price reaches."""
+        return self.end is not None
+
 
 # Provenance marker for `ScheduleEntry.price_source`. "market" means the slot
 # was planned on an interval that a price source actually published and that
@@ -31,6 +54,14 @@ class PricePoint:
 # for anything else: the optimizer no longer manufactures a price, so an entry
 # with no marker is an entry whose price cannot be vouched for.
 PRICE_SOURCE_MARKET = "market"
+
+# The reason a slot carries when nobody published a price for its interval.
+# ONE spelling, because three things test it: the orchestrator's
+# `_is_no_price_fallback` (the stand-in HOLD for an unpriced CURRENT interval),
+# the DP's forced-HOLD entry for an unpriced interval INSIDE the horizon, and
+# `execute_scheduled_mode`, which must treat the two identically once the
+# second becomes the first.
+NO_PRICE_REASON = "no_price"
 
 
 @dataclass

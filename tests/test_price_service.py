@@ -37,7 +37,14 @@ def _make_price_service(slot_minutes: int = 15, ha_url: str = "", ha_token: str 
 
 
 class TestNormalizePrices:
-    """Tests for _normalize_prices with various input resolutions."""
+    """Tests for _normalize_prices with various input resolutions.
+
+    Source points carry the ``end`` the sources publish. That is what states
+    how far a price reaches: the width is never inferred from the spacing of
+    whatever records survived, because that cannot tell an hourly interval from
+    a quarter-hourly one whose three neighbours are missing (see
+    ``tests/test_price_coverage_gaps.py``).
+    """
 
     def test_normalize_hourly_to_15min(self):
         """Hourly prices (24 points) should expand to 96 fifteen-minute points."""
@@ -46,7 +53,11 @@ class TestNormalizePrices:
 
         # Create 24 hourly PricePoints with distinct prices
         hourly_prices = [
-            PricePoint(time=base_time + datetime.timedelta(hours=h), price=0.10 + h * 0.01)
+            PricePoint(
+                time=base_time + datetime.timedelta(hours=h),
+                price=0.10 + h * 0.01,
+                end=base_time + datetime.timedelta(hours=h + 1),
+            )
             for h in range(24)
         ]
 
@@ -104,7 +115,8 @@ class TestNormalizePrices:
         prices_30min = [
             PricePoint(
                 time=base_time + datetime.timedelta(minutes=30 * i),
-                price=0.08 + i * 0.002
+                price=0.08 + i * 0.002,
+                end=base_time + datetime.timedelta(minutes=30 * (i + 1)),
             )
             for i in range(48)
         ]
@@ -139,6 +151,7 @@ class TestNormalizePrices:
             PricePoint(
                 time=(utc_start + datetime.timedelta(hours=i)).astimezone(riga),
                 price=float(i),
+                end=(utc_start + datetime.timedelta(hours=i + 1)).astimezone(riga),
             )
             for i in range(25)
         ]

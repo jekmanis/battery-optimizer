@@ -86,6 +86,7 @@ from battery_optimizer_lib.plan_validation import (
     replay_plan,
 )
 from battery_optimizer_lib.models import (
+    NO_PRICE_REASON,
     PRICE_SOURCE_MARKET,
     ScheduleModeCounts,
     count_schedule_modes,
@@ -182,14 +183,20 @@ _HEDGE_VALUE_EPS = 1e-9      # EUR/kWh
 _HEDGE_ENERGY_EPS = 1e-6     # kWh
 _HEDGE_POWER_EPS = 1e-9      # kW
 
-# The reason on the HOLD that stands in for a current interval nobody published
-# a price for. It is a real schedule entry, not an absence: the pre-solve step
-# advances the pack across that interval (a HOLD still absorbs PV surplus), and
-# a consumer that cannot see the entry rebuilds the expected-SOC trajectory
-# from the measured SOC and skips the interval entirely. Reason string rather
-# than a flag because `execute_scheduled_mode` has always constructed exactly
-# this entry on the fly and the schedule log already prints it.
-NO_PRICE_REASON = "no_price"
+# `NO_PRICE_REASON` (imported from `models` above) is the reason on the HOLD
+# that stands in for an interval nobody published a price for. It is a real
+# schedule entry, not an absence: the plan advances the pack across that
+# interval (a HOLD still absorbs PV surplus), and a consumer that cannot see
+# the entry rebuilds the expected-SOC trajectory from the measured SOC and
+# skips the interval entirely. Reason string rather than a flag because
+# `execute_scheduled_mode` has always constructed exactly this entry on the fly
+# and the schedule log already prints it.
+#
+# It moved to `models` because there are now TWO producers and they must spell
+# it identically: the pre-solve step for an unpriced CURRENT interval, and the
+# DP's forced HOLD for an unpriced interval inside the horizon. When the second
+# becomes current it has to be indistinguishable from the first, or
+# `_is_no_price_fallback` stops recognising it and the retry stops being armed.
 
 
 def first_slot_fraction(minutes_into_slot: float, slot_minutes: int) -> float:
@@ -205,6 +212,67 @@ def first_slot_fraction(minutes_into_slot: float, slot_minutes: int) -> float:
         1.0,
         max(0.0, (slot_minutes - minutes_into_slot) / max(1, slot_minutes)),
     )
+
+
+def modeled_horizon(
+    priced_sorted: List[PricePoint], slot_minutes: int
+) -> List[PricePoint]:
+    """The contiguous slot sequence the plan describes.
+
+    From the first interval the DP is given to the LAST PRICED one, one point
+    per slot, with the intervals no source published carrying ``price=None``.
+    Those become forced HOLDs: the DP evaluates no other action for them,
+    scores no cash flow for them, and still models their PV, SOC and
+    temperature (see the note above ``dp_optimizer._is_priced``).
+
+    Handing the DP only the priced points made a hole inside the horizon vanish
+    from planning altogether - the slot after it was treated as following the
+    slot before it - and the final replay skipped it for the same reason, so it
+    validated a trajectory that was wrong from the gap onwards.
+
+    Two boundaries, both deliberate:
+
+    * It does not extend PAST the last priced interval. A gap at the END of the
+      horizon is the horizon ending; modelling beyond it would invent slots as
+      well as prices.
+    * It starts at the first point it is given, which is the current slot when
+      that is priced and the first published interval otherwise - because an
+      unpriced CURRENT interval is already owned by
+      `_resolve_unpriced_current_slot`. The two mechanisms differ exactly
+      there: only the current slot can RETAIN a decision made earlier on a real
+      price, and only the current slot runs for part of its interval.
+
+    Elapsed time, never wall clock: the two autumn 03:00 intervals are four
+    quarter-hours apart, not zero.
+
+    Module-level, like `first_slot_fraction`: several test doubles borrow
+    `find_optimal_schedule` without the full app surface.
+    """
+    if not priced_sorted:
+        return []
+    step = datetime.timedelta(minutes=slot_minutes)
+    by_instant = {instant_key(p.time): p for p in priced_sorted}
+    last_key = instant_key(priced_sorted[-1].time)
+
+    modeled: List[PricePoint] = []
+    slot = priced_sorted[0].time
+    key = instant_key(slot)
+    # A source handing us an interval a decade out must not spin here.
+    max_slots = len(priced_sorted) * 4 + 1000
+    while key <= last_key and len(modeled) < max_slots:
+        published = by_instant.get(key)
+        modeled.append(
+            published if published is not None
+            else PricePoint(time=slot, price=None)
+        )
+        slot = slot_offset(slot, slot_minutes, 1)
+        key = key + step
+        if instant_key(slot) != key:
+            # Cannot happen for a slot-aligned aware datetime. If a source ever
+            # hands us an unaligned one, follow the elapsed-time key rather
+            # than silently planning a different interval.
+            slot = key
+    return modeled
 
 
 def _cloud_safe_candidates(schedule, predict_load_kw, predict_pv_kw):
@@ -1415,8 +1483,22 @@ class BatteryOptimizer(hass.Hass):
             for p in future_prices
         )
 
-        # Calculate min_charge_slots for informational purposes
+        # The MODELLED horizon: every slot from the first the DP is given to
+        # the last one a source priced, contiguous, with the unpublished ones
+        # carrying `price=None`.
+        #
+        # Handing the DP only the priced points made a hole inside the horizon
+        # vanish from planning: the slot after it was treated as following the
+        # slot before it, and the gap's PV, load, SOC and temperature were never
+        # modelled. On the reference reproduction that cost an unnecessary kWh
+        # of import — the plan charged at 0.50 for energy the unmodelled slot's
+        # own PV would have stored for free — and `_validate_final_plan` skipped
+        # the same slot, so it agreed with a trajectory that was ten SOC points
+        # wrong from there on.
         slots_sorted_by_time = sorted(future_prices, key=lambda p: instant_key(p.time))
+        modeled_slots = modeled_horizon(
+            slots_sorted_by_time, self.config.slot_minutes
+        )
         n_slots = len(slots_sorted_by_time)
         min_charge_slots = max(0, int(charge_hours_needed))
         if min_charge_slots > n_slots:
@@ -1528,7 +1610,7 @@ class BatteryOptimizer(hass.Hass):
 
         # Run optimization
         result = optimizer.optimize(
-            prices=future_prices,
+            prices=modeled_slots,
             current_slot=current_slot,
             current_soc=current_soc_for_calc,
             current_temp=current_temp,
@@ -1595,12 +1677,14 @@ class BatteryOptimizer(hass.Hass):
         # slot and left the expensive one to the grid, with exact forecasts and
         # no cloud anywhere. The DP had already chosen the rest of the horizon
         # on the assumption that HOLD preserved that energy.
+        # Fractions cover the MODELLED horizon, not just the priced part: a
+        # forced-HOLD slot is a slot the projected-cost column has to walk.
         slot_fractions = self._compute_slot_fractions(
-            slots_sorted_by_time, current_slot, minutes_into_slot, local_tz=local_tz,
+            modeled_slots, current_slot, minutes_into_slot, local_tz=local_tz,
         )
         slot_fractions_by_slot = {
             canonical_slot_key(p.time): slot_fractions[i]
-            for i, p in enumerate(slots_sorted_by_time)
+            for i, p in enumerate(modeled_slots)
         }
         if current_slot_entry is not None:
             # The unpriced current slot runs for the remainder of its interval

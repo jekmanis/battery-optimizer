@@ -77,7 +77,7 @@ tests/
 
 ### Data Models
 - `BatteryMode` enum: HOLD (0), CHARGE (1), DISCHARGE (2)
-- `PricePoint` dataclass: Time (datetime) + price
+- `PricePoint` dataclass: Time (datetime) + price + optional `end` (the exclusive interval end the SOURCE published)
 - `ScheduleEntry` dataclass: Time (datetime) + mode + reason + direct-control fields (export_rate, ac_charge_mode, power_percent, SOC cutoffs)
 - `LoadProfileStats` dataclass: Min/max/sum/count for load observations
 - `LearningStats` dataclass: Charge rate learning data per SOC range
@@ -86,7 +86,7 @@ tests/
 - Default `slot_minutes=15` (96 slots/day) — matches Nord Pool 15-minute pricing periods
 - Configurable via `apps.yaml` (`slot_minutes: 15`)
 - Price service requests 15-min resolution from Nord Pool (`resolution` parameter)
-- `_normalize_prices()` handles expansion if source data is coarser (e.g., hourly → 4x15min)
+- `_normalize_prices()` maps each published interval onto the slot grid **within its own `[start, end)`** — a coarser interval expands (hourly → 4x15min), finer ones aggregate, and a slot no interval covers completely stays ABSENT. **Interval width is never inferred from timestamp spacing.** It used to be, and spacing cannot tell "these are 30-minute intervals" from "these are 15-minute intervals and the record between them is missing": a reply holding only 10:00-10:15 at 0.01 and 10:30-10:45 at 1.00 was expanded into four quarter hours, so 10:15 — the interval the app was living in — was published at 0.01 and the planner sent CHARGE with `price_source="market"`. Both parsers keep the `end` their source publishes (`{start, end, price}`, `{start, end, value}`); a point with no `end` covers exactly one `slot_minutes` slot. The one exception is the simple sensor list, where the format's own resolution (24 values for a local day, 96 values) IS explicit coverage.
 - Load profile supports migration from coarser buckets (30-min → 15-min) on first load
 - A local day is not always 96 slots: Europe/Riga spring/autumn transitions produce 23/25-hour days. Internally, aware timestamps are keyed, sorted, and compared as UTC instants so the two autumn `03:00` intervals remain distinct; local time is for prediction and presentation.
 
@@ -468,6 +468,32 @@ source for the missing interval is a **fetch** and belongs in the price service
 and the retry, never a substitution at planning time. See
 `docs/scheduling-algorithm.md`, "The current interval when nobody published a
 price for it".
+
+**A missing interval INSIDE the horizon is a forced HOLD, not an absence.** The
+DP was handed only the priced points, so a hole in the middle of the horizon
+did not exist for planning: the slot after it was treated as following the slot
+before it, and the gap's PV, load, SOC and temperature were never modelled. On
+the reproduction (10 kWh pack at its 10 % minimum, unit efficiencies, 10:00 at
+0.50 with nothing happening, 10:15 unpublished with 4 kW of PV, 10:30 at 1.00
+with 4 kW of load) both planning paths charged at 10:00 and imported a kWh the
+gap's own sunshine would have stored for free — and `_validate_final_plan`
+agreed with the plan, because it skipped the same slot, so its SOC was ten
+points wrong from there on. `modeled_horizon` now builds the contiguous slot
+sequence from the first interval the DP is given to the **last priced** one
+(never past it — a gap at the horizon END is the horizon ending), and an
+unpriced slot enters the DP with `price=None`: only the HOLD transition is
+evaluated, PV absorption is modelled normally, and that slot's grid import and
+export cash flows are omitted from the objective. Omitting import is safe
+because the action is fixed and the import is therefore path-independent;
+export at an unknown price is valued 0, which is the conservative direction.
+The terminal-rate median uses priced slots only. The schedule gets a
+`HOLD`/`no_price` entry with no provenance and no `marginal_value_eur_kwh`, so
+the census, the replay, the cost column and the trajectories all describe it,
+`_is_no_price_fallback` recognises it when it becomes current, and the cloud-safe
+hedge skips it for want of a price to justify the trade. `NO_PRICE_REASON` lives
+in `models.py` because two producers must spell it identically. The horizon
+monitor still judges the FETCHED snapshot, so the `gap` verdict and the armed
+retry are unchanged.
 
 ## Deployment to the HA machine
 

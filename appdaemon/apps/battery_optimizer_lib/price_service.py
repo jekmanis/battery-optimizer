@@ -136,71 +136,101 @@ class NordPoolPriceService:
         self.log("No price data available from any source", level="WARNING")
         return []
 
-    def _normalize_prices(self, prices: List[PricePoint]) -> List[PricePoint]:
+    def _shift(self, dt: datetime.datetime, minutes: float) -> datetime.datetime:
+        """Add elapsed time to *dt*, in UTC when it identifies an instant.
+
+        Wall-clock addition is an hour wrong across a DST transition, and both
+        Riga transitions fall inside a published day.
         """
-        Normalize price points to the configured slot size.
-        Aggregates higher-resolution data or expands lower-resolution data.
+        delta = datetime.timedelta(minutes=minutes)
+        if dt.tzinfo is not None and dt.utcoffset() is not None:
+            return (dt.astimezone(datetime.timezone.utc) + delta).astimezone(dt.tzinfo)
+        return dt + delta
+
+    def _interval_end(self, point: PricePoint) -> datetime.datetime:
+        """Exclusive end of the interval *point* actually covers.
+
+        The source's own ``end`` when it published one. Otherwise exactly ONE
+        `slot_minutes` slot -- never a width guessed from how far away the next
+        surviving timestamp happens to be.
+        """
+        end = getattr(point, "end", None)
+        if end is not None and instant_key(end) > instant_key(point.time):
+            return end
+        return self._shift(point.time, self.slot_minutes)
+
+    def _normalize_prices(self, prices: List[PricePoint]) -> List[PricePoint]:
+        """Map published intervals onto the configured slot grid.
+
+        A price covers `[start, end)` and NOTHING else. Coarser intervals are
+        expanded within their own span; finer ones are aggregated, and only
+        into a slot they FILL. A slot no source interval covers completely
+        stays absent -- it is a gap, and every consumer downstream is built to
+        see one (`PriceHorizonMonitor.evaluate` reports `gap` or
+        `missing_current_interval`, the planner models the interval as a forced
+        HOLD, `execute_scheduled_mode` refuses to send anything else).
+
+        There is deliberately no inference from timestamp SPACING. It was the
+        whole mechanism here, and it cannot distinguish "these are 30-minute
+        intervals" from "these are 15-minute intervals and the record between
+        them is missing" -- so a reply holding 10:00-10:15 at 0.01 and
+        10:30-10:45 at 1.00 published 10:15 at 0.01, and the planner charged
+        the live slot on it.
+
+        Overlap is resolved by publication order rather than by summing: a
+        later interval contributes only the minutes an earlier one did not
+        already cover. Summing raw overlaps would let two intervals that both
+        start inside a slot add up to its full width and mark it covered when
+        the beginning of the slot never was.
         """
         if not prices:
             return []
 
-        def chronological_key(point: PricePoint):
-            return instant_key(point.time)
+        slot_minutes = self.slot_minutes
+        slot = datetime.timedelta(minutes=slot_minutes)
+        # UTC instant of a slot start -> [local slot start, covered minutes,
+        # sum(price * minutes)].
+        buckets: Dict[datetime.datetime, List] = {}
+        covered_until: Optional[datetime.datetime] = None
 
-        def bucket_points(points: List[PricePoint]) -> List[PricePoint]:
-            """Average points by slot without collapsing autumn-fold instants."""
-            buckets: Dict[datetime.datetime, tuple] = {}
-            for point in points:
-                bucket = self._align_to_slot(point.time)
-                identity = instant_key(bucket)
-                if identity not in buckets:
-                    buckets[identity] = (bucket, [])
-                buckets[identity][1].append(point.price)
-            normalized = [
-                PricePoint(time=bucket, price=sum(values) / len(values))
-                for bucket, values in buckets.values()
-            ]
-            return sorted(normalized, key=chronological_key)
+        for point in sorted(prices, key=lambda p: instant_key(p.time)):
+            start_key = instant_key(point.time)
+            end_key = instant_key(self._interval_end(point))
+            if end_key <= start_key:
+                continue
+            if covered_until is not None and start_key < covered_until:
+                start_key = covered_until
+                if end_key <= start_key:
+                    continue
+            covered_until = end_key
 
-        sorted_prices = sorted(prices, key=chronological_key)
-        deltas = []
-        for i in range(1, len(sorted_prices)):
-            current = chronological_key(sorted_prices[i])
-            previous = chronological_key(sorted_prices[i - 1])
-            delta_min = (current - previous).total_seconds() / 60
-            if delta_min > 0:
-                deltas.append(delta_min)
-        min_delta = min(deltas) if deltas else self.slot_minutes
+            cursor = self._align_to_slot(point.time)
+            while True:
+                cursor_key = instant_key(cursor)
+                if cursor_key >= end_key:
+                    break
+                overlap_start = max(cursor_key, start_key)
+                overlap_end = min(cursor_key + slot, end_key)
+                minutes = (overlap_end - overlap_start).total_seconds() / 60.0
+                if minutes > 0:
+                    bucket = buckets.setdefault(cursor_key, [cursor, 0.0, 0.0])
+                    bucket[1] += minutes
+                    bucket[2] += point.price * minutes
+                cursor = self._shift(cursor, slot_minutes)
 
-        # Already at desired resolution
-        if abs(min_delta - self.slot_minutes) < 0.1:
-            return sorted_prices
-
-        # Aggregate finer data into slot buckets
-        if min_delta < self.slot_minutes:
-            return bucket_points(sorted_prices)
-
-        # Expand coarser data into multiple slots
-        factor = int(round(min_delta / self.slot_minutes))
-        if factor <= 1 or abs(min_delta - factor * self.slot_minutes) > 0.1:
-            # Fallback to bucketing if resolution is irregular
-            return bucket_points(sorted_prices)
-
-        expanded: List[PricePoint] = []
-        for p in sorted_prices:
-            for i in range(factor):
-                if p.time.tzinfo is not None and p.time.utcoffset() is not None:
-                    expanded_time = (
-                        p.time.astimezone(datetime.timezone.utc)
-                        + datetime.timedelta(minutes=i * self.slot_minutes)
-                    ).astimezone(p.time.tzinfo)
-                else:
-                    expanded_time = p.time + datetime.timedelta(minutes=i * self.slot_minutes)
-                expanded.append(PricePoint(
-                    time=expanded_time,
-                    price=p.price
-                ))
-        return sorted(expanded, key=chronological_key)
+        normalized: List[PricePoint] = []
+        for cursor_key in sorted(buckets):
+            slot_start, minutes, weighted = buckets[cursor_key]
+            if minutes < slot_minutes - 1e-6:
+                # Partially covered: a fraction of a slot is not a price for
+                # the slot.
+                continue
+            normalized.append(PricePoint(
+                time=slot_start,
+                price=weighted / minutes,
+                end=self._shift(slot_start, slot_minutes),
+            ))
+        return normalized
 
     def _align_to_slot(self, dt: datetime.datetime) -> datetime.datetime:
         """Floor datetime to the start of the current time slot."""
@@ -439,13 +469,46 @@ class NordPoolPriceService:
 
                 # Convert EUR/MWh to EUR/kWh
                 price_kwh = float(price_mwh) / 1000.0
-                prices.append(PricePoint(time=start_dt, price=price_kwh))
+                prices.append(PricePoint(
+                    time=start_dt,
+                    price=price_kwh,
+                    # How far this price REACHES, as published. Dropping it
+                    # left `_normalize_prices` guessing the width from the
+                    # spacing of whatever records survived, which prices the
+                    # gaps.
+                    end=self._parse_interval_end(entry.get("end"), tz),
+                ))
 
             except (ValueError, TypeError) as e:
                 self.log(f"Error parsing price entry {entry}: {e}", level="DEBUG")
                 continue
 
         return prices
+
+    def _parse_interval_end(self, value, tz) -> Optional[datetime.datetime]:
+        """The source's ``end`` field as a local datetime, or None.
+
+        An unparseable or absent end is not fatal and is not guessed at: the
+        point then covers exactly one slot (`_interval_end`).
+        """
+        if value is None:
+            return None
+        try:
+            if isinstance(value, str):
+                end_dt = datetime.datetime.fromisoformat(
+                    value.replace("Z", "+00:00")
+                )
+            elif isinstance(value, datetime.datetime):
+                end_dt = value
+            else:
+                return None
+        except (ValueError, TypeError):
+            return None
+        if tz and end_dt.tzinfo:
+            return end_dt.astimezone(tz)
+        if tz:
+            return end_dt.replace(tzinfo=tz)
+        return end_dt
 
     def _get_prices_via_sensor(self, today, tomorrow, tz) -> List[PricePoint]:
         """
@@ -500,11 +563,23 @@ class NordPoolPriceService:
                             dt = dt.astimezone(tz)
                         elif tz:
                             dt = dt.replace(tzinfo=tz)
-                        prices.append(PricePoint(time=dt, price=float(price)))
+                        prices.append(PricePoint(
+                            time=dt,
+                            price=float(price),
+                            # The raw attributes publish an `end`; keeping it
+                            # is what stops a missing record from being filled
+                            # in from its neighbour's spacing.
+                            end=self._parse_interval_end(entry.get("end"), tz),
+                        ))
                     except (ValueError, TypeError):
                         pass
         else:
-            # Simple list of prices (infer step size)
+            # Simple list of prices. This format carries no ends, but its own
+            # RESOLUTION is explicit coverage: 24 values for a local day are
+            # hourly intervals, 96 are quarter-hours, and the list is the whole
+            # day by construction. That is a statement by the format, not an
+            # inference from the spacing of surviving records, so each value is
+            # given the step as its end.
             step_minutes = 60
             day_minutes = 1440
             local_midnight = datetime.datetime.combine(date_for_simple, datetime.time(), tzinfo=tz)
@@ -534,6 +609,10 @@ class NordPoolPriceService:
                         ).astimezone(tz)
                     else:
                         dt = local_midnight + datetime.timedelta(minutes=idx * step_minutes)
-                    prices.append(PricePoint(time=dt, price=float(price)))
+                    prices.append(PricePoint(
+                        time=dt,
+                        price=float(price),
+                        end=self._shift(dt, step_minutes),
+                    ))
 
         return prices

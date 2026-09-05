@@ -1380,36 +1380,33 @@ are performed by the optimizer.
 Use dry-run mode (`device_id: ""`) first and compare the schedule, SOC trajectory,
 and actual inverter behavior before enabling hardware control.
 
-### Restart continuity is a constraint on the solve
+### There is no restart override
 
 AppDaemon can restart in the middle of a CHARGE or DISCHARGE interval, and the
-plan it was executing is gone. `sensor.battery_optimizer` still carries it, so
-the app reads back the mode for the interval it woke up in and **keeps
-executing that action for the rest of the slot**. Stopping mid-charge, or
-holding through a peak the previous plan was discharging into, is a real cost.
+plan it was executing is gone. Nothing reads it back. **The DP's partial-slot
+fraction is the continuity mechanism**: the first slot of the solve is the
+remaining minutes of the interval the app woke up in, priced at that interval's
+real price and started from the SOC that was just measured. Whatever the DP
+decides there is what runs.
 
-That continuity is applied **before** the DP runs, exactly like a current
-interval nobody published a price for:
+A forced continuation on top of that answer can only duplicate it or contradict
+it, and it contradicted it. Two measured counterexamples, on a 10 kWh pack at
+50 % with 59 minutes of the slot left:
 
-- the action is fixed for the remainder of the slot;
-- the SOC and temperature are advanced across the remaining fraction through
-  `soc_projection.project_slot_soc`;
-- the DP plans the rest of the horizon from there, starting at the next
-  interval.
+- prices 2.00 / 0.05 / 0.05 with a previous CHARGE: the forced CHARGE imports
+  3.93 kWh at 2.00 EUR/kWh — about 7.87 EUR — where the DP discharges and
+  refills two slots later at 0.05.
+- prices -0.50 / 1.00 / 1.00 with a previous DISCHARGE: the forced DISCHARGE
+  spends the pack while the grid is *paying* to take energy, where the DP
+  charges.
 
-It used to be applied *after* `find_optimal_schedule` had validated, replayed,
-counted, costed and logged its answer — so the plan that executed was not the
-plan that was checked. A validated `HOLD, DISCHARGE` pair that reserved the
-pack for a 1.00 EUR/kWh slot and imported during the 0.10 one became
-`DISCHARGE, DISCHARGE`: the import moved to the expensive slot, the second slot
-was credited with battery service the pack no longer had, and the published SOC
-trajectory, mode census, projected-cost column, decision log and final-plan
-replay all still described the plan that had been replaced. **No action change
-may follow the final validation** — the one post-optimization rewrite is the
-cloud-safe hedge, which runs before it.
+On an interval nobody published a price for it was worse than an economic
+error. The continuation carried no provenance, so `execute_scheduled_mode`
+refused it and applied `HOLD` — after the plan had already advanced the pack
+across the refused action. On the reference fixture that is a 20-point SOC
+error in the published trajectory, and every later discharge scheduled on
+energy that will not exist.
 
-The continued entry carries the interval's published-price provenance only when
-that interval was actually published. When it was not, `execute_scheduled_mode`'s
-provenance guard degrades it to `HOLD/unpriced_slot`, which is the right answer
-for an action nobody can price. The restored schedule is consumed once: a later
-re-optimization of the same slot is an ordinary optimization.
+**No action change may follow the final validation** either — the one
+post-optimization rewrite is the cloud-safe hedge, which runs before it. See
+`tests/test_restart_continuity.py`.

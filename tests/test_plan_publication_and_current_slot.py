@@ -217,7 +217,6 @@ for _name in (
     "_retain_current_slot_if_unpriced",
     "_advance_across_unpriced_current_slot",
     "_advance_current_slot",
-    "_restart_continuation_entry",
     "_rate_refinement_diagnostics",
 ):
     setattr(PlannerApp, _name, getattr(BatteryOptimizer, _name, None))

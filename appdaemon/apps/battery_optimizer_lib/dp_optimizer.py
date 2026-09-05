@@ -268,7 +268,6 @@ class DPOptimizer:
         self._temp_projector = temp_projector
         # (soc, temperature) -> charge_input_dc_kw, reset per optimize() call.
         self._rate_cache: Dict[Tuple[float, Optional[float]], float] = {}
-        self._rate_soc_dependent = True
         # Whether a terminal value pinned to 0 (legacy/degenerate mode) is
         # surfaced at WARNING from this optimizer instance. The orchestrator
         # sets it only for the daily/full optimization so the adaptive
@@ -417,12 +416,6 @@ class DPOptimizer:
         state_socs = (
             [e / cfg.battery_capacity * 100 for e in energy_levels]
             if cfg.battery_capacity else []
-        )
-        # Hoisting hint for the hot loop, not a modelling choice: when the rate
-        # is the same at every state, the per-slot derived energies are real
-        # constants again.
-        self._rate_soc_dependent = self._rate_is_soc_dependent(
-            state_socs, current_temp
         )
         seen_profiles: List[List[Optional[float]]] = []
         passes = 0
@@ -643,29 +636,24 @@ class DPOptimizer:
             current_temp + 10, current_temp + 15, current_temp + 25,
         ]
 
-    def _rate_is_soc_dependent(
-        self, state_socs: List[float], current_temp: Optional[float]
-    ) -> bool:
-        """Whether the rate varies across the DP's own SOC grid.
-
-        When it does not -- a fresh install on the nominal rate, or a flat
-        learned curve -- the slot's rate is a genuine constant and the derived
-        per-slot energies can be hoisted out of the state loop, which is worth
-        about a third of the DP's runtime.
-
-        Sampled at the DP's own state resolution and at the same temperatures
-        the refinement can reach. A rate curve that differs ONLY strictly
-        between two adjacent grid points would be missed; that is a feature
-        narrower than the resolution the whole DP works at.
-        """
-        if not state_socs:
-            return False
-        for temp in self._probe_temps(current_temp):
-            base = self._rate_for(state_socs[0], temp)
-            for soc in state_socs[1:]:
-                if abs(self._rate_for(soc, temp) - base) > 1e-9:
-                    return True
-        return False
+    # NOTE: there is deliberately no "is the rate SOC-independent, so hoist it
+    # out of the state loop" fast path. There was one, decided from a fixed
+    # probe set around the CURRENT temperature, and it was wrong in exactly the
+    # way a sampled test of an arbitrary callback is always eventually wrong: a
+    # curve that is flat at every probe but tapers at a temperature the REFINED
+    # profile reaches had its taper erased, because the hoisted value was
+    # `rate(min_soc, slot_temp)` -- the fastest point of the curve -- applied to
+    # every state. On the regression in
+    # `tests/test_dp_rate_compatibility.py::TestRateIsEvaluatedAtTheTemperature
+    # ProfileReaches` that invented 1.875 kWh in a single slot, with
+    # `converged=True` and no fallback to hint at it.
+    #
+    # The probe cannot be repaired by widening it: `charge_rate_predictor` is an
+    # arbitrary callable, and the temperatures the refinement will reach are not
+    # known when the probe runs. The rate is therefore always evaluated per
+    # state, memoized by `(soc, temperature)` globally and by state index within
+    # a slot. Cost, measured on the 132-slot horizon at a 1 % step: 140 -> 184 ms
+    # with a partial first slot. That is the price of the answer being right.
 
     def _rate_is_temperature_sensitive(self, current_temp: Optional[float]) -> bool:
         """Whether refinement can change anything at all.
@@ -1062,19 +1050,6 @@ class DPOptimizer:
             hold_sell = sell_price  # already floored at 0
             rate_for = self._rate_for
             rate_cache_slot = {}
-            soc_dependent = self._rate_soc_dependent
-            const_slot_rate = None
-            if not soc_dependent:
-                const_slot_rate = rate_for(cfg.min_soc, slot_temp)
-                const_charge_dc_kwh = const_slot_rate * slot_hours_fraction
-                const_charge_energy_kwh = const_charge_dc_kwh * cfg.efficiency
-                const_pv_free_charge_kwh = (
-                    min(pv_surplus_kw, const_slot_rate) * slot_hours_fraction
-                )
-                const_hold_pv_charge_max = const_pv_free_charge_kwh * cfg.efficiency
-                const_hold_excess_pv_kwh = (
-                    max(0.0, pv_surplus_kw - const_slot_rate) * slot_hours_fraction
-                )
 
             slot_trace = []
             trace_this_slot = self._decision_log_level >= 3 and fraction > 0.5
@@ -1091,28 +1066,20 @@ class DPOptimizer:
                 available = max(0.0, curr_energy - min_energy)
 
                 # Charge capability of THIS state, at THIS slot's temperature.
-                if const_slot_rate is not None:
-                    slot_charge_rate = const_slot_rate
-                    charge_dc_kwh = const_charge_dc_kwh
-                    charge_energy_kwh = const_charge_energy_kwh
-                    pv_free_charge_kwh = const_pv_free_charge_kwh
-                    hold_pv_charge_max = const_hold_pv_charge_max
-                    hold_excess_pv_kwh = const_hold_excess_pv_kwh
-                else:
-                    slot_charge_rate = rate_cache_slot.get(idx)
-                    if slot_charge_rate is None:
-                        slot_charge_rate = rate_for(curr_soc, slot_temp)
-                        rate_cache_slot[idx] = slot_charge_rate
-                    charge_dc_kwh = slot_charge_rate * slot_hours_fraction
-                    charge_energy_kwh = charge_dc_kwh * cfg.efficiency
-                    # PV surplus charges battery for free (pv_priority, DC→DC)
-                    pv_free_charge_kwh = (
-                        min(pv_surplus_kw, slot_charge_rate) * slot_hours_fraction
-                    )
-                    hold_pv_charge_max = pv_free_charge_kwh * cfg.efficiency
-                    hold_excess_pv_kwh = (
-                        max(0.0, pv_surplus_kw - slot_charge_rate) * slot_hours_fraction
-                    )
+                slot_charge_rate = rate_cache_slot.get(idx)
+                if slot_charge_rate is None:
+                    slot_charge_rate = rate_for(curr_soc, slot_temp)
+                    rate_cache_slot[idx] = slot_charge_rate
+                charge_dc_kwh = slot_charge_rate * slot_hours_fraction
+                charge_energy_kwh = charge_dc_kwh * cfg.efficiency
+                # PV surplus charges battery for free (pv_priority, DC→DC)
+                pv_free_charge_kwh = (
+                    min(pv_surplus_kw, slot_charge_rate) * slot_hours_fraction
+                )
+                hold_pv_charge_max = pv_free_charge_kwh * cfg.efficiency
+                hold_excess_pv_kwh = (
+                    max(0.0, pv_surplus_kw - slot_charge_rate) * slot_hours_fraction
+                )
 
                 # HOLD - no grid charge; PV covers load, surplus charges battery for free
                 hold_updated = False

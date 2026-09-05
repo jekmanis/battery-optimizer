@@ -353,6 +353,35 @@ class TestEmptyThenSuccessRecovery:
         assert len(app.planner_calls) == planner_calls_before + 1
         assert app.schedule, "a schedule must exist after recovery"
 
+    def test_a_recovery_fetches_exactly_once(self, base_now):
+        """B5: one blocking fetch, and the verdict and the plan share it.
+
+        ``_price_recovery_retry`` fetched, judged the horizon, and then
+        ``_recalculate_remaining_schedule`` fetched AGAIN -- a second blocking
+        REST call on the shared AppDaemon worker thread, and a second snapshot,
+        so the plan could be built from data the verdict never saw.
+        """
+        app = RecoveryOptimizer(base_now, prices=[])
+        app.full_optimize(None)
+        app.advance(30)
+        app.set_prices(full_day_prices(app.datetime()))
+
+        fetches_before = app._price_service.calls
+        app.fire_latest_retry()
+
+        assert app.schedule, "a schedule must exist after recovery"
+        assert app._price_service.calls - fetches_before == 1
+
+    def test_a_rebuild_from_another_trigger_still_fetches_and_reviews(
+        self, base_now
+    ):
+        """Only the recovery hands its snapshot on; nothing else changes."""
+        app = RecoveryOptimizer(base_now, prices=full_day_prices(base_now))
+        fetches_before = app._price_service.calls
+        app._recalculate_remaining_schedule(50.0)
+        assert app._price_service.calls - fetches_before == 1
+        assert app._price_horizon.last_health is not None
+
     def test_recovered_schedule_is_applied_through_the_normal_path(self, base_now):
         app = RecoveryOptimizer(base_now, prices=[])
         app.full_optimize(None)
@@ -608,6 +637,39 @@ class TestRetryLifecycle:
         app.fire_latest_retry()
         assert app.schedule
         assert app.applied[-1].reason != "no_schedule"
+
+    def test_a_restart_reports_the_current_slot_as_unknown_not_priced(
+        self, base_now
+    ):
+        """B4: `last_health is None` is a THIRD state, and it is not "priced".
+
+        A fresh instance has never looked at prices, so an empty snapshot says
+        nothing about whether this interval was published. Reporting
+        ``current_slot_priced=True`` there asserted something nobody knows. The
+        `no_schedule` reason is unchanged -- that part IS known.
+        """
+        app = RecoveryOptimizer(base_now, prices=full_day_prices(base_now))
+        assert app._price_horizon.last_health is None
+
+        app.execute_scheduled_mode({})
+
+        assert app.applied[-1].reason == "no_schedule"
+        priced, entry_state = app._current_slot_state_for()
+        assert entry_state == "fallback"
+        assert priced is None, (
+            "a restart that has never fetched cannot claim the current slot "
+            "was priced"
+        )
+        assert app._price_horizon_diagnostics()["current_slot_priced"] is None
+
+    def test_a_known_unpriced_slot_still_reports_false(self, base_now):
+        """The other two states keep their answers."""
+        app = RecoveryOptimizer(base_now, prices=[])
+        app.full_optimize(None)  # a real verdict now exists
+        app.execute_scheduled_mode({})
+        priced, entry_state = app._current_slot_state_for()
+        assert entry_state == "fallback"
+        assert priced is False
 
     def test_disabled_app_does_not_arm_retries_from_execute(self, base_now):
         app = RecoveryOptimizer(base_now, prices=[])

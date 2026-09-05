@@ -316,55 +316,469 @@ def _cost_tracker(cost_tracker_module):
     )
 
 
+def _fine_grained_end_soc(
+    rate_fn,
+    soc_start=START_SOC,
+    temp_start=START_TEMP,
+    warm_per_min=0.0,
+    minutes=15.0,
+    substep=1.0,
+    efficiency=1.0,
+    capacity=CAPACITY,
+):
+    """1-minute sub-stepped truth for a slot, through the same rate curve."""
+    soc = soc_start
+    temp = temp_start
+    elapsed = 0.0
+    while elapsed < minutes - 1e-9:
+        step = min(substep, minutes - elapsed)
+        rate = rate_fn(soc, temp)
+        soc += rate * (step / 60.0) * efficiency / capacity * 100
+        temp += warm_per_min * step
+        elapsed += step
+    return soc
+
+
+def _rates_visited(
+    rate_fn,
+    soc_start=START_SOC,
+    temp_start=START_TEMP,
+    warm_per_min=0.0,
+    minutes=15.0,
+    substep=1.0,
+    efficiency=1.0,
+    capacity=CAPACITY,
+):
+    """Every rate the sub-stepped truth evaluates during the slot."""
+    soc = soc_start
+    temp = temp_start
+    elapsed = 0.0
+    rates = []
+    while elapsed < minutes - 1e-9:
+        step = min(substep, minutes - elapsed)
+        rate = rate_fn(soc, temp)
+        rates.append(rate)
+        soc += rate * (step / 60.0) * efficiency / capacity * 100
+        temp += warm_per_min * step
+        elapsed += step
+    return rates
+
+
+def _span_end_soc(
+    rate_fn,
+    soc_start=START_SOC,
+    temp_start=START_TEMP,
+    minutes=15.0,
+    efficiency=1.0,
+    capacity=CAPACITY,
+    max_soc=100.0,
+):
+    """The model, computed straight from the documented rule.
+
+    Kept independent of the implementation so the scenarios below measure the
+    RULE, not ``charge_rate_for_span``'s own arithmetic; a separate test asserts
+    the shipped helper agrees with this.
+    """
+    duration_h = minutes / 60.0
+    r0 = rate_fn(soc_start, temp_start)
+    reached = min(
+        max_soc, soc_start + r0 * duration_h * efficiency / capacity * 100
+    )
+    rate = min(r0, rate_fn(reached, temp_start))
+    return soc_start + rate * duration_h * efficiency / capacity * 100
+
+
+def _constant_end_soc(
+    rate_fn,
+    soc_start=START_SOC,
+    temp_start=START_TEMP,
+    minutes=15.0,
+    efficiency=1.0,
+    capacity=CAPACITY,
+):
+    """The old model: the start-SOC, start-temperature rate for the whole slot."""
+    return (
+        soc_start
+        + rate_fn(soc_start, temp_start) * (minutes / 60.0) * efficiency / capacity * 100
+    )
+
+
+def _soc_taper(boundary, fast=4.0, slow=1.0):
+    """A learned SOC-taper bucket boundary (the engine uses 25/50/75/90 %)."""
+
+    def _fn(soc, temp=None):
+        return slow if soc >= boundary else fast
+
+    return _fn
+
+
 class TestTheApproximationIsBounded:
-    """How far the one model can be from a fine-grained reference.
+    """How far the one model can be from a 1-minute sub-stepped reference.
 
-    Documented bound, per slot, in stored energy::
+    Two different statements, and they are different kinds of statement:
 
-        (warm_rate - cold_rate) * slot_hours * efficiency
+    * an IDENTITY of the model -- the slot runs at one rate drawn from the
+      rates the truth visits, and the truth is a duration-weighted average of
+      those same rates, so the gap cannot exceed
+      ``(max rate visited - min rate visited) * slot_hours * efficiency``.
+      Nothing can violate it and it proves nothing on its own;
+    * the falsifiable DIRECTION claims, which hold only under their stated
+      monotonicity assumptions (see ``TestTheRateSpanErrsConservative`` and
+      ``TestTheDirectionClaimNeedsMonotonicity``).
 
-    i.e. ``(warm_rate - cold_rate) * slot_hours * efficiency / capacity * 100``
-    SOC points. The reference is 1-minute sub-stepping through the same rate
-    curve and the same warming model.
+    The bound that used to be documented here -- ``(rate at end - rate at
+    start) * slot_hours * efficiency`` -- is not an identity and is violated by
+    an order of magnitude by a non-monotonic curve; that counterexample is
+    pinned below.
     """
 
-    @staticmethod
-    def _fine_grained_end_soc(engine, minutes=15, substep=1.0):
-        soc = START_SOC
-        temp = START_TEMP
-        elapsed = 0.0
-        while elapsed < minutes - 1e-9:
-            step = min(substep, minutes - elapsed)
-            rate = engine.get_charge_rate_for_soc(soc, temp)
-            soc += rate * (step / 60.0) / CAPACITY * 100
-            temp = engine.predict_temp_after_duration(temp, step)
-            elapsed += step
-        return soc
-
-    def test_constant_rate_is_within_one_slot_of_rate_difference(self):
+    def test_the_identity_bound_holds_for_the_crossing_curve(self):
         engine = CrossingEngine()
-        reference = self._fine_grained_end_soc(engine)
-        bound_soc = (
-            (WARM_RATE - COLD_RATE) * 0.25 * 1.0 / CAPACITY * 100
+        rate_fn = engine.get_charge_rate_for_soc
+
+        def warming(soc, temp):
+            return rate_fn(soc, temp)
+
+        reference = _fine_grained_end_soc(
+            warming, warm_per_min=WARMING_C_PER_MIN
         )
+        visited = _rates_visited(warming, warm_per_min=WARMING_C_PER_MIN)
+        bound_soc = (max(visited) - min(visited)) * 0.25 * 1.0 / CAPACITY * 100
         assert bound_soc == pytest.approx(7.5)
         assert abs(reference - CONSTANT_RATE_END_SOC) <= bound_soc + 1e-9
-        # It is a real difference, not a vacuous bound.
-        assert abs(reference - CONSTANT_RATE_END_SOC) > 1.0
 
-    def test_the_constant_rate_is_the_conservative_side(self):
-        """Charging at the start-of-slot rate never over-credits a warming pack."""
+    def test_the_identity_bound_holds_for_the_non_monotonic_curve(self):
+        """The only bound that survives a non-monotonic rate curve."""
+        reference = _fine_grained_end_soc(
+            _BANDED_RATE, warm_per_min=BAND_WARMING_C_PER_MIN
+        )
+        visited = _rates_visited(
+            _BANDED_RATE, warm_per_min=BAND_WARMING_C_PER_MIN
+        )
+        bound_soc = (max(visited) - min(visited)) * 0.25 * 1.0 / CAPACITY * 100
+        model = _span_end_soc(_BANDED_RATE)
+        assert bound_soc == pytest.approx(12.5)
+        assert abs(reference - model) <= bound_soc + 1e-9
+
+
+# The A3 counterexample: a NON-MONOTONIC rate curve. 1.0 kW below 14 C,
+# 6.0 kW from 14 C to 20 C, 1.2 kW above 20 C, pack warming 1 C/min from 10 C.
+# Sub-stepped truth 17.667 %, model 12.5 % -- an error of 5.17 SOC points,
+# against the 0.5 points the "rate at the end minus rate at the start" reading
+# of the old bound allows.
+BAND_WARMING_C_PER_MIN = 1.0
+
+
+def _BANDED_RATE(soc, temp):
+    if temp is None:
+        return 6.0
+    if temp < 14.0:
+        return 1.0
+    if temp < 20.0:
+        return 6.0
+    return 1.2
+
+
+class TestTheDirectionClaimNeedsMonotonicity:
+    """The falsifiable half, and the case that falsifies the general version."""
+
+    def test_conservative_when_the_rate_is_monotone_over_the_span(self):
+        """Warming pack, rate non-decreasing in temperature: never over-credits."""
         engine = CrossingEngine()
-        reference = self._fine_grained_end_soc(engine)
-        assert CONSTANT_RATE_END_SOC <= reference + 1e-9
+        reference = _fine_grained_end_soc(
+            engine.get_charge_rate_for_soc, warm_per_min=WARMING_C_PER_MIN
+        )
+        model = _span_end_soc(engine.get_charge_rate_for_soc)
+        assert model <= reference + 1e-9
+
+    def test_a_non_monotonic_curve_over_credits_and_only_the_identity_holds(self):
+        """DOCUMENTED counterexample -- pinned, not wished away.
+
+        The old bound (rate at the end minus rate at the start) allows 0.5 SOC
+        points here. The real error is 5.17.
+        """
+        reference = _fine_grained_end_soc(
+            _BANDED_RATE, warm_per_min=BAND_WARMING_C_PER_MIN
+        )
+        model = _span_end_soc(_BANDED_RATE)
+        assert reference == pytest.approx(17.6667, abs=1e-3)
+        assert model == pytest.approx(12.5, abs=1e-9)
+        old_bound = (
+            abs(_BANDED_RATE(model, START_TEMP + 15 * BAND_WARMING_C_PER_MIN)
+                - _BANDED_RATE(START_SOC, START_TEMP))
+            * 0.25 / CAPACITY * 100
+        )
+        assert old_bound == pytest.approx(0.5, abs=1e-9)
+        assert abs(reference - model) > 10 * old_bound
+
+    def test_a_cooling_pack_can_be_over_credited_within_the_stated_bound(self):
+        """The one direction the span rule does NOT fix, stated out loud.
+
+        The rate is evaluated at the temperature the slot STARTS at, so a pack
+        that cools while charging is credited at the warmer (faster) rate. The
+        over-credit is bounded by
+        ``(rate(T_start) - rate(T_end)) * slot_hours * efficiency``.
+        """
+        engine = CrossingEngine()
+        cooling = -0.8
+
+        reference = _fine_grained_end_soc(
+            engine.get_charge_rate_for_soc,
+            temp_start=THRESHOLD_C,
+            warm_per_min=cooling,
+        )
+        model = _span_end_soc(engine.get_charge_rate_for_soc, temp_start=THRESHOLD_C)
+        over_credit = model - reference
+        assert over_credit > 0  # it really does over-credit here
+        bound = (
+            (
+                engine.get_charge_rate_for_soc(START_SOC, THRESHOLD_C)
+                - engine.get_charge_rate_for_soc(
+                    START_SOC, THRESHOLD_C + 15 * cooling
+                )
+            )
+            * 0.25
+            / CAPACITY
+            * 100
+        )
+        assert over_credit <= bound + 1e-9
+
+
+class TestTheRateSpanErrsConservative:
+    """A2: the rate is evaluated over the SPAN, not frozen at the start SOC.
+
+    Freezing the rate at the start SOC over-credits every slot that crosses a
+    learned SOC-taper boundary, and ``replay_plan`` could not catch it because
+    it evaluated the same frozen model. The rule now is: evaluate the rate at
+    the start SOC and at the end SOC the start rate would reach (capped at
+    ``max_soc``) and use the MINIMUM of the two for the whole slot.
+    """
+
+    def test_taper_at_90_percent(self):
+        rate_fn = _soc_taper(90.0)
+        truth = _fine_grained_end_soc(rate_fn, soc_start=88.0)
+        old = _constant_end_soc(rate_fn, soc_start=88.0)
+        new = _span_end_soc(rate_fn, soc_start=88.0)
+        assert truth == pytest.approx(92.0, abs=1e-9)
+        assert old == pytest.approx(98.0, abs=1e-9)  # +6 SOC points of credit
+        assert new <= truth + 1e-9
+        assert new == pytest.approx(90.5, abs=1e-9)
+
+    def test_taper_at_25_percent(self):
+        rate_fn = _soc_taper(25.0)
+        truth = _fine_grained_end_soc(rate_fn, soc_start=22.0)
+        old = _constant_end_soc(rate_fn, soc_start=22.0)
+        new = _span_end_soc(rate_fn, soc_start=22.0)
+        assert truth == pytest.approx(27.0, abs=1e-9)
+        assert old == pytest.approx(32.0, abs=1e-9)  # +5 SOC points of credit
+        assert new <= truth + 1e-9
+
+    def test_a_cooling_pack_whose_curve_also_tapers(self):
+        """Cooling 0.8 C/min, learned curve keyed on temperature AND SOC."""
+
+        def rate_fn(soc, temp):
+            if temp is None or temp < 14.0:
+                return 1.0
+            return 1.0 if soc >= 25.0 else 4.0
+
+        truth = _fine_grained_end_soc(
+            rate_fn, soc_start=22.0, temp_start=16.0, warm_per_min=-0.8
+        )
+        old = _constant_end_soc(rate_fn, soc_start=22.0, temp_start=16.0)
+        new = _span_end_soc(rate_fn, soc_start=22.0, temp_start=16.0)
+        assert old > truth + 1e-9  # the frozen rate over-credits
+        assert new <= truth + 1e-9
+
+    def test_the_shipped_helper_implements_the_rule(self):
+        from battery_optimizer_lib.slot_energy import charge_rate_for_span
+
+        rate_fn = _soc_taper(90.0)
+        assert charge_rate_for_span(
+            rate_fn,
+            soc_start=88.0,
+            temp=None,
+            duration_h=0.25,
+            efficiency=1.0,
+            capacity=CAPACITY,
+            max_soc=100.0,
+        ) == pytest.approx(1.0)
+        # No boundary in the span: the start rate stands.
+        assert charge_rate_for_span(
+            rate_fn,
+            soc_start=10.0,
+            temp=None,
+            duration_h=0.25,
+            efficiency=1.0,
+            capacity=CAPACITY,
+            max_soc=100.0,
+        ) == pytest.approx(4.0)
+
+    def test_the_span_is_capped_at_max_soc(self):
+        """The reachable end SOC is a physical SOC, not an extrapolation."""
+        from battery_optimizer_lib.slot_energy import charge_rate_for_span
+
+        # A curve that only tapers ABOVE 100 % must never be sampled there.
+        def rate_fn(soc, temp=None):
+            return 0.0 if soc > 100.0 else 4.0
+
+        assert charge_rate_for_span(
+            rate_fn,
+            soc_start=99.0,
+            temp=None,
+            duration_h=0.25,
+            efficiency=1.0,
+            capacity=CAPACITY,
+            max_soc=100.0,
+        ) == pytest.approx(4.0)
+
+
+class TaperEngine:
+    """Learning-engine double with a 4 kW -> 1 kW taper at 90 % SOC."""
+
+    storage_efficiency = 1.0
+
+    def get_charge_rate_for_soc(self, soc, battery_temp=None):
+        return 1.0 if soc >= 90.0 else 4.0
+
+    def predict_temp_after_duration(self, start_temp, duration_minutes, **kw):
+        return start_temp
+
+    def predict_temp_after_idle(self, start_temp, duration_minutes, **kw):
+        return start_temp
+
+
+class TestEveryConsumerAgreesOnATaperCrossingSlot:
+    """One rule, one answer: 88 % -> 90.5 % in every consumer, to 1e-9."""
+
+    START = 88.0
+    EXPECTED = 90.5
+    # A high floor so the pack cannot simply serve slot 1 from what it already
+    # holds: the DP has to buy the cheap slot's energy, which is the transition
+    # under test. Nothing else here depends on the floor.
+    MIN_SOC = 85.0
+
+    def test_dp_optimize(self):
+        engine = TaperEngine()
+        opt = DPOptimizer(
+            config=_dp_config(min_soc=self.MIN_SOC),
+            load_predictor=_load,
+            charge_rate_predictor=engine.get_charge_rate_for_soc,
+            temp_after_charge_predictor=engine.predict_temp_after_duration,
+            temp_after_idle_predictor=engine.predict_temp_after_idle,
+            pv_predictor=lambda dt: 0.0,
+        )
+        result = opt.optimize(
+            prices=[
+                PricePoint(time=SLOT_0, price=0.01),
+                PricePoint(time=SLOT_1, price=1.00),
+            ],
+            current_slot=SLOT_0,
+            current_soc=self.START,
+            current_temp=START_TEMP,
+        )
+        assert result.schedule[SLOT_0].mode == BatteryMode.CHARGE
+        assert result.soc_trajectory[SLOT_0][1] == pytest.approx(
+            self.EXPECTED, abs=1e-9
+        )
+
+    def test_project_slot_soc(self):
+        engine = TaperEngine()
+        transition = project_slot_soc(
+            soc_start=self.START,
+            mode=BatteryMode.CHARGE,
+            params=_projection_params(),
+            temp_start=START_TEMP,
+            learning_engine=engine,
+        )
+        assert transition.soc_end == pytest.approx(self.EXPECTED, abs=1e-9)
+
+    def test_replay_plan(self):
+        engine = TaperEngine()
+        schedule = {
+            SLOT_0: ScheduleEntry(time=SLOT_0, mode=BatteryMode.CHARGE, reason="t"),
+        }
+        replay = replay_plan(
+            schedule=schedule,
+            config=_dp_config(min_soc=self.MIN_SOC),
+            starting_soc=self.START,
+            predict_load_kw=lambda dt: 0.0,
+            predict_pv_kw=lambda dt: 0.0,
+            charge_rate_for=lambda slot, soc, temp: engine.get_charge_rate_for_soc(
+                soc, temp
+            ),
+            starting_temp=START_TEMP,
+        )
+        assert replay.by_slot[SLOT_0].soc_end == pytest.approx(
+            self.EXPECTED, abs=1e-9
+        )
+
+    def test_partial_slot_lookahead(self):
+        """The DP's separate first-slot candidate path uses the same rule."""
+        engine = TaperEngine()
+        opt = DPOptimizer(
+            config=_dp_config(min_soc=self.MIN_SOC),
+            load_predictor=_load,
+            charge_rate_predictor=engine.get_charge_rate_for_soc,
+            temp_after_charge_predictor=engine.predict_temp_after_duration,
+            temp_after_idle_predictor=engine.predict_temp_after_idle,
+            pv_predictor=lambda dt: 0.0,
+        )
+        result = opt.optimize(
+            prices=[
+                PricePoint(time=SLOT_0, price=0.01),
+                PricePoint(time=SLOT_1, price=1.00),
+            ],
+            current_slot=SLOT_0,
+            current_soc=self.START,
+            current_temp=START_TEMP,
+            minutes_into_slot=7.5,
+        )
+        # Half a slot at the span rate (1 kW): 88 % + 0.125 kWh -> 89.25 %.
+        assert result.schedule[SLOT_0].mode == BatteryMode.CHARGE
+        assert result.soc_trajectory[SLOT_0][1] == pytest.approx(89.25, abs=1e-9)
 
 
 class TestTemperatureStillEvolvesBetweenSlots:
-    """Removing the within-slot split must not freeze the pack's temperature."""
+    """Removing the within-slot split must not freeze the pack's temperature.
+
+    It evolves through the SHARED projector, and only through it. This test
+    used to pass a bare ``learning_engine`` and rely on ``project_slot_soc``
+    falling through to ``predict_temp_after_duration`` — the second thermal
+    model that the deviation detector was also reaching (A1). There is no such
+    fallback any more: no projector, no temperature movement.
+    """
+
+    @staticmethod
+    def _projector():
+        from battery_optimizer_lib.thermal_model import TemperatureProjector
+
+        class _Ambient:
+            def predict_c(self, dt=None):
+                return 30.0
+
+        return TemperatureProjector(
+            learning_engine=None,
+            ambient_provider=_Ambient(),
+            default_cooling_rate=0.1,
+            default_heating_c_per_kwh=0.0,
+        )
+
+    def test_without_a_projector_the_temperature_is_unchanged(self):
+        engine = CrossingEngine()
+        transition = project_slot_soc(
+            soc_start=START_SOC,
+            mode=BatteryMode.CHARGE,
+            params=_projection_params(),
+            fraction=1.0,
+            temp_start=START_TEMP,
+            learning_engine=engine,
+        )
+        assert transition.temp_end == pytest.approx(START_TEMP)
 
     def test_the_projector_still_warms_the_pack_across_slots(self):
         engine = CrossingEngine()
         params = _projection_params()
+        projector = self._projector()
         first = project_slot_soc(
             soc_start=START_SOC,
             mode=BatteryMode.CHARGE,
@@ -372,9 +786,11 @@ class TestTemperatureStillEvolvesBetweenSlots:
             fraction=1.0,
             temp_start=START_TEMP,
             learning_engine=engine,
+            temp_projector=projector,
+            slot_time=SLOT_0,
         )
         assert first.temp_end is not None
-        assert first.temp_end > START_TEMP
+        assert first.temp_end > THRESHOLD_C
         second = project_slot_soc(
             soc_start=first.soc_end,
             mode=BatteryMode.CHARGE,
@@ -382,6 +798,8 @@ class TestTemperatureStillEvolvesBetweenSlots:
             fraction=1.0,
             temp_start=first.temp_end,
             learning_engine=engine,
+            temp_projector=projector,
+            slot_time=SLOT_1,
         )
         # The second slot starts warm, so it charges at the warm rate: the
         # temperature dependence survives, it just lives between slots.

@@ -194,6 +194,13 @@ Coverage state is published on `sensor.battery_optimizer` under the
 `last_success_horizon_end`, `last_failure_reason`, `retry_pending`,
 `retry_attempts`).
 
+Next to it, `rate_refinement` reports how the current plan's charge rates were
+settled: `branch` (`single_solve`, `converged`, `conservative_fallback`,
+`degraded`), `passes`, and `shortfall_kwh`. `degraded` means the pack cannot
+take the charge energy the plan was chosen on at the temperatures it reaches —
+nothing published credits that energy, but the plan is no longer the cheapest
+one. It is rare and is also logged at WARNING.
+
 **Set a timezone in AppDaemon.** The "end of tomorrow" boundary needs real DST
 rules; when `get_timezone()` reports no usable zone the app falls back to the
 current UTC offset and warns once, and that boundary is an hour off on the two

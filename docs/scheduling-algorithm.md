@@ -192,6 +192,25 @@ The consequences are worth being precise about:
   which is the evidence that what is lost is merge resolution and not
   correctness of the transition.
 
+  **A finer grid is not reliably better.** The merge error is *not monotone* in
+  `soc_step_percent`. Measured on a 5-slot case (prices 0.6450 / 0.9446 / 0.6896
+  / 0.7114 / 0.0915 EUR/kWh, load 1.35 kW, 1 kW charge capability, initial SOC
+  14.75 % on a 10 kWh pack) the gap against exhaustive enumeration is 0.0000 EUR
+  at a 2 % step, **0.0092 EUR at 1 %**, and 0.0000 again at 0.5 %, 0.25 % and
+  0.1 %. Halving the step moved a path across a bucket boundary and lost it.
+  Neither the pinned counterexample above nor
+  `docs/dp_optimization_parameters.md`'s 0.25 % recommendation should be read as
+  "finer is safer".
+
+  **When the approximation bites.** It needs a physical limit (`min_soc` or
+  `max_soc`) truncating a transition inside the horizon, so in practice a nearly
+  empty or nearly full pack. A randomised sweep found a gap in 35 of 300 cases
+  with an initial SOC of 10-20 % (worst 0.060 EUR over five slots) and in **0 of
+  600** cases with an initial SOC of 50-95 %. The pinned example is the *mildest*
+  of its family: at an initial SOC of 10.5 % rather than 10.9 % the same two
+  slots cost 0.045 EUR of gap, and a 0.9 % step already recovers the pinned case
+  — 0.1 % is nowhere near necessary for it.
+
   **Size of the gap.** Per merge, the energy loss is less than one step (a
   bucket is one step wide) and the value loss is at most
   `step * marginal_value` of a kWh. Over the horizon the only bound established
@@ -250,6 +269,12 @@ cumulative stored-DC discharge
 plus the AC energy served after inverter loss, the AC demand the plan assigned
 to the battery that the battery could not supply, and agreement with the
 trajectory about to be published.
+
+Validation runs **before** the mode census, the projected-cost column and the
+decision log are derived, because `_resolve_plan_shortfall` can still change the
+plan at that point — it reverts an unserviceable cloud-safe hedge slot back to
+`HOLD`. Deriving those three first published a census, a cost column and a
+decision log describing a schedule that `find_optimal_schedule` does not return.
 
 The trajectory tolerance is one tenth of a DP grid step. That number is derived
 from the representation, not fitted to an observed error: the planner and the
@@ -381,18 +406,48 @@ input cannot masquerade as a failure to converge.
 
 ### Within-slot charge model — one of them, in every consumer
 
-**A charge slot runs at a constant `charge_input_dc_kw`, taken from the
-temperature the slot *starts* at.** The rate does not change inside a slot;
-temperature evolves *between* slots, and only through
-`thermal_model.TemperatureProjector`. Every consumer uses that one model:
+**A charge slot runs at a constant `charge_input_dc_kw` for its whole length.**
+The rate does not change inside a slot; temperature evolves *between* slots, and
+only through `thermal_model.TemperatureProjector`.
+
+**Which constant** is decided by one helper, `slot_energy.charge_rate_for_span`:
+
+```text
+r_start   = rate(soc_start, temp_start)
+soc_end   = min(max_soc, soc_start + r_start * slot_hours * efficiency)
+rate      = min(r_start, rate(soc_end, temp_start))
+```
+
+i.e. the rate is evaluated at the SOC the slot starts from **and** at the SOC
+that rate would reach, and the slower of the two runs for the whole slot. The
+end-of-span probe steps back from `soc_end` by a billionth of the span, because
+the pack is at `soc_end` for zero seconds: a slot that exactly fills a learned
+bucket (a clean 40 % → 50 % calibration observation) must still replay its own
+measurement.
+
+Freezing the rate at the start SOC instead over-credited every slot that crossed
+one of the learning engine's SOC-taper buckets (25 / 50 / 75 / 90 %), and no
+validation could catch it, because `plan_validation.replay_plan` and
+`DPOptimizer._replay_plan` evaluated the same frozen model. Measured on a 10 kWh
+pack with a 4 kW → 1 kW taper at 90 % and a 15-minute slot from 88 %: 1-minute
+sub-stepped truth 92.0 %, frozen model **98.0 %** — six SOC points of energy
+credited to a plan that could not take it. The taper at 25 % from 22 % gave
++5 points the same way.
+
+Every consumer calls that one helper:
 
 | Consumer | Where |
 | --- | --- |
 | DP candidate evaluation and the partial-slot lookahead | `dp_optimizer._run_dp`, `_build_schedule` |
-| the pure physical transition | `slot_energy.simulate_slot` |
+| the DP's feasibility/temperature replay | `dp_optimizer._replay_plan` |
+| the pure physical transition | `slot_energy.simulate_slot` (given the span rate) |
 | final-plan replay | `plan_validation.replay_plan` |
 | expected-SOC trajectory and the deviation detector | `soc_projection.project_slot_soc` |
 | projected-cost column | `cost_tracker.project_costs` |
+
+The DP memoizes it by state index within a slot, as before; it is now two rate
+lookups per state per slot instead of one, and both go through the same
+`(soc, temperature)` cache.
 
 There used to be a second one. `project_slot_soc` called
 `learning_engine.predict_charge_input_dc_energy`, which split a CHARGE slot into
@@ -410,19 +465,52 @@ SOC shortfalls against a battery that was following the planner exactly.
 `project_slot_soc` with a default of 16 °C — and it has been removed from that
 signature rather than left accepted-and-ignored.
 
-**Bound on the approximation.** Against a fine-grained reference (1-minute
-sub-stepping through the same rate curve and the same warming model) the
-constant-rate model is off by at most, per slot,
+**What the model claims, and which claims can fail.** Two different kinds of
+statement, kept apart on purpose — the bound that used to be documented here
+conflated them and was wrong under either reading.
+
+*An identity.* Against a 1-minute sub-stepped reference through the same rate
+curve, the error per slot is at most
 
 ```text
-(warm_rate - cold_rate) * slot_hours * efficiency          kWh stored
-(warm_rate - cold_rate) * slot_hours * efficiency / capacity * 100   SOC points
+(max rate visited - min rate visited) * slot_hours * efficiency        kWh stored
+(max rate visited - min rate visited) * slot_hours * efficiency / capacity * 100  SOC points
 ```
 
-and it errs on the **conservative** side whenever the pack warms during the
-slot: the start-of-slot rate is the slower one, so the plan never credits energy
-a warming pack could not have taken. `tests/test_within_slot_charge_model.py`
-measures the reproduction against the sub-stepped reference and pins the bound.
+This cannot fail and proves nothing on its own: the slot runs at one rate drawn
+from the set the truth visits, and the truth is a duration-weighted average of
+that same set. It is stated because it is the only bound that survives a
+non-monotonic rate curve, and because it is the number a reader wants when a
+direction claim does not apply.
+
+*Falsifiable direction claims*, and the conditions they need:
+
+- **Exact** for a piecewise-constant bucket rate when at most one bucket
+  boundary falls inside the slot. On the reference pack a 15-minute slot moves
+  at most about 8 SOC points against 25-point buckets, so that is the normal
+  case, not a lucky one.
+- **Conservative** (never over-credits) when the rate is monotone over the SOC
+  span the slot covers: the minimum of the two endpoints is then a lower bound
+  on every rate the slot visits.
+- **Conservative** when the pack *warms* during the slot and the rate is
+  non-decreasing in temperature — the physical case while charging, since the
+  rate is looked up at the start-of-slot temperature.
+- **Over-crediting**, and bounded rather than eliminated, on a pack that *cools*
+  while charging. Temperature is not spanned (the DP's 1-D energy state cannot
+  carry it), so the over-credit is at most
+  `(rate(T_start) - rate(T_end)) * slot_hours * efficiency`.
+- **An approximation otherwise**, with only the identity above. The pinned
+  counterexample: a non-monotonic curve of 1.0 kW below 14 °C, 6.0 kW from 14 to
+  20 °C and 1.2 kW above 20 °C, on a pack warming 1 °C/min from 10 °C. The
+  sub-stepped truth is 17.667 %, the model says 12.5 % — an error of **5.17 SOC
+  points** against the 0.5 points the old "rate at the end minus rate at the
+  start" bound allowed, a violation by a factor of ten. The identity bound for
+  that slot is 12.5 points, and it holds.
+
+`tests/test_within_slot_charge_model.py` measures all of these against the
+sub-stepped reference: the direction claims on monotone curves, the identity on
+the non-monotonic counterexample, and the taper scenarios above in every
+consumer.
 
 A finer model is possible — N sub-steps of the shared projector — but it would
 have to be *the same code path* in all five consumers above, and it would
@@ -1157,6 +1245,17 @@ What happens instead:
   prices as fetched; it finds no index for the current slot, so it solves the
   remaining slots at full width with no partial first slot. The horizon is not
   lost because one interval is.
+- **The current slot is resolved BEFORE the solve, not after it.** Whatever is
+  going to run for the rest of this quarter hour — the retained entry, or the
+  `HOLD` fallback, which still absorbs PV surplus — is walked through
+  `soc_projection.project_slot_soc` for the remaining fraction of the slot, and
+  the DP is handed the SOC and temperature that walk ends at. Solving from the
+  SOC measured mid-slot modelled the retained action as doing nothing: a
+  retained `CHARGE` running 10:07 → 10:15 at 4.5 kW × 0.85 adds about 3.6 SOC
+  points on the 14.3 kWh reference pack that the plan never saw, and a retained
+  `DISCHARGE` errs the other way. The retain-or-fall-back decision is the same
+  one `_retain_current_slot_if_unpriced` makes and is taken from the same test,
+  so the slot that gets advanced is the slot that gets stamped.
 - **A previously planned entry is retained** if it was itself built from a
   published price. `ScheduleEntry.price_source` records that provenance
   (`"market"`), stamped when the schedule is built against the price keys the
@@ -1220,6 +1319,18 @@ end, pending-retry/attempt information, and - for the slot running right now -
 `current_slot_priced` plus `current_slot_entry`
 (`planned` / `retained` / `fallback`). The last two are scoped to the interval
 they describe, so they report `null` rather than the previous slot's answer.
+`current_slot_priced` is also `null` when it is genuinely *unknown* — a restart
+that has never fetched prices cannot say whether the interval it woke up in was
+published, and it reports `no_schedule`, not `no_price`.
+
+`sensor.battery_optimizer` also publishes `rate_refinement`, the outcome of the
+solve/replay/refine loop for the current plan: `branch` (`single_solve`,
+`converged`, `conservative_fallback` or `degraded`), `passes`, `converged`,
+`fallback`, `degraded` and `shortfall_kwh`. `degraded` is the one that matters
+to a reader: the plan's actions were chosen for charge energy the pack will not
+have at the temperatures it reaches, so nothing published credits that energy
+but the plan is no longer economically optimal. It is logged at WARNING when it
+happens; the attribute is how you see it afterwards.
 
 ## Re-optimization and execution
 

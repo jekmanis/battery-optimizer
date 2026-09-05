@@ -637,7 +637,22 @@ class TestOneTrajectoryPerPlan:
             current_temp=0.0,
         )
         assert result.rate_refinement_fallback
-        app = self._App(cfg, None, self._load, lambda dt: 0.0)
+        # The app must be given THE SAME thermal model the planner used, or the
+        # two trajectories differ because they model different batteries rather
+        # than because one of them is wrong. This DP was built without a shared
+        # projector, so it runs the legacy two-predictor interface (warm while
+        # charging, otherwise unchanged); this adapter is that model, in the
+        # projector shape `project_slot_soc` accepts. `project_slot_soc` no
+        # longer has a fallback thermal model of its own -- that fallback was a
+        # SECOND model, and the deviation detector was reaching it.
+        class _LegacyProjector:
+            @staticmethod
+            def project(temp, slot_time=None, duration_minutes=0.0, battery_power_kw=0.0):
+                if temp is None or battery_power_kw <= 1e-9:
+                    return temp
+                return temp + duration_minutes
+
+        app = self._App(cfg, _LegacyProjector(), self._load, lambda dt: 0.0)
         return cfg, app, result
 
     def test_expected_soc_matches_the_dp_trajectory(self):

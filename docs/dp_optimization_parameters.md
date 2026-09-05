@@ -77,6 +77,25 @@ Review these against your actual electricity contract to see if anything is miss
 | Max SOC | `max_soc` | 100 | **100** | % | Upper bound for DP state space |
 | SOC step | `soc_step_percent` | 1.0 | **0.25** | % | DP granularity (0.25% of 14.3 kWh = 0.036 kWh steps) |
 
+**`soc_step_percent` is not a dial you turn down until the answer is right.**
+It controls how aggressively distinct paths are *merged*, and the merge error is
+**not monotone** in it: a finer grid usually helps and sometimes hurts. Measured
+on this solver (5 slots, prices 0.6450 / 0.9446 / 0.6896 / 0.7114 / 0.0915
+EUR/kWh, load 1.35 kW, 1 kW charge capability, initial SOC 14.75 % on a 10 kWh
+pack) the gap against exhaustive enumeration is 0.0000 EUR at a 2 % step,
+**0.0092 EUR at 1 %**, and 0.0000 again at 0.5 %, 0.25 % and 0.1 %.
+
+The approximation only bites when a physical limit (`min_soc` or `max_soc`)
+truncates a transition inside the horizon, which in practice means a nearly
+empty or nearly full pack. A randomised sweep on the same solver found a gap in
+35 of 300 cases with an initial SOC of 10-20 % (worst 0.060 EUR over five slots)
+and in **0 of 600** cases with an initial SOC of 50-95 %.
+
+So 0.25 % is a reasonable value and 1 % is a reasonable value; the cost of the
+finer one is CPU (a 132-slot horizon with a partial first slot: 1 % -> ~250 ms,
+0.25 % -> roughly four times that), and the benefit is not guaranteed. See
+`docs/scheduling-algorithm.md` SS Conservative quantization.
+
 ---
 
 ## 5. Schedule Resolution

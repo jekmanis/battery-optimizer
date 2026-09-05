@@ -1248,6 +1248,21 @@ class TestProjectCostsUsesTheLearnedChargeModel:
 
         monkeypatch.setattr(soc_projection, "project_slot_soc", spy)
 
+        class _Warming:
+            """The app's shared thermal model, standing in for the projector.
+
+            ``project_slot_soc`` has exactly one temperature model and it is the
+            injected projector: without one the temperature is returned
+            unchanged, deliberately, rather than falling back to the learning
+            engine's own warming predictor (a second thermal model, which the
+            SOC deviation detector was reaching on every multi-slot charge
+            projection).
+            """
+
+            @staticmethod
+            def project(temp, slot_time=None, duration_minutes=0.0, battery_power_kw=0.0):
+                return temp + 2.0 * duration_minutes / 15.0
+
         tracker.project_costs(
             schedule=schedule,
             starting_soc=50.0,
@@ -1256,6 +1271,7 @@ class TestProjectCostsUsesTheLearnedChargeModel:
             predict_load_func=lambda _: 0.5,
             starting_temp=20.0,
             learning_engine=engine,
+            temp_projector=_Warming(),
         )
 
         assert len(seen) == 3

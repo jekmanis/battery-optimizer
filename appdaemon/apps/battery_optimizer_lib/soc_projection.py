@@ -30,15 +30,25 @@ Invariants (see also docs/scheduling-algorithm.md):
    serves ``max(0, load - pv)`` and stores ``max(0, pv - load)``.
 3. Battery-side (DC) energy is what moves the SOC. AC load served is converted
    with ``inverter_efficiency``; storage retention uses ``efficiency``.
-4. ONE within-slot charge model: a CONSTANT ``charge_input_dc_kw`` at the
-   temperature the slot STARTS at. The rate does not change inside a slot; the
-   temperature evolves between slots through ``thermal_model``. This function
-   used to split a CHARGE slot into a cold and a warm phase via
+4. ONE within-slot charge model: a CONSTANT ``charge_input_dc_kw`` for the
+   whole slot, chosen by ``slot_energy.charge_rate_for_span`` -- the minimum of
+   the rate at the SOC the slot starts from and the rate at the SOC that rate
+   would reach. The rate does not change inside a slot; the temperature evolves
+   between slots through ``thermal_model``. This function used to split a
+   CHARGE slot into a cold and a warm phase via
    ``learning_engine.predict_charge_input_dc_energy`` -- a second thermal model
    that disagreed with the DP by 3.75 SOC points on a single 15-minute slot
    crossing 1 kW -> 4 kW, and recreated false SOC-shortfall events. That
    predictor is now diagnostic-only and is not called from any planning or
    projection path.
+
+5. ONE thermal model, and it is ``thermal_model.TemperatureProjector``. Without
+   a ``temp_projector`` the temperature is simply UNCHANGED. There used to be
+   two private fallbacks here -- ``_charge_temp`` (the learning engine's linear
+   warming predictor) and ``_idle_temp`` (its cooling predictor) -- and the SOC
+   deviation detector reached the first of them on every multi-slot charge
+   projection, so its answer compounded away from the published trajectory:
+   32.5 % against 17.5 % over three 15-minute CHARGE slots.
 
 Charge-rate units: ``params.charge_rate`` and anything returned by
 ``learning_engine.get_charge_rate_for_soc`` are ``charge_input_dc_kw`` --
@@ -53,7 +63,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .models import BatteryMode
-from .slot_energy import params_from_soc_projection, simulate_slot
+from .slot_energy import (
+    charge_rate_for_span,
+    params_from_soc_projection,
+    simulate_slot,
+)
 
 
 @dataclass(frozen=True)
@@ -105,18 +119,41 @@ class SocTransition:
     unmet_battery_ac_kwh: float = 0.0
 
 
+def _rate_lookup(params: SocProjectionParams, learning_engine):
+    """``(soc, temp) -> charge_input_dc_kw``: learned when available, else nominal."""
+
+    def _fn(soc: float, temp: Optional[float]) -> float:
+        if learning_engine is not None:
+            learned = learning_engine.get_charge_rate_for_soc(soc, temp)
+            if learned is not None and learned > 0:
+                return learned
+        return params.charge_rate
+
+    return _fn
+
+
 def _effective_charge_rate(
     params: SocProjectionParams,
     rate_soc: float,
     temp_start: Optional[float],
     learning_engine,
+    duration_h: float,
 ) -> float:
-    """Learned charge rate when available, else the configured nominal rate."""
-    if learning_engine is not None:
-        learned = learning_engine.get_charge_rate_for_soc(rate_soc, temp_start)
-        if learned is not None and learned > 0:
-            return learned
-    return params.charge_rate
+    """THE within-slot charge rate: ``slot_energy.charge_rate_for_span``.
+
+    Never a bare ``rate(rate_soc, temp_start)`` lookup -- that is the frozen
+    start-SOC model, and it over-credits every slot that crosses a learned
+    SOC-taper bucket.
+    """
+    return charge_rate_for_span(
+        _rate_lookup(params, learning_engine),
+        soc_start=rate_soc,
+        temp=temp_start,
+        duration_h=duration_h,
+        efficiency=params.efficiency,
+        capacity=params.battery_capacity,
+        max_soc=params.max_soc,
+    )
 
 
 def project_slot_soc(
@@ -147,16 +184,19 @@ def project_slot_soc(
         export_rate: Direct-control export rate of the slot. A positive value
             marks a grid-export discharge slot (full export discharge rate).
         temp_start: Battery temperature (C) at the start, or None.
-        learning_engine: Optional BatteryLearningEngine for learned charge
-            rates and (without a ``temp_projector``) temperature evolution.
+        learning_engine: Optional BatteryLearningEngine, for learned charge
+            rates ONLY. It is never asked about temperature here.
         rate_lookup_soc: SOC to use for charge-rate lookups instead of
             ``soc_start``. The deviation detector passes the *actual* SOC here
             because that is what the inverter's rate really depends on.
-        temp_projector: Optional ``thermal_model.TemperatureProjector``. When
-            given, the end temperature comes from the SHARED thermal model for
-            every mode (relaxation toward a time-varying ambient plus
-            ``k2*|P_bat|``) instead of the old mode-specific split where only
-            CHARGE could warm the pack. The SOC/energy result is unaffected.
+        temp_projector: Optional ``thermal_model.TemperatureProjector`` -- the
+            ONLY temperature model. When given, the end temperature comes from
+            it for every mode (relaxation toward a time-varying ambient plus
+            ``k2*|P_bat|``), driven by the power that actually flowed. When it
+            is absent the temperature is returned UNCHANGED; there is no
+            fallback thermal model, because a fallback is a second model and
+            consumers reached different ones. The SOC/energy result is
+            unaffected either way.
         slot_time: Slot timestamp, used by ``temp_projector`` to look up the
             ambient temperature at that point of the horizon.
 
@@ -177,14 +217,11 @@ def project_slot_soc(
     # planner's arithmetic against the planner's own guess. The DP now publishes
     # the trajectory of the forward walk at the reached temperatures, which is
     # exactly what this function computes, so the pin has nothing left to do.
-    charge_rate = _effective_charge_rate(params, rate_soc, temp_start, learning_engine)
-
-    temp_end = temp_start
-
     # THE within-slot charge model, and there is only one of it: a CONSTANT
-    # ``charge_input_dc_kw`` taken from the temperature at the START of the
-    # slot. Identical to the DP's candidate transition, to `simulate_slot` and
-    # to `plan_validation.replay_plan`; temperature evolves BETWEEN slots only,
+    # ``charge_input_dc_kw`` for the whole slot, chosen over the SPAN the slot
+    # covers by `slot_energy.charge_rate_for_span`. Identical to the DP's
+    # candidate transition, to `simulate_slot` and to
+    # `plan_validation.replay_plan`; temperature evolves BETWEEN slots only,
     # through `thermal_model.TemperatureProjector`.
     #
     # This used to call `learning_engine.predict_charge_input_dc_energy`, which
@@ -195,20 +232,20 @@ def project_slot_soc(
     # this function said 16.25 %, which recreated SOC-shortfall events on a
     # battery that was following the planner's model exactly.
     #
-    # The constant rate is the conservative side of the approximation whenever
-    # the pack warms during the slot, and the error is bounded per slot by
-    # ``(warm_rate - cold_rate) * slot_hours * efficiency`` of stored energy --
-    # see `docs/scheduling-algorithm.md` SS Within-slot charge model and
-    # `tests/test_within_slot_charge_model.py`, which measures it against
-    # 1-minute sub-stepping.
-    slot_charge_input_dc_kw = charge_rate
-    if mode == BatteryMode.CHARGE:
-        # Legacy fallback only (no shared projector): the learning engine's
-        # charge-warming predictor. When a `temp_projector` is supplied it
-        # overwrites this a few lines below, from the power that actually flowed.
-        temp_end = _charge_temp(learning_engine, temp_start, duration_minutes)
-    else:
-        temp_end = _idle_temp(learning_engine, temp_start, duration_minutes)
+    # The rate was then frozen at the START SOC, which over-credited any slot
+    # crossing a learned SOC-taper bucket by up to 6 SOC points; the span rule
+    # and its exact/conservative/approximate cases are documented on
+    # `charge_rate_for_span` and in `docs/scheduling-algorithm.md` SS Within-slot
+    # charge model.
+    slot_charge_input_dc_kw = _effective_charge_rate(
+        params, rate_soc, temp_start, learning_engine, params.slot_hours * fraction
+    )
+
+    # ONE thermal model. Without a projector the temperature does not move at
+    # all -- it is NOT quietly handed to the learning engine's own warming and
+    # cooling predictors, which is how the deviation detector ended up running a
+    # second thermal model on every multi-slot charge projection.
+    temp_end = temp_start
 
     # THE physical transition. Delegated rather than re-derived, so the SOC view
     # and the energy view of a slot cannot drift apart (they did: this function
@@ -252,25 +289,3 @@ def project_slot_soc(
         requested_dc_energy_out_kwh=outcome.requested_stored_dc_out_kwh,
         unmet_battery_ac_kwh=outcome.unmet_battery_ac_kwh,
     )
-
-
-def _charge_temp(learning_engine, temp_start: Optional[float], duration_minutes: float):
-    """Temperature after a CHARGE interval, WITHOUT a shared thermal projector.
-
-    Legacy path only. Every caller that has a ``temp_projector`` overwrites this
-    from the power that actually flowed, which is the one thermal model; this
-    exists so callers that predate the projector keep working.
-    """
-    if learning_engine is None or temp_start is None:
-        return temp_start
-    warm = getattr(learning_engine, "predict_temp_after_duration", None)
-    if warm is None:
-        return _idle_temp(learning_engine, temp_start, duration_minutes)
-    return warm(temp_start, duration_minutes)
-
-
-def _idle_temp(learning_engine, temp_start: Optional[float], duration_minutes: float):
-    """Temperature after a non-charging interval (cools toward ambient)."""
-    if learning_engine is not None and temp_start is not None:
-        return learning_engine.predict_temp_after_idle(temp_start, duration_minutes)
-    return temp_start

@@ -29,6 +29,7 @@ appdaemon/apps/
 │   ├── thermal_model.py           # Shared battery temperature model (k1/k2)
 │   ├── ambient_service.py         # Time-varying ambient temperature T_ambient(t)
 │   ├── slot_energy.py             # Shared pure slot energy-flow transition
+│   ├── plan_validation.py         # Continuous replay of the final plan
 │   ├── soc_projection.py          # Shared slot SOC transition model
 │   ├── soc_deviation.py           # SOC deviation detection
 │   ├── load_prediction_tracker.py # Predicted vs actual load accuracy
@@ -63,6 +64,7 @@ tests/
 | `thermal_model.py` | TemperatureProjector, step_temperature, battery_power_for_entry | The ONE battery temperature model. Warming depends on `\|P_bat\|`, never on the scheduled mode |
 | `ambient_service.py` | AmbientTemperatureService, AmbientServiceConfig | `T_ambient(t)` across the horizon: weather forecast → outdoor sensor → diurnal profile |
 | `slot_energy.py` | simulate_slot, SlotEnergyParams, SlotEnergyResult | The ONE pure slot transition: every energy flow with its measurement boundary in the name |
+| `plan_validation.py` | replay_plan, PlanReplay | Continuous replay of the FINAL plan; prefix energy conservation before clamping |
 | `soc_projection.py` | project_slot_soc, SocProjectionParams | Single slot-SOC transition model shared by the expected-SOC trajectory and the deviation detector (the DP keeps its own inlined transition; `tests/test_soc_projection.py` guards that they agree) |
 | `soc_deviation.py` | SocDeviationDetector, SocDeviationConfig | Detects unexpected SOC changes for revalidation |
 | `load_prediction_tracker.py` | LoadPredictionTracker | Predicted vs actual load accuracy tracking |
@@ -109,6 +111,8 @@ Uses **dynamic programming** with SOC state tracking:
 `learned_efficiency` is NOT a measurement. It can only be learned from an independent AC meter reading for the charge interval, and there is none; the synthetic `stored / configured_efficiency` input that used to feed it is a tautology and is rejected.
 
 **One slot-energy model.** `slot_energy.simulate_slot` is the pure transition that names every flow (stored in/out, PV vs grid share of a charge, AC served, import, export, `unmet_battery_ac_kwh`). `soc_projection.project_slot_soc` delegates to it. Its `dc_energy_in_kwh`/`dc_energy_out_kwh` are what the pack ACTUALLY moved; the uncapped request lives in `requested_dc_energy_*`. Never report a request as delivered energy.
+
+**Conservative quantization.** A DP state carries a floored bucket *label* and the *exact* energy of the best path reaching it; every transition is computed from the exact energy. Nearest rounding on the grid was not zero-mean for a constant load on a constant slot length — it credited 2.8 kWh of service from a 2.0 kWh battery and published 15 % SOC for a pack its own model had emptied. Pure floor-to-grid is safe but throws away 30 % of the usable energy at 1 % steps, so it is not the answer either. Physics is now exact; what `soc_step_percent` controls is only how aggressively distinct paths are MERGED (ties broken toward more energy — a dominance rule). Energy-limited discharges deliver what the pack has and the grid pays for the rest; no threshold decides whether a slot "counts". `plan_validation.replay_plan`, called last in `find_optimal_schedule`, re-walks the FINAL action sequence and checks prefix conservation before any clamping.
 
 **One slot-SOC model.** The expected-SOC trajectory, the SOC deviation detector
 and the schedule log's fallback trajectory

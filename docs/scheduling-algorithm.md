@@ -139,10 +139,82 @@ the best cumulative value and a predecessor for backtracking. Transitions obey
 `min_soc`, `max_soc`, charge/discharge power limits, PV availability, and the
 remaining fraction of the current interval.
 
-Continuous energy is mapped conservatively to the discrete grid: a transition
-must never credit energy that is not physically present. A smaller
-`soc_step_percent` reduces this conservative quantization error at the cost of
-more states and CPU time.
+### Conservative quantization: bucket label plus exact path energy
+
+A DP state used to *be* the energy of its grid point, and a discharge was
+rounded to the **nearest** grid point. Nearest rounding is unbiased only for a
+random signal. A constant load on a constant slot length produces the same
+error with the same sign in every slot: at 0.14 kWh per slot on a 0.10 kWh grid
+the planner deducted 0.10 kWh twenty times and credited 2.8 kWh of battery
+service from a battery holding 2.0 kWh, publishing 15 % SOC after 15 slots for
+a pack its own model had already emptied. The old no-free-lunch guard caught
+only the sub-step case, never the systematic one.
+
+Rounding **down** instead is safe but far too pessimistic on its own. Measured
+on that same reproduction, floor-to-grid serves 1.40 kWh of the 2.00 kWh
+available and discards 30 % of it, discharging for 10 slots instead of 15. A
+15-minute slot on the reference installation routinely moves barely two grid
+steps, so that is the normal case. Buying the accuracy back by shrinking
+`soc_step_percent` costs proportionally more states and CPU — over a 132-slot
+horizon with a partial first slot: 1 % → 125 ms, 0.5 % → 241 ms, 0.25 % →
+527 ms.
+
+So the grid stays where it is and each state carries **both**:
+
+- an **index**, floored, so a state's label never claims energy the path does
+  not hold. The index is what merges paths — it is the resolution of the
+  *optimization*.
+- `dp_energy[idx]`, the **exact** continuous energy of the best path reaching
+  that bucket. Every transition is computed from it.
+
+The consequences are worth being precise about:
+
+- **Physics is exact.** No transition can create a joule; the initial observed
+  energy is kept exactly; replaying the backtracked plan continuously reproduces
+  the planner's own trajectory to floating-point precision.
+- **The merging is the approximation.** Two paths in one bucket differ by up to
+  one step and only the better-valued one survives. Ties are broken toward the
+  path holding more energy, which is a genuine dominance rule (more energy can
+  only widen later options). The optimality gap is bounded by one step times the
+  marginal value of a kWh; the solver is exact for its discretized model, and an
+  approximation of the continuous problem.
+- **Energy-limited candidates pay the grid.** A discharge delivers what the pack
+  has; whatever it cannot cover is charged to the grid at the import price in the
+  same slot. No threshold decides whether a slot "counts" — the energy does. The
+  old `> min_energy + dc * 0.5` and `* 0.3` thresholds are gone.
+- **The published SOC trajectory is built from the path's energies**, not from
+  grid indices.
+
+`soc_step_percent` therefore now controls only how aggressively distinct paths
+are merged, not how much energy the plan may invent.
+
+### Final-plan replay
+
+`plan_validation.replay_plan` walks the **final** action sequence — after any
+orchestrator postprocessing — through `slot_energy.simulate_slot` in continuous
+energy, and `BatteryOptimizer._validate_final_plan` runs it as the last step of
+`find_optimal_schedule`, on the plan that will actually execute. It checks, at
+every prefix and **before** any SOC clamping:
+
+```text
+cumulative stored-DC discharge
+    <= initially usable stored-DC energy + cumulative actual stored-DC charge
+```
+
+plus the AC energy served after inverter loss, the AC demand the plan assigned
+to the battery that the battery could not supply, and agreement with the
+trajectory about to be published.
+
+The trajectory tolerance is one tenth of a DP grid step. That number is derived
+from the representation, not fitted to an observed error: the planner and the
+replay evaluate the same closed-form transition on the same fixed forecasts and
+the same per-slot rates, so they can differ only by floating-point accumulation
+— on the order of `n_slots * 2.2e-16 * capacity`, about 1e-12 SOC % over a
+132-slot horizon. A tenth of a step is astronomically above that and far below
+anything quantization could explain, so a breach is a model disagreement.
+
+A breach is reported (ERROR for conservation, WARNING for trajectory
+disagreement) and never silently rewrites the plan.
 
 Temperature-aware charge rates are predicted before the DP from the learned
 SOC/temperature model. These are planning estimates; actual SOC deviation can

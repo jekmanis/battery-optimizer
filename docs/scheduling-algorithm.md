@@ -500,23 +500,35 @@ direction claim does not apply.
 - **Conservative** when the pack *warms* during the slot and the rate is
   non-decreasing in temperature — the physical case while charging, since the
   rate is looked up at the start-of-slot temperature.
-- **Over-crediting**, and bounded rather than eliminated, on a pack that *cools*
-  while charging **and the rate is non-decreasing in temperature over the range
-  the slot traverses**. Temperature is not spanned (the DP's 1-D energy state
-  cannot carry it), so the over-credit is then at most
+- **May over-credit**, and bounded rather than eliminated, on a pack that
+  *cools* while charging **and the rate is non-decreasing in temperature over
+  the range the slot traverses and monotone over the SOC span the slot
+  covers**. Temperature is not spanned (the DP's 1-D energy state cannot carry
+  it), so the over-credit is then at most
   `(rate(T_start) - rate(T_end)) * slot_hours * efficiency`: every temperature
   the slot visits is between `T_end` and `T_start`, so every rate it visits is
   between the two endpoint rates. It is the same monotonicity direction the
   warming bullet above needs, and only this direction produces an over-credit
   at all — a rate that *falls* as temperature rises makes a cooling pack faster
   than the rate it was looked up at, so the model under-credits and there is
-  nothing to bound. Without the monotonicity that bound compares two endpoints
-  of a curve the slot leaves:
+  nothing to bound. Without the temperature monotonicity that bound compares
+  two endpoints of a curve the slot leaves:
   a pack cooling 20 → 5 °C on a curve of 2.0 kW at or above 19 °C, 0.1 kW from
   11 to 19 °C and 1.9 kW below 11 °C has both endpoints fast and the middle
   slow — the model says 25.0 %, the sub-stepped truth is 22.4 %, and the
   endpoint bound allows 0.25, a violation by a factor of ten and a half. Only
   the identity above survives there.
+
+  The SOC condition is the same trap one axis over: `charge_rate_for_span`
+  probes two SOCs at *one* temperature, so a rate that dips in SOC between the
+  probes and recovers by the reached SOC passes the minimum test unchanged.
+  4 kW outside 11-19 %, 0.1 kW inside it, plus a 0.008 kW/°C slope, cooling
+  20 → 5 °C from 10 %: the model over-credits by 8.59 SOC points against an
+  endpoint bound of 0.30, a factor of 29. And the model does not always
+  over-credit a cooling pack — that holds only for SOC-independent curves. A
+  plain 4 → 1 kW taper at 26 % with the same slope, from 20 %, *under*-credits
+  by 4.15 points, because the reached-SOC probe lands past the taper and the
+  slow rate is applied to the whole slot. Both stay inside the identity bound.
 - **An approximation otherwise**, with only the identity above. The pinned
   counterexample: a non-monotonic curve of 1.0 kW below 14 °C, 6.0 kW from 14 to
   20 °C and 1.2 kW above 20 °C, on a pack warming 1 °C/min from 10 °C. The

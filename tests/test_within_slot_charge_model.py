@@ -697,6 +697,24 @@ class TestTheDocumentedClaimMatchesTheMeasurement:
             flat = " ".join(text.split()).lower()
             assert "no bucket boundary falls strictly inside" in flat, name
 
+    def test_both_texts_condition_the_cooling_bound_on_soc_monotonicity(self):
+        """The cooling bound needs BOTH monotonicities, not just temperature.
+
+        Stated on the temperature direction alone, the bound is a claim about
+        the temperature term that silently assumes the SOC term contributes
+        nothing. It does: see
+        ``TestTheCoolingBoundAlsoNeedsSocMonotonicity``.
+        """
+        for name, text in self._texts().items():
+            flat = " ".join(text.split()).lower()
+            assert "monotone over the soc span the slot covers" in flat, name
+
+    def test_neither_text_claims_a_cooling_pack_is_always_over_credited(self):
+        """A SOC-tapered curve under-credits a cooling pack; "may" is the word."""
+        for name, text in self._texts().items():
+            flat = " ".join(text.split()).lower()
+            assert "may over-credit" in flat, name
+
 
 # ---------------------------------------------------------------------------
 # The cooling bound, measured rather than quoted
@@ -753,6 +771,53 @@ def _rate_ladder(*, points):
     return _fn
 
 
+def _soc_taper_with_temperature_slope(boundary=26.0, fast=4.0, slow=1.0,
+                                      slope=0.02):
+    """A 4 -> 1 kW SOC taper plus a mild, non-decreasing temperature slope."""
+
+    def _fn(soc, temp):
+        base = fast if soc < boundary else slow
+        if temp is None:
+            return base
+        return base + slope * temp
+
+    return _fn
+
+
+def _soc_dip_with_temperature_slope(low=11.0, high=19.0, fast=4.0, slow=0.1,
+                                    slope=0.008):
+    """Fast at both SOC probes, slow in between; non-decreasing in temperature."""
+
+    def _fn(soc, temp):
+        base = slow if low <= soc < high else fast
+        if temp is None:
+            return base
+        return base + slope * temp
+
+    return _fn
+
+
+def _identity_bound(rate_fn, *, soc_start, temp_start, cooling, minutes=15.0,
+                    efficiency=1.0, capacity=CAPACITY):
+    """``(max rate visited - min rate visited) * slot_hours * efficiency``, in SOC %."""
+    visited = _rates_visited(
+        rate_fn,
+        soc_start=soc_start,
+        temp_start=temp_start,
+        warm_per_min=cooling,
+        minutes=minutes,
+        efficiency=efficiency,
+        capacity=capacity,
+    )
+    return (
+        (max(visited) - min(visited))
+        * (minutes / 60.0)
+        * efficiency
+        / capacity
+        * 100
+    )
+
+
 NON_DECREASING_IN_TEMPERATURE = {
     # The engine double's own step, driven downwards through its threshold.
     "step_1kW_to_4kW_at_16C": (_rate_step(16.0, COLD_RATE, WARM_RATE), 20.0, -0.8),
@@ -770,6 +835,14 @@ NON_DECREASING_IN_TEMPERATURE = {
     # Cooling far enough to leave the curve's whole interesting range behind.
     "step_deep_cooling": (_rate_step(16.0, COLD_RATE, WARM_RATE), 17.0, -1.5),
 }
+# Every curve above ignores SOC. That is deliberate and is the scope of the
+# class below: `charge_rate_for_span` probes TWO SOCs at ONE temperature, so a
+# SOC-dependent curve moves the endpoint pair the bound is stated over. See
+# TestTheCoolingBoundAlsoNeedsSocMonotonicity.
+assert all(
+    fn(10.0, 20.0) == fn(90.0, 20.0)
+    for fn, _temp, _cooling in NON_DECREASING_IN_TEMPERATURE.values()
+), "these fixtures must stay SOC-independent"
 
 
 class TestTheCoolingBoundHoldsWhereItsMonotonicityHolds:
@@ -784,10 +857,18 @@ class TestTheCoolingBoundHoldsWhereItsMonotonicityHolds:
     rates. On a cooling pack the visited temperatures lie in
     ``[T_end, T_start]``, so that is exactly the NON-DECREASING case -- and it
     is also the only direction that over-credits at all.
+
+    **Scope: SOC-INDEPENDENT curves.** ``charge_rate_for_span`` probes two SOCs
+    at one temperature, so the endpoint pair the bound is stated over moves as
+    soon as the rate depends on SOC as well. Every fixture here therefore
+    returns the same rate at every SOC; the SOC direction is
+    ``TestTheCoolingBoundAlsoNeedsSocMonotonicity``.
     """
 
     @pytest.mark.parametrize("name", sorted(NON_DECREASING_IN_TEMPERATURE))
-    def test_a_cooling_pack_is_over_credited_within_the_endpoint_bound(self, name):
+    def test_a_soc_independent_cooling_pack_is_over_credited_within_the_bound(
+        self, name
+    ):
         rate_fn, temp_start, cooling = NON_DECREASING_IN_TEMPERATURE[name]
 
         truth = _fine_grained_end_soc(
@@ -798,7 +879,9 @@ class TestTheCoolingBoundHoldsWhereItsMonotonicityHolds:
 
         over_credit = model - truth
         assert bound >= -1e-12, "a non-decreasing rate cannot give a negative bound"
-        assert over_credit >= -1e-9, "the model never under-credits a cooling pack"
+        assert over_credit >= -1e-9, (
+            "a SOC-INDEPENDENT model never under-credits a cooling pack"
+        )
         assert over_credit <= bound + 1e-9, (
             f"{name}: over-credit {over_credit:.4f} exceeds the stated bound "
             f"{bound:.4f}"
@@ -859,6 +942,82 @@ class TestTheCoolingBoundHoldsWhereItsMonotonicityHolds:
         )
         identity = (max(visited) - min(visited)) * 0.25 / CAPACITY * 100
         assert abs(truth - model) <= identity + 1e-9
+
+
+class TestTheCoolingBoundAlsoNeedsSocMonotonicity:
+    """The endpoint bound is a claim about the temperature term alone.
+
+    It silently assumes the SOC term contributes nothing, and
+    ``charge_rate_for_span`` probes two SOCs at ONE temperature -- so a rate
+    that is perfectly well behaved in temperature can still leave the endpoint
+    pair the bound is stated over. Only the identity bound survives.
+
+    Neither direction was exercised: every fixture in
+    ``NON_DECREASING_IN_TEMPERATURE`` is SOC-independent.
+    """
+
+    def test_a_soc_dip_between_the_probes_breaks_the_endpoint_bound(self):
+        """Both SOC probes fast, the middle slow: the minimum test sees nothing.
+
+        4 kW outside 11-19 % and 0.1 kW inside it, plus a 0.008 kW/C slope, on
+        a pack cooling 20 -> 5 C from 10 %. The rate is non-decreasing in
+        temperature throughout, so the stated condition is met -- and the model
+        over-credits by 8.59 SOC points against an endpoint bound of 0.30, a
+        factor of 29.
+        """
+        rate_fn = _soc_dip_with_temperature_slope()
+        soc_start, temp_start, cooling = 10.0, 20.0, -1.0
+
+        truth = _fine_grained_end_soc(
+            rate_fn, soc_start=soc_start, temp_start=temp_start,
+            warm_per_min=cooling,
+        )
+        model = _span_end_soc(
+            rate_fn, soc_start=soc_start, temp_start=temp_start
+        )
+        bound = _cooling_endpoint_bound(
+            rate_fn, temp_start, cooling, soc_start=soc_start
+        )
+        identity = _identity_bound(
+            rate_fn, soc_start=soc_start, temp_start=temp_start, cooling=cooling
+        )
+
+        assert bound == pytest.approx(0.30, abs=1e-9)
+        assert model - truth == pytest.approx(8.59, abs=1e-2)
+        assert model - truth > 25 * bound, "the endpoint bound is not violated"
+        assert abs(model - truth) <= identity + 1e-9, (
+            "only the identity bound holds here"
+        )
+
+    def test_a_soc_tapered_cooling_pack_may_be_under_credited(self):
+        """"Never under-credits a cooling pack" is true only without SOC taper.
+
+        A plain 4 -> 1 kW taper at 26 % with the same mild temperature slope,
+        from 20 % on a pack cooling 20 -> 5 C. The reached-SOC probe lands past
+        the taper, so the slow rate is applied to the whole slot while the pack
+        really spends most of it above 4 kW: the model UNDER-credits by 4.15
+        SOC points. The endpoint bound (0.75) is not violated -- it bounds the
+        wrong direction -- and the identity bound is what actually holds.
+        """
+        rate_fn = _soc_taper_with_temperature_slope()
+        soc_start, temp_start, cooling = 20.0, 20.0, -1.0
+
+        truth = _fine_grained_end_soc(
+            rate_fn, soc_start=soc_start, temp_start=temp_start,
+            warm_per_min=cooling,
+        )
+        model = _span_end_soc(
+            rate_fn, soc_start=soc_start, temp_start=temp_start
+        )
+        identity = _identity_bound(
+            rate_fn, soc_start=soc_start, temp_start=temp_start, cooling=cooling
+        )
+
+        assert model - truth == pytest.approx(-4.15, abs=1e-2)
+        assert model < truth, "the model under-credits this cooling pack"
+        assert abs(model - truth) <= identity + 1e-9, (
+            "only the identity bound holds here"
+        )
 
 
 class TestTheRateSpanErrsConservative:

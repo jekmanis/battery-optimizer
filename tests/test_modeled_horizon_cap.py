@@ -156,17 +156,28 @@ class TestAnAbsurdTimestampIsDroppedLoudly:
 
 
 # ===========================================================================
-# The caller drops them too
+# End to end: an unreachable interval never reaches the schedule
+#
+# There are two guards on the same week, and this is the OUTER one.
+# `NordPoolPriceService._normalize_prices` bounds the source window BEFORE it
+# expands anything (`MAX_NORMALIZED_WINDOW_HOURS`, the value
+# `MODELED_HORIZON_MAX_HOURS` is defined from), so in production a timestamp
+# this far out is rejected there and the budget branch above never has to fire.
+# That ordering is the point: reaching the planner's guard means every bucket
+# for the intervening slots has already been allocated.
 # ===========================================================================
 
 class TestThePlannerDropsWhatItCannotModel:
     def test_no_entry_is_planned_for_an_unreachable_interval(self):
         app = PlanningOptimizer(NOW, soc=50.0)
         # One corrupt timestamp inside an otherwise ordinary reply.
-        attach_service_path(
+        service = attach_service_path(
             app,
             {DAY: [_point(SLOT_10_00), _point(SLOT_10_15), _point(FAR, price=9.99)]},
         )
+        # `attach_service_path` silences the service; the WARNING is what this
+        # test is about, so let it through to the app log.
+        service.log = app.log
 
         app.full_optimize(None)
 
@@ -174,9 +185,9 @@ class TestThePlannerDropsWhatItCannotModel:
             app.schedule, FAR, app._get_local_timezone()
         ) is None, "a priced interval past the budget is dropped, not planned"
         assert any(
-            "priced" in message and "budget" in message.lower()
+            "window" in message.lower() and "dropping" in message.lower()
             for message in [m for m, level in app.logs if level == "WARNING"]
-        ), "the planner says the horizon was shortened"
+        ), "something says the horizon was shortened; it is never silent"
         assert bo.lookup_by_time(
             app.schedule, SLOT_10_00, app._get_local_timezone()
         ) is not None

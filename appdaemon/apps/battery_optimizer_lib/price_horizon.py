@@ -373,6 +373,15 @@ class PriceHorizonMonitor:
           failure this method exists to prevent.  Nord Pool does not withdraw a
           published interval; if a source ever does, its correction will only
           take effect for instants the reply actually contains.
+
+        The incoming list is bounded before it gets here, and it has to be: this
+        method and `evaluate` are O(len(prices)), and whatever they are handed
+        becomes the retained set.  `NordPoolPriceService._normalize_prices` caps
+        the window it maps onto the slot grid at `MAX_NORMALIZED_WINDOW_HOURS`,
+        and `BatteryOptimizer.get_prices` is the only caller.  Every other
+        `evaluate` call site passes `retained_prices`, which is a subset of a
+        list that already went through here, pruned to the future on the way in.
+        Nothing reaches either method from an unbounded path.
         """
         incoming = {self._key(p.time): p for p in (prices or [])}
         slot_key = self._slot_key(now)

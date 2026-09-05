@@ -55,6 +55,39 @@ class _MalformedEnd:
 
 MALFORMED_END = _MalformedEnd()
 
+# The longest span a SINGLE published record may declare.
+#
+# Nord Pool publishes 15- or 60-minute intervals and a day-ahead block never
+# exceeds a day, so anything longer is a corrupt timestamp rather than a market
+# that changed its mind about resolution.
+#
+# It bounds the WORK a record can ask for as much as its plausibility.
+# `_normalize_prices` allocates a bucket for every slot inside a declared
+# interval, and the only guard on that used to be `modeled_horizon`'s 168-hour
+# budget -- which runs on the RESULT, long after every bucket has been built.
+# One record declaring a year produced 35,040 quarter-hour buckets, silently,
+# inside the app lock and on a callback that has to finish in milliseconds.
+#
+# A 25-hour local day is not a counterexample: the day is published as hourly or
+# quarter-hourly records, never as one record spanning it.
+MAX_RECORD_SPAN_HOURS = 24.0
+
+# The widest window `_normalize_prices` will map onto the slot grid, measured
+# from the EARLIEST record in the reply.
+#
+# The same week as `battery_optimizer.MODELED_HORIZON_MAX_HOURS`, which takes
+# its value from this name so the two cannot drift: anything past it is dropped
+# by the planner anyway, so expanding it here only spends memory to produce
+# slots that are then discarded. `price_retain_max_age_hours` is clamped to the
+# same week.
+#
+# It is the second half of the bound. `MAX_RECORD_SPAN_HOURS` stops ONE record
+# from being unbounded; this stops a reply of ten thousand plausible records
+# from being unbounded in aggregate, and it is what keeps the list handed to
+# `PriceHorizonMonitor.merge_with_retained` -- and therefore the retained set --
+# finite.
+MAX_NORMALIZED_WINDOW_HOURS = 168.0
+
 Span = Tuple[datetime.datetime, datetime.datetime]
 
 
@@ -327,6 +360,72 @@ class NordPoolPriceService:
         )
         return None
 
+    def _slots_in(self, span: datetime.timedelta) -> int:
+        """How many slots a span would expand to, WITHOUT expanding it."""
+        minutes = span.total_seconds() / 60.0
+        if minutes <= 0:
+            return 0
+        slots = int(minutes // self.slot_minutes)
+        if minutes % self.slot_minutes:
+            slots += 1
+        return slots
+
+    def _bounded_to_window(self, records: List[Tuple]) -> List[Tuple]:
+        """*records* clipped to `MAX_NORMALIZED_WINDOW_HOURS` of coverage.
+
+        Measured from the EARLIEST record, because that is the only anchor a
+        reply carries: the app clock says nothing about how far ahead a source
+        chose to publish, and a reply that legitimately starts in the past must
+        still reach a week forward from its own beginning.
+
+        A record that STRADDLES the bound is truncated rather than dropped -
+        the part inside the window was published like any other. A record
+        entirely past it is dropped. One WARNING says how many slots went, so a
+        horizon shortened here is a stated fact and not, as it would be
+        downstream, a sequence that simply ends.
+
+        Arithmetic only: nothing here iterates a span, which is the whole point
+        (see `MAX_RECORD_SPAN_HOURS`).
+        """
+        if not records:
+            return records
+        window_end = (
+            min(r[2] for r in records)
+            + datetime.timedelta(hours=MAX_NORMALIZED_WINDOW_HOURS)
+        )
+
+        bounded: List[Tuple] = []
+        dropped_slots = 0
+        dropped_records = 0
+        first_dropped = None
+        for span, rank, start_key, end_key, start_dt, price in records:
+            if start_key >= window_end:
+                dropped_slots += self._slots_in(end_key - start_key)
+                dropped_records += 1
+                if first_dropped is None or start_key < first_dropped:
+                    first_dropped = start_key
+                continue
+            if end_key > window_end:
+                dropped_slots += self._slots_in(end_key - window_end)
+                dropped_records += 1
+                if first_dropped is None or window_end < first_dropped:
+                    first_dropped = window_end
+                end_key = window_end
+                span = end_key - start_key
+            bounded.append((span, rank, start_key, end_key, start_dt, price))
+
+        if dropped_slots:
+            self._warn_malformed_record(
+                f"Price data reaches beyond the "
+                f"{MAX_NORMALIZED_WINDOW_HOURS:.0f}h normalization window from "
+                f"{records[0][4] if records else '?'}: dropping {dropped_slots} "
+                f"slot(s) across {dropped_records} record(s), from "
+                f"{first_dropped} on. Nothing past that window is planned, so "
+                f"expanding it would only spend memory on slots that are then "
+                f"discarded."
+            )
+        return bounded
+
     def _normalize_prices(self, prices: List[PricePoint]) -> List[PricePoint]:
         """Map published intervals onto the configured slot grid.
 
@@ -375,6 +474,8 @@ class NordPoolPriceService:
         # sum(price * minutes)].
         buckets: Dict[datetime.datetime, List] = {}
 
+        max_span = datetime.timedelta(hours=MAX_RECORD_SPAN_HOURS)
+
         records = []
         for index, point in enumerate(prices):
             # ONE awareness for the whole record, before anything is compared.
@@ -388,13 +489,28 @@ class NordPoolPriceService:
                 start_dt, getattr(point, "end", None)
             )
             if interval_end is None:
-                # Corrupt: an end at or before its own start. `_interval_end`
-                # has already said so, once an hour.
+                # Corrupt: an end at or before its own start, or one that was
+                # published unreadably. `_interval_end` has already said so,
+                # once an hour.
                 continue
             start_key = instant_key(start_dt)
             end_key = instant_key(interval_end)
-            records.append((end_key - start_key, -index, start_key, end_key,
+            span = end_key - start_key
+            if span > max_span:
+                # Rejected on the DECLARED span, before a single bucket exists
+                # for it. See `MAX_RECORD_SPAN_HOURS`.
+                self._warn_malformed_record(
+                    f"Price record for {start_dt} declares a span of "
+                    f"{span.total_seconds() / 3600.0:.1f}h, longer than the "
+                    f"{MAX_RECORD_SPAN_HOURS:.0f}h a single published interval "
+                    f"can be; dropping it. The interval it claimed is a gap "
+                    f"until a source publishes it properly."
+                )
+                continue
+            records.append((span, -index, start_key, end_key,
                             start_dt, point.price))
+
+        records = self._bounded_to_window(records)
 
         # Narrowest span first, then the later record of an equal-span pair.
         # `-index` sorts second so the key is total and the outcome cannot

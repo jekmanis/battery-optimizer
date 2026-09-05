@@ -3603,16 +3603,31 @@ class BatteryOptimizer(hass.Hass):
 
             # Currently learned charge rate at present SOC and battery temperature
             # (same rate-query API the optimizer uses). Fall back to 0 without SOC.
+            #
+            # UNITS, in the attribute names: this one is `charge_input_dc_kw` --
+            # terminal power before storage retention, what the planner uses.
+            # `soc_charge_rates` / `temp_aware_rates` come straight off the
+            # observations, which are `stored_charge_kw` -- the rate stored
+            # energy grew at. The two differ by `efficiency` and used to sit
+            # side by side unlabelled, so the headline number looked like a
+            # 1/efficiency jump against the table underneath it.
             current_soc = self._get_current_soc()
             if current_soc is not None:
-                learned_charge_rate_kw = round(
+                learned_charge_input_dc_kw = round(
                     self.learning_engine.get_charge_rate_for_soc(
                         current_soc, self._get_battery_temp()
                     ),
                     2,
                 )
+                learned_stored_charge_kw = round(
+                    self.learning_engine.get_stored_charge_rate_for_soc(
+                        current_soc, self._get_battery_temp()
+                    ),
+                    2,
+                )
             else:
-                learned_charge_rate_kw = 0.0
+                learned_charge_input_dc_kw = 0.0
+                learned_stored_charge_kw = 0.0
 
             self.set_state(
                 "sensor.battery_learning_stats",
@@ -3627,9 +3642,12 @@ class BatteryOptimizer(hass.Hass):
                     "total_profit_eur": summary["total_profit_eur"],
                     "total_observations": summary["total_observations"],
                     "confidence_pct": confidence_pct,
-                    "learned_charge_rate_kw": learned_charge_rate_kw,
-                    "soc_charge_rates": summary["soc_charge_rates"],
-                    "temp_aware_rates": summary.get("temp_aware_rates", {}),
+                    "learned_charge_input_dc_kw": learned_charge_input_dc_kw,
+                    "learned_stored_charge_kw": learned_stored_charge_kw,
+                    # The observation tables, in the units they were observed
+                    # in: stored-energy growth, not terminal power.
+                    "soc_stored_charge_rates": summary["soc_charge_rates"],
+                    "temp_aware_stored_rates": summary.get("temp_aware_rates", {}),
                     "icon": "mdi:brain",
                 }
             )

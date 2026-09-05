@@ -146,8 +146,15 @@ def _energy_to_index(
 # floating-point precision. What remains approximate is the MERGING: two paths
 # in one bucket differ by up to one step, and only the better-valued one
 # survives (ties are broken toward the one with more energy, which is a genuine
-# dominance rule). That is an approximation of the optimum, bounded by one step
-# times the marginal value of a kWh -- not a licence to invent energy.
+# dominance rule). That is an approximation of the OPTIMUM, never a licence to
+# invent energy.
+#
+# One step times the marginal value of a kWh is the PER-MERGE error, not the
+# horizon bound: a discarded path can be discarded again at every later slot, so
+# the only bound proven here is the sum, `n_slots * step * marginal_value`. It is
+# loose -- the errors are not independent and a merged path usually rejoins --
+# but nothing here establishes anything tighter, so the loose statement is the
+# honest one.
 
 
 @dataclass

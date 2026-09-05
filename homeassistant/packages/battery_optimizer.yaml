@@ -215,12 +215,19 @@ template:
           {% set conf = state_attr('sensor.battery_learning_stats', 'confidence_pct') %}
           {{ conf | default(0, true) | round(0) }}
 
+      # Terminal (input-DC) power, i.e. what the inverter is commanded to and
+      # what the planner uses. The observation tables on the same sensor
+      # (soc_stored_charge_rates / temp_aware_stored_rates) are the OTHER
+      # quantity, stored-energy growth; the two differ by `efficiency`. The
+      # older attribute name `learned_charge_rate_kw` did not say which, so it
+      # is kept as a fallback for an un-upgraded package only.
       - name: "Battery Learned Charge Rate"
         unique_id: battery_learned_charge_rate
         icon: mdi:lightning-bolt
         unit_of_measurement: "kW"
         state: >-
-          {% set rate = state_attr('sensor.battery_learning_stats', 'learned_charge_rate_kw') %}
+          {% set rate = state_attr('sensor.battery_learning_stats', 'learned_charge_input_dc_kw')
+             | default(state_attr('sensor.battery_learning_stats', 'learned_charge_rate_kw'), true) %}
           {{ rate | default(0, true) | round(2) }}
 
       - name: "Battery Total Profit"

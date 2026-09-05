@@ -12,11 +12,16 @@ Historically three places modelled this independently:
 * ``SocDeviationDetector._interpolate_expected_soc`` (the deviation detector)
 
 They disagreed, which produced false "SOC behind plan" / "SOC ahead" events and
-a recalculation loop. The semantics below are copied 1:1 from the DP so that the
-two consumers cannot drift from it again. The DP keeps its own inlined
-transition (it is fused with the value recursion and the discrete SOC grid);
-``tests/test_soc_projection.py`` guards that the two agree within one DP grid
-step per slot.
+a recalculation loop. The physics is now delegated to
+``slot_energy.simulate_slot``, so this function and the energy view of a slot
+cannot drift apart at all. The DP keeps its own inlined transition (it is fused
+with the value recursion and the discrete SOC grid), and THAT parity is proven
+by replay: ``tests/test_dp_energy_conservation.py::
+TestPrefixConservationAcrossConditions::test_no_prefix_creates_energy`` sweeps
+210 (starting SOC, load, PV, partial-slot) combinations, replays each selected
+plan through ``simulate_slot`` and requires the DP's own SOC trajectory to match
+to 1e-6 %. ``tests/test_slot_energy_parity.py`` sweeps this function against
+``simulate_slot`` directly.
 
 Invariants (see also docs/scheduling-algorithm.md):
 

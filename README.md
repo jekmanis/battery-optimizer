@@ -255,15 +255,21 @@ appdaemon/apps/
     ├── config.py                 # Typed config loader
     ├── models.py                 # BatteryMode, ScheduleEntry, … data types
     ├── dp_optimizer.py           # Dynamic‑programming SOC scheduler
+    ├── slot_energy.py            # The one pure slot transition (named units)
+    ├── soc_projection.py         # Shared slot‑SOC model, delegates to slot_energy
+    ├── plan_validation.py        # Continuous replay of the final plan
     ├── learning_engine.py        # Charge‑rate / efficiency learning
+    ├── thermal_model.py          # Shared battery temperature model (k1/k2)
+    ├── ambient_service.py        # T_ambient(t) across the horizon
     ├── load_profile.py           # Statistical load forecasting
     ├── pv_forecast_service.py    # Solcast PV forecast integration
+    ├── pv_bias_tracker.py        # Sliding PV forecast bias
     ├── price_service.py          # Nord Pool price fetching
+    ├── price_horizon.py          # Price recovery and horizon health
     ├── direct_control.py         # Real‑time control via set_wit_mode
     ├── cost_tracker.py           # Stored‑energy cost tracking
     ├── schedule_formatter.py     # Schedule → sensor/dashboard formatting
     ├── soc_deviation.py          # Detects unexpected SOC changes
-    ├── charge_rate_utils.py      # Temperature‑aware rate computation
     ├── ha_helpers.py             # HA state reading helpers
     └── timezone_utils.py         # TZ‑aware datetime helpers
 homeassistant/packages/

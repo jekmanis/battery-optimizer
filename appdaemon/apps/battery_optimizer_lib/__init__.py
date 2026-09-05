@@ -69,6 +69,7 @@ from .slot_energy import (
     simulate_slot,
     params_from_soc_projection,
 )
+from .plan_validation import PlanReplay, SlotReplay, replay_plan
 from .soc_deviation import SocDeviationDetector, SocDeviationConfig
 from .schedule_formatter import ScheduleFormatter, ScheduleFormatterConfig
 from .load_prediction_tracker import LoadPredictionTracker
@@ -144,6 +145,10 @@ __all__ = [
     "SlotEnergyResult",
     "simulate_slot",
     "params_from_soc_projection",
+    # Final-plan replay / validation
+    "PlanReplay",
+    "SlotReplay",
+    "replay_plan",
     # SOC deviation detection
     "SocDeviationDetector",
     "SocDeviationConfig",

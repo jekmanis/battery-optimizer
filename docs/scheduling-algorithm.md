@@ -501,11 +501,17 @@ direction claim does not apply.
   non-decreasing in temperature — the physical case while charging, since the
   rate is looked up at the start-of-slot temperature.
 - **Over-crediting**, and bounded rather than eliminated, on a pack that *cools*
-  while charging **and the rate is non-increasing in temperature over the range
+  while charging **and the rate is non-decreasing in temperature over the range
   the slot traverses**. Temperature is not spanned (the DP's 1-D energy state
   cannot carry it), so the over-credit is then at most
-  `(rate(T_start) - rate(T_end)) * slot_hours * efficiency`. Without the
-  monotonicity that bound compares two endpoints of a curve the slot leaves:
+  `(rate(T_start) - rate(T_end)) * slot_hours * efficiency`: every temperature
+  the slot visits is between `T_end` and `T_start`, so every rate it visits is
+  between the two endpoint rates. It is the same monotonicity direction the
+  warming bullet above needs, and only this direction produces an over-credit
+  at all — a rate that *falls* as temperature rises makes a cooling pack faster
+  than the rate it was looked up at, so the model under-credits and there is
+  nothing to bound. Without the monotonicity that bound compares two endpoints
+  of a curve the slot leaves:
   a pack cooling 20 → 5 °C on a curve of 2.0 kW at or above 19 °C, 0.1 kW from
   11 to 19 °C and 1.9 kW below 11 °C has both endpoints fast and the middle
   slow — the model says 25.0 %, the sub-stepped truth is 22.4 %, and the

@@ -182,6 +182,15 @@ _HEDGE_VALUE_EPS = 1e-9      # EUR/kWh
 _HEDGE_ENERGY_EPS = 1e-6     # kWh
 _HEDGE_POWER_EPS = 1e-9      # kW
 
+# The reason on the HOLD that stands in for a current interval nobody published
+# a price for. It is a real schedule entry, not an absence: the pre-solve step
+# advances the pack across that interval (a HOLD still absorbs PV surplus), and
+# a consumer that cannot see the entry rebuilds the expected-SOC trajectory
+# from the measured SOC and skips the interval entirely. Reason string rather
+# than a flag because `execute_scheduled_mode` has always constructed exactly
+# this entry on the fly and the schedule log already prints it.
+NO_PRICE_REASON = "no_price"
+
 
 def first_slot_fraction(minutes_into_slot: float, slot_minutes: int) -> float:
     """How much of the interval running NOW is still ahead of us.
@@ -1180,9 +1189,14 @@ class BatteryOptimizer(hass.Hass):
             return False
 
         # Coverage is fine, so an absent entry for the current slot means the
-        # PLAN ran out (or was never built), not that prices are missing.
+        # PLAN ran out (or was never built), not that prices are missing. The
+        # stand-in HOLD an unpriced interval leaves behind counts as absent:
+        # it was never a plan, and the price it was waiting for has arrived.
         current_slot = self._align_to_slot(now)
-        if lookup_by_time(self.schedule, current_slot, self._get_local_timezone()) is not None:
+        entry = lookup_by_time(
+            self.schedule, current_slot, self._get_local_timezone()
+        )
+        if entry is not None and not self._is_no_price_fallback(entry):
             return False
         if current_soc is None:
             return False
@@ -1821,6 +1835,21 @@ class BatteryOptimizer(hass.Hass):
             and getattr(entry, "price_source", None) == PRICE_SOURCE_MARKET
         )
 
+    def _is_no_price_fallback(self, entry: Optional[ScheduleEntry]) -> bool:
+        """True for the stand-in HOLD an unpriced current interval gets.
+
+        It occupies the slot so the expected-SOC trajectory, the deviation
+        detector and the schedule log all see what is running, but it is not a
+        PLAN: the retry still has to fetch the missing interval, and the
+        horizon extension must replace it once one arrives.
+        """
+        return (
+            entry is not None
+            and entry.mode == BatteryMode.HOLD
+            and entry.reason == NO_PRICE_REASON
+            and not self._entry_has_real_price(entry)
+        )
+
     def _advance_across_unpriced_current_slot(
         self,
         *,
@@ -1991,8 +2020,15 @@ class BatteryOptimizer(hass.Hass):
           from a real price, so that decision stands. It is still subject to
           every execution guard (enabled, manual override, min/max SOC): this
           keeps a decision that was made on real data, it does not exempt it.
-        * ``"fallback"`` - nothing can vouch for a price, so the slot is left
-          unplanned and `execute_scheduled_mode` applies HOLD/`no_price`.
+        * ``"fallback"`` - nothing can vouch for a price, so the slot gets a
+          HOLD/`no_price` entry with no provenance. It is an ENTRY, not an
+          absence: the pre-solve step already advanced the pack across this
+          interval (a HOLD still absorbs PV surplus), and a schedule that omits
+          it makes `expected_soc_schedule` restart from the measured SOC and
+          skip the interval, contradicting the SOC the DP was handed. Every
+          path that treated the absence as the signal - the `no_price` retry
+          arming in `execute_scheduled_mode`, the diagnostics, the horizon
+          extension - now tests `_is_no_price_fallback` instead.
 
         Shared by every planning path (`full_optimize`,
         `_recalculate_remaining_schedule` and therefore SOC deviation, PV
@@ -2011,6 +2047,11 @@ class BatteryOptimizer(hass.Hass):
             # it to HOLD, which is the fallback outcome, so say so.
             return "planned" if self._entry_has_real_price(existing) else "fallback"
         if not self._entry_has_real_price(previous_entry):
+            schedule[canonical_slot_key(current_slot)] = ScheduleEntry(
+                time=current_slot,
+                mode=BatteryMode.HOLD,
+                reason=NO_PRICE_REASON,
+            )
             return "fallback"
 
         retained = ScheduleEntry(
@@ -3069,7 +3110,13 @@ class BatteryOptimizer(hass.Hass):
                     current_slot = schedule_hour
                     break
 
-        if entry is None:
+        if entry is None or self._is_no_price_fallback(entry):
+            # No plan, or the stand-in HOLD a planning path leaves for an
+            # interval nobody published. The two are the same failure and get
+            # the same answer: the entry exists so the expected-SOC trajectory
+            # and the schedule log can see what is running, and it must not
+            # make the missing price look answered.
+            #
             # HOLD stays the safe answer while there is no plan - recovery must
             # never invent a cheap price and force charging. But an empty
             # current slot IS a coverage failure, so ask for prices again on a

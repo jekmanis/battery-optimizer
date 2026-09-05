@@ -446,7 +446,15 @@ the substitution planned, logged and EXECUTED the live slot on a number nobody
 published (yesterday at 0.01 against a real 1.00 next slot produced a grid-charge
 command). Planning now starts at the next validated interval; the current slot
 either keeps an existing entry that carries `ScheduleEntry.price_source ==
-"market"` provenance or applies `HOLD/no_price`. `execute_scheduled_mode`
+"market"` provenance or gets a real `HOLD/no_price` entry with no provenance —
+an ENTRY, not an absence, because the pre-solve step advanced the pack across
+that interval and a schedule that omits it makes `expected_soc_schedule`
+restart from the measured SOC and skip the quarter hour the DP was handed
+(40 % published against the DP's 42.3776 % at 10:15, one fixture, one slot).
+`schedule` is the one source of truth for what runs; the paths that used to key
+off the absence test `_is_no_price_fallback` instead, so the retry arming, the
+`current_slot_entry: fallback` diagnostics and the horizon extension are
+unchanged. `execute_scheduled_mode`
 refuses to send any non-HOLD current-slot entry without that provenance. Asking a
 source for the missing interval is a **fetch** and belongs in the price service
 and the retry, never a substitution at planning time. See

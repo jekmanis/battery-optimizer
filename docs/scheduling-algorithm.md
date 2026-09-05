@@ -1275,11 +1275,30 @@ What happens instead:
   guard - the enable switch, the manual override, the min-SOC and max-SOC
   overrides. Retention keeps a decision made on real data; it does not exempt
   it from anything.
-- **Otherwise the slot applies `HOLD` with reason `no_price`**, the retry stays
-  armed, and no other command is sent for that slot. (`no_schedule` remains the
-  reason for the different failure where prices are fine and the plan ran out;
-  a restart that has not fetched yet also reports `no_schedule`, because an
-  empty snapshot says nothing about whether the interval was published.)
+- **Otherwise the slot gets a `HOLD` entry with reason `no_price`**, no price
+  provenance, the retry stays armed, and no other command is sent for that
+  slot. (`no_schedule` remains the reason for the different failure where
+  prices are fine and the plan ran out; a restart that has not fetched yet also
+  reports `no_schedule`, because an empty snapshot says nothing about whether
+  the interval was published.)
+
+  It is an **entry, not an absence**. The pre-solve step advanced the pack
+  across this interval, so a schedule that omits it makes both callers rebuild
+  `expected_soc_schedule` from the measured SOC and skip the interval
+  altogether: at 10:07 with 40 % SOC and 3 kW of PV the DP starts 10:15 at
+  42.3776 % while the published trajectory says 40 %, for the same quarter
+  hour. `schedule` is the one source of truth for what runs, and every
+  consumer walks it; the alternative — threading an advanced SOC, temperature
+  and time anchor through `calculate_expected_soc_schedule`,
+  `project_schedule_trajectory`, the cost projection and the deviation
+  detector's anchor — is four more places that can disagree.
+
+  A stand-in `HOLD` must not make the missing price look answered, so the
+  paths that used to key off the absence test for it instead
+  (`_is_no_price_fallback`): `execute_scheduled_mode` still applies
+  `HOLD/no_price` and still arms the retry, the diagnostics still report
+  `current_slot_entry: fallback`, and the adaptive horizon extension still
+  rebuilds over it once the interval is published.
 - **`execute_scheduled_mode` will not send a non-HOLD current-slot entry that
   carries no provenance.** After the above there should be none, so this is a
   guard that makes the claim falsifiable rather than a rule the code merely

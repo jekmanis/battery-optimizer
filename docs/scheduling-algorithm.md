@@ -415,12 +415,26 @@ the two actions apart. `BatteryOptimizer._cloud_safe_hedge` requires all four:
    plan stored the whole surplus in the pack. The check reads the shared
    model's continuous trajectory of the HOLD plan, not the DP's quantized one:
    a single SOC step of rounding is enough to hide a slot's worth of
-   exportable PV. A full pack therefore never converts — which is the planning
-   side of the execution-time `DISCHARGE -> HOLD at max SOC with PV > load`
-   override.
+   exportable PV. A full pack with a **sellable** surplus therefore never
+   converts — which is the planning side of the execution-time
+   `DISCHARGE -> HOLD at max SOC with PV > load` override. (With export
+   remuneration at zero there is nothing to curtail, so this condition does not
+   apply and a full pack may convert; the execution-time override still stands
+   behind it.)
 3. **The avoided import beats battery wear**, per discharged DC kWh.
-4. **The avoided import beats the value of keeping that kWh** — the DP's own
-   terminal rate (`terminal_energy_value_eur_kwh`, or the derived `auto` value).
+4. **The avoided import beats what the plan says the kWh is worth kept** —
+   `max(terminal rate, best marginal_value_eur_kwh among LATER DISCHARGE slots
+   of this plan)`. The horizon-end terminal rate alone is not an opportunity
+   cost: with the common `terminal_energy_value_eur_kwh: 0` it is zero while
+   the plan is reserving that kWh for a 1.00 EUR/kWh evening slot, and the
+   hedge would spend it to avoid 0.10 of import the moment a cloud arrived.
+   The per-slot `marginal_value_eur_kwh` the DP already fills is exactly the
+   EUR the plan expects from that kWh in that slot; a missing value counts as
+   zero. This is deliberately **conservative**: it ignores whether the pack
+   would have been recharged (from PV or a cheap slot) before the expensive
+   slot, so the hedge is refused on some slots where spending the kWh would in
+   fact have cost nothing. Under-hedging is the accepted direction of error —
+   the insurance is optional, the energy the plan is counting on is not.
 
 Converted entries keep the DP's marginal value, because their modeled flow is
 unchanged; their `value_basis` becomes `kept (cloud-safe)` so a DISCHARGE row
@@ -429,9 +443,10 @@ are rebuilt from the final schedule through the shared model, and the mode
 census is taken after the conversion.
 
 **Forecast equivalence is not equivalence under every cloud event.** If PV does
-collapse, the hedge spends energy that a later, more expensive slot may have
-been counting on; conditions 3 and 4 bound that per kWh against the plan's own
-valuation, but not against the best remaining slot. The expected SOC trajectory
+collapse, the pack drains where the plan expected it to idle. Conditions 3 and
+4 price that per kWh against the plan's own numbers, but they cannot model a
+*sequence* of cloudy slots, a load above forecast, or a peak that arrives after
+a charge the hedge made unaffordable. The expected SOC trajectory
 assumes PV covers the slot, so a cloud-induced drain surfaces as an SOC
 deviation, and the reactive PV-shortfall path forces a forecast refresh and a
 replan — that, not the hedge itself, is what limits the exposure.

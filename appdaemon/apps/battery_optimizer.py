@@ -193,6 +193,39 @@ def _cloud_safe_candidates(schedule, predict_load_kw, predict_pv_kw):
     return candidates
 
 
+def _best_later_discharge_value(schedule):
+    """Per slot: the best EUR/kWh any LATER slot of this plan discharges at.
+
+    This is the opportunity cost of one stored DC kWh at that point in the
+    horizon, taken from the plan's own numbers: ``marginal_value_eur_kwh`` is
+    what the DP scored each DISCHARGE slot with (avoided import or export
+    revenue, net of wear, per battery DC kWh). The horizon-end terminal value
+    is NOT that quantity — with the common ``terminal_energy_value_eur_kwh: 0``
+    it is zero while the plan may still be reserving the kWh for a 1.00
+    EUR/kWh evening slot, which is exactly the "silently spend energy assigned
+    to later slots" failure.
+
+    A missing value counts as 0, and the running maximum starts at 0, so the
+    result is never negative.
+
+    Conservative in one direction: it ignores whether the pack would have been
+    recharged before that expensive slot, so the hedge is refused on some slots
+    where spending the kWh would in fact have cost nothing. Under-hedging is
+    the accepted direction of error — the hedge is an optional insurance, the
+    energy the plan is counting on is not.
+    """
+    best_after = {}
+    running = 0.0
+    for slot_time in sorted(schedule.keys(), key=instant_key, reverse=True):
+        best_after[slot_time] = running
+        entry = schedule[slot_time]
+        if entry.mode == BatteryMode.DISCHARGE:
+            value = getattr(entry, "marginal_value_eur_kwh", None) or 0.0
+            if value > running:
+                running = value
+    return best_after
+
+
 def _hold_stores_all_pv_surplus(
     *,
     slot_time,
@@ -253,15 +286,18 @@ def _cloud_safe_hedge(
     cloud case: if PV collapses, the battery — not the grid — picks up the
     load, without waiting for the shortfall re-optimization.
 
-    Forecast equivalence is NOT equivalence under every cloud event: the energy
-    the hedge spends may have been planned for a more expensive slot later.
-    That is why the hedge additionally requires the avoided import to beat both
-    wear and the DP's own valuation of keeping the energy (``terminal_rate``),
-    and why the reactive PV-shortfall path stays in place to bound the
-    exposure. It is a hedge, not an improvement on the DP's economics.
+    Forecast equivalence is NOT equivalence under every cloud event: if PV does
+    collapse, the hedge spends a kWh the plan may have assigned to a later,
+    more expensive slot. So the avoided import must beat wear AND the value of
+    keeping the kWh, where "keeping" is priced at the better of the horizon-end
+    terminal rate and the best later DISCHARGE slot of this very plan
+    (``_best_later_discharge_value``). The reactive PV-shortfall replan stays in
+    place to bound what is left. It is a hedge, not an improvement on the DP's
+    economics.
     """
     inv_eff = config.inverter_efficiency if config.inverter_efficiency > 0 else 1.0
-    keep_value = max(0.0, terminal_rate or 0.0)
+    terminal_floor = max(0.0, terminal_rate or 0.0)
+    best_later_value = _best_later_discharge_value(schedule)
     converted = []
 
     for slot_time in candidates:
@@ -272,8 +308,10 @@ def _cloud_safe_hedge(
         buy_price = (price + config.grid_fee) * config.import_price_multiplier
         # Value of serving the load from the pack instead of the grid IF the
         # forecast is wrong, per battery DC kWh. It must beat wear AND what the
-        # plan says that kWh is worth kept.
+        # plan says that kWh is worth kept — at the horizon end, and in the
+        # best later slot the plan already means to spend it in.
         hedge_value = buy_price * inv_eff - config.battery_wear_cost
+        keep_value = max(terminal_floor, best_later_value.get(slot_time, 0.0))
         if hedge_value <= keep_value + _HEDGE_VALUE_EPS:
             continue
 

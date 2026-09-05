@@ -32,9 +32,11 @@ from .learning_engine import BatteryLearningEngine
 from .load_profile import LoadProfile, _quantile
 from .price_service import NordPoolPriceService
 from .price_horizon import (
+    COVERAGE_REASONS,
     HorizonHealth,
     PriceHorizonConfig,
     PriceHorizonMonitor,
+    is_coverage_reason,
 )
 from .direct_control import (
     ApplyOutcome,
@@ -95,9 +97,11 @@ __all__ = [
     "LoadProfile",
     "NordPoolPriceService",
     # Price horizon health / recovery
+    "COVERAGE_REASONS",
     "HorizonHealth",
     "PriceHorizonConfig",
     "PriceHorizonMonitor",
+    "is_coverage_reason",
     "DirectControl",
     "ApplyOutcome",
     "ModeSensorVerifier",

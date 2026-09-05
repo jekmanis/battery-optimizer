@@ -158,7 +158,7 @@ Common parameters (see `apps.yaml.example` for the full, commented list):
 | `price_retry_enabled` | true | Retry a failed or incomplete price fetch automatically — see *Price recovery* |
 | `price_retry_delays_seconds` | `[30, 120, 300]` | Backoff for the 1st/2nd/3rd retry (list or `"30,120,300"`); every further attempt waits `price_retry_max_seconds` |
 | `price_retry_max_seconds` | 900 | Cap for the backoff |
-| `price_retain_max_age_hours` | 36 | How long already‑fetched **future** intervals may be reused to fill a shortened or failed refresh |
+| `price_retain_max_age_hours` | 36 | How long already‑fetched **future** intervals stay reusable **without any non‑empty reply** — a backstop for a silent source, not a per‑interval age |
 
 ### Price recovery
 
@@ -175,9 +175,19 @@ so the enable switch and the manual override still decide whether anything is
 sent to the inverter. While waiting, the safe `HOLD` stands — recovery never
 invents a price.
 
+An incomplete horizon is *noted*, never acted on: missing tomorrow between
+`tomorrow_prices_hour` and publication is normal, so the periodic pass records
+it and still runs the reactive PV‑shortfall check.
+
 Coverage state is published on `sensor.battery_optimizer` under the
 `price_horizon` attribute (`ok`, `reason`, `horizon_end`, `required_end`,
-`last_success_horizon_end`, `retry_pending`, `retry_attempts`).
+`last_success_horizon_end`, `last_failure_reason`, `retry_pending`,
+`retry_attempts`).
+
+**Set a timezone in AppDaemon.** The "end of tomorrow" boundary needs real DST
+rules; when `get_timezone()` reports no usable zone the app falls back to the
+current UTC offset and warns once, and that boundary is an hour off on the two
+DST transition days.
 
 ### End‑of‑horizon value (`0` = no‑salvage mode)
 

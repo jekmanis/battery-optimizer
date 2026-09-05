@@ -23,6 +23,7 @@ appdaemon/apps/
 │   ├── pv_forecast_service.py     # PV forecast fetching (Solcast / Forecast.Solar)
 │   ├── pv_bias_tracker.py         # Sliding PV forecast bias + slot-energy sampling
 │   ├── price_service.py           # Nord Pool price fetching
+│   ├── price_horizon.py           # Price coverage health + bounded recovery backoff
 │   ├── direct_control.py          # Direct inverter control via set_wit_mode
 │   ├── cost_tracker.py            # Battery cost tracking
 │   ├── schedule_formatter.py      # Schedule logging/formatting
@@ -56,6 +57,7 @@ tests/
 | `pv_forecast_service.py` | PvForecastService, PvForecastServiceConfig | PV forecast fetching (Solcast / Forecast.Solar) |
 | `pv_bias_tracker.py` | PvBiasTracker, PvBiasConfig, ClosedSlot | Slot-energy PV sampling and sliding actual/forecast bias |
 | `price_service.py` | NordPoolPriceService | Nord Pool price fetching (built-in HA + HACS) |
+| `price_horizon.py` | PriceHorizonMonitor, PriceHorizonConfig, HorizonHealth | Usable-coverage verdict, retained intervals, recovery backoff state |
 | `direct_control.py` | DirectControl | Direct inverter control via `growatt_modbus/set_wit_mode` |
 | `cost_tracker.py` | BatteryCostTracker, BatteryCostConfig | Battery cost tracking with weighted averages |
 | `schedule_formatter.py` | ScheduleFormatter, ScheduleFormatterConfig | Schedule logging and HA sensor formatting |
@@ -317,9 +319,29 @@ wording does not match master.
 - **13:15 daily**: Full optimization (after Nord Pool prices publish)
 - **Startup**: Initial optimization
 - **Every `pv_sample_seconds` (60s)**: PV power sampling + slot close + bias refresh
-- **Every 15 min**: Adaptive re-evaluation + schedule change logging
+- **Every 15 min**: Adaptive re-evaluation + schedule change logging + price-horizon health check
 - **Every 5 min**: Safety checks
 - **Hourly**: Mode execution + battery cost update
+- **On demand, bounded backoff (30s / 2min / 5min / 15min)**: price recovery —
+  `_price_recovery_retry`, armed by whichever path noticed the unusable horizon
+
+**Price coverage has one owner.** `battery_optimizer_lib/price_horizon.py`
+answers "is the horizon usable" (current interval present, contiguous, reaching
+the end of the current publication window — measured between UTC instants, never
+as a count of slots, because a Riga DST day is 92 or 100 quarter-hours). The
+orchestrator owns only the timer: **at most one pending retry per app
+instance**, carrying a generation token so a timer queued before a disable,
+a `terminate()` or a successful recovery is inert. Every path that can notice the
+same gap in the same minute — `full_optimize`, the `no_schedule` HOLD in
+`execute_scheduled_mode`, `adaptive_optimize` — shares that one retry and none of
+them advances the backoff while it is armed.
+
+The periodic adaptive pass evaluates the **last known** snapshot and never
+fetches; the retry is the only new path that performs a blocking price fetch,
+and it does so exactly where `full_optimize` already did. Recovery rebuilds
+through `_recalculate_remaining_schedule` -> `execute_scheduled_mode`, so
+enabled/override gating and command tracking are unchanged: during a manual
+override the plan is refreshed and nothing is sent.
 
 ## Deployment to the HA machine
 

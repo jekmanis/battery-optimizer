@@ -7,6 +7,7 @@ This package contains helper modules for the main BatteryOptimizer AppDaemon app
 - learning_engine: Self-learning battery performance tracking
 - load_profile: Statistical load forecasting by time-of-day
 - price_service: Nord Pool electricity price fetching
+- price_horizon: Price coverage health and bounded price-recovery backoff
 - direct_control: Direct inverter control via set_wit_mode service
 - timezone_utils: Timezone-aware datetime comparison and slot alignment
 - ha_helpers: Home Assistant state reading helpers
@@ -30,6 +31,11 @@ from .pv_profile import PvProfile
 from .learning_engine import BatteryLearningEngine
 from .load_profile import LoadProfile, _quantile
 from .price_service import NordPoolPriceService
+from .price_horizon import (
+    HorizonHealth,
+    PriceHorizonConfig,
+    PriceHorizonMonitor,
+)
 from .direct_control import (
     ApplyOutcome,
     DirectControl,
@@ -88,6 +94,10 @@ __all__ = [
     "BatteryLearningEngine",
     "LoadProfile",
     "NordPoolPriceService",
+    # Price horizon health / recovery
+    "HorizonHealth",
+    "PriceHorizonConfig",
+    "PriceHorizonMonitor",
     "DirectControl",
     "ApplyOutcome",
     "ModeSensorVerifier",

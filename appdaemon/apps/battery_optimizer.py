@@ -25,6 +25,10 @@ from battery_optimizer_lib import (
     BatteryLearningEngine,
     LoadProfile,
     NordPoolPriceService,
+    # Price coverage health + bounded recovery backoff
+    HorizonHealth,
+    PriceHorizonConfig,
+    PriceHorizonMonitor,
     DirectControl,
     # App-wide callback lock (AppDaemon multi-thread dispatch)
     CallbackLock,
@@ -368,6 +372,11 @@ class BatteryOptimizer(hass.Hass):
                 log_func=self.log,
             )
 
+            # One owner for price-coverage health and recovery scheduling.
+            # Built AFTER the price service and BEFORE the first thing that can
+            # fetch prices, because `get_prices()` merges through it.
+            self._init_price_recovery_state()
+
             # Schedule formatter for logging and sensor updates
             self._schedule_formatter = ScheduleFormatter(
                 config=ScheduleFormatterConfig(
@@ -506,6 +515,20 @@ class BatteryOptimizer(hass.Hass):
                 self._check_soc_boundaries(startup_soc)
 
             self.log("Battery Optimizer initialized successfully")
+
+    @_timed_callback
+    def terminate(self):
+        """AppDaemon teardown: make every pending timer of this instance inert.
+
+        AppDaemon cancels an app's timers on reload, but the price retry is the
+        one callback that would otherwise re-plan and re-apply a mode on behalf
+        of an app that is going away. `_terminated` is the belt to
+        `_cancel_price_retry`'s braces: a callback already queued by the
+        scheduler finds both the flag set and its generation token cleared.
+        """
+        self._terminated = True
+        self._cancel_price_retry()
+        self.log("Battery Optimizer terminated")
 
     def _should_warn_degenerate_terminal(self) -> bool:
         """Rate-limit the legacy terminal-value warning to once every 6 hours.
@@ -675,8 +698,271 @@ class BatteryOptimizer(hass.Hass):
     # =========================================================================
 
     def get_prices(self) -> List[PricePoint]:
-        """Fetch prices from Nord Pool. Delegates to NordPoolPriceService."""
-        return self._price_service.get_prices()
+        """Fetch prices from Nord Pool, keeping still-valid known intervals.
+
+        `NordPoolPriceService` already falls back to its cache when EVERY source
+        fails, but it replaces the cache wholesale on any non-empty reply. A
+        service that answers with today only - which happens around the daily
+        publication, and whenever the tomorrow request errors on its own - used
+        to shorten a horizon that already contained tomorrow.
+
+        `PriceHorizonMonitor.merge_with_retained` fills only the FUTURE
+        intervals the fresh reply does not contain, and a fresh value always
+        wins over a retained one. Nothing is invented, extrapolated, or carried
+        across the retention age limit.
+        """
+        monitor = getattr(self, "_price_horizon", None)
+        try:
+            prices = self._price_service.get_prices()
+        except Exception as e:
+            # A raising provider (REST layer, HA restart, malformed response)
+            # must degrade to "no fresh data", not abort the callback that was
+            # about to notice the missing horizon and schedule a retry.
+            self.log(f"Price fetch failed: {e}", level="WARNING")
+            prices = []
+        if monitor is None:
+            return prices
+        return monitor.merge_with_retained(prices, self.datetime())
+
+    # =========================================================================
+    # Price coverage health and bounded recovery
+    #
+    # Defect: `full_optimize` returned on missing prices without scheduling a
+    # retry, `adaptive_optimize` was not a price-refresh pass, and
+    # `execute_scheduled_mode` applied HOLD/no_schedule forever. A transient
+    # empty reply, or a reply without tomorrow after the publication window,
+    # left the optimizer on an old or absent plan until the next daily run.
+    #
+    # ONE owner: `PriceHorizonMonitor` decides *whether* coverage is usable and
+    # *how long* to wait; this section owns the AppDaemon timer, the generation
+    # guard, and the "at most one pending retry" rule. Recovery never invents a
+    # price and never forces a mode: it re-fetches, and on success rebuilds
+    # through the normal execution path so the enabled/override checks and the
+    # command tracking still apply.
+    # =========================================================================
+
+    def _init_price_recovery_state(self) -> None:
+        """Create the horizon monitor and the retry bookkeeping."""
+        self._price_horizon = PriceHorizonMonitor(
+            config=PriceHorizonConfig.from_main_config(self.config),
+            get_timezone_func=self._get_local_timezone,
+            log_func=self.log,
+        )
+        # At most ONE pending retry per app instance. `_price_retry_token` is
+        # the token of the retry that is allowed to run; a callback arriving
+        # with any other token belongs to a superseded generation and is inert.
+        self._price_retry_token: Optional[int] = None
+        self._price_retry_seq: int = 0
+        self._price_retry_handle = None
+        self._terminated: bool = False
+
+    def _price_retry_pending(self) -> bool:
+        return getattr(self, "_price_retry_token", None) is not None
+
+    def _arm_price_retry(self, delay_seconds: float, reason: str) -> None:
+        """Schedule the single pending price retry, if one is not already due."""
+        if getattr(self, "_terminated", False):
+            return
+        if not self.config.price_retry_enabled:
+            return
+        if self._price_retry_pending():
+            # Already one in flight: a retry storm is exactly what the bounded
+            # backoff exists to prevent, and every failing path (full_optimize,
+            # execute_scheduled_mode, adaptive_optimize) can fire in the same
+            # minute.
+            return
+        self._price_retry_seq = getattr(self, "_price_retry_seq", 0) + 1
+        token = self._price_retry_seq
+        self._price_retry_token = token
+        try:
+            self._price_retry_handle = self.run_in(
+                self._price_recovery_retry,
+                delay_seconds,
+                price_retry_token=token,
+            )
+        except Exception as e:
+            # A timer we could not register must not look pending forever.
+            self._price_retry_token = None
+            self._price_retry_handle = None
+            self.log(f"Could not schedule price retry: {e}", level="WARNING")
+            return
+        self.log(
+            f"Price recovery scheduled in {delay_seconds:.0f}s ({reason}, "
+            f"attempt {self._price_horizon.attempts})",
+            level="DEBUG",
+        )
+
+    def _cancel_price_retry(self) -> None:
+        """Invalidate the pending retry (generation guard + best-effort cancel).
+
+        Clearing the token is what actually makes the callback inert: AppDaemon
+        may still fire an already-queued timer, and a timer registered before a
+        disable/terminate must never replace a newer valid plan.
+        """
+        self._price_retry_token = None
+        handle = getattr(self, "_price_retry_handle", None)
+        self._price_retry_handle = None
+        if handle is None:
+            return
+        try:
+            self.cancel_timer(handle)
+        except Exception:
+            pass
+
+    def _review_price_horizon(
+        self,
+        prices: Optional[List[PricePoint]],
+        now: Optional[datetime.datetime] = None,
+        context: str = "",
+    ) -> "HorizonHealth":
+        """Judge coverage and either reset the backoff or arm the next retry."""
+        now = now if now is not None else self.datetime()
+        monitor = self._price_horizon
+        health = monitor.evaluate(prices, now)
+        if health.ok:
+            was_failing = monitor.attempts > 0
+            monitor.record_success(health, now)
+            self._cancel_price_retry()
+            if was_failing:
+                monitor.clear_log_gate("horizon_incomplete")
+                self.log(
+                    f"Price horizon recovered ({context or 'check'}): coverage to "
+                    f"{health.horizon_end}"
+                )
+            return health
+
+        self._note_price_horizon_failure(health.reason, now, health, context)
+        return health
+
+    def _note_price_horizon_failure(
+        self,
+        reason: str,
+        now: Optional[datetime.datetime] = None,
+        health: Optional["HorizonHealth"] = None,
+        context: str = "",
+    ) -> None:
+        """Record a coverage failure and arm the bounded retry.
+
+        Also reached from `execute_scheduled_mode`'s HOLD/no_schedule branch:
+        an empty current slot is a coverage failure even when nothing fetched.
+        """
+        if not self._is_enabled():
+            # A disabled optimizer plans nothing; retrying would only produce
+            # background work and log noise.
+            return
+        if self._price_retry_pending():
+            # One armed retry already covers this failure. Counting it again
+            # would inflate the backoff (and the log) purely because several
+            # paths - full_optimize, the slot execution and the adaptive pass -
+            # can notice the same missing horizon within the same minute.
+            return
+        now = now if now is not None else self.datetime()
+        monitor = self._price_horizon
+        delay = monitor.record_failure(reason, now, health)
+        if monitor.should_log("horizon_incomplete", now):
+            detail = ""
+            if health is not None and health.horizon_end is not None:
+                detail = (
+                    f" (coverage to {health.horizon_end}, required "
+                    f"{health.required_end})"
+                )
+            self.log(
+                f"Price horizon unusable: {reason}{detail}"
+                f"{' during ' + context if context else ''} - retrying in "
+                f"{delay:.0f}s (attempt {monitor.attempts})",
+                level="WARNING",
+            )
+        self._arm_price_retry(delay, reason)
+
+    @_timed_callback
+    def _price_recovery_retry(self, kwargs=None) -> None:
+        """Timer callback: re-fetch prices and rebuild the plan if they arrived.
+
+        Inert unless it is the generation that is currently allowed to run, so
+        a timer queued before a disable, a terminate, or a successful recovery
+        cannot resurrect a superseded plan.
+        """
+        token = (kwargs or {}).get("price_retry_token")
+        if getattr(self, "_terminated", False):
+            return
+        if token is None or token != getattr(self, "_price_retry_token", None):
+            self.log("Ignoring stale price recovery callback", level="DEBUG")
+            return
+        # Consume this generation before doing any work: whatever happens next
+        # either succeeds (nothing pending) or arms the next attempt itself.
+        self._price_retry_token = None
+        self._price_retry_handle = None
+
+        if not self._is_enabled():
+            self.log("Optimizer disabled, abandoning price recovery", level="DEBUG")
+            return
+
+        now = self.datetime()
+        prices = self.get_prices()
+        health = self._review_price_horizon(prices, now, context="price_recovery")
+        if not health.ok:
+            return
+
+        current_soc = self._get_current_soc()
+        if current_soc is None:
+            # Prices are back but the battery is unreadable: treat it as an
+            # unfinished recovery rather than planning from a guessed SOC.
+            self._note_price_horizon_failure("soc_unavailable", now, health)
+            return
+
+        # Rebuild from the CURRENT SOC and time. `_recalculate_remaining_schedule`
+        # projects only the remaining fraction of the active slot and finishes
+        # with `execute_scheduled_mode(None)`, which is the normal execution
+        # path: it re-checks enabled/override and tracks the command. During a
+        # manual override it therefore refreshes the plan without sending
+        # anything to the inverter.
+        self.log("Price data recovered - rebuilding the remaining schedule")
+        self._recalculate_remaining_schedule(current_soc)
+        self._last_recalc_trigger = "price_recovery"
+        self._last_recalc_time = now
+
+    def _check_price_horizon_health(self, current_soc: Optional[float]) -> bool:
+        """Periodic horizon check for `adaptive_optimize`.
+
+        Deliberately evaluates the LAST KNOWN price snapshot rather than
+        fetching: a fetch is a blocking REST call on the shared AppDaemon
+        thread, and this runs every `adaptive_recalc_minutes`. When the snapshot
+        is unusable the bounded retry does the fetching.
+
+        Returns True when it took an action the caller should not duplicate.
+        """
+        now = self.datetime()
+        monitor = self._price_horizon
+        health = monitor.evaluate(monitor.retained_prices, now)
+        if not health.ok:
+            self._note_price_horizon_failure(
+                health.reason, now, health, context="adaptive"
+            )
+            return True
+
+        # Coverage is fine, so an absent entry for the current slot means the
+        # PLAN ran out (or was never built), not that prices are missing.
+        current_slot = self._align_to_slot(now)
+        if lookup_by_time(self.schedule, current_slot, self._get_local_timezone()) is not None:
+            return False
+        if current_soc is None:
+            return False
+        if monitor.should_log("schedule_exhausted", now):
+            self.log(
+                f"No schedule entry for {current_slot} but prices cover the "
+                f"horizon - rebuilding"
+            )
+        self._recalculate_remaining_schedule(current_soc)
+        self._last_recalc_trigger = "horizon_extension"
+        self._last_recalc_time = now
+        return True
+
+    def _price_horizon_diagnostics(self) -> Dict:
+        """Coverage/retry payload published on `sensor.battery_optimizer`."""
+        monitor = getattr(self, "_price_horizon", None)
+        if monitor is None:
+            return {}
+        return monitor.diagnostics(retry_pending=self._price_retry_pending())
 
     # =========================================================================
     # Optimization Algorithm
@@ -1279,8 +1565,12 @@ class BatteryOptimizer(hass.Hass):
             self.log("Cannot get current SOC, skipping optimization", level="WARNING")
             return
 
-        # Fetch prices
+        # Fetch prices, then judge COVERAGE - not just "did the call return
+        # something". A reply with today only, after the tomorrow publication
+        # window, is an incomplete horizon and arms the bounded retry here
+        # rather than waiting for the next daily run.
         prices = self.get_prices()
+        self._review_price_horizon(prices, now, context="full_optimize")
         if not prices:
             self.log("No price data available, skipping optimization", level="WARNING")
             return
@@ -1395,6 +1685,14 @@ class BatteryOptimizer(hass.Hass):
             )
             self._handle_mode_transition(BatteryMode.HOLD)
             self._apply_mode_tracked(entry)
+            return
+
+        # Horizon health on the periodic pass. Without it, an absent or
+        # exhausted schedule could only recover through an unrelated SOC/PV
+        # event or the next daily optimization. This reads the last known price
+        # snapshot - it never adds a blocking fetch to the periodic path; the
+        # bounded retry does the fetching when the snapshot is unusable.
+        if self._check_price_horizon_health(current_soc):
             return
 
         # Reactive PV check on the just-COMPLETED slot.  The comparison uses the
@@ -1709,10 +2007,17 @@ class BatteryOptimizer(hass.Hass):
                     break
 
         if entry is None:
+            # HOLD stays the safe answer while there is no plan - recovery must
+            # never invent a cheap price and force charging. But an empty
+            # current slot IS a coverage failure, so ask for prices again on a
+            # bounded backoff instead of holding until the next daily run.
             entry = ScheduleEntry(
                 time=current_slot,
                 mode=BatteryMode.HOLD,
                 reason="no_schedule",
+            )
+            self._note_price_horizon_failure(
+                "no_schedule", now, context="execute_scheduled_mode"
             )
 
         self.log(f"Executing scheduled mode for {current_slot}: {entry.mode.name} ({entry.reason})")
@@ -2335,9 +2640,19 @@ class BatteryOptimizer(hass.Hass):
             # uncommanded grid energy, so the window keeps its original expiry.
             if released:
                 self._shrink_grid_charge_window()
+            # A disabled optimizer must not keep waking up to fetch prices, and
+            # a retry armed before the toggle must not plan on its behalf.
+            self._cancel_price_retry()
         elif new == "on" and old == "off":
             self.log("Optimizer re-enabled — resuming scheduled operation")
+            # Start recovery from a clean backoff: the horizon may have gone
+            # stale while disabled, and the previous attempt count says nothing
+            # about the price service now.
+            self._price_horizon.reset_backoff()
             self.execute_scheduled_mode(None)
+            self._review_price_horizon(
+                self._price_horizon.retained_prices, context="enable"
+            )
 
     @_timed_callback
     def on_override_change(self, entity, attribute, old, new, kwargs):
@@ -3191,6 +3506,10 @@ class BatteryOptimizer(hass.Hass):
                     "next_discharge": next_discharge,
                     "last_optimization": self.last_optimization.isoformat() if self.last_optimization else None,
                     "prices_cached": len(self._price_service.cached_prices),
+                    # Coverage health: last usable horizon end, why it is not
+                    # usable, and whether a bounded retry is pending. A nonempty
+                    # `prices_cached` alone never proved a usable horizon.
+                    "price_horizon": self._price_horizon_diagnostics(),
                     "battery_avg_cost": round(self.battery_avg_cost, 4),
                     "discharge_threshold": round(self._get_discharge_threshold(), 4),
                     # Decision transparency attributes

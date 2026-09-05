@@ -5,7 +5,7 @@ Centralizes all configuration with type hints, defaults, and validation.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 
 
 # Emitted at startup (config load) and by the DP whenever the deployed
@@ -64,6 +64,19 @@ class BatteryOptimizerConfig:
     nordpool_area: str = "LV"
     nordpool_sensor: str = "sensor.nord_pool_lv_current_price"  # For HACS component
     tomorrow_prices_hour: int = 14  # Hour when tomorrow's prices become available (local time)
+
+    # Price recovery: a transient fetch failure, or a reply without tomorrow's
+    # intervals after `tomorrow_prices_hour`, used to leave the app on an old or
+    # absent plan until the next daily optimization. Recovery is a bounded
+    # backoff with at most ONE pending retry (see price_horizon.py).
+    price_retry_enabled: bool = True
+    # Delays for the 1st, 2nd, 3rd attempt; every further attempt waits
+    # `price_retry_max_seconds`.
+    price_retry_delays_seconds: Tuple[int, ...] = (30, 120, 300)
+    price_retry_max_seconds: int = 900
+    # How long already-fetched FUTURE intervals may be reused to fill a
+    # shortened or failed refresh.
+    price_retain_max_age_hours: float = 36.0
 
     # =========================================================================
     # Home Assistant Connection
@@ -480,6 +493,24 @@ class BatteryOptimizerConfig:
         self.verify_source = source
         self.callback_warn_seconds = max(1.0, min(60.0, float(self.callback_warn_seconds)))
 
+        # Price recovery backoff. A zero/negative first delay would turn the
+        # bounded retry into a busy loop against the price service, so every
+        # step is floored at 5 s and capped by `price_retry_max_seconds`.
+        self.price_retry_enabled = bool(self.price_retry_enabled)
+        self.price_retry_max_seconds = max(
+            30, min(3600, int(self.price_retry_max_seconds))
+        )
+        delays = tuple(
+            max(5, min(self.price_retry_max_seconds, int(d)))
+            for d in (self.price_retry_delays_seconds or ())
+        )
+        self.price_retry_delays_seconds = delays or (
+            min(30, self.price_retry_max_seconds),
+        )
+        self.price_retain_max_age_hours = max(
+            0.0, min(168.0, float(self.price_retain_max_age_hours))
+        )
+
         # Compute derived values
         self.slot_hours = self.slot_minutes / 60.0
 
@@ -530,6 +561,35 @@ class BatteryOptimizerConfig:
         if load_observation_minutes <= 0 or 1440 % load_observation_minutes != 0:
             log_warn(f"Invalid load_observation_minutes={load_observation_minutes}, falling back to 15")
 
+        # Price-recovery backoff. Accepts a YAML list, a comma-separated string
+        # or a single number; a blank key means "use the default".
+        def parse_delays(raw, default):
+            if raw is None:
+                return default
+            if isinstance(raw, (list, tuple)):
+                values = list(raw)
+            elif isinstance(raw, str):
+                values = [part for part in raw.replace(";", ",").split(",") if part.strip()]
+            else:
+                values = [raw]
+            parsed = []
+            for value in values:
+                try:
+                    parsed.append(int(float(str(value).strip())))
+                except (TypeError, ValueError):
+                    log_warn(f"Ignoring invalid price_retry_delays_seconds entry: {value!r}")
+            if not parsed:
+                log_warn(
+                    "price_retry_delays_seconds had no usable values, falling back "
+                    f"to {list(default)}"
+                )
+                return default
+            return tuple(parsed)
+
+        price_retry_delays = parse_delays(
+            args.get("price_retry_delays_seconds"), (30, 120, 300)
+        )
+
         terminal_zero_notice_emitted = False
         terminal_value_raw = args.get("terminal_energy_value_eur_kwh", "auto")
         if terminal_value_raw is None or str(terminal_value_raw).strip().lower() == "auto":
@@ -549,6 +609,12 @@ class BatteryOptimizerConfig:
             nordpool_area=args.get("nordpool_area", "LV"),
             nordpool_sensor=args.get("nordpool_sensor", "sensor.nord_pool_lv_current_price"),
             tomorrow_prices_hour=int(args.get("tomorrow_prices_hour", 14)),
+            price_retry_enabled=bool(_arg(args, "price_retry_enabled", True)),
+            price_retry_delays_seconds=price_retry_delays,
+            price_retry_max_seconds=int(_arg(args, "price_retry_max_seconds", 900)),
+            price_retain_max_age_hours=float(
+                _arg(args, "price_retain_max_age_hours", 36.0)
+            ),
 
             # HA Connection
             ha_url=args.get("ha_url", ""),
@@ -786,6 +852,20 @@ class BatteryOptimizerConfig:
             f"; verification source={self.verify_source}"
             f"{self._verification_summary()}"
         )
+        if self.price_retry_enabled:
+            log_func(
+                "Price recovery: tomorrow expected from "
+                f"{self.tomorrow_prices_hour:02d}:00 local, retry backoff "
+                f"{list(self.price_retry_delays_seconds)}s then "
+                f"{self.price_retry_max_seconds}s, cached intervals reused for up "
+                f"to {self.price_retain_max_age_hours:.0f}h"
+            )
+        else:
+            warn(
+                "Price recovery DISABLED (price_retry_enabled=false): a failed or "
+                "incomplete price fetch will not be retried before the next daily "
+                "optimization"
+            )
         log_func(f"Loaded grid_fee: {self.grid_fee} EUR/kWh")
         if self.terminal_energy_value_eur_kwh is None:
             log_func(

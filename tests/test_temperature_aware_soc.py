@@ -1056,26 +1056,37 @@ class TestCloudSafeConversionRebuildsTrajectories:
     ``find_optimal_schedule`` rewrites HOLD -> DISCHARGE(to load) for PV hours
     AFTER the DP has already built ``soc_trajectory`` / ``temp_trajectory``.
     Those DP trajectories are what ``schedule_formatter`` prefers (it falls back
-    to the expected-SOC map only when they are missing), so leaving them stale
-    printed a flat SOC and a cooling pack for a plan that actually drains and
-    heats the battery — inside the very log used to diagnose SOC deviations.
+    to the expected-SOC map only when they are missing), so they are rebuilt
+    from the FINAL schedule through the shared model — by derivation, not by an
+    equivalence argument, inside the very log used to diagnose SOC deviations.
+
+    The conversion is now restricted to slots whose modeled flow is identical
+    to HOLD, so the scenario is a sunny slot with PV ABOVE the load: the pack
+    charges from the surplus under either action. The old scenario had PV at
+    0.3 kW against a 1.0 kW load, where the conversion drained a battery the DP
+    had reserved — see ``tests/test_cloud_safe_conversion.py``.
     """
 
-    START_SOC = 100.0
+    START_SOC = 50.0
     START_TEMP = 20.0
     BASE = datetime.datetime(2026, 7, 27, 10, 0)
 
     def _optimizer(self):
         opt = MockOptimizer(slot_minutes=60, discharge_rate=4.5)
-        # Stored energy is worth far more than any horizon price, so the DP
-        # holds; the battery starts at max_soc so it cannot charge either.
-        opt.config.terminal_energy_value_eur_kwh = 1.0
+        # 0.10 keeps the DP off both extremes: grid charging lands at
+        # 0.25/0.85 = 0.29 EUR/kWh so it does not charge, and the hedge's
+        # avoided import (0.25) still beats the value of keeping a kWh.
+        opt.config.terminal_energy_value_eur_kwh = 0.10
         opt.config.battery_wear_cost = 0.0
+        # Export must stay worth something (so the hedge's export-equivalence
+        # branch is actually exercised) but less than a kept kWh, or the DP
+        # sells the pack instead of holding it: 0.20 - 0.16 = 0.04 < 0.10.
+        opt.config.grid_export_fee = 0.16
         opt._ambient_service = FixedAmbient(20.0)
         opt._predict_load_kw = lambda dt: 1.0
-        # Sunny, but PV does not cover the load: HOLD stays flat while
-        # discharge-to-load drains. That difference is the whole point.
-        opt._predict_pv_kw = lambda dt: 0.3
+        # PV covers the load with a surplus small enough for the pack to
+        # absorb all of it, so nothing that HOLD would have exported is lost.
+        opt._predict_pv_kw = lambda dt: 1.3
         opt.set_battery_temp(self.START_TEMP)
         opt.set_datetime(self.BASE)
         return opt
@@ -1096,7 +1107,8 @@ class TestCloudSafeConversionRebuildsTrajectories:
         assert converted, "scenario no longer exercises the conversion"
         assert all(e.mode == BatteryMode.DISCHARGE for e in converted)
 
-    def test_soc_trajectory_drains_like_the_converted_plan(self):
+    def test_soc_trajectory_charges_like_the_converted_plan(self):
+        """``discharge_to_load`` with PV above the load is a PV charge."""
         opt, schedule = self._run()
         soc_traj = opt._last_dp_soc_trajectory
         assert soc_traj
@@ -1104,9 +1116,7 @@ class TestCloudSafeConversionRebuildsTrajectories:
         first = min(schedule)
         start_soc, end_soc = soc_traj[first]
         assert start_soc == pytest.approx(self.START_SOC)
-        # The stale DP trajectory reported a flat HOLD (no PV surplus at
-        # 0.3 kW PV vs 1.0 kW load), i.e. end_soc == start_soc.
-        assert end_soc < start_soc - 1.0
+        assert end_soc > start_soc
 
     def test_trajectories_match_the_shared_model_for_the_final_schedule(self):
         opt, schedule = self._run()
@@ -1122,8 +1132,8 @@ class TestCloudSafeConversionRebuildsTrajectories:
         assert opt._last_dp_soc_trajectory == rebuilt_soc
         assert opt._last_dp_temp_trajectory == rebuilt_temp
 
-    def test_temperature_trajectory_reflects_the_discharge(self):
-        """Warming is a function of |P_bat| — a discharging pack heats up."""
+    def test_temperature_trajectory_reflects_the_battery_power(self):
+        """Warming is a function of |P_bat|, not of the mode label."""
         opt, schedule = self._run()
         temps = opt._last_dp_temp_trajectory
         assert temps

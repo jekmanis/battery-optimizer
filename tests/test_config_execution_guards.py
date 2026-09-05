@@ -374,6 +374,58 @@ class TestMinSocDischargeOverride:
 
 
 # ---------------------------------------------------------------------------
+# The cloud-safe hedge does not weaken the execution guards
+# ---------------------------------------------------------------------------
+
+class TestCloudSafeEntriesStillHitTheSafetyOverrides:
+    """A hedged slot is an ordinary ``discharge_to_load`` entry at execution.
+
+    ``find_optimal_schedule`` only converts slots whose forecast has PV
+    covering the load, so a hedged entry is expected to charge from surplus,
+    not to drain. Both live overrides must still fire when reality disagrees:
+    an empty pack (nothing to discharge) and a full one (DISCHARGE would clip
+    the PV export that HOLD allows).
+    """
+
+    def _hedged_entry(self, when):
+        entry = _entry(when, BatteryMode.DISCHARGE)
+        entry.export_rate = 0
+        entry.reason += " [cloud-safe]"
+        entry.value_basis = "kept (cloud-safe)"
+        return entry
+
+    def test_a_hedged_entry_at_min_soc_becomes_hold(self):
+        """The cloud came, the pack emptied, the plan still says discharge."""
+        app = ExecOptimizer(now=_slot(12, 0), soc=10.0)
+        app.schedule = {_slot(12, 0): self._hedged_entry(_slot(12, 0))}
+
+        app.execute_scheduled_mode(None)
+
+        assert app.applied[-1].mode is BatteryMode.HOLD
+        assert app.applied[-1].reason == "safety_min_soc"
+
+    def test_a_hedged_entry_at_max_soc_with_surplus_becomes_hold(self):
+        app = ExecOptimizer(now=_slot(12, 0), soc=100.0)
+        app.schedule = {_slot(12, 0): self._hedged_entry(_slot(12, 0))}
+        app._get_pv_power = lambda: 4000.0
+        app._get_load_power = lambda: 600.0
+
+        app.execute_scheduled_mode(None)
+
+        assert app.applied[-1].mode is BatteryMode.HOLD
+        assert app.applied[-1].reason == "safety_max_soc_pv_export"
+
+    def test_a_hedged_entry_between_the_limits_is_applied_as_planned(self):
+        app = ExecOptimizer(now=_slot(12, 0), soc=55.0)
+        app.schedule = {_slot(12, 0): self._hedged_entry(_slot(12, 0))}
+
+        app.execute_scheduled_mode(None)
+
+        assert app.applied[-1].mode is BatteryMode.DISCHARGE
+        assert app.applied[-1].export_rate == 0
+
+
+# ---------------------------------------------------------------------------
 # Grid-charge window feeding the cost tracker
 # ---------------------------------------------------------------------------
 

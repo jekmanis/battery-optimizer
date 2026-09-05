@@ -610,6 +610,68 @@ through `grid_export_fee_eur_kwh` and `export_rate_multiplier`. Set all three
 from the actual electricity contract; the example values are assumptions, not
 universal Latvian tariffs.
 
+## Price coverage and recovery
+
+A non-empty fetch is not a usable horizon, and `_last_recalc_time` is not
+freshness. `battery_optimizer_lib/price_horizon.py` owns one verdict
+(`PriceHorizonMonitor.evaluate`) built from three questions, all answered on
+canonical UTC instants:
+
+1. **Is the current interval present?** The interval whose start equals the
+   current slot boundary must exist. Without it there is nothing to execute.
+2. **Is the data continuous from there?** Intervals must step forward by exactly
+   `slot_minutes` of elapsed time. The first break ends the usable horizon.
+3. **Does it reach far enough?** Before the configured `tomorrow_prices_hour`,
+   the required end is the next local midnight. From that hour on, it is the
+   midnight after that. A reply containing today only is therefore *complete*
+   at 10:00 and *incomplete* at 15:00.
+
+The required end is a local midnight converted to its instant, never a slot
+count: a Europe/Riga spring day needs 92 fifteen-minute intervals and an autumn
+day needs 100. The verdict distinguishes a `gap` (data exists past the break -
+a hole in otherwise available data) from `tomorrow_missing` (nothing past the
+break, and publication was expected).
+
+### Recovery
+
+An unusable verdict arms **one** pending retry with a bounded backoff
+(`price_retry_delays_seconds`, default 30 s / 2 min / 5 min, then
+`price_retry_max_seconds`). Rules:
+
+- At most one pending retry per app instance. Every path that can notice the
+  same missing horizon in the same minute - the daily optimization, the slot
+  execution's `no_schedule` HOLD, the periodic adaptive pass - shares it, and
+  none of them advances the backoff while it is armed.
+- The retry carries a generation token. Disabling the optimizer, terminating
+  the app, or a successful recovery clears the token, so a timer the scheduler
+  has already queued cannot replace a newer valid plan.
+- On success the backoff resets and the schedule is rebuilt from the **current**
+  SOC and time (the active slot contributes only its remaining fraction)
+  through `_recalculate_remaining_schedule`, which finishes with the normal
+  `execute_scheduled_mode` path. Enabled and manual-override checks therefore
+  still apply: during an override the plan is refreshed and no command is sent.
+- While waiting, a slot with no entry stays `HOLD/no_schedule`. Recovery never
+  invents a price and never forces charging to paper over missing data.
+
+The periodic adaptive pass evaluates the **last known** snapshot rather than
+fetching: a price fetch is a blocking REST call on the shared AppDaemon worker
+thread, and the retry is what pays that cost. Only when the snapshot is unusable
+- or when it is fine but the current slot has no entry, i.e. the plan ran out -
+does the adaptive pass act.
+
+### Retained intervals
+
+`get_prices()` merges each reply with the still-valid intervals already known.
+A fresh value always wins for the same instant; retained values only fill
+instants the reply does not contain, only in the future, and only while the last
+successful fetch is younger than `price_retain_max_age_hours`. This exists
+because the price service replaces its cache wholesale on any non-empty reply,
+so a today-only response could shorten a horizon that already held tomorrow.
+
+`sensor.battery_optimizer` publishes the verdict under `price_horizon`:
+coverage end, required end, the failure reason, the last successful horizon
+end, and pending-retry/attempt information.
+
 ## Re-optimization and execution
 
 The app performs a full optimization after tomorrow's prices are expected and

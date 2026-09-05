@@ -154,6 +154,30 @@ Common parameters (see `apps.yaml.example` for the full, commented list):
 | `verify_delay_seconds` | 90 | Delay before the first verify‑after‑set read of the Inverter Mode sensor |
 | `verify_recheck_seconds` | 60 | Delay of the single re‑check performed after a resend |
 | `callback_warn_seconds` | 10 | Warn when one of this app's callbacks blocks for longer than this |
+| `tomorrow_prices_hour` | 14 | Local hour from which tomorrow's intervals are expected. Before it, a today‑only reply is complete; from it, a missing tomorrow is an incomplete horizon |
+| `price_retry_enabled` | true | Retry a failed or incomplete price fetch automatically — see *Price recovery* |
+| `price_retry_delays_seconds` | `[30, 120, 300]` | Backoff for the 1st/2nd/3rd retry (list or `"30,120,300"`); every further attempt waits `price_retry_max_seconds` |
+| `price_retry_max_seconds` | 900 | Cap for the backoff |
+| `price_retain_max_age_hours` | 36 | How long already‑fetched **future** intervals may be reused to fill a shortened or failed refresh |
+
+### Price recovery
+
+A fetch that returns nothing — or one that returns today but no tomorrow after
+`tomorrow_prices_hour` — used to leave the optimizer on an old or absent plan
+until the next daily optimization: a slot with no entry simply applied
+`HOLD/no_schedule`.
+
+The app now judges *coverage* (current interval present, no gaps, horizon
+reaching the end of the current publication window) and, when it is unusable,
+schedules **one** retry on a bounded backoff. On success it rebuilds from the
+current SOC and time and applies the result through the normal execution path,
+so the enable switch and the manual override still decide whether anything is
+sent to the inverter. While waiting, the safe `HOLD` stands — recovery never
+invents a price.
+
+Coverage state is published on `sensor.battery_optimizer` under the
+`price_horizon` attribute (`ok`, `reason`, `horizon_end`, `required_end`,
+`last_success_horizon_end`, `retry_pending`, `retry_attempts`).
 
 ### End‑of‑horizon value (`0` = no‑salvage mode)
 

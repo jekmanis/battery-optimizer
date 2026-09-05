@@ -1122,22 +1122,25 @@ class TestDepletedSocStartIsNotFalsy:
 
 
 class _WarmingChargeEngine:
-    """Learning engine whose warming model differs sharply from the flat rate."""
+    """Learning engine whose learned rate differs sharply from the nominal one.
 
-    def __init__(self, ac_kwh_per_15min: float = 3.0, warming_per_15min: float = 2.0):
-        self._ac = ac_kwh_per_15min
+    The rate is CONSTANT within a slot (the one within-slot model) and depends
+    on the temperature the slot STARTS at; the pack warms between slots. It used
+    to expose ``predict_charge_input_dc_energy`` and the projection called it,
+    which split a slot into a cold and a warm phase -- a second thermal model.
+    """
+
+    def __init__(self, rate_kw: float = 12.0, warming_per_15min: float = 2.0):
+        self._rate = rate_kw
         self._warming = warming_per_15min
-        self.warming_calls = []
+        self.rate_calls = []
 
     def get_charge_rate_for_soc(self, soc, temp=None):
-        return None  # force the flat branch to use the configured nominal rate
+        self.rate_calls.append((soc, temp))
+        return self._rate
 
-    def predict_charge_input_dc_energy(
-        self, current_soc, start_temp, duration_minutes, temp_threshold=16.0
-    ):
-        self.warming_calls.append((current_soc, start_temp, duration_minutes))
-        scale = duration_minutes / 15.0
-        return self._ac * scale, start_temp + self._warming * scale
+    def predict_temp_after_duration(self, temp, duration_minutes):
+        return temp + self._warming * duration_minutes / 15.0
 
     def predict_temp_after_idle(self, temp, duration_minutes):
         return temp
@@ -1147,12 +1150,15 @@ class TestProjectCostsUsesTheLearnedChargeModel:
     """The projected-cost column must use the same CHARGE model as the SOC column.
 
     ``project_costs`` called ``project_slot_soc`` without ``learning_engine``
-    and ``temp_start``, so its CHARGE slots silently fell back to the flat
+    and ``temp_start``, so its CHARGE slots silently fell back to the nominal
     ``charge_rate * efficiency * duration`` while
-    ``project_schedule_trajectory`` - which passes both - used
-    ``predict_charge_input_dc_energy``.  One log then carried two different
-    charge models, the contradiction that adopting the shared model was
-    supposed to remove.
+    ``project_schedule_trajectory`` - which passes both - used the LEARNED
+    rate.  One log then carried two different charge models, the contradiction
+    that adopting the shared model was supposed to remove.
+
+    Retargeted when the within-slot cold/warm split was removed: the mechanism
+    is now ``get_charge_rate_for_soc`` at the start-of-slot temperature plus the
+    thermal model between slots, not ``predict_charge_input_dc_energy``.
     """
 
     @staticmethod
@@ -1192,7 +1198,7 @@ class TestProjectCostsUsesTheLearnedChargeModel:
             starting_temp=20.0,
             learning_engine=engine,
         )
-        assert engine.warming_calls, "project_costs never reached the warming model"
+        assert engine.rate_calls, "project_costs never reached the learned rate"
 
         def cost_for(dc_in: float) -> float:
             old_energy = tracker._soc_to_energy_kwh(50.0)

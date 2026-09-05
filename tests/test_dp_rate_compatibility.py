@@ -779,6 +779,11 @@ class TestWithinSlotApproximation:
     A threshold crossed inside a slot is therefore a documented, bounded
     approximation: at most ``(warm_rate - cold_rate) * slot_hours`` of stored
     energy per slot.
+
+    ``project_slot_soc`` and ``cost_tracker.project_costs`` now use this model
+    too -- they used to split the slot into a cold and a warm phase, which was a
+    second thermal model and a second answer. See
+    ``tests/test_within_slot_charge_model.py``.
     """
 
     def test_planner_and_replay_agree_across_a_threshold_crossing(self):

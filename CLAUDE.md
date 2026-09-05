@@ -131,6 +131,20 @@ discharge rate, DC-side energy moves the SOC, mid-slot anchoring) are documented
 in `docs/scheduling-algorithm.md` § SOC transitions and discretization.
 Divergence here caused a production recalculation loop, not a threshold problem.
 
+**One within-slot charge model.** A CHARGE slot runs at a *constant*
+`charge_input_dc_kw` looked up at the temperature the slot **starts** at — in
+the DP's candidate transition, in `simulate_slot`, in
+`plan_validation.replay_plan`, in `project_slot_soc` (expected SOC and the
+deviation detector) and in `cost_tracker.project_costs`. The rate never changes
+inside a slot; temperature changes only *between* slots, through
+`TemperatureProjector`. `learning_engine.predict_charge_input_dc_energy` splits
+a slot into a cold and a warm phase using a second thermal model; it is
+**diagnostic only** and must not be called from a planning or projection path.
+It was, from `project_slot_soc`, and on one 15-minute slot crossing 1 kW → 4 kW
+the DP said 12.5 % while the published trajectory said 16.25 %. The bound on the
+constant-rate approximation, and why it errs conservative, is in
+`docs/scheduling-algorithm.md` § Within-slot charge model.
+
 **One thermal model.** Battery temperature is projected only by
 `thermal_model.TemperatureProjector`, shared by the DP's rate refinement
 (`_idle_temp_profile`, `_replay_plan_temps`), the expected-SOC trajectory

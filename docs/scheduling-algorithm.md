@@ -278,13 +278,55 @@ warms nothing. Imaginary power must not manufacture future charging capability.
 Forecasts are computed once and reused across every refinement pass, so a moving
 input cannot masquerade as a failure to converge.
 
-**Within-slot approximation.** The DP charges a slot at the rate implied by the
-temperature at its *start*, and the replay does the same, so the two agree
-exactly. A threshold crossed mid-slot is therefore mis-modelled by at most
-`(warm_rate - cold_rate) * slot_hours` of stored energy in that slot. The
-expected-SOC trajectory's `predict_charge_input_dc_energy` splits the slot into
-a cold and a warm phase, which is finer; the difference is bounded by the same
-quantity.
+### Within-slot charge model — one of them, in every consumer
+
+**A charge slot runs at a constant `charge_input_dc_kw`, taken from the
+temperature the slot *starts* at.** The rate does not change inside a slot;
+temperature evolves *between* slots, and only through
+`thermal_model.TemperatureProjector`. Every consumer uses that one model:
+
+| Consumer | Where |
+| --- | --- |
+| DP candidate evaluation and the partial-slot lookahead | `dp_optimizer._run_dp`, `_build_schedule` |
+| the pure physical transition | `slot_energy.simulate_slot` |
+| final-plan replay | `plan_validation.replay_plan` |
+| expected-SOC trajectory and the deviation detector | `soc_projection.project_slot_soc` |
+| projected-cost column | `cost_tracker.project_costs` |
+
+There used to be a second one. `project_slot_soc` called
+`learning_engine.predict_charge_input_dc_energy`, which split a CHARGE slot into
+a cold phase and a warm phase using the learning engine's own warming-rate model
+(`get_time_to_reach_temp`, `predict_temp_after_duration`) — a second thermal
+model, reached only on that one code path. On a 10 kWh pack at 10 % SOC with a
+single 15-minute CHARGE crossing 1 kW → 4 kW halfway, the DP answered 12.5 % and
+the projector answered 16.25 %. The published trajectory therefore disagreed
+with the plan by 3.75 SOC points on one slot, and the deviation detector raised
+SOC shortfalls against a battery that was following the planner exactly.
+
+`predict_charge_input_dc_energy` survives in the learning engine, marked
+**diagnostic only**; nothing in planning or projection calls it. Its
+`temp_threshold` argument was never an `apps.yaml` key — it was a parameter of
+`project_slot_soc` with a default of 16 °C — and it has been removed from that
+signature rather than left accepted-and-ignored.
+
+**Bound on the approximation.** Against a fine-grained reference (1-minute
+sub-stepping through the same rate curve and the same warming model) the
+constant-rate model is off by at most, per slot,
+
+```text
+(warm_rate - cold_rate) * slot_hours * efficiency          kWh stored
+(warm_rate - cold_rate) * slot_hours * efficiency / capacity * 100   SOC points
+```
+
+and it errs on the **conservative** side whenever the pack warms during the
+slot: the start-of-slot rate is the slower one, so the plan never credits energy
+a warming pack could not have taken. `tests/test_within_slot_charge_model.py`
+measures the reproduction against the sub-stepped reference and pins the bound.
+
+A finer model is possible — N sub-steps of the shared projector — but it would
+have to be *the same code path* in all five consumers above, and it would
+multiply the DP's inner loop by N. The constant rate is the cheap end of that
+trade, taken deliberately and bounded here.
 
 Two designs were rejected:
 

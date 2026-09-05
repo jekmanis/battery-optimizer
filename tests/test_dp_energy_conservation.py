@@ -259,11 +259,21 @@ class TestMetamorphic:
 class TestExhaustiveEnumeration:
     """Small horizon: compare the DP against every feasible action sequence.
 
-    This separates a wrong recurrence from quantization error. The enumeration
-    evaluates each action sequence with the SHARED continuous model, so the DP's
-    value may fall short of the enumerated optimum by the quantization gap --
-    but it must never EXCEED it, which would mean it scored a plan that cannot
-    physically happen.
+    This separates a wrong recurrence from the MERGE approximation, and the two
+    have opposite signatures:
+
+    * a wrong recurrence, or postprocessing that overrides the DP's economics,
+      makes the solver claim a value the enumeration says is impossible. It
+      must never EXCEED the enumerated optimum -- that is the falsifiable half;
+    * the merge only ever LOSES value. Keeping one path per SOC bucket is not a
+      valid dominance rule (a lower-valued path holding more energy can be worth
+      more later), so falling short is expected, bounded per merge by
+      ``step * marginal value of a kWh``. The named counterexample and the
+      horizon bound live in ``tests/test_merge_approximation.py`` and
+      ``docs/scheduling-algorithm.md`` SS Conservative quantization.
+
+    The enumeration evaluates each action sequence with the SHARED continuous
+    model, so neither side of the comparison is the planner's own arithmetic.
     """
 
     @staticmethod
@@ -318,8 +328,15 @@ class TestExhaustiveEnumeration:
             prices_by_slot={p.time: p.price for p in prices},
         )
         best = self._enumerate(cfg, prices, 1.2, 0.0, 40.0)
+        # The falsifiable half: exceeding the enumeration is a recurrence error.
         assert replay.total_value_eur <= best + 1e-9
-        # And the quantization gap must be small, not an excuse for a bad plan.
+        # The merge half: bounded by the horizon bound the docs state,
+        # n_slots * step * marginal value of a stored kWh. Not an excuse for a
+        # bad plan -- it is 0.20 EUR here and the observed gap is far inside it.
+        step_kwh = cfg.soc_step_percent / 100.0 * cfg.battery_capacity
+        marginal_value = max(p.price for p in prices) * cfg.inverter_efficiency
+        horizon_bound = len(prices) * step_kwh * marginal_value
+        assert replay.total_value_eur >= best - horizon_bound
         assert replay.total_value_eur >= best - 0.02
 
 

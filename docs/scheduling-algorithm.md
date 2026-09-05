@@ -172,19 +172,58 @@ The consequences are worth being precise about:
 - **Physics is exact.** No transition can create a joule; the initial observed
   energy is kept exactly; replaying the backtracked plan continuously reproduces
   the planner's own trajectory to floating-point precision.
-- **The merging is the approximation.** Two paths in one bucket differ by up to
-  one step and only the better-valued one survives. Ties are broken toward the
-  path holding more energy, which is a genuine dominance rule (more energy can
-  only widen later options).
+- **The merging is the approximation, and it is not a valid state reduction.**
+  Two paths in one bucket differ by up to one step and only the better-valued
+  one survives. **A higher-valued path does not dominate a lower-valued path
+  holding more energy** — the extra energy can be worth more later than the
+  value gap is worth now. The solver is therefore *not* exact for its
+  discretized model. That claim was made here and in the code; it was wrong.
 
-  **Size of that gap.** One step times the marginal value of a kWh is the
-  *per-merge* error, not the horizon bound: a discarded path can be discarded
-  again at every later slot, so the only bound proven here is the sum,
-  `n_slots * step * marginal_value`. That is loose — the errors are not
+  **The counterexample**, at the default 1 % step, pinned as a named regression
+  test (`tests/test_merge_approximation.py`): 10 kWh pack, min SOC 10 %, initial
+  10.9 %, two 15-minute slots drawing 0.2 kW at 0.10 then 1.00 EUR/kWh, unit
+  efficiencies, no fees, wear or terminal value. The solver returns
+  `DISCHARGE, DISCHARGE` costing **0.010 EUR**; exhaustive enumeration of the
+  same action space finds `HOLD, DISCHARGE` at **0.005 EUR**. Both paths land in
+  bucket 0 after slot 1 — `DISCHARGE` holding 1.04 kWh at value 0, `HOLD`
+  holding 1.09 kWh at value −0.005 — so `DISCHARGE` wins the merge and the extra
+  0.05 kWh, worth 1.00 EUR/kWh in slot 2, is discarded with the losing path. At
+  a 0.1 % step the two no longer share a bucket and the solver finds 0.005,
+  which is the evidence that what is lost is merge resolution and not
+  correctness of the transition.
+
+  **Size of the gap.** Per merge, the energy loss is less than one step (a
+  bucket is one step wide) and the value loss is at most
+  `step * marginal_value` of a kWh. Over the horizon the only bound established
+  here is the sum, `n_slots * step * marginal_value`: a discarded path can be
+  discarded again at every later slot. That is loose — the errors are not
   independent and a merged path usually rejoins — but nothing in this
-  implementation establishes anything tighter, and the honest statement is the
-  loose one. What IS exact: the solver is exact for its discretized model given
-  a temperature profile, and the physics of every transition is exact.
+  implementation proves anything tighter, and the honest statement is the loose
+  one.
+
+  Ties are broken toward the path holding more energy. *That* is a genuine
+  dominance rule (equal value, more energy can only widen later options); it
+  makes the merge deterministic and it is not the part that is approximate.
+
+  **What IS exact:** the physics of every transition, at the path's exact
+  continuous energy; replay parity, so `plan_validation.replay_plan` walking the
+  published action sequence reproduces the planner's own SOC trajectory; the SOC
+  dependence of the charge rate; and the value arithmetic of a given action
+  sequence under a given temperature profile. Not the search.
+
+  **The exact alternative, and why it is not used.** Keeping a
+  Pareto-nondominated set of `(value, energy)` labels per bucket — discarding a
+  label only when another in the same bucket has *both* at least as much value
+  and at least as much energy — is exact for the discretized model, because that
+  is the real dominance relation. It is not adopted because the label count per
+  bucket is unbounded without a cap: every distinct value that survives on the
+  energy axis is a separate label, and the DP's inner loop is already the
+  hot path (a 132-slot horizon at a 1 % step runs the whole DP once per
+  partial-first-slot candidate). A capped variant — keep the best *k* labels by
+  value, or bucket the value axis too — reintroduces an approximation with a
+  second tuning knob and no better bound than the one above. If it is ever
+  revisited, `tests/test_merge_approximation.py` is the test that must change,
+  deliberately, with the new rule's runtime measured.
 - **Energy-limited candidates pay the grid.** A discharge delivers what the pack
   has; whatever it cannot cover is charged to the grid at the import price in the
   same slot. No threshold decides whether a slot "counts" — the energy does. The

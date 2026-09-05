@@ -3008,6 +3008,29 @@ class BatteryOptimizer(hass.Hass):
                 reason="safety_min_soc",
             )
 
+        # The mirror of the guard above: a CHARGE entry must never be
+        # (re-)applied at max SOC. `_check_soc_boundaries` has the same rule,
+        # but it only runs from the SOC listener and startup and only fires
+        # while `current_mode` is still CHARGE. Once it has applied its
+        # safety HOLD the SOC sits pinned at max, so no further SOC event
+        # arrives -- and the interval is then unpriced, so a rebuild retains
+        # the previous real-priced CHARGE entry
+        # (`_retain_current_slot_if_unpriced`) and sends CHARGE into a full
+        # pack with nothing left to correct it. Exactly the min-SOC failure
+        # with the signs flipped.
+        if (entry.mode == BatteryMode.CHARGE
+                and current_soc is not None
+                and current_soc >= self.max_soc):
+            self.log(
+                f"Overriding CHARGE->HOLD at max SOC ({current_soc}%) "
+                f"- battery full, nothing to charge"
+            )
+            entry = ScheduleEntry(
+                time=entry.time,
+                mode=BatteryMode.HOLD,
+                reason="safety_max_soc",
+            )
+
         # Track mode transition for cost tracking / learning
         self._handle_mode_transition(entry.mode)
 

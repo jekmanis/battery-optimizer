@@ -382,6 +382,80 @@ class TestMinSocDischargeOverride:
 
 
 # ---------------------------------------------------------------------------
+# CHARGE must not be re-applied at max SOC
+# ---------------------------------------------------------------------------
+
+class TestMaxSocChargeOverride:
+    """The mirror of the min-SOC DISCHARGE guard, and it was missing.
+
+    ``_check_soc_boundaries`` has a CHARGE-at-max-SOC guard, but it fires only
+    from the SOC listener and startup, and only while ``current_mode`` is
+    already CHARGE. Once it has applied its ``safety_max_soc`` HOLD the SOC sits
+    pinned at 100 %, so no further SOC event arrives -- and a rebuild mid-slot
+    re-applies the planned (or retained) CHARGE entry into a full pack with
+    nothing left to correct it. Exactly the min-SOC failure of 2026-09-02 with
+    the signs flipped.
+    """
+
+    def test_a_charge_entry_at_max_soc_becomes_hold(self):
+        app = ExecOptimizer(now=_slot(13, 0), soc=100.0)
+        app.schedule = {_slot(13, 0): _entry(_slot(13, 0), BatteryMode.CHARGE)}
+
+        app.execute_scheduled_mode(None)
+
+        assert app.applied[-1].mode is BatteryMode.HOLD
+        assert app.applied[-1].reason == "safety_max_soc"
+        assert any("max SOC" in m for m in app.messages())
+
+    def test_a_charge_entry_below_max_soc_is_untouched(self):
+        app = ExecOptimizer(now=_slot(13, 0), soc=99.0)
+        app.schedule = {_slot(13, 0): _entry(_slot(13, 0), BatteryMode.CHARGE)}
+
+        app.execute_scheduled_mode(None)
+
+        assert app.applied[-1].mode is BatteryMode.CHARGE
+
+    def test_the_guard_fires_after_the_safety_hold_already_ran(self):
+        """The scenario the SOC listener cannot cover.
+
+        ``_check_soc_boundaries`` already turned the running CHARGE into a
+        ``safety_max_soc`` HOLD, so ``current_mode`` is no longer CHARGE and the
+        SOC has stopped moving. The next execution of the same slot must still
+        refuse to send CHARGE.
+        """
+        app = ExecOptimizer(now=_slot(13, 0), soc=100.0)
+        app.schedule = {_slot(13, 0): _entry(_slot(13, 0), BatteryMode.CHARGE)}
+        app.current_mode = BatteryMode.HOLD
+
+        app.execute_scheduled_mode(None)
+
+        assert app.applied[-1].mode is BatteryMode.HOLD
+        assert app.applied[-1].reason == "safety_max_soc"
+
+    def test_an_ac_charge_entry_at_max_soc_becomes_hold(self):
+        """A grid-charge entry carries extra direct-control fields; the guard
+        must not let them through on a HOLD."""
+        app = ExecOptimizer(now=_slot(13, 0), soc=100.0)
+        entry = _entry(_slot(13, 0), BatteryMode.CHARGE)
+        entry.ac_charge_mode = "ac_priority"
+        app.schedule = {_slot(13, 0): entry}
+
+        app.execute_scheduled_mode(None)
+
+        assert app.applied[-1].mode is BatteryMode.HOLD
+        assert app.applied[-1].reason == "safety_max_soc"
+
+    def test_discharge_at_max_soc_without_surplus_is_untouched(self):
+        """The existing max-SOC DISCHARGE guard keeps its PV condition."""
+        app = ExecOptimizer(now=_slot(13, 0), soc=100.0)
+        app.schedule = {_slot(13, 0): _entry(_slot(13, 0), BatteryMode.DISCHARGE)}
+
+        app.execute_scheduled_mode(None)
+
+        assert app.applied[-1].mode is BatteryMode.DISCHARGE
+
+
+# ---------------------------------------------------------------------------
 # The cloud-safe hedge does not weaken the execution guards
 # ---------------------------------------------------------------------------
 

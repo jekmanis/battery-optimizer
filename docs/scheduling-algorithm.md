@@ -1482,11 +1482,22 @@ The rules, in full:
   exception: it has no ends, but the format's own resolution is explicit —
   24 values for a local day are hourly, 96 are quarter-hours, and the list is
   the whole day by construction. Each value is given that step as its end.
-- Overlapping records are resolved by publication order, not by summing
-  minutes: a later interval contributes only what an earlier one did not
-  already cover. Summing raw overlaps would let two intervals that both start
-  *inside* a slot add up to its width and mark it covered when its first
-  minutes never were.
+- Overlapping records are resolved by **specificity**, not by summing minutes.
+  For the minutes two records share, the winner is the NARROWER span; equal
+  spans are broken by the later position in the reply. Every minute is
+  attributed to exactly one record, so a finer correction nested inside a
+  coarse interval takes effect for its own minutes and the rest of the coarse
+  interval survives — 10:00-11:00 at 0.10 with 10:15-10:30 at 0.90 is three
+  quarters at 0.10 and one at 0.90.
+
+  This rule used to be described as publication order while the code
+  implemented earliest-start-wins, so the correction above was discarded and
+  all four quarters came out at 0.10. Publication order is not recoverable from
+  a reply — the records arrive as a list, with no publication timestamps — but
+  specificity is a property of the record itself.
+
+  Summing raw overlaps would let two intervals that both start *inside* a slot
+  add up to its width and mark it covered when its first minutes never were.
 
 ### Retained intervals
 

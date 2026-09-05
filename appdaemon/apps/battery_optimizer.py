@@ -160,6 +160,153 @@ def _timed_callback(func):
     return wrapper
 
 
+# --- Cloud-safe hedge -------------------------------------------------------
+#
+# Rewriting a DP action after the fact is only sound where the DP cannot tell
+# the two actions apart. Everything below exists to establish that, per slot.
+# Module-level and pure so it can be reasoned about (and tested) without an
+# AppDaemon instance.
+
+_HEDGE_VALUE_EPS = 1e-9      # EUR/kWh
+_HEDGE_ENERGY_EPS = 1e-6     # kWh
+_HEDGE_POWER_EPS = 1e-9      # kW
+
+
+def _cloud_safe_candidates(schedule, predict_load_kw, predict_pv_kw):
+    """HOLD slots where the forecast has PV covering the whole house load.
+
+    This is the first equivalence condition and the one that killed the old
+    ``pv > 0`` test: with ``0 < pv < load`` the net load is positive, so
+    ``soc_projection.project_slot_soc`` drains the pack under DISCHARGE and
+    leaves it flat under HOLD. The two actions are then not interchangeable at
+    any price — converting spends energy the DP assigned to a later slot.
+
+    ``pv <= 0`` is excluded because there is no PV forecast to be wrong about:
+    the hedge would be a plain discharge, which is the DP's decision to make.
+    """
+    candidates = []
+    for slot_time, entry in schedule.items():
+        if entry.mode != BatteryMode.HOLD:
+            continue
+        pv_kw = predict_pv_kw(slot_time)
+        if pv_kw <= 0:
+            continue
+        if pv_kw + _HEDGE_POWER_EPS < predict_load_kw(slot_time):
+            continue
+        candidates.append(slot_time)
+    return candidates
+
+
+def _hold_stores_all_pv_surplus(
+    *,
+    slot_time,
+    pv_kw,
+    load_kw,
+    fraction,
+    hold_soc_trajectory,
+    config,
+) -> bool:
+    """Did the HOLD plan put every kWh of this slot's PV surplus in the pack?
+
+    The second equivalence condition, and the one that is invisible from the
+    energy model alone: ``discharge_to_load`` pins the export limiter to 0 %
+    (``direct_control.expected_registers`` — "Zero export is CRITICAL here"),
+    while ``hold`` leaves it open. Any surplus the DP priced as export revenue
+    (``hold_excess_pv_kwh`` in ``DPOptimizer._run_dp``) would therefore be
+    curtailed instead of sold, which changes the objective the schedule was
+    chosen by.
+
+    The comparison uses the shared model's CONTINUOUS trajectory of the HOLD
+    plan rather than the DP's quantized one: one SOC step of rounding is enough
+    to hide a slot's worth of exportable PV. An unknown slot answers False —
+    the hedge is optional, the export revenue is not.
+    """
+    span = hold_soc_trajectory.get(slot_time) if hold_soc_trajectory else None
+    if span is None:
+        return False
+    surplus_kwh = max(0.0, pv_kw - load_kw) * config.slot_hours * fraction
+    if surplus_kwh <= _HEDGE_ENERGY_EPS:
+        return True
+    efficiency = config.efficiency if config.efficiency > 0 else 1.0
+    start_soc, end_soc = span
+    stored_dc_kwh = max(0.0, (end_soc - start_soc) / 100.0 * config.battery_capacity)
+    absorbed_pv_kwh = stored_dc_kwh / efficiency
+    return absorbed_pv_kwh >= surplus_kwh - _HEDGE_ENERGY_EPS
+
+
+def _cloud_safe_hedge(
+    schedule,
+    *,
+    candidates,
+    config,
+    prices_by_slot,
+    predict_load_kw,
+    predict_pv_kw,
+    slot_fractions_by_slot,
+    hold_soc_trajectory,
+    terminal_rate,
+):
+    """Convert the forecast-equivalent HOLD slots to DISCHARGE(to load).
+
+    Returns the list of converted slot times.
+
+    A converted slot is one where, under the forecast the schedule was built
+    from, ``discharge_to_load`` and ``hold`` have the SAME modeled energy flow
+    (PV covers the load; the surplus charges the pack in both) and the SAME
+    export behaviour (nothing was going to be sold anyway). What it buys is the
+    cloud case: if PV collapses, the battery — not the grid — picks up the
+    load, without waiting for the shortfall re-optimization.
+
+    Forecast equivalence is NOT equivalence under every cloud event: the energy
+    the hedge spends may have been planned for a more expensive slot later.
+    That is why the hedge additionally requires the avoided import to beat both
+    wear and the DP's own valuation of keeping the energy (``terminal_rate``),
+    and why the reactive PV-shortfall path stays in place to bound the
+    exposure. It is a hedge, not an improvement on the DP's economics.
+    """
+    inv_eff = config.inverter_efficiency if config.inverter_efficiency > 0 else 1.0
+    keep_value = max(0.0, terminal_rate or 0.0)
+    converted = []
+
+    for slot_time in candidates:
+        price = prices_by_slot.get(slot_time)
+        if price is None:
+            # No price means no way to establish the hedge is worth taking.
+            continue
+        buy_price = (price + config.grid_fee) * config.import_price_multiplier
+        # Value of serving the load from the pack instead of the grid IF the
+        # forecast is wrong, per battery DC kWh. It must beat wear AND what the
+        # plan says that kWh is worth kept.
+        hedge_value = buy_price * inv_eff - config.battery_wear_cost
+        if hedge_value <= keep_value + _HEDGE_VALUE_EPS:
+            continue
+
+        sell_price = max(
+            0.0, price * config.export_rate_multiplier - config.grid_export_fee
+        )
+        if sell_price > 0 and not _hold_stores_all_pv_surplus(
+            slot_time=slot_time,
+            pv_kw=predict_pv_kw(slot_time),
+            load_kw=predict_load_kw(slot_time),
+            fraction=slot_fractions_by_slot.get(slot_time, 1.0),
+            hold_soc_trajectory=hold_soc_trajectory,
+            config=config,
+        ):
+            continue
+
+        entry = schedule[slot_time]
+        entry.mode = BatteryMode.DISCHARGE
+        entry.export_rate = 0
+        entry.reason += " [cloud-safe]"
+        # The DP valued this slot as kept energy and, because the conversion is
+        # restricted to slots whose modeled flow is unchanged, that number is
+        # still the right one. Say so explicitly: a DISCHARGE row reporting a
+        # bare "kept" basis reads like a stale label.
+        entry.value_basis = "kept (cloud-safe)"
+        converted.append(slot_time)
+
+    return converted
+
 
 class BatteryOptimizer(hass.Hass):
     """
@@ -1115,41 +1262,72 @@ class BatteryOptimizer(hass.Hass):
         soc_trajectory = result.soc_trajectory
         temp_trajectory = result.temp_trajectory
 
-        # Cloud-safe conversion: HOLD → DISCHARGE(to load) during PV hours.
+        # Cloud-safe hedge: HOLD → DISCHARGE(to load) during PV hours.
         # discharge_to_load charges from PV surplus (confirmed on Growatt WIT),
         # so it behaves identically to HOLD while PV covers the load. But when
-        # clouds kill PV, the battery covers the load instead of the grid —
-        # cheaper whenever the import price exceeds battery wear. The forced
-        # forecast refresh on PV shortfall complements this: the hedge bridges
-        # the gap until re-optimization, without waiting for it.
-        cloud_safe_count = 0
+        # clouds kill PV, the battery covers the load instead of the grid. The
+        # forced forecast refresh on PV shortfall complements this: the hedge
+        # bridges the gap until re-optimization, without waiting for it.
+        #
+        # It is restricted to slots the DP's own model cannot tell apart from
+        # HOLD (see _cloud_safe_hedge). The old test — any PV at all, and an
+        # import price above wear — was not an equivalence test and not an
+        # economic one: with two slots priced 0.10 and 1.00, PV at half the
+        # load and one slot of usable charge, it emptied the pack in the cheap
+        # slot and left the expensive one to the grid, with exact forecasts and
+        # no cloud anywhere. The DP had already chosen the rest of the horizon
+        # on the assumption that HOLD preserved that energy.
+        local_tz = self._get_local_timezone()
+        slot_fractions = self._compute_slot_fractions(
+            slots_sorted_by_time, current_slot, minutes_into_slot, local_tz=local_tz,
+        )
+        slot_fractions_by_slot = {
+            canonical_slot_key(p.time): slot_fractions[i]
+            for i, p in enumerate(slots_sorted_by_time)
+        }
         prices_by_slot_map = {
             canonical_slot_key(p.time): p.price for p in slots_sorted_by_time
         }
-        for slot_time, entry in schedule.items():
-            if entry.mode == BatteryMode.HOLD:
-                pv_kw = self._predict_pv_kw(slot_time)
-                if pv_kw > 0:
-                    price = prices_by_slot_map.get(slot_time, 0.0)
-                    buy_price = (
-                        (price + self.config.grid_fee)
-                        * self.config.import_price_multiplier
-                    )
-                    if buy_price > self.config.battery_wear_cost:
-                        entry.mode = BatteryMode.DISCHARGE
-                        entry.export_rate = 0
-                        entry.reason += " [cloud-safe]"
-                        cloud_safe_count += 1
+        converted_slots = []
+        hedge_candidates = _cloud_safe_candidates(
+            schedule, self._predict_load_kw, self._predict_pv_kw
+        )
+        if hedge_candidates:
+            # The export-equivalence test needs the HOLD plan's continuous SOC,
+            # not the DP's quantized one: one SOC step of rounding is enough to
+            # hide a slot's worth of exportable PV.
+            hold_soc_trajectory, _hold_temp_trajectory = self.project_schedule_trajectory(
+                schedule,
+                current_soc_for_calc,
+                starting_temp=current_temp,
+                current_slot=current_slot,
+                minutes_into_slot=minutes_into_slot,
+            )
+            converted_slots = _cloud_safe_hedge(
+                schedule,
+                candidates=hedge_candidates,
+                config=self.config,
+                prices_by_slot=prices_by_slot_map,
+                predict_load_kw=self._predict_load_kw,
+                predict_pv_kw=self._predict_pv_kw,
+                slot_fractions_by_slot=slot_fractions_by_slot,
+                hold_soc_trajectory=hold_soc_trajectory,
+                terminal_rate=result.terminal_value_eur_kwh,
+            )
+        cloud_safe_count = len(converted_slots)
         if cloud_safe_count > 0:
-            self.log(f"Cloud-safe: converted {cloud_safe_count} HOLD→DISCHARGE(to load) "
-                     f"slots during PV hours (buy_price > wear_cost)")
-            # The DP built its trajectories for the PRE-conversion HOLD plan:
-            # flat SOC and a cooling pack, while the plan that executes drains
-            # the battery on every cloudy minute and heats it. Those same
-            # trajectories are what the schedule log prefers (schedule_formatter
-            # falls back to the expected-SOC map only when they are absent), so
-            # leaving them stale means the log used to diagnose SOC deviations
-            # describes a plan nobody runs. Rebuild through the shared model.
+            self.log(
+                f"Cloud-safe: converted {cloud_safe_count} of "
+                f"{len(hedge_candidates)} eligible HOLD→DISCHARGE(to load) "
+                f"slots (forecast PV covers the load, no export at risk, "
+                f"avoided import beats wear and the value of keeping it)"
+            )
+            # Rebuild the reported trajectories from the FINAL schedule. Under
+            # the restriction above they equal the HOLD plan's by construction,
+            # but the published trajectory must describe the plan that will
+            # execute by derivation, not by argument: schedule_formatter
+            # prefers these over the expected-SOC map, and this is the very log
+            # used to diagnose SOC deviations.
             soc_trajectory, temp_trajectory = self.project_schedule_trajectory(
                 schedule,
                 current_soc_for_calc,
@@ -1180,17 +1358,9 @@ class BatteryOptimizer(hass.Hass):
             for slot_time, entry in schedule.items()
         )
         if schedule and (has_projected_charge or has_projected_pv_gain):
-            local_tz = self._get_local_timezone()
-            prices_by_slot = {
-                canonical_slot_key(p.time): p.price for p in slots_sorted_by_time
-            }
-            # Re-compute charge rates per slot for cost projection
-            slot_fractions = self._compute_slot_fractions(
-                slots_sorted_by_time,
-                current_slot,
-                minutes_into_slot,
-                local_tz=local_tz,
-            )
+            # local_tz / slot_fractions / prices were computed for the hedge
+            # above; recomputing them here would be a second source of truth
+            # for the same partial-first-slot fraction.
             charge_rates_per_slot = self._compute_charge_rates_per_slot(
                 slots_sorted_by_time, slot_fractions, current_soc_for_calc, current_temp
             )
@@ -1198,15 +1368,11 @@ class BatteryOptimizer(hass.Hass):
                 canonical_slot_key(p.time): charge_rates_per_slot[i]
                 for i, p in enumerate(slots_sorted_by_time)
             }
-            slot_fractions_by_slot = {
-                canonical_slot_key(p.time): slot_fractions[i]
-                for i, p in enumerate(slots_sorted_by_time)
-            }
             projected_costs, _ = self._cost_tracker.project_costs(
                 schedule,
                 current_soc_for_calc,
                 self.battery_avg_cost,
-                prices_by_slot,
+                prices_by_slot_map,
                 predict_load_func=self._predict_load_kw,
                 predict_pv_func=self._predict_pv_kw,
                 charge_rates_by_slot=slot_charge_rates_by_slot,

@@ -1466,6 +1466,12 @@ The rules, in full:
 
 - `PricePoint.end` carries the source's own end. Both parsers now set it.
 - A point with **no** `end` covers exactly one `slot_minutes` slot.
+- A point whose `end` is at or **before** its `start` is **dropped**, with a
+  WARNING rate-limited to once an hour. An absent end is a normal case with a
+  documented answer; a reversed one is evidence the record is corrupt, and
+  giving it one slot published a price for that interval on the strength of a
+  field saying the opposite. The interval stays a gap until a source publishes
+  it properly.
 - The simple sensor list (`today` / `tomorrow`, bare numbers) is the one
   exception: it has no ends, but the format's own resolution is explicit —
   24 values for a local day are hourly, 96 are quarter-hours, and the list is

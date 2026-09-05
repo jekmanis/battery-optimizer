@@ -12,13 +12,18 @@ import traceback
 from typing import Callable, Dict, List, Optional
 
 from .models import PricePoint
-from .timezone_utils import instant_key
+from .timezone_utils import instant_key, normalize_tz_pair
 
 try:
     import requests
     REQUESTS_AVAILABLE = True
 except ImportError:
     REQUESTS_AVAILABLE = False
+
+
+# How often a corrupt price record may be reported. See
+# `NordPoolPriceService._warn_malformed_record`.
+MALFORMED_WARNING_INTERVAL_S = 3600
 
 
 class NordPoolPriceService:
@@ -81,6 +86,10 @@ class NordPoolPriceService:
         # Cache
         self.cached_prices: List[PricePoint] = []
         self.cached_prices_date: Optional[datetime.date] = None
+
+        # When a corrupt record was last reported (see
+        # `_warn_malformed_record`).
+        self._last_malformed_warning: Optional[datetime.datetime] = None
 
     def get_prices(self) -> List[PricePoint]:
         """
@@ -147,17 +156,54 @@ class NordPoolPriceService:
             return (dt.astimezone(datetime.timezone.utc) + delta).astimezone(dt.tzinfo)
         return dt + delta
 
-    def _interval_end(self, point: PricePoint) -> datetime.datetime:
-        """Exclusive end of the interval *point* actually covers.
+    def _warn_malformed_record(self, message: str) -> None:
+        """WARN about a corrupt record at most once an hour.
+
+        Prices are re-fetched every slot and again on every bounded retry, so a
+        source that keeps sending the same bad record would otherwise produce a
+        line per poll -- and be scrolled past exactly like the WARNINGs that
+        need reading. Rate-limited is not silenced: it says so again an hour
+        later, for as long as the source keeps saying it.
+        """
+        now = None
+        try:
+            now = self.datetime()
+        except Exception:
+            now = None
+        last = self._last_malformed_warning
+        if now is not None and last is not None:
+            cmp_last, cmp_now = normalize_tz_pair(last, now)
+            if (cmp_now - cmp_last).total_seconds() < MALFORMED_WARNING_INTERVAL_S:
+                return
+        self._last_malformed_warning = now
+        self.log(message, level="WARNING")
+
+    def _interval_end(self, point: PricePoint) -> Optional[datetime.datetime]:
+        """Exclusive end of the interval *point* actually covers, or None.
 
         The source's own ``end`` when it published one. Otherwise exactly ONE
         `slot_minutes` slot -- never a width guessed from how far away the next
         surviving timestamp happens to be.
+
+        ``None`` means the record is unusable and the caller must DROP it. An
+        ABSENT end is a normal case with a documented answer; an end that does
+        not come after its start is not a width to guess around, it is evidence
+        the record is corrupt. Falling back to one slot for it published a
+        price for that interval on the strength of a field saying the opposite,
+        and coverage is what the schedule, the horizon monitor and the
+        provenance guard are all built on.
         """
         end = getattr(point, "end", None)
-        if end is not None and instant_key(end) > instant_key(point.time):
+        if end is None:
+            return self._shift(point.time, self.slot_minutes)
+        if instant_key(end) > instant_key(point.time):
             return end
-        return self._shift(point.time, self.slot_minutes)
+        self._warn_malformed_record(
+            f"Price record for {point.time} declares an end of {end}, which "
+            f"is not after its start; dropping it. The interval it claimed is "
+            f"a gap until a source publishes it properly."
+        )
+        return None
 
     def _normalize_prices(self, prices: List[PricePoint]) -> List[PricePoint]:
         """Map published intervals onto the configured slot grid.
@@ -194,10 +240,13 @@ class NordPoolPriceService:
         covered_until: Optional[datetime.datetime] = None
 
         for point in sorted(prices, key=lambda p: instant_key(p.time)):
-            start_key = instant_key(point.time)
-            end_key = instant_key(self._interval_end(point))
-            if end_key <= start_key:
+            interval_end = self._interval_end(point)
+            if interval_end is None:
+                # Corrupt: an end at or before its own start. `_interval_end`
+                # has already said so, once an hour.
                 continue
+            start_key = instant_key(point.time)
+            end_key = instant_key(interval_end)
             if covered_until is not None and start_key < covered_until:
                 start_key = covered_until
                 if end_key <= start_key:

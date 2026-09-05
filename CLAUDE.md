@@ -469,6 +469,32 @@ and the retry, never a substitution at planning time. See
 `docs/scheduling-algorithm.md`, "The current interval when nobody published a
 price for it".
 
+**A missing interval INSIDE the horizon is a forced HOLD, not an absence.** The
+DP was handed only the priced points, so a hole in the middle of the horizon
+did not exist for planning: the slot after it was treated as following the slot
+before it, and the gap's PV, load, SOC and temperature were never modelled. On
+the reproduction (10 kWh pack at its 10 % minimum, unit efficiencies, 10:00 at
+0.50 with nothing happening, 10:15 unpublished with 4 kW of PV, 10:30 at 1.00
+with 4 kW of load) both planning paths charged at 10:00 and imported a kWh the
+gap's own sunshine would have stored for free — and `_validate_final_plan`
+agreed with the plan, because it skipped the same slot, so its SOC was ten
+points wrong from there on. `modeled_horizon` now builds the contiguous slot
+sequence from the first interval the DP is given to the **last priced** one
+(never past it — a gap at the horizon END is the horizon ending), and an
+unpriced slot enters the DP with `price=None`: only the HOLD transition is
+evaluated, PV absorption is modelled normally, and that slot's grid import and
+export cash flows are omitted from the objective. Omitting import is safe
+because the action is fixed and the import is therefore path-independent;
+export at an unknown price is valued 0, which is the conservative direction.
+The terminal-rate median uses priced slots only. The schedule gets a
+`HOLD`/`no_price` entry with no provenance and no `marginal_value_eur_kwh`, so
+the census, the replay, the cost column and the trajectories all describe it,
+`_is_no_price_fallback` recognises it when it becomes current, and the cloud-safe
+hedge skips it for want of a price to justify the trade. `NO_PRICE_REASON` lives
+in `models.py` because two producers must spell it identically. The horizon
+monitor still judges the FETCHED snapshot, so the `gap` verdict and the armed
+retry are unchanged.
+
 ## Deployment to the HA machine
 
 The running app lives on the Home Assistant share, not in this repo:

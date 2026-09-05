@@ -55,6 +55,14 @@ class PricePoint:
 # with no marker is an entry whose price cannot be vouched for.
 PRICE_SOURCE_MARKET = "market"
 
+# The reason a slot carries when nobody published a price for its interval.
+# ONE spelling, because three things test it: the orchestrator's
+# `_is_no_price_fallback` (the stand-in HOLD for an unpriced CURRENT interval),
+# the DP's forced-HOLD entry for an unpriced interval INSIDE the horizon, and
+# `execute_scheduled_mode`, which must treat the two identically once the
+# second becomes the first.
+NO_PRICE_REASON = "no_price"
+
 
 @dataclass
 class ScheduleEntry:

@@ -378,6 +378,14 @@ FORBIDDEN_CLAIMS = (
     r"guaranteed\s+minimum\s+cost",
     r"finds\s+the\s+cheapest\s+schedule",
     r"exact\s+for\s+(?:its|the)\s+discretized\s+model",
+    # "optimal schedule" as a LABEL -- a Markdown heading, a diagram box, a
+    # table cell: the phrase standing on its own as the name of the thing the
+    # solver produces. Anchored to the start of the line through non-word
+    # characters only (`#`, `|`, `-`, whitespace, box-drawing glyphs), so
+    # prose that merely mentions the phrase mid-sentence is untouched --
+    # including `dp_optimizer.py`'s own `Not "the optimal schedule": ...`,
+    # which denies the claim and must keep working without an allowance.
+    r"^[\s\W]*optimal\s+schedule\b",
 )
 
 # (path suffix, exact substring that must appear in the offending line).
@@ -427,19 +435,42 @@ def _tracked_paths(root):
     return {root / p for p in out.decode("utf-8").split("\0") if p}
 
 
-def _scanned_files():
-    root = _repo_root()
-    paths = []
-    for pattern in ("appdaemon/**/*.py", "docs/**/*.md"):
-        paths.extend(
-            p for p in root.glob(pattern) if "__pycache__" not in p.parts
-        )
-    paths.append(root / "README.md")
-    paths.append(root / "CLAUDE.md")
+def _scanned_files(root=None):
+    """Every tracked `.py`/`.md` outside `tests/`, or a glob when git is absent.
+
+    The tracked set is the SOURCE of the list, not a filter over globs. It was
+    a filter, which meant the four glob patterns still decided what could ever
+    be scanned: `AGENTS.md`, `scripts/smoke_config.py` and 66 other tracked
+    files were never opened, and a forbidden claim planted in any of them
+    passed the guard silently. Narrowing a list of candidates by "is it
+    tracked?" answers a different question from "what does this repository
+    say?".
+
+    `tests/` is excluded because this file itself has to spell the forbidden
+    phrases out to test for them.
+    """
+    root = _repo_root() if root is None else root
     tracked = _tracked_paths(root)
-    if tracked is not None:
-        paths = [p for p in paths if p.resolve() in {t.resolve() for t in tracked}]
-    return sorted(set(paths))
+    if tracked is None:
+        # No git metadata (a source export). Fall back to the globs; partial
+        # cover beats none, and `test_the_guard_scans_every_tracked_source`
+        # skips rather than lying about it.
+        paths = []
+        for pattern in ("appdaemon/**/*.py", "docs/**/*.md"):
+            paths.extend(
+                p for p in root.glob(pattern) if "__pycache__" not in p.parts
+            )
+        paths.append(root / "README.md")
+        paths.append(root / "CLAUDE.md")
+        return sorted({p for p in paths if p.is_file()})
+    return sorted(
+        p
+        for p in tracked
+        if p.suffix in (".py", ".md")
+        and not p.relative_to(root).as_posix().startswith("tests/")
+        and "__pycache__" not in p.parts
+        and p.is_file()
+    )
 
 
 def _is_allowed(root, path, line) -> bool:
@@ -449,23 +480,29 @@ def _is_allowed(root, path, line) -> bool:
     )
 
 
+def _offences(root, paths):
+    """Every line in *paths* that makes a forbidden claim without an allowance."""
+    found = []
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        for number, line in enumerate(text.splitlines(), start=1):
+            for pattern in FORBIDDEN_CLAIMS:
+                if re.search(pattern, line, re.IGNORECASE) and not _is_allowed(
+                    root, path, line
+                ):
+                    found.append(
+                        f"{path.relative_to(root).as_posix()}:{number}: "
+                        f"{line.strip()}"
+                    )
+    return found
+
+
 class TestNoSourceClaimsAnOptimalityItDoesNotHave:
     """The solver is an approximation; nothing may say otherwise."""
 
     def test_no_forbidden_claim_survives_anywhere(self):
         root = _repo_root()
-        offences = []
-        for path in _scanned_files():
-            text = path.read_text(encoding="utf-8")
-            for number, line in enumerate(text.splitlines(), start=1):
-                for pattern in FORBIDDEN_CLAIMS:
-                    if re.search(pattern, line, re.IGNORECASE) and not _is_allowed(
-                        root, path, line
-                    ):
-                        offences.append(
-                            f"{path.relative_to(root).as_posix()}:{number}: "
-                            f"{line.strip()}"
-                        )
+        offences = _offences(root, _scanned_files())
         assert not offences, (
             "these lines claim an optimality the bucket merge does not have:\n"
             + "\n".join(offences)
@@ -481,10 +518,33 @@ class TestNoSourceClaimsAnOptimalityItDoesNotHave:
             r"exact\s+for\s+(?:its|the)\s+discretized\s+model": (
                 "exact for the discretized model"
             ),
+            r"^[\s\W]*optimal\s+schedule\b": "## Optimal Schedule",
         }
         assert set(samples) == set(FORBIDDEN_CLAIMS)
         for pattern, sample in samples.items():
             assert re.search(pattern, sample, re.IGNORECASE), pattern
+
+    def test_the_label_pattern_leaves_prose_alone(self):
+        """The anchored pattern must not fire on a sentence that uses the
+        phrase, only on one that titles something with it."""
+        for label in (
+            "## Optimal Schedule",
+            "        Optimal Schedule (CHARGE / HOLD / DISCHARGE per slot)",
+            "| Optimal schedule | per slot |",
+            "  - Optimal Schedule",
+        ):
+            assert re.search(
+                r"^[\s\W]*optimal\s+schedule\b", label, re.IGNORECASE
+            ), label
+        for prose in (
+            'Not "the optimal schedule": the merge keeps one path per bucket',
+            "The result is close to the optimal schedule but is not it.",
+            "def find_optimal_schedule(self):",
+            "This is no more the optimal schedule than a greedy pass is.",
+        ):
+            assert not re.search(
+                r"^[\s\W]*optimal\s+schedule\b", prose, re.IGNORECASE
+            ), prose
 
     def test_the_guard_covers_the_files_that_have_made_the_claim(self):
         root = _repo_root()
@@ -497,8 +557,75 @@ class TestNoSourceClaimsAnOptimalityItDoesNotHave:
             "docs/dp_optimization_parameters.md",
             "README.md",
             "CLAUDE.md",
+            # Tracked, and outside every glob the guard used to use. AGENTS.md
+            # is the file an agent reads before touching the solver; a claim
+            # planted there was invisible to this guard.
+            "AGENTS.md",
+            "scripts/smoke_config.py",
+            "scripts/README.md",
         ):
             assert required in scanned, required
+
+    def test_the_guard_scans_every_tracked_source_and_document(self):
+        """No tracked .py/.md outside tests/ may fall outside the scan.
+
+        The previous version globbed four patterns and then FILTERED by the
+        tracked set, so "tracked" only ever narrowed the globs -- 68 of the 101
+        tracked files were never opened.
+        """
+        root = _repo_root()
+        tracked = _tracked_paths(root)
+        if tracked is None:
+            pytest.skip("git metadata unavailable")
+        expected = {
+            p.relative_to(root).as_posix()
+            for p in tracked
+            if p.suffix in (".py", ".md")
+            and not p.relative_to(root).as_posix().startswith("tests/")
+        }
+        scanned = {p.relative_to(root).as_posix() for p in _scanned_files()}
+        assert expected - scanned == set(), sorted(expected - scanned)
+
+    def test_a_claim_planted_in_a_tracked_file_outside_the_globs_trips(
+        self, tmp_path
+    ):
+        """The proof, not the argument.
+
+        A throwaway git checkout containing exactly one file -- ``AGENTS.md``,
+        which matches none of the old globs -- with one forbidden sentence in
+        it. The guard must report it.
+        """
+        import subprocess
+
+        def git(*args):
+            subprocess.run(
+                ["git", *args], cwd=tmp_path, check=True, capture_output=True
+            )
+
+        try:
+            git("init", "-q")
+        except (OSError, subprocess.CalledProcessError):
+            pytest.skip("git unavailable")
+        git("config", "user.email", "guard@example.invalid")
+        git("config", "user.name", "guard")
+        (tmp_path / "AGENTS.md").write_text(
+            "# Agent notes\n\nThe DP is globally optimal.\n", encoding="utf-8"
+        )
+        # A second tracked file with no claim, so a scan that returned
+        # everything unconditionally would still have to pick the right line.
+        (tmp_path / "innocent.md").write_text(
+            "# Notes\n\nThe DP is an approximation.\n", encoding="utf-8"
+        )
+        git("add", "AGENTS.md", "innocent.md")
+        git("commit", "-qm", "plant")
+
+        scanned = _scanned_files(tmp_path)
+        assert tmp_path / "AGENTS.md" in scanned, (
+            "a tracked file outside the old globs is never opened"
+        )
+        offences = _offences(tmp_path, scanned)
+        assert len(offences) == 1, offences
+        assert offences[0].startswith("AGENTS.md:3:")
 
     def test_every_allowance_is_still_needed(self):
         """A stale allowlist entry is a hole nobody is watching."""

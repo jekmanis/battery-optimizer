@@ -15,6 +15,7 @@ CHARGE running 10:07 -> 10:15 at 4.5 kW x 0.85 adds ~3.6 SOC points on the
 
 from __future__ import annotations
 
+import copy
 import datetime
 from typing import Dict, List, Optional
 
@@ -271,11 +272,17 @@ def _hedge_case():
         decision_log_level=1,
     )
     slots = [HEDGE_BASE + datetime.timedelta(hours=i) for i in range(2)]
-    # Slot 0: PV exactly covers the load, so the DP calls it HOLD and the hedge
-    # converts it — and it is that slot's PV that vanishes before validation.
+    # Slot 0: PV more than covers the load, so the DP calls it HOLD and the
+    # hedge converts it — and it is that slot's PV that vanishes before
+    # validation. The surplus is deliberate rather than an exact match: it is
+    # what makes the projected-cost column DIFFER between the pre-validation
+    # plan (a discharge_to_load slot banking 1 kWh of surplus at the export
+    # floor) and the returned one (a HOLD slot whose PV never arrived). Without
+    # it both orderings produce the same numbers and the column cannot tell
+    # anyone which plan it describes.
     # Slot 1 keeps a PV surplus, so the plan can still gain stored energy and
     # the projected-cost column is not trivially empty.
-    app.load_by_slot = {slots[0]: 2.0, slots[1]: 0.0}
+    app.load_by_slot = {slots[0]: 1.0, slots[1]: 0.0}
     app.pv_by_slot = {slots[0]: 2.0, slots[1]: 1.0}
     app.collapse_slot = slots[0]
     prices = [
@@ -285,9 +292,41 @@ def _hedge_case():
     return app, slots, prices
 
 
+def _project(app, schedule, prices, starting_soc=10.0):
+    """A fresh projected-cost column for *schedule*, as the app would build it."""
+    from battery_optimizer_lib.timezone_utils import canonical_slot_key
+
+    costs, _ = app._cost_tracker.project_costs(
+        schedule,
+        starting_soc,
+        app.battery_avg_cost,
+        {canonical_slot_key(p.time): p.price for p in prices},
+        predict_load_func=app._predict_load_kw,
+        predict_pv_func=app._predict_pv_kw,
+        starting_temp=app._get_battery_temp(),
+        learning_engine=app.learning_engine,
+        temp_projector=app._temp_projector,
+    )
+    return costs
+
+
 class TestTheCensusDescribesThePlanThatIsReturned:
     def test_a_reverted_hedge_slot_is_counted_as_hold(self):
         app, slots, prices = _hedge_case()
+
+        # Everything the old ordering would have derived from, captured at the
+        # instant before validation: the plan with the hedge conversion still
+        # in it, and the PV view that has not collapsed yet.
+        pre_validation = {}
+        _real_validate = app._validate_final_plan
+
+        def _capture(**kwargs):
+            pre_validation["schedule"] = copy.deepcopy(kwargs["schedule"])
+            pre_validation["pv"] = dict(app.pv_by_slot)
+            return _real_validate(**kwargs)
+
+        app._validate_final_plan = _capture
+
         # The pack is at min SOC: the moment PV disappears, the converted
         # DISCHARGE slot cannot serve a joule.
         schedule = app.find_optimal_schedule(prices, 0, current_soc=10.0)
@@ -296,6 +335,12 @@ class TestTheCensusDescribesThePlanThatIsReturned:
             "the unserviceable hedge conversion was not reverted -- this test "
             "no longer exercises the ordering it is about"
         )
+        assert pre_validation["schedule"][slots[0]].mode == BatteryMode.DISCHARGE, (
+            "the pre-validation plan must really differ, or nothing below can "
+            "distinguish the two orderings"
+        )
+
+        # --- the census -----------------------------------------------------
         counts = app._last_schedule_counts
         assert counts is not None
         returned_hold = sum(
@@ -309,6 +354,46 @@ class TestTheCensusDescribesThePlanThatIsReturned:
         )
         assert counts.hold == returned_hold
         assert counts.self_consume == returned_self_consume
+
+        # --- the projected-cost column --------------------------------------
+        # Same three derivations, same ordering question. This one is the
+        # sensitive half: the numbers a pre-validation source would publish are
+        # measurably different, so the assertion cannot pass by coincidence.
+        assert set(app._last_projected_costs) == set(schedule)
+        assert app._last_projected_costs == pytest.approx(
+            _project(app, schedule, prices)
+        )
+
+        saved_pv = app.pv_by_slot
+        app.pv_by_slot = pre_validation["pv"]
+        try:
+            stale = _project(app, pre_validation["schedule"], prices)
+        finally:
+            app.pv_by_slot = saved_pv
+        assert app._last_projected_costs != pytest.approx(stale), (
+            "the projected-cost column would be identical either way -- this "
+            "scenario no longer proves the column is derived after validation"
+        )
+
+        # --- the decision log ------------------------------------------------
+        # `_last_charge_slots` lists the plan's CHARGE slots. It must describe
+        # the plan that is returned: the reverted slot is not one of them, and
+        # nothing appears that the returned plan does not call CHARGE.
+        #
+        # Unlike the column above this one cannot be made sensitive by any
+        # scenario: `_resolve_plan_shortfall` only ever turns DISCHARGE into
+        # HOLD, and it mutates the entries in place, so the CHARGE set is the
+        # same object graph before and after. The correspondence is asserted
+        # anyway, because it is the property that would break if the rows were
+        # ever built from a genuine pre-validation COPY of the plan.
+        logged = {row["time"] for row in app._last_charge_slots}
+        returned_charge = {
+            slot.isoformat()
+            for slot, entry in schedule.items()
+            if entry.mode == BatteryMode.CHARGE
+        }
+        assert logged == returned_charge
+        assert slots[0].isoformat() not in logged
 
     def test_the_decision_log_rows_describe_the_returned_plan(self):
         app, slots, prices = _hedge_case()

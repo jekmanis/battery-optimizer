@@ -351,10 +351,16 @@ def charge_rate_for_span(
 
     What this rule is, precisely:
 
-    * **exact** for a piecewise-constant bucket rate when at most one bucket
-      boundary falls inside the slot. On the reference pack a 15-minute slot
-      moves at most ~8 SOC points against 25-point buckets, so that is the
-      normal case rather than a lucky one;
+    * **exact** for a piecewise-constant bucket rate when NO bucket boundary
+      falls strictly inside ``[soc_start, reached_soc)``. Both probes then
+      return the same rate and there is nothing to approximate. On the
+      reference pack a 15-minute slot moves at most ~8 SOC points against
+      25-point buckets, so most slots clear the buckets entirely -- but a slot
+      that DOES cross one is not exact, it is merely conservative: 88 % over a
+      4 kW -> 1 kW taper at 90 % gives 90.5 % against a sub-stepped truth of
+      92.0 %, and 22 % over a 1 kW -> 4 kW step at 23 % gives 24.5 % against
+      29.0 %. "At most one boundary" was the condition for the rule being
+      well-behaved, never for it being exact;
     * **conservative** (never over-credits) when the rate is monotone over the
       span the slot covers -- the minimum of the endpoints is then a lower
       bound on every rate the slot visits;
@@ -369,7 +375,15 @@ def charge_rate_for_span(
     carry it. That is conservative when the pack WARMS during the slot -- the
     physical case while charging -- and over-credits a pack that cools while
     charging, bounded by
-    ``(rate(T_start) - rate(T_end)) * duration_h * efficiency``.
+    ``(rate(T_start) - rate(T_end)) * duration_h * efficiency`` **only when the
+    rate is non-increasing in temperature over the range the slot traverses**.
+    That bound compares two endpoints, so a rate that is non-monotone in
+    temperature breaks it outright: a pack cooling 20 -> 5 C on a curve of
+    2.0 kW at or above 19 C, 0.1 kW from 11 to 19 C and 1.9 kW below 11 C has
+    both endpoints fast and the middle slow -- the model says 25.0 %, the
+    sub-stepped truth is 22.4 %, and the endpoint bound allows 0.25. Outside
+    that condition only the identity bound
+    ``(max rate visited - min rate visited) * duration_h * efficiency`` holds.
 
     See ``docs/scheduling-algorithm.md`` SS Within-slot charge model and
     ``tests/test_within_slot_charge_model.py``.

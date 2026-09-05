@@ -485,10 +485,15 @@ direction claim does not apply.
 
 *Falsifiable direction claims*, and the conditions they need:
 
-- **Exact** for a piecewise-constant bucket rate when at most one bucket
-  boundary falls inside the slot. On the reference pack a 15-minute slot moves
-  at most about 8 SOC points against 25-point buckets, so that is the normal
-  case, not a lucky one.
+- **Exact** for a piecewise-constant bucket rate when no bucket boundary falls
+  strictly inside `[soc_start, reached_soc)`. Both probes then return the same
+  rate and there is nothing to approximate. On the reference pack a 15-minute
+  slot moves at most about 8 SOC points against 25-point buckets, so most slots
+  clear the buckets entirely — but a slot that *does* cross one is not exact,
+  only conservative: 88 % over a 4 kW → 1 kW taper at 90 % gives 90.5 % against
+  a sub-stepped truth of 92.0 %, and 22 % over a 1 kW → 4 kW step at 23 % gives
+  24.5 % against 29.0 %. "At most one boundary" was the condition for the rule
+  being well-behaved, never for it being exact.
 - **Conservative** (never over-credits) when the rate is monotone over the SOC
   span the slot covers: the minimum of the two endpoints is then a lower bound
   on every rate the slot visits.
@@ -496,9 +501,16 @@ direction claim does not apply.
   non-decreasing in temperature — the physical case while charging, since the
   rate is looked up at the start-of-slot temperature.
 - **Over-crediting**, and bounded rather than eliminated, on a pack that *cools*
-  while charging. Temperature is not spanned (the DP's 1-D energy state cannot
-  carry it), so the over-credit is at most
-  `(rate(T_start) - rate(T_end)) * slot_hours * efficiency`.
+  while charging **and the rate is non-increasing in temperature over the range
+  the slot traverses**. Temperature is not spanned (the DP's 1-D energy state
+  cannot carry it), so the over-credit is then at most
+  `(rate(T_start) - rate(T_end)) * slot_hours * efficiency`. Without the
+  monotonicity that bound compares two endpoints of a curve the slot leaves:
+  a pack cooling 20 → 5 °C on a curve of 2.0 kW at or above 19 °C, 0.1 kW from
+  11 to 19 °C and 1.9 kW below 11 °C has both endpoints fast and the middle
+  slow — the model says 25.0 %, the sub-stepped truth is 22.4 %, and the
+  endpoint bound allows 0.25, a violation by a factor of ten and a half. Only
+  the identity above survives there.
 - **An approximation otherwise**, with only the identity above. The pinned
   counterexample: a non-monotonic curve of 1.0 kW below 14 °C, 6.0 kW from 14 to
   20 °C and 1.2 kW above 20 °C, on a pack warming 1 °C/min from 10 °C. The

@@ -543,6 +543,165 @@ class TestTheDirectionClaimNeedsMonotonicity:
         )
         assert over_credit <= bound + 1e-9
 
+    def test_a_rate_non_monotone_in_temperature_breaks_the_cooling_bound(self):
+        """The cooling bound needs monotonicity too, and it was not stated.
+
+        ``(rate(T_start) - rate(T_end)) * slot_hours * efficiency`` compares
+        two endpoints. On a rate that is non-monotone in temperature the slot
+        traverses values outside that pair, and the bound is simply false --
+        here by a factor of ten and a half.
+
+        Pack cooling 1 C/min from 20 C; rate 2.0 kW at or above 19 C, 0.1 kW
+        between 11 and 19 C, 1.9 kW below 11 C. Both endpoints are fast, the
+        middle is not, so the endpoint difference is a tenth of a kW while the
+        slot spends most of its length at 0.1 kW.
+        """
+
+        def rate_fn(soc, temp):
+            if temp is None:
+                return 2.0
+            if temp >= 19.0:
+                return 2.0
+            if temp >= 11.0:
+                return 0.1
+            return 1.9
+
+        cooling = -1.0
+        truth = _fine_grained_end_soc(
+            rate_fn, soc_start=20.0, temp_start=20.0, warm_per_min=cooling
+        )
+        model = _span_end_soc(rate_fn, soc_start=20.0, temp_start=20.0)
+        assert model == pytest.approx(25.0, abs=1e-9)
+        assert truth == pytest.approx(22.3833, abs=1e-3)
+
+        over_credit = model - truth
+        stated_bound = (
+            (rate_fn(20.0, 20.0) - rate_fn(20.0, 20.0 + 15 * cooling))
+            * 0.25
+            / CAPACITY
+            * 100
+        )
+        assert stated_bound == pytest.approx(0.25, abs=1e-9)
+        assert over_credit > 10 * stated_bound, (
+            "the cooling bound is stated unconditionally and is violated here"
+        )
+
+        # Only the identity survives, and it does.
+        visited = _rates_visited(
+            rate_fn, soc_start=20.0, temp_start=20.0, warm_per_min=cooling
+        )
+        identity = (max(visited) - min(visited)) * 0.25 / CAPACITY * 100
+        assert identity == pytest.approx(4.75, abs=1e-9)
+        assert abs(truth - model) <= identity + 1e-9
+
+
+class TestTheExactnessClaimNeedsAZeroBoundarySpan:
+    """"At most one boundary inside the slot" was the wrong condition.
+
+    One boundary strictly inside ``[soc_start, reached_soc)`` is exactly the
+    case the span rule was built for, and it is precisely the case where the
+    model and the truth differ: the model runs the whole slot at the slower
+    post-boundary rate, the truth runs the pre-boundary part at the faster one.
+    The rule is exact only when NO boundary falls strictly inside that span --
+    then both probes return the same rate and there is nothing to approximate.
+    """
+
+    def test_zero_boundaries_in_the_span_is_exact(self):
+        rate_fn = _soc_taper(90.0)
+        truth = _fine_grained_end_soc(rate_fn, soc_start=10.0)
+        model = _span_end_soc(rate_fn, soc_start=10.0)
+        assert model == pytest.approx(20.0, abs=1e-9)
+        assert model == pytest.approx(truth, abs=1e-9)
+
+    def test_zero_boundaries_is_exact_above_the_taper_too(self):
+        """The slow side of the same curve: still one constant rate."""
+        rate_fn = _soc_taper(90.0)
+        truth = _fine_grained_end_soc(rate_fn, soc_start=92.0)
+        model = _span_end_soc(rate_fn, soc_start=92.0)
+        assert model == pytest.approx(94.5, abs=1e-9)
+        assert model == pytest.approx(truth, abs=1e-9)
+
+    def test_one_descending_boundary_is_conservative_but_not_exact(self):
+        """Fast -> slow at 90 %, starting at 88 %: 1.5 SOC points apart."""
+        rate_fn = _soc_taper(90.0)
+        truth = _fine_grained_end_soc(rate_fn, soc_start=88.0)
+        model = _span_end_soc(rate_fn, soc_start=88.0)
+        assert truth == pytest.approx(92.0, abs=1e-9)
+        assert model == pytest.approx(90.5, abs=1e-9)
+        assert model < truth - 1e-9, "one boundary inside the span is NOT exact"
+        assert truth - model == pytest.approx(1.5, abs=1e-9)
+
+    def test_one_ascending_boundary_is_conservative_but_not_exact(self):
+        """The other taper direction: slow -> fast at 23 %, starting at 22 %."""
+
+        def rate_fn(soc, temp=None):
+            return 4.0 if soc >= 23.0 else 1.0
+
+        truth = _fine_grained_end_soc(rate_fn, soc_start=22.0)
+        model = _span_end_soc(rate_fn, soc_start=22.0)
+        assert model == pytest.approx(24.5, abs=1e-9)
+        assert truth == pytest.approx(29.0, abs=1e-9)
+        assert model < truth - 1e-9, "one boundary inside the span is NOT exact"
+
+    def test_the_shipped_helper_shows_the_same_split(self):
+        from battery_optimizer_lib.slot_energy import charge_rate_for_span
+
+        rate_fn = _soc_taper(90.0)
+        kw = dict(
+            temp=None,
+            duration_h=0.25,
+            efficiency=1.0,
+            capacity=CAPACITY,
+            max_soc=100.0,
+        )
+        # Zero boundaries in [10, 20): the start rate stands, and it is right.
+        assert charge_rate_for_span(rate_fn, soc_start=10.0, **kw) == pytest.approx(
+            4.0
+        )
+        # One boundary in [88, 93): the slow rate for the whole slot, which
+        # under-credits rather than matching.
+        assert charge_rate_for_span(rate_fn, soc_start=88.0, **kw) == pytest.approx(
+            1.0
+        )
+
+
+class TestTheDocumentedClaimMatchesTheMeasurement:
+    """The two texts that state these conditions, pinned to the measurements.
+
+    Both said "at most one bucket boundary" for exactness and stated the
+    cooling bound unconditionally. Nothing in the suite held either sentence to
+    the numbers above, so both drifted from the code they describe.
+    """
+
+    def _texts(self):
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parent.parent
+        return {
+            "appdaemon/apps/battery_optimizer_lib/slot_energy.py": (
+                root / "appdaemon/apps/battery_optimizer_lib/slot_energy.py"
+            ).read_text(encoding="utf-8"),
+            "docs/scheduling-algorithm.md": (
+                root / "docs/scheduling-algorithm.md"
+            ).read_text(encoding="utf-8"),
+        }
+
+    def test_neither_text_claims_exactness_with_a_boundary_inside(self):
+        for name, text in self._texts().items():
+            flat = " ".join(text.split())
+            assert "at most one bucket boundary falls inside" not in flat, name
+            assert "at most one bucket boundary" not in flat, name
+
+    def test_both_texts_state_the_zero_boundary_condition(self):
+        for name, text in self._texts().items():
+            flat = " ".join(text.split()).lower()
+            assert "no bucket boundary falls strictly inside" in flat, name
+
+    def test_both_texts_condition_the_cooling_bound_on_monotonicity(self):
+        for name, text in self._texts().items():
+            flat = " ".join(text.split()).lower()
+            assert "non-increasing in temperature" in flat, name
+
 
 class TestTheRateSpanErrsConservative:
     """A2: the rate is evaluated over the SPAN, not frozen at the start SOC.

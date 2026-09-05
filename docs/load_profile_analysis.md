@@ -378,7 +378,7 @@ When the load profile has no data for a slot:
         └── CHARGE cost  = charge_cost + buy_price × load × slot_hours
                 │
                 ▼
-        Optimal Schedule (CHARGE / HOLD / DISCHARGE per slot)
+        Chosen Schedule (CHARGE / HOLD / DISCHARGE per slot)
                 │
                 ▼
         growatt_modbus/set_wit_mode (per-slot execution)

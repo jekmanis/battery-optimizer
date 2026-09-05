@@ -30,6 +30,64 @@ except ImportError:
 # `NordPoolPriceService._warn_malformed_record`.
 MALFORMED_WARNING_INTERVAL_S = 3600
 
+
+class _MalformedEnd:
+    """Sentinel: the source PUBLISHED an ``end`` and it cannot be used.
+
+    `_parse_interval_end` used to answer ``None`` both for a record that
+    carries no ``end`` and for one whose ``end`` is ``"not-a-timestamp"``.
+    Those are opposite statements. An absent end is a normal case with a
+    documented answer - one `slot_minutes` slot - and collapsing the second
+    into the first handed that slot of coverage to a record whose own width
+    field is garbage. A cheap current record with an unreadable end therefore
+    reported `has_current=True` and was planned as CHARGE carrying
+    `PRICE_SOURCE_MARKET`.
+
+    Three states, so the caller can tell them apart: a datetime, ``None`` for
+    absent, this for published-and-unusable.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return "<malformed interval end>"
+
+
+MALFORMED_END = _MalformedEnd()
+
+# The longest span a SINGLE published record may declare.
+#
+# Nord Pool publishes 15- or 60-minute intervals and a day-ahead block never
+# exceeds a day, so anything longer is a corrupt timestamp rather than a market
+# that changed its mind about resolution.
+#
+# It bounds the WORK a record can ask for as much as its plausibility.
+# `_normalize_prices` allocates a bucket for every slot inside a declared
+# interval, and the only guard on that used to be `modeled_horizon`'s 168-hour
+# budget -- which runs on the RESULT, long after every bucket has been built.
+# One record declaring a year produced 35,040 quarter-hour buckets, silently,
+# inside the app lock and on a callback that has to finish in milliseconds.
+#
+# A 25-hour local day is not a counterexample: the day is published as hourly or
+# quarter-hourly records, never as one record spanning it.
+MAX_RECORD_SPAN_HOURS = 24.0
+
+# The widest window `_normalize_prices` will map onto the slot grid, measured
+# from the EARLIEST record in the reply.
+#
+# The same week as `battery_optimizer.MODELED_HORIZON_MAX_HOURS`, which takes
+# its value from this name so the two cannot drift: anything past it is dropped
+# by the planner anyway, so expanding it here only spends memory to produce
+# slots that are then discarded. `price_retain_max_age_hours` is clamped to the
+# same week.
+#
+# It is the second half of the bound. `MAX_RECORD_SPAN_HOURS` stops ONE record
+# from being unbounded; this stops a reply of ten thousand plausible records
+# from being unbounded in aggregate, and it is what keeps the list handed to
+# `PriceHorizonMonitor.merge_with_retained` -- and therefore the retained set --
+# finite.
+MAX_NORMALIZED_WINDOW_HOURS = 168.0
+
 Span = Tuple[datetime.datetime, datetime.datetime]
 
 
@@ -255,6 +313,14 @@ class NordPoolPriceService:
             end = end.astimezone(tz)
         return end.replace(tzinfo=None)
 
+    def _reject_malformed_end(self, start, raw) -> None:
+        """Say, once an hour, that a record declared an unusable ``end``."""
+        self._warn_malformed_record(
+            f"Price record for {start} declares an end of {raw!r}, which is "
+            f"not a usable timestamp; dropping it. The interval it claimed is "
+            f"a gap until a source publishes it properly."
+        )
+
     def _interval_end(
         self,
         start: datetime.datetime,
@@ -273,9 +339,17 @@ class NordPoolPriceService:
         price for that interval on the strength of a field saying the opposite,
         and coverage is what the schedule, the horizon monitor and the
         provenance guard are all built on.
+
+        An end that was PUBLISHED but cannot be read (`MALFORMED_END`, or any
+        value that is not a datetime) is the same kind of evidence and gets the
+        same answer. Both parsers already drop such a record where they build
+        it; this is the second gate, for a `PricePoint` assembled anywhere else.
         """
         if end is None:
             return self._shift(start, self.slot_minutes)
+        if not isinstance(end, datetime.datetime):
+            self._reject_malformed_end(start, end)
+            return None
         end = self._match_awareness(end, start)
         if instant_key(end) > instant_key(start):
             return end
@@ -285,6 +359,72 @@ class NordPoolPriceService:
             f"a gap until a source publishes it properly."
         )
         return None
+
+    def _slots_in(self, span: datetime.timedelta) -> int:
+        """How many slots a span would expand to, WITHOUT expanding it."""
+        minutes = span.total_seconds() / 60.0
+        if minutes <= 0:
+            return 0
+        slots = int(minutes // self.slot_minutes)
+        if minutes % self.slot_minutes:
+            slots += 1
+        return slots
+
+    def _bounded_to_window(self, records: List[Tuple]) -> List[Tuple]:
+        """*records* clipped to `MAX_NORMALIZED_WINDOW_HOURS` of coverage.
+
+        Measured from the EARLIEST record, because that is the only anchor a
+        reply carries: the app clock says nothing about how far ahead a source
+        chose to publish, and a reply that legitimately starts in the past must
+        still reach a week forward from its own beginning.
+
+        A record that STRADDLES the bound is truncated rather than dropped -
+        the part inside the window was published like any other. A record
+        entirely past it is dropped. One WARNING says how many slots went, so a
+        horizon shortened here is a stated fact and not, as it would be
+        downstream, a sequence that simply ends.
+
+        Arithmetic only: nothing here iterates a span, which is the whole point
+        (see `MAX_RECORD_SPAN_HOURS`).
+        """
+        if not records:
+            return records
+        window_end = (
+            min(r[2] for r in records)
+            + datetime.timedelta(hours=MAX_NORMALIZED_WINDOW_HOURS)
+        )
+
+        bounded: List[Tuple] = []
+        dropped_slots = 0
+        dropped_records = 0
+        first_dropped = None
+        for span, rank, start_key, end_key, start_dt, price in records:
+            if start_key >= window_end:
+                dropped_slots += self._slots_in(end_key - start_key)
+                dropped_records += 1
+                if first_dropped is None or start_key < first_dropped:
+                    first_dropped = start_key
+                continue
+            if end_key > window_end:
+                dropped_slots += self._slots_in(end_key - window_end)
+                dropped_records += 1
+                if first_dropped is None or window_end < first_dropped:
+                    first_dropped = window_end
+                end_key = window_end
+                span = end_key - start_key
+            bounded.append((span, rank, start_key, end_key, start_dt, price))
+
+        if dropped_slots:
+            self._warn_malformed_record(
+                f"Price data reaches beyond the "
+                f"{MAX_NORMALIZED_WINDOW_HOURS:.0f}h normalization window from "
+                f"{records[0][4] if records else '?'}: dropping {dropped_slots} "
+                f"slot(s) across {dropped_records} record(s), from "
+                f"{first_dropped} on. Nothing past that window is planned, so "
+                f"expanding it would only spend memory on slots that are then "
+                f"discarded."
+            )
+        return bounded
 
     def _normalize_prices(self, prices: List[PricePoint]) -> List[PricePoint]:
         """Map published intervals onto the configured slot grid.
@@ -334,6 +474,8 @@ class NordPoolPriceService:
         # sum(price * minutes)].
         buckets: Dict[datetime.datetime, List] = {}
 
+        max_span = datetime.timedelta(hours=MAX_RECORD_SPAN_HOURS)
+
         records = []
         for index, point in enumerate(prices):
             # ONE awareness for the whole record, before anything is compared.
@@ -347,13 +489,28 @@ class NordPoolPriceService:
                 start_dt, getattr(point, "end", None)
             )
             if interval_end is None:
-                # Corrupt: an end at or before its own start. `_interval_end`
-                # has already said so, once an hour.
+                # Corrupt: an end at or before its own start, or one that was
+                # published unreadably. `_interval_end` has already said so,
+                # once an hour.
                 continue
             start_key = instant_key(start_dt)
             end_key = instant_key(interval_end)
-            records.append((end_key - start_key, -index, start_key, end_key,
+            span = end_key - start_key
+            if span > max_span:
+                # Rejected on the DECLARED span, before a single bucket exists
+                # for it. See `MAX_RECORD_SPAN_HOURS`.
+                self._warn_malformed_record(
+                    f"Price record for {start_dt} declares a span of "
+                    f"{span.total_seconds() / 3600.0:.1f}h, longer than the "
+                    f"{MAX_RECORD_SPAN_HOURS:.0f}h a single published interval "
+                    f"can be; dropping it. The interval it claimed is a gap "
+                    f"until a source publishes it properly."
+                )
+                continue
+            records.append((span, -index, start_key, end_key,
                             start_dt, point.price))
+
+        records = self._bounded_to_window(records)
 
         # Narrowest span first, then the later record of an equal-span pair.
         # `-index` sorts second so the key is total and the outcome cannot
@@ -634,16 +791,22 @@ class NordPoolPriceService:
                 elif tz:
                     start_dt = start_dt.replace(tzinfo=tz)
 
+                # How far this price REACHES, as published. Dropping it left
+                # `_normalize_prices` guessing the width from the spacing of
+                # whatever records survived, which prices the gaps.
+                interval_end = self._parse_interval_end(entry.get("end"), tz)
+                if interval_end is MALFORMED_END:
+                    # Published and unreadable: the record is corrupt, and one
+                    # slot of coverage for it is a price nobody stated.
+                    self._reject_malformed_end(start_dt, entry.get("end"))
+                    continue
+
                 # Convert EUR/MWh to EUR/kWh
                 price_kwh = float(price_mwh) / 1000.0
                 prices.append(PricePoint(
                     time=start_dt,
                     price=price_kwh,
-                    # How far this price REACHES, as published. Dropping it
-                    # left `_normalize_prices` guessing the width from the
-                    # spacing of whatever records survived, which prices the
-                    # gaps.
-                    end=self._parse_interval_end(entry.get("end"), tz),
+                    end=interval_end,
                 ))
 
             except (ValueError, TypeError) as e:
@@ -652,25 +815,34 @@ class NordPoolPriceService:
 
         return prices
 
-    def _parse_interval_end(self, value, tz) -> Optional[datetime.datetime]:
-        """The source's ``end`` field as a local datetime, or None.
+    def _parse_interval_end(self, value, tz):
+        """The source's ``end`` field, TRI-STATE.
 
-        An unparseable or absent end is not fatal and is not guessed at: the
-        point then covers exactly one slot (`_interval_end`).
+        * a local datetime -- the source said how far this price reaches;
+        * ``None`` -- the source said NOTHING, and the record then covers
+          exactly one slot (`_interval_end`);
+        * `MALFORMED_END` -- the source published an ``end`` and it is not a
+          timestamp: an empty string, a bare number, a list, garbage.
+
+        The third case used to answer ``None``, which is the second case's
+        answer, so a record whose own width field was unreadable was granted a
+        slot of coverage anyway. Both are "no usable end", but only one of them
+        is a record saying so on purpose. See `_MalformedEnd`.
         """
         if value is None:
             return None
         try:
-            if isinstance(value, str):
-                end_dt = datetime.datetime.fromisoformat(
-                    value.replace("Z", "+00:00")
-                )
-            elif isinstance(value, datetime.datetime):
+            if isinstance(value, datetime.datetime):
                 end_dt = value
+            elif isinstance(value, str) and value.strip():
+                end_dt = datetime.datetime.fromisoformat(
+                    value.strip().replace("Z", "+00:00")
+                )
             else:
-                return None
+                # A bool, an int, an empty string, a list: published, unusable.
+                return MALFORMED_END
         except (ValueError, TypeError):
-            return None
+            return MALFORMED_END
         if tz and end_dt.tzinfo:
             return end_dt.astimezone(tz)
         if tz:
@@ -730,13 +902,21 @@ class NordPoolPriceService:
                             dt = dt.astimezone(tz)
                         elif tz:
                             dt = dt.replace(tzinfo=tz)
+                        # The raw attributes publish an `end`; keeping it is
+                        # what stops a missing record from being filled in from
+                        # its neighbour's spacing.
+                        interval_end = self._parse_interval_end(
+                            entry.get("end"), tz
+                        )
+                        if interval_end is MALFORMED_END:
+                            # Published and unreadable: drop it, exactly as the
+                            # service path does.
+                            self._reject_malformed_end(dt, entry.get("end"))
+                            continue
                         prices.append(PricePoint(
                             time=dt,
                             price=float(price),
-                            # The raw attributes publish an `end`; keeping it
-                            # is what stops a missing record from being filled
-                            # in from its neighbour's spacing.
-                            end=self._parse_interval_end(entry.get("end"), tz),
+                            end=interval_end,
                         ))
                     except (ValueError, TypeError):
                         pass

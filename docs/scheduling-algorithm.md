@@ -1466,6 +1466,14 @@ The rules, in full:
 
 - `PricePoint.end` carries the source's own end. Both parsers now set it.
 - A point with **no** `end` covers exactly one `slot_minutes` slot.
+- A record whose `end` was **published but cannot be read** — `"not-a-timestamp"`,
+  an empty string, a bare number, a list — is **dropped**, with the same
+  once-an-hour WARNING. `_parse_interval_end` is tri-state for this reason: a
+  datetime, `None` for an end the source never stated, and a `MALFORMED_END`
+  sentinel for one it stated unusably. Answering `None` for both gave the
+  corrupt record the absent-end rule's one slot of coverage, so a cheap current
+  record with an unreadable end reported `has_current=True` and was planned as
+  CHARGE carrying `price_source="market"`.
 - A record whose `start` and `end` disagree about being timezone-aware is
   normalized to ONE awareness - its start's, through the local zone - before
   anything is compared. With no timezone configured in AppDaemon both parsers
@@ -1478,6 +1486,23 @@ The rules, in full:
   giving it one slot published a price for that interval on the strength of a
   field saying the opposite. The interval stays a gap until a source publishes
   it properly.
+- The source window is **bounded before it is expanded**, never after. A record
+  declaring more than `MAX_RECORD_SPAN_HOURS` (24) is rejected — Nord Pool
+  publishes 15- or 60-minute intervals and a day-ahead block never exceeds a
+  day, and a 25-hour DST day is published as 25 hourly records, not as one
+  record spanning it. The reply as a whole is then clipped to
+  `MAX_NORMALIZED_WINDOW_HOURS` (168) measured from its **earliest** record, so
+  ten thousand individually plausible records cannot be unbounded in aggregate.
+  A record straddling that bound is truncated rather than dropped; one WARNING
+  says how many slots went.
+
+  `modeled_horizon`'s week-long budget is the same number and is deliberately
+  defined from this one, but it runs on the *result*: it cannot stop the work,
+  only discard it afterwards. A single record declaring a year therefore built
+  35,040 quarter-hour buckets first — inside the app lock, on a callback that
+  has to finish in milliseconds — and only then had them thrown away. Bounding
+  the window is also what keeps the list handed to
+  `PriceHorizonMonitor.merge_with_retained`, and hence the retained set, finite.
 - The simple sensor list (`today` / `tomorrow`, bare numbers) is the one
   exception: it has no ends, but the format's own resolution is explicit —
   24 values for a local day are hourly, 96 are quarter-hours, and the list is

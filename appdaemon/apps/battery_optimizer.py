@@ -92,6 +92,7 @@ from battery_optimizer_lib.models import (
     ScheduleModeCounts,
     count_schedule_modes,
 )
+from battery_optimizer_lib.price_service import MAX_NORMALIZED_WINDOW_HOURS
 from battery_optimizer_lib.pv_profile import PvProfile
 from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
 
@@ -230,7 +231,15 @@ def first_slot_fraction(minutes_into_slot: float, slot_minutes: int) -> float:
 # generous - a source that starts publishing further ahead should get planned,
 # not truncated - while still being three orders of magnitude short of the
 # decade the guard is there for.
-MODELED_HORIZON_MAX_HOURS = 168.0
+#
+# It is the SAME week `NordPoolPriceService._normalize_prices` will map onto the
+# slot grid, and deliberately the same number rather than a second copy of it.
+# This guard runs on the RESULT; the normalization guard runs on the source
+# window, BEFORE any expansion, which is where an interval a decade out has to
+# be stopped if it is not to cost 35,040 buckets on the way here. Two different
+# numbers would mean either expanding slots the planner then discards, or
+# discarding slots the planner was told it could have.
+MODELED_HORIZON_MAX_HOURS = MAX_NORMALIZED_WINDOW_HOURS
 
 
 def modeled_horizon(

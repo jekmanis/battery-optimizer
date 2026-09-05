@@ -437,6 +437,41 @@ class TestFallbackAndRetention:
         assert app.applied[-1].mode == BatteryMode.HOLD
         assert app.applied[-1].reason == "safety_min_soc"
 
+    def test_a_retained_entry_still_respects_the_max_soc_guard(self, scenario_now):
+        """The retention path is how a CHARGE reaches a full pack.
+
+        The safety HOLD makes the current interval unpriced from the plan's
+        point of view; the rebuild then retains the previous real-priced CHARGE
+        entry and re-sends it. With the SOC pinned at max no SOC event fires to
+        undo it, so the execution guard is the only thing that can.
+        """
+        app, current_slot = self._app_with_a_real_priced_plan(
+            scenario_now, mode=BatteryMode.CHARGE
+        )
+        app._soc = app.max_soc
+        _, today_points, _ = maintainer_scenario(scenario_now)
+        attach_service_path(app, {scenario_now.date(): today_points})
+
+        app.full_optimize(None)
+
+        assert current_entry(app, current_slot) is not None, (
+            "the real-priced entry is still retained"
+        )
+        assert app.applied[-1].mode == BatteryMode.HOLD
+        assert app.applied[-1].reason == "safety_max_soc"
+
+    def test_a_retained_charge_below_max_soc_is_still_sent(self, scenario_now):
+        app, current_slot = self._app_with_a_real_priced_plan(
+            scenario_now, mode=BatteryMode.CHARGE
+        )
+        app._soc = app.max_soc - 1.0
+        _, today_points, _ = maintainer_scenario(scenario_now)
+        attach_service_path(app, {scenario_now.date(): today_points})
+
+        app.full_optimize(None)
+
+        assert app.applied[-1].mode == BatteryMode.CHARGE
+
     def test_a_retained_entry_sends_nothing_during_a_manual_override(
         self, scenario_now
     ):

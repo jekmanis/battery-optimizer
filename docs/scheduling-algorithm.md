@@ -1300,6 +1300,18 @@ end, pending-retry/attempt information, and - for the slot running right now -
 `current_slot_priced` plus `current_slot_entry`
 (`planned` / `retained` / `fallback`). The last two are scoped to the interval
 they describe, so they report `null` rather than the previous slot's answer.
+`current_slot_priced` is also `null` when it is genuinely *unknown* — a restart
+that has never fetched prices cannot say whether the interval it woke up in was
+published, and it reports `no_schedule`, not `no_price`.
+
+`sensor.battery_optimizer` also publishes `rate_refinement`, the outcome of the
+solve/replay/refine loop for the current plan: `branch` (`single_solve`,
+`converged`, `conservative_fallback` or `degraded`), `passes`, `converged`,
+`fallback`, `degraded` and `shortfall_kwh`. `degraded` is the one that matters
+to a reader: the plan's actions were chosen for charge energy the pack will not
+have at the temperatures it reaches, so nothing published credits that energy
+but the plan is no longer economically optimal. It is logged at WARNING when it
+happens; the attribute is how you see it afterwards.
 
 ## Re-optimization and execution
 

@@ -126,6 +126,22 @@ TEMP_FIXED_POINT_C = 0.25
 # whole tenths of a kWh, never 1e-9.
 CHARGE_FEASIBILITY_EPS_KWH = 1e-9
 
+# The one place the "this slot runs the pack dry" prose is spelled. It is
+# appended and removed together with `ScheduleEntry.energy_limited`, so the log
+# text and the flag cannot disagree.
+DEPLETION_NOTE = " (until depleted)"
+
+
+def _with_depletion_note(reason: str, energy_limited: bool) -> str:
+    """``reason`` carrying the depletion note iff the slot is energy-limited."""
+    reason = reason or ""
+    has_note = DEPLETION_NOTE in reason
+    if energy_limited and not has_note:
+        return reason + DEPLETION_NOTE
+    if not energy_limited and has_note:
+        return reason.replace(DEPLETION_NOTE, "")
+    return reason
+
 
 def _energy_to_index(
     energy: float,
@@ -411,6 +427,12 @@ class DPOptimizer:
         self._temp_projector = temp_projector
         # (soc, temperature) -> charge_input_dc_kw, reset per optimize() call.
         self._rate_cache: Dict[Tuple[float, Optional[float]], float] = {}
+        # The EXACT state SOCs `_run_dp` evaluated a rate at during the last
+        # solve. `_profiles_agree`'s "do these two profiles imply the same
+        # charge capability?" criterion is evaluated at these and not at the
+        # grid: the grid is where a state's LABEL sits, `dp_energy[idx]` is what
+        # every transition is computed from, and those are not the same points.
+        self._visited_state_socs: set = set()
         # Whether a terminal value pinned to 0 (legacy/degenerate mode) is
         # surfaced at WARNING from this optimizer instance. The orchestrator
         # sets it only for the daily/full optimization so the adaptive
@@ -561,10 +583,14 @@ class DPOptimizer:
         # skipped the whole loop for a curve that varied only between its
         # sample points.
         refine = current_temp is not None
-        state_socs = (
+        # Fallback only, for the case where a solve visited nothing (an empty
+        # horizon). The real set is the exact state energies the solve reached,
+        # collected during `_run_dp` and read back after each `_solve`.
+        grid_state_socs = (
             [e / cfg.battery_capacity * 100 for e in energy_levels]
             if cfg.battery_capacity else []
         )
+        state_socs = grid_state_socs
         seen_profiles: List[List[Optional[float]]] = []
         # Every profile any rate in this call was ever taken from. The
         # conservative fallback minimises over exactly these.
@@ -594,6 +620,11 @@ class DPOptimizer:
         while True:
             passes += 1
             schedule, idx_trajectory, energy_trajectory, best_value = _solve(temp_profile)
+            # Criterion 2 of `_profiles_agree` asks whether two profiles imply
+            # the same charge capability. "The same" has to mean at the states
+            # the solve actually visits, which are exact path energies, not grid
+            # points.
+            state_socs = self.last_visited_state_socs() or grid_state_socs
             if not refine:
                 branch = "single_solve"
                 break
@@ -678,17 +709,23 @@ class DPOptimizer:
             )
             energy_trajectory = list(replay.energies)
             temp_profile = replay.temp_profile
-            # A slot the walk cannot serve in full must SAY so, or
-            # `plan_validation` reports a plan crediting service it does not
-            # have. The plan already declares the ones the DP found.
+            # The FINAL walk decides `energy_limited`, in BOTH directions.
+            #
+            # Setting it only where the walk is short left the flag — and the
+            # "(until depleted)" prose the schedule log prints — on every slot
+            # the DP's own conservative pass thought would run the pack dry but
+            # the walk serves in full. That is the normal outcome of the
+            # conservative fallback: the plan is built on deliberately
+            # pessimistic rates and the pack then has more energy than the plan
+            # credited it with.
             for i, price_point in enumerate(slots_sorted_by_time):
                 entry = schedule.get(price_point.time)
-                if (
-                    entry is not None
-                    and i < len(replay.unmet_slots)
-                    and replay.unmet_slots[i]
-                ):
-                    entry.energy_limited = True
+                if entry is None or i >= len(replay.unmet_slots):
+                    continue
+                entry.energy_limited = bool(replay.unmet_slots[i])
+                entry.reason = _with_depletion_note(
+                    entry.reason, entry.energy_limited
+                )
 
         soc_trajectory = self._build_soc_trajectory(
             slots_sorted_by_time, energy_trajectory, start_energy
@@ -821,6 +858,17 @@ class DPOptimizer:
             cached = max(0.0, float(self._get_charge_rate_for_soc(soc, temp) or 0.0))
             self._rate_cache[key] = cached
         return cached
+
+    def last_visited_state_socs(self) -> List[float]:
+        """The exact state SOCs the last solve evaluated a charge rate at.
+
+        Not the DP's SOC grid: a state's bucket index is only its LABEL, and
+        every transition is computed from ``dp_energy[idx]``, the path's exact
+        continuous energy. Comparing two temperature profiles' implied charge
+        capability at the grid was therefore comparing them at points the solve
+        never asks about.
+        """
+        return sorted(self._visited_state_socs)
 
     def _span_rate(self, rate_fn, soc: float, temp, duration_h: float) -> float:
         """THE within-slot rate for a candidate transition.
@@ -1141,17 +1189,20 @@ class DPOptimizer:
         Two criteria, either of which stops the refinement:
 
         1. The temperatures themselves agree within ``TEMP_FIXED_POINT_C``.
-        2. They imply the SAME charge capability at every state of the DP's SOC
-           grid. Temperature only reaches the plan through the rate, so two
-           profiles that produce identical rates produce identical plans -- and
-           a pack that keeps warming inside one temperature bucket would
+        2. They imply the SAME charge capability at every state the last solve
+           actually visited. Temperature only reaches the plan through the rate,
+           so two profiles that produce identical rates produce identical plans
+           -- and a pack that keeps warming inside one temperature bucket would
            otherwise never reach a fixed point at all.
 
-        Criterion 2 is evaluated at the grid SOCs. A rate curve with a
-        discontinuity strictly between two adjacent grid points could be missed;
-        that is the same 1 %-of-capacity resolution the whole DP works at, and
-        the final replay in ``plan_validation`` is what catches a genuine
-        disagreement.
+        ``state_socs`` is ``last_visited_state_socs()``: the EXACT
+        ``dp_energy[idx]`` of every state a rate was looked up for. It used to
+        be the DP's SOC grid, which is where a state's LABEL sits and not where
+        its transition is computed -- so a curve whose two profiles differ only
+        at an energy strictly between two grid points read as "the same plan" at
+        precisely the states the solve visits. A curve that differs only at an
+        energy NO state reaches is genuinely the same plan, which is the
+        question being asked.
         """
         if len(a) != len(b):
             return False
@@ -1305,6 +1356,10 @@ class DPOptimizer:
 
         dp_trace_slots = []
 
+        # Accumulated across every `_run_dp` of one solve, including the one per
+        # partial-first-slot candidate. See `_visited_state_socs`.
+        visited_socs = self._visited_state_socs
+
         inv_eff = cfg.inverter_efficiency
 
         for t in range(n_list_slots):
@@ -1391,6 +1446,7 @@ class DPOptimizer:
                         slot_rate_lookup, curr_soc, slot_temp, slot_hours_fraction
                     )
                     rate_cache_slot[idx] = slot_charge_rate
+                    visited_socs.add(round(curr_soc, 6))
                 charge_dc_kwh = slot_charge_rate * slot_hours_fraction
                 charge_energy_kwh = charge_dc_kwh * cfg.efficiency
                 # PV surplus charges battery for free (pv_priority, DC→DC)
@@ -1719,6 +1775,11 @@ class DPOptimizer:
         cfg = self._config
         neg_inf = -1e18
 
+        # One solve: the exact state SOCs this solve visits start empty and
+        # accumulate across the `_run_dp` call(s) below, including the one per
+        # partial-first-slot candidate.
+        self._visited_state_socs = set()
+
         # Discharge cost
         discharge_cost_per_kwh = cfg.battery_wear_cost
 
@@ -1765,6 +1826,7 @@ class DPOptimizer:
                 partial_temp,
                 cfg.slot_hours * fraction,
             )
+            self._visited_state_socs.add(round(partial_soc, 6))
             charge_energy_kwh = slot_charge_rate * cfg.efficiency * cfg.slot_hours * fraction
             charge_dc_kwh = slot_charge_rate * cfg.slot_hours * fraction
             pv_free_charge_kwh = min(pv_surplus_kw, slot_charge_rate) * cfg.slot_hours * fraction
@@ -1999,7 +2061,7 @@ class DPOptimizer:
             if pv > 0:
                 reason += f" pv~{pv:.2f}kW"
             if is_partial:
-                reason += " (until depleted)"
+                reason += DEPLETION_NOTE
             if is_export:
                 reason += " [EXPORT]"
             if action == BatteryMode.HOLD:

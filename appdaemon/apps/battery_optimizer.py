@@ -1125,8 +1125,11 @@ class BatteryOptimizer(hass.Hass):
         # path: it re-checks enabled/override and tracks the command. During a
         # manual override it therefore refreshes the plan without sending
         # anything to the inverter.
+        # The reviewed snapshot is handed on rather than re-fetched: one
+        # blocking REST call per recovery, and the verdict that armed this
+        # rebuild and the plan it produces describe the same data.
         self.log("Price data recovered - rebuilding the remaining schedule")
-        self._recalculate_remaining_schedule(current_soc)
+        self._recalculate_remaining_schedule(current_soc, prices=prices)
         self._last_recalc_trigger = "price_recovery"
         self._last_recalc_time = now
 
@@ -1185,11 +1188,31 @@ class BatteryOptimizer(hass.Hass):
             current_slot_entry=entry_state,
         )
 
+    def _rate_refinement_diagnostics(self) -> Dict:
+        """Which rate/temperature refinement branch produced the current plan.
+
+        Published on `sensor.battery_optimizer` next to `price_horizon`. The
+        three fields the DP already computed — the branch, whether it degraded
+        and by how many kWh — had no consumer at all, so the one branch that
+        abandons economic optimality was visible only as a WARNING line in the
+        log of whoever happened to be reading it.
+        """
+        return dict(getattr(self, "_last_rate_refinement", None) or {})
+
     def _note_current_slot_state(
-        self, slot: datetime.datetime, priced: bool, entry_state: str
+        self, slot: datetime.datetime, priced: Optional[bool], entry_state: str
     ) -> None:
-        """Record how the slot at *slot* got its entry, for diagnostics."""
-        self._current_slot_state = (slot, bool(priced), entry_state)
+        """Record how the slot at *slot* got its entry, for diagnostics.
+
+        ``priced`` may be ``None``: "nothing is known about whether this
+        interval was published". A restart that has never fetched is in exactly
+        that state, and reporting ``True`` there asserted a fact nobody had.
+        """
+        self._current_slot_state = (
+            slot,
+            priced if priced is None else bool(priced),
+            entry_state,
+        )
 
     def _current_slot_state_for(
         self, now: Optional[datetime.datetime] = None
@@ -1645,6 +1668,21 @@ class BatteryOptimizer(hass.Hass):
         self._last_planning_temp_by_slot = getattr(
             result, "planning_temp_by_slot", None
         ) or {}
+        # Which of the four rate/temperature refinement paths produced this
+        # plan, and what it cost. The degrade branch already logs at WARNING;
+        # this is what lets a user (or an issue report) see the branch without
+        # having the log. Published next to `price_horizon` on
+        # `sensor.battery_optimizer`.
+        self._last_rate_refinement = {
+            "branch": getattr(result, "rate_refinement_branch", None),
+            "passes": getattr(result, "rate_refinement_passes", None),
+            "converged": getattr(result, "rate_refinement_converged", None),
+            "fallback": getattr(result, "rate_refinement_fallback", None),
+            "degraded": getattr(result, "rate_refinement_degraded", None),
+            "shortfall_kwh": round(
+                getattr(result, "rate_refinement_shortfall_kwh", 0.0) or 0.0, 3
+            ),
+        }
         self._last_dp_soc_trajectory = soc_trajectory
         self._last_dp_temp_trajectory = temp_trajectory
 
@@ -2593,7 +2631,12 @@ class BatteryOptimizer(hass.Hass):
         self._pv_bias_factor = new_factor
         return new_factor
 
-    def _recalculate_remaining_schedule(self, current_soc: float, extra_charge_slots: int = 0):
+    def _recalculate_remaining_schedule(
+        self,
+        current_soc: float,
+        extra_charge_slots: int = 0,
+        prices: Optional[List[PricePoint]] = None,
+    ):
         """
         Recalculate schedule for remaining hours based on current SOC.
 
@@ -2601,26 +2644,41 @@ class BatteryOptimizer(hass.Hass):
             current_soc: Current battery state of charge (%)
             extra_charge_slots: Additional charge slots to add beyond minimum required
                                (used for catch-up charging when behind schedule)
+            prices: An already-fetched and already-reviewed snapshot. A price
+                fetch is a blocking REST call on the shared AppDaemon worker
+                thread, so a caller that has just made one and judged it — the
+                bounded price recovery — hands it over instead of paying for a
+                second. It is also the only way the verdict and the plan are
+                guaranteed to describe the SAME snapshot: prices can change
+                between two calls, and then the horizon the retry declared
+                healthy is not the horizon the plan was built from.
         """
         local_tz = self._get_local_timezone()
         now = ensure_local_tz(self.datetime(), local_tz)
         now_slot = self._align_to_slot(now)
-        prices = self.get_prices()
 
-        # One owner judges every fetch. A rebuild triggered by an SOC
-        # deviation, a PV shortfall or a depletion can be the first path to see
-        # a horizon that has lost its current interval; without this it would
-        # plan the future correctly and leave NOTHING armed to go and fetch the
-        # missing price, because only `full_optimize`, the slot execution and
-        # the adaptive pass reviewed. `_note_price_horizon_failure` still
-        # refuses to advance the backoff while a retry is armed, so the extra
-        # call sites cannot turn into a retry storm.
-        #
-        # getattr, like `_validate_final_plan` above: several test doubles
-        # borrow this method without the price-recovery state.
-        _review = getattr(self, "_review_price_horizon", None)
-        if callable(_review):
-            _review(prices, now, context="recalculate")
+        if prices is None:
+            prices = self.get_prices()
+
+            # One owner judges every fetch. A rebuild triggered by an SOC
+            # deviation, a PV shortfall or a depletion can be the first path to
+            # see a horizon that has lost its current interval; without this it
+            # would plan the future correctly and leave NOTHING armed to go and
+            # fetch the missing price, because only `full_optimize`, the slot
+            # execution and the adaptive pass reviewed.
+            # `_note_price_horizon_failure` still refuses to advance the backoff
+            # while a retry is armed, so the extra call sites cannot turn into a
+            # retry storm.
+            #
+            # A snapshot supplied by the caller has already been reviewed by it;
+            # reviewing it twice would record the same verdict against the same
+            # data.
+            #
+            # getattr, like `_validate_final_plan` above: several test doubles
+            # borrow this method without the price-recovery state.
+            _review = getattr(self, "_review_price_horizon", None)
+            if callable(_review):
+                _review(prices, now, context="recalculate")
 
         # Filter to future prices only
         future_prices = [p for p in prices if dt_ge(p.time, now_slot, local_tz)]
@@ -2833,7 +2891,16 @@ class BatteryOptimizer(hass.Hass):
                 mode=BatteryMode.HOLD,
                 reason="no_price" if unpriced else "no_schedule",
             )
-            self._note_current_slot_state(current_slot, not unpriced, "fallback")
+            # Three states, three answers. `health is None` is the restart case:
+            # nothing has been fetched, so whether this interval was published
+            # is UNKNOWN — reporting `priced=True` there (the old `not unpriced`)
+            # asserted a fact nobody had. The `no_schedule` reason above is
+            # unchanged; that part IS known, because the plan is empty.
+            self._note_current_slot_state(
+                current_slot,
+                None if health is None else not unpriced,
+                "fallback",
+            )
             self._note_price_horizon_failure(
                 health.reason if unpriced else "no_schedule",
                 now,
@@ -4428,6 +4495,11 @@ class BatteryOptimizer(hass.Hass):
                     # usable, and whether a bounded retry is pending. A nonempty
                     # `prices_cached` alone never proved a usable horizon.
                     "price_horizon": self._price_horizon_diagnostics(),
+                    # Which of the four rate/temperature refinement paths built
+                    # the current plan, and the kWh the degrade branch could not
+                    # supply. "degraded" means the actions were chosen for
+                    # energy the pack will not have.
+                    "rate_refinement": self._rate_refinement_diagnostics(),
                     "battery_avg_cost": round(self.battery_avg_cost, 4),
                     "discharge_threshold": round(self._get_discharge_threshold(), 4),
                     # Decision transparency attributes

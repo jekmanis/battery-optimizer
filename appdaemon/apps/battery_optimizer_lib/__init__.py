@@ -49,6 +49,7 @@ from .dp_optimizer import DPOptimizer, DPOptimizerConfig, DPOptimizerResult
 from .timezone_utils import (
     normalize_tz_pair,
     datetimes_match_slot,
+    is_aware,
     instant_key,
     canonical_slot_key,
     dt_ge,
@@ -121,6 +122,7 @@ __all__ = [
     # Timezone utilities
     "normalize_tz_pair",
     "datetimes_match_slot",
+    "is_aware",
     "instant_key",
     "canonical_slot_key",
     "dt_ge",

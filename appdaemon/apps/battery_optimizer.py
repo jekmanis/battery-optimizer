@@ -42,6 +42,7 @@ from battery_optimizer_lib import (
     # Timezone utilities
     normalize_tz_pair,
     datetimes_match_slot,
+    is_aware,
     instant_key,
     canonical_slot_key,
     dt_ge,
@@ -214,8 +215,31 @@ def first_slot_fraction(minutes_into_slot: float, slot_minutes: int) -> float:
     )
 
 
+# How far a modelled sequence may reach, in ELAPSED HOURS from its first slot.
+#
+# The runaway guard exists for one case: a source handing us an interval a
+# decade out must not spin here. It used to be a slot COUNT
+# (`len(priced) * 4 + 1000`), which is not a horizon - it allowed 252 hours for
+# a two-point reply and 346 for a full day of quarter hours - and it truncated
+# in silence.
+#
+# A week is far outside anything a price source publishes: the horizon the app
+# can even require ends at the end of TOMORROW
+# (`PriceHorizonMonitor.required_horizon_end`), under 48 hours out, and
+# `price_retain_max_age_hours` is clamped to the same week. It is deliberately
+# generous - a source that starts publishing further ahead should get planned,
+# not truncated - while still being three orders of magnitude short of the
+# decade the guard is there for.
+MODELED_HORIZON_MAX_HOURS = 168.0
+
+
 def modeled_horizon(
-    priced_sorted: List[PricePoint], slot_minutes: int
+    priced_sorted: List[PricePoint],
+    slot_minutes: int,
+    *,
+    start: Optional[datetime.datetime] = None,
+    max_hours: float = MODELED_HORIZON_MAX_HOURS,
+    log_fn=None,
 ) -> List[PricePoint]:
     """The contiguous slot sequence the plan describes.
 
@@ -230,17 +254,34 @@ def modeled_horizon(
     slot before it - and the final replay skipped it for the same reason, so it
     validated a trajectory that was wrong from the gap onwards.
 
-    Two boundaries, both deliberate:
+    Three boundaries, all deliberate:
 
     * It does not extend PAST the last priced interval. A gap at the END of the
       horizon is the horizon ending; modelling beyond it would invent slots as
       well as prices.
-    * It starts at the first point it is given, which is the current slot when
-      that is priced and the first published interval otherwise - because an
+    * It starts where the CALLER says, in ``start``: the current slot when that
+      is priced, and the slot immediately AFTER it when it is not - because an
       unpriced CURRENT interval is already owned by
       `_resolve_unpriced_current_slot`. The two mechanisms differ exactly
       there: only the current slot can RETAIN a decision made earlier on a real
       price, and only the current slot runs for part of its interval.
+
+      The lower bound has to be passed rather than inferred, because
+      `_resolve_unpriced_current_slot` owns exactly ONE interval. Starting at
+      the first PRICED point instead dropped every unpublished slot between the
+      current one and it: a reply holding 10:00-10:15 and 10:45-11:00 at 10:17
+      left 10:30 in no mechanism at all - not in the DP, not in the replay, not
+      in the schedule - and the plan then imported at 1.00 EUR/kWh the kWh
+      10:30's own sun would have stored for nothing.
+
+    * It stops after ``max_hours`` of ELAPSED TIME (`MODELED_HORIZON_MAX_HOURS`)
+      and says so at WARNING. The priced intervals past that point are DROPPED
+      - the caller drops them from its own price list too - rather than left
+      to look like a horizon that was modelled.
+
+    Priced points earlier than ``start`` stay out of the sequence; they are the
+    caller's to account for (the retained or fallback current-slot entry), and
+    the DP must not be handed an interval that is already running.
 
     Elapsed time, never wall clock: the two autumn 03:00 intervals are four
     quarter-hours apart, not zero.
@@ -256,9 +297,19 @@ def modeled_horizon(
 
     modeled: List[PricePoint] = []
     slot = priced_sorted[0].time
+    if start is not None and is_aware(start) == is_aware(slot):
+        slot = start
+    # A naive app clock against aware prices (or the reverse) has no comparable
+    # lower bound - only an invented offset would make one - so the first
+    # priced point stands, which is what the loop below did unconditionally
+    # before the bound became explicit.
+    #
+    # A bound already past the last priced interval models nothing: the loop
+    # below stops immediately, and extending past the last price is exactly
+    # what the end-of-horizon rule forbids.
     key = instant_key(slot)
-    # A source handing us an interval a decade out must not spin here.
-    max_slots = len(priced_sorted) * 4 + 1000
+    # Elapsed time, not a count of points: see MODELED_HORIZON_MAX_HOURS.
+    max_slots = 1 + max(0, int((max_hours * 60) // max(1, slot_minutes)))
     while key <= last_key and len(modeled) < max_slots:
         published = by_instant.get(key)
         modeled.append(
@@ -272,6 +323,22 @@ def modeled_horizon(
             # hands us an unaligned one, follow the elapsed-time key rather
             # than silently planning a different interval.
             slot = key
+    if key <= last_key:
+        # The budget ran out before the last priced interval. Whatever is out
+        # there is unreachable: say so, and let the caller drop it. Ending the
+        # sequence quietly published a horizon that had been shortened without
+        # a word - and a timestamp this far out is corrupt far more often than
+        # it is a market that started publishing a week ahead.
+        dropped = [p for p in priced_sorted if instant_key(p.time) >= key]
+        if log_fn is not None:
+            log_fn(
+                f"Price data reaches beyond the {max_hours:.0f}h modelling "
+                f"budget from {modeled[0].time if modeled else slot}: "
+                f"dropping {len(dropped)} priced interval(s) from "
+                f"{dropped[0].time if dropped else '?'} on and planning the "
+                f"{len(modeled)} slots inside it",
+                level="WARNING",
+            )
     return modeled
 
 
@@ -1470,9 +1537,10 @@ class BatteryOptimizer(hass.Hass):
         # 0.01 and the real next interval at 1.00, that is a grid-charge command
         # issued at a price that does not exist.
         #
-        # Planning simply starts at the next validated interval instead: the DP
-        # finds no index for `current_slot`, so `has_partial` is False and it
-        # solves the remaining slots at full width. The horizon is not lost.
+        # Planning simply starts at the next SLOT instead - published or not,
+        # see the modelled horizon below: the DP finds no index for
+        # `current_slot`, so `has_partial` is False and it solves the remaining
+        # slots at full width. The horizon is not lost.
         #
         # If a source can be asked for the real current price, that is a FETCH
         # and belongs in the price service and the bounded retry, which already
@@ -1483,9 +1551,20 @@ class BatteryOptimizer(hass.Hass):
             for p in future_prices
         )
 
-        # The MODELLED horizon: every slot from the first the DP is given to
-        # the last one a source priced, contiguous, with the unpublished ones
+        # The MODELLED horizon: every slot from the lower bound below to the
+        # last one a source priced, contiguous, with the unpublished ones
         # carrying `price=None`.
+        #
+        # The bound is stated here rather than inferred from the first priced
+        # point, because `_resolve_unpriced_current_slot` owns exactly ONE
+        # interval - the one running now. A LEADING RUN of unpublished slots
+        # (the current one and one or more after it, before the next published
+        # interval) therefore fell between the two mechanisms: with a reply
+        # holding 10:00-10:15 and 10:45-11:00 at 10:17, the 10:30 interval was
+        # in neither the DP, the replay nor the schedule, and the plan imported
+        # a kWh at 1.00 EUR/kWh that 10:30's own PV would have stored for
+        # nothing. Moving the same physics one slot earlier - so the hole falls
+        # INSIDE the horizon - already planned it correctly.
         #
         # Handing the DP only the priced points made a hole inside the horizon
         # vanish from planning: the slot after it was treated as following the
@@ -1496,9 +1575,28 @@ class BatteryOptimizer(hass.Hass):
         # the same slot, so it agreed with a trajectory that was ten SOC points
         # wrong from there on.
         slots_sorted_by_time = sorted(future_prices, key=lambda p: instant_key(p.time))
-        modeled_slots = modeled_horizon(
-            slots_sorted_by_time, self.config.slot_minutes
+        modeled_from = (
+            current_slot if current_slot_priced
+            else slot_offset(current_slot, self.config.slot_minutes, 1, local_tz)
         )
+        modeled_slots = modeled_horizon(
+            slots_sorted_by_time,
+            self.config.slot_minutes,
+            start=modeled_from,
+            log_fn=self.log,
+        )
+        if modeled_slots:
+            # A priced interval past the modelling budget is DROPPED, not left
+            # in the price list: the replay, the projected-cost column, the
+            # decision log and the provenance stamp all derive from this list,
+            # and an interval the DP never saw must not appear in any of them.
+            # (An ordinary reply never reaches the budget - see
+            # `MODELED_HORIZON_MAX_HOURS`.)
+            horizon_end_key = instant_key(modeled_slots[-1].time)
+            slots_sorted_by_time = [
+                p for p in slots_sorted_by_time
+                if instant_key(p.time) <= horizon_end_key
+            ]
         n_slots = len(slots_sorted_by_time)
         min_charge_slots = max(0, int(charge_hours_needed))
         if min_charge_slots > n_slots:
@@ -1552,7 +1650,7 @@ class BatteryOptimizer(hass.Hass):
             # way.
             self.log(
                 f"No published price for the current slot {current_slot}; "
-                f"planning from the next validated interval and leaving this "
+                f"planning from the next slot on and leaving this "
                 f"slot to the retained entry or the HOLD fallback",
                 level="WARNING",
             )
@@ -1626,7 +1724,9 @@ class BatteryOptimizer(hass.Hass):
         # cannot. Stamped against the price keys rather than blanket-set: if a
         # synthetic price is ever reintroduced upstream, its slot will not
         # silently inherit the marker.
-        real_price_keys = {canonical_slot_key(p.time) for p in future_prices}
+        real_price_keys = {
+            canonical_slot_key(p.time) for p in slots_sorted_by_time
+        }
         for slot_key, entry in schedule.items():
             if slot_key in real_price_keys:
                 entry.price_source = PRICE_SOURCE_MARKET

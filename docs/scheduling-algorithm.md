@@ -1276,10 +1276,34 @@ slots; its SOC from 10:30 onwards was ten points low.
 
 What happens instead:
 
-- **The modelled horizon is a contiguous slot sequence** from the first
-  interval the DP is given to the LAST PRICED one (`modeled_horizon`). It is
-  not extended past that: a gap at the *end* of the horizon is the horizon
-  ending, and modelling beyond it would invent slots as well as prices.
+- **The modelled horizon is a contiguous slot sequence** from the lower bound
+  below to the LAST PRICED interval (`modeled_horizon`). It is not extended
+  past that: a gap at the *end* of the horizon is the horizon ending, and
+  modelling beyond it would invent slots as well as prices.
+- **The lower bound is the current slot, or the one after it.** The caller
+  states it; it is not the first priced point. When the current interval is
+  priced the DP starts there and solves it at its remaining fraction; when it
+  is not, the DP starts at the slot immediately AFTER it, because that
+  interval is owned by `_resolve_unpriced_current_slot`.
+
+  Inferring the bound from the first priced point instead lost a **leading run
+  of unpublished slots**, since the current-slot mechanism owns exactly one
+  interval. A reply holding only 10:00-10:15 at 0.50 and 10:45-11:00 at 1.00,
+  read at 10:17, left 10:30 in neither mechanism: not in the DP, not in the
+  replay, not in the schedule at all. With 4 kW of PV forecast at 10:30 and
+  4 kW of load at 10:45 the plan then imported a full kWh at 1.00 EUR/kWh -
+  the kWh the missing slot's own sun stores for nothing - and the published
+  trajectory was ten SOC points low from 10:45 on. The identical hole one slot
+  earlier, *inside* the horizon, was already planned correctly; where the
+  sequence starts must not change what the physics does.
+- **A runaway timestamp is dropped, loudly.** The sequence is bounded by
+  ELAPSED TIME - a week from its first slot (`MODELED_HORIZON_MAX_HOURS`),
+  against a horizon the app can only ever require to the end of tomorrow. A
+  priced interval beyond the budget is dropped from the modelled sequence *and*
+  from the price list the replay, the cost column, the decision log and the
+  provenance stamp derive from, with a WARNING naming how many and from when.
+  The bound used to be a slot COUNT that grew with the size of the reply, and
+  it shortened the horizon in silence.
 - **An unpriced slot enters the DP with `price=None`** and is a **forced
   HOLD**:
   - only the HOLD transition is evaluated - nothing may be chosen at a price
@@ -1333,10 +1357,11 @@ interval means the data is genuinely missing.
 
 What happens instead:
 
-- **Planning starts at the next validated interval.** The DP is given the
-  prices as fetched; it finds no index for the current slot, so it solves the
-  remaining slots at full width with no partial first slot. The horizon is not
-  lost because one interval is.
+- **Planning starts at the next SLOT** - published or not. The DP finds no
+  index for the current slot, so it solves the remaining slots at full width
+  with no partial first slot. The horizon is not lost because one interval is,
+  and an unpublished slot immediately after the current one is modelled like
+  any other gap (see the lower bound above).
 - **The current slot is resolved BEFORE the solve, not after it — the whole
   decision.** `_resolve_unpriced_current_slot` picks the entry that will run
   for the rest of this quarter hour (the retained one, or the `HOLD` fallback,
@@ -1441,15 +1466,38 @@ The rules, in full:
 
 - `PricePoint.end` carries the source's own end. Both parsers now set it.
 - A point with **no** `end` covers exactly one `slot_minutes` slot.
+- A record whose `start` and `end` disagree about being timezone-aware is
+  normalized to ONE awareness - its start's, through the local zone - before
+  anything is compared. With no timezone configured in AppDaemon both parsers
+  leave each field with whatever its own ISO string carried, and comparing the
+  two raised `TypeError` out of `get_prices`, losing the whole reply and the
+  fetch that would have noticed the gap.
+- A point whose `end` is at or **before** its `start` is **dropped**, with a
+  WARNING rate-limited to once an hour. An absent end is a normal case with a
+  documented answer; a reversed one is evidence the record is corrupt, and
+  giving it one slot published a price for that interval on the strength of a
+  field saying the opposite. The interval stays a gap until a source publishes
+  it properly.
 - The simple sensor list (`today` / `tomorrow`, bare numbers) is the one
   exception: it has no ends, but the format's own resolution is explicit —
   24 values for a local day are hourly, 96 are quarter-hours, and the list is
   the whole day by construction. Each value is given that step as its end.
-- Overlapping records are resolved by publication order, not by summing
-  minutes: a later interval contributes only what an earlier one did not
-  already cover. Summing raw overlaps would let two intervals that both start
-  *inside* a slot add up to its width and mark it covered when its first
-  minutes never were.
+- Overlapping records are resolved by **specificity**, not by summing minutes.
+  For the minutes two records share, the winner is the NARROWER span; equal
+  spans are broken by the later position in the reply. Every minute is
+  attributed to exactly one record, so a finer correction nested inside a
+  coarse interval takes effect for its own minutes and the rest of the coarse
+  interval survives — 10:00-11:00 at 0.10 with 10:15-10:30 at 0.90 is three
+  quarters at 0.10 and one at 0.90.
+
+  This rule used to be described as publication order while the code
+  implemented earliest-start-wins, so the correction above was discarded and
+  all four quarters came out at 0.10. Publication order is not recoverable from
+  a reply — the records arrive as a list, with no publication timestamps — but
+  specificity is a property of the record itself.
+
+  Summing raw overlaps would let two intervals that both start *inside* a slot
+  add up to its width and mark it covered when its first minutes never were.
 
 ### Retained intervals
 

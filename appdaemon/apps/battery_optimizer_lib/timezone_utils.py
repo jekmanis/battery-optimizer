@@ -12,14 +12,21 @@ T = TypeVar("T")
 UTC = datetime.timezone.utc
 
 
-def _is_aware(dt: datetime.datetime) -> bool:
-    """Return whether *dt* identifies an unambiguous instant."""
+def is_aware(dt: datetime.datetime) -> bool:
+    """Return whether *dt* identifies an unambiguous instant.
+
+    Public because "can these two values be compared at all?" is a question
+    outside this module too: a naive app clock alongside aware price
+    timestamps is a supported combination (it is why :func:`dt_ge` and
+    :func:`datetimes_match_slot` exist), and code that compares the two
+    directly raises ``TypeError``.
+    """
     return dt.tzinfo is not None and dt.utcoffset() is not None
 
 
 def instant_key(dt: datetime.datetime) -> datetime.datetime:
     """Return an aware datetime as UTC, leaving legacy naive values unchanged."""
-    return dt.astimezone(UTC) if _is_aware(dt) else dt
+    return dt.astimezone(UTC) if is_aware(dt) else dt
 
 
 def canonical_slot_key(dt: datetime.datetime) -> datetime.datetime:
@@ -30,7 +37,7 @@ def canonical_slot_key(dt: datetime.datetime) -> datetime.datetime:
     representation preserves the local clock fields while keeping both
     physical intervals distinct.
     """
-    if not _is_aware(dt):
+    if not is_aware(dt):
         return dt
     return dt.astimezone(datetime.timezone(dt.utcoffset()))
 
@@ -92,7 +99,7 @@ def datetimes_match_slot(
     """
     # Aware values identify physical instants.  Comparing local components loses
     # that identity during the autumn DST fold (there are two 03:00 slots).
-    if _is_aware(dt1) and _is_aware(dt2):
+    if is_aware(dt1) and is_aware(dt2):
         cmp1, cmp2 = dt1.astimezone(UTC), dt2.astimezone(UTC)
     else:
         # Preserve compatibility for legacy naive schedule keys: a naive value
@@ -121,7 +128,7 @@ def dt_ge(
     Returns:
         True if dt1 >= dt2
     """
-    if _is_aware(dt1) and _is_aware(dt2):
+    if is_aware(dt1) and is_aware(dt2):
         cmp1, cmp2 = dt1.astimezone(UTC), dt2.astimezone(UTC)
     else:
         cmp1, cmp2 = normalize_tz_pair(dt1, dt2, local_tz)
@@ -206,7 +213,7 @@ def slot_offset(
     dt = ensure_local_tz(dt, local_tz)
     current_slot = align_to_slot(dt, slot_minutes)
     delta = datetime.timedelta(minutes=slot_minutes * slots)
-    if _is_aware(current_slot):
+    if is_aware(current_slot):
         # Move in UTC so a spring gap is skipped and both autumn fold slots
         # remain reachable.
         shifted = (current_slot.astimezone(UTC) + delta).astimezone(
@@ -305,7 +312,7 @@ def lookup_by_time(
     canonical_key = canonical_slot_key(slot_time)
     if canonical_key in data:
         return data[canonical_key]
-    if not _is_aware(slot_time) and slot_time in data:
+    if not is_aware(slot_time) and slot_time in data:
         return data[slot_time]
 
     # Fallback: match by local time components

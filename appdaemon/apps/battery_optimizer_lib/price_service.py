@@ -9,16 +9,69 @@ Handles fetching electricity prices from Nord Pool via:
 import datetime
 import json
 import traceback
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .models import PricePoint
-from .timezone_utils import instant_key
+from .timezone_utils import (
+    ensure_local_tz,
+    instant_key,
+    is_aware,
+    normalize_tz_pair,
+)
 
 try:
     import requests
     REQUESTS_AVAILABLE = True
 except ImportError:
     REQUESTS_AVAILABLE = False
+
+
+# How often a corrupt price record may be reported. See
+# `NordPoolPriceService._warn_malformed_record`.
+MALFORMED_WARNING_INTERVAL_S = 3600
+
+Span = Tuple[datetime.datetime, datetime.datetime]
+
+
+def _unclaimed(
+    start: datetime.datetime,
+    end: datetime.datetime,
+    claimed: List[Span],
+) -> List[Span]:
+    """The parts of ``[start, end)`` no more specific record has taken.
+
+    ``claimed`` is disjoint and sorted (see :func:`_merge_claims`). Attributing
+    each minute to exactly one record is what keeps overlaps from being SUMMED
+    into coverage that was never published.
+    """
+    pieces: List[Span] = []
+    cursor = start
+    for taken_start, taken_end in claimed:
+        if taken_end <= cursor:
+            continue
+        if taken_start >= end:
+            break
+        if taken_start > cursor:
+            pieces.append((cursor, min(taken_start, end)))
+        cursor = max(cursor, taken_end)
+        if cursor >= end:
+            return pieces
+    if cursor < end:
+        pieces.append((cursor, end))
+    return pieces
+
+
+def _merge_claims(
+    claimed: List[Span], start: datetime.datetime, end: datetime.datetime
+) -> List[Span]:
+    """``claimed`` with ``[start, end)`` added, kept disjoint and sorted."""
+    merged: List[Span] = []
+    for span_start, span_end in sorted(claimed + [(start, end)]):
+        if merged and span_start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], span_end))
+        else:
+            merged.append((span_start, span_end))
+    return merged
 
 
 class NordPoolPriceService:
@@ -81,6 +134,10 @@ class NordPoolPriceService:
         # Cache
         self.cached_prices: List[PricePoint] = []
         self.cached_prices_date: Optional[datetime.date] = None
+
+        # When a corrupt record was last reported (see
+        # `_warn_malformed_record`).
+        self._last_malformed_warning: Optional[datetime.datetime] = None
 
     def get_prices(self) -> List[PricePoint]:
         """
@@ -147,17 +204,87 @@ class NordPoolPriceService:
             return (dt.astimezone(datetime.timezone.utc) + delta).astimezone(dt.tzinfo)
         return dt + delta
 
-    def _interval_end(self, point: PricePoint) -> datetime.datetime:
-        """Exclusive end of the interval *point* actually covers.
+    def _warn_malformed_record(self, message: str) -> None:
+        """WARN about a corrupt record at most once an hour.
+
+        Prices are re-fetched every slot and again on every bounded retry, so a
+        source that keeps sending the same bad record would otherwise produce a
+        line per poll -- and be scrolled past exactly like the WARNINGs that
+        need reading. Rate-limited is not silenced: it says so again an hour
+        later, for as long as the source keeps saying it.
+        """
+        now = None
+        try:
+            now = self.datetime()
+        except Exception:
+            now = None
+        last = self._last_malformed_warning
+        if now is not None and last is not None:
+            cmp_last, cmp_now = normalize_tz_pair(last, now)
+            if (cmp_now - cmp_last).total_seconds() < MALFORMED_WARNING_INTERVAL_S:
+                return
+        self._last_malformed_warning = now
+        self.log(message, level="WARNING")
+
+    def _match_awareness(
+        self, end: datetime.datetime, start: datetime.datetime
+    ) -> datetime.datetime:
+        """*end* expressed with the same awareness as its own *start*.
+
+        A record whose two fields disagree is not exotic: with no timezone
+        configured in AppDaemon, both parsers leave `start` and `end` with
+        whatever awareness their own ISO strings carried, so a source
+        publishing one bare and the other with an offset produces exactly this
+        pair. Comparing them raised `TypeError` out of `_normalize_prices` and
+        out of `get_prices`, which does not catch it -- one malformed record
+        cost the whole reply and the fetch that would have noticed.
+
+        The conversion goes through the local zone when there is one, so an end
+        published as 08:00Z against a +03:00 clock is read as 11:00 local, not
+        as a span that runs backwards.
+        """
+        if is_aware(end) == is_aware(start):
+            return end
+        tz = self.get_timezone()
+        if is_aware(start):
+            # Naive end: local wall time, like every other naive value here.
+            return end.replace(tzinfo=tz or start.tzinfo)
+        # Aware end against a naive start: convert to local time, then drop the
+        # offset so the two describe the same clock.
+        if tz is not None:
+            end = end.astimezone(tz)
+        return end.replace(tzinfo=None)
+
+    def _interval_end(
+        self,
+        start: datetime.datetime,
+        end: Optional[datetime.datetime],
+    ) -> Optional[datetime.datetime]:
+        """Exclusive end of the interval a record actually covers, or None.
 
         The source's own ``end`` when it published one. Otherwise exactly ONE
         `slot_minutes` slot -- never a width guessed from how far away the next
         surviving timestamp happens to be.
+
+        ``None`` means the record is unusable and the caller must DROP it. An
+        ABSENT end is a normal case with a documented answer; an end that does
+        not come after its start is not a width to guess around, it is evidence
+        the record is corrupt. Falling back to one slot for it published a
+        price for that interval on the strength of a field saying the opposite,
+        and coverage is what the schedule, the horizon monitor and the
+        provenance guard are all built on.
         """
-        end = getattr(point, "end", None)
-        if end is not None and instant_key(end) > instant_key(point.time):
+        if end is None:
+            return self._shift(start, self.slot_minutes)
+        end = self._match_awareness(end, start)
+        if instant_key(end) > instant_key(start):
             return end
-        return self._shift(point.time, self.slot_minutes)
+        self._warn_malformed_record(
+            f"Price record for {start} declares an end of {end}, which "
+            f"is not after its start; dropping it. The interval it claimed is "
+            f"a gap until a source publishes it properly."
+        )
+        return None
 
     def _normalize_prices(self, prices: List[PricePoint]) -> List[PricePoint]:
         """Map published intervals onto the configured slot grid.
@@ -177,11 +304,26 @@ class NordPoolPriceService:
         10:30-10:45 at 1.00 published 10:15 at 0.01, and the planner charged
         the live slot on it.
 
-        Overlap is resolved by publication order rather than by summing: a
-        later interval contributes only the minutes an earlier one did not
-        already cover. Summing raw overlaps would let two intervals that both
-        start inside a slot add up to its full width and mark it covered when
-        the beginning of the slot never was.
+        Where two records overlap, the MOST SPECIFIC one owns the shared
+        minutes: the narrower span wins, and equal spans are broken by the
+        later position in the reply. Every minute is then attributed to exactly
+        ONE record.
+
+        That is the documented rule made real. It used to say "publication
+        order - a later interval contributes only the minutes an earlier one
+        did not already cover" while the code sorted by instant (discarding
+        input order) and clipped to `covered_until`, which is EARLIEST START
+        WINS. The two differ exactly where a correction lives: 10:00-11:00 at
+        0.10 followed by 10:15-10:30 at 0.90 came out as four quarter hours at
+        0.10, the correction discarded in silence. Publication order cannot be
+        recovered from a reply - the records arrive as a list, with no
+        publication timestamps - but specificity is a property of the record
+        itself, and a narrower interval nested inside a wider one is a more
+        specific statement about the minutes they share.
+
+        Attribution, never SUMMING: summing raw overlaps would let two
+        intervals that both start inside a slot add up to its full width and
+        mark it covered when the beginning of the slot never was.
         """
         if not prices:
             return []
@@ -191,32 +333,57 @@ class NordPoolPriceService:
         # UTC instant of a slot start -> [local slot start, covered minutes,
         # sum(price * minutes)].
         buckets: Dict[datetime.datetime, List] = {}
-        covered_until: Optional[datetime.datetime] = None
 
-        for point in sorted(prices, key=lambda p: instant_key(p.time)):
-            start_key = instant_key(point.time)
-            end_key = instant_key(self._interval_end(point))
-            if end_key <= start_key:
+        records = []
+        for index, point in enumerate(prices):
+            # ONE awareness for the whole record, before anything is compared.
+            # `_align_to_slot` reads a naive value as local wall time, so a
+            # naive `start` at a site that HAS a timezone produced an aware
+            # cursor against naive keys and raised `TypeError` in the walk
+            # below - the same defect `_match_awareness` fixes one field
+            # earlier, and the fetch has no catch for either.
+            start_dt = ensure_local_tz(point.time, self.get_timezone())
+            interval_end = self._interval_end(
+                start_dt, getattr(point, "end", None)
+            )
+            if interval_end is None:
+                # Corrupt: an end at or before its own start. `_interval_end`
+                # has already said so, once an hour.
                 continue
-            if covered_until is not None and start_key < covered_until:
-                start_key = covered_until
-                if end_key <= start_key:
-                    continue
-            covered_until = end_key
+            start_key = instant_key(start_dt)
+            end_key = instant_key(interval_end)
+            records.append((end_key - start_key, -index, start_key, end_key,
+                            start_dt, point.price))
 
-            cursor = self._align_to_slot(point.time)
-            while True:
-                cursor_key = instant_key(cursor)
-                if cursor_key >= end_key:
-                    break
-                overlap_start = max(cursor_key, start_key)
-                overlap_end = min(cursor_key + slot, end_key)
-                minutes = (overlap_end - overlap_start).total_seconds() / 60.0
-                if minutes > 0:
-                    bucket = buckets.setdefault(cursor_key, [cursor, 0.0, 0.0])
-                    bucket[1] += minutes
-                    bucket[2] += point.price * minutes
-                cursor = self._shift(cursor, slot_minutes)
+        # Narrowest span first, then the later record of an equal-span pair.
+        # `-index` sorts second so the key is total and the outcome cannot
+        # depend on the sort being stable.
+        claimed: List[Tuple[datetime.datetime, datetime.datetime]] = []
+        for _span, _rank, start_key, end_key, start_dt, price in sorted(
+            records, key=lambda r: (r[0], r[1])
+        ):
+            for piece_start, piece_end in _unclaimed(
+                start_key, end_key, claimed
+            ):
+                offset = (piece_start - start_key).total_seconds() / 60.0
+                cursor = self._align_to_slot(self._shift(start_dt, offset))
+                while True:
+                    cursor_key = instant_key(cursor)
+                    if cursor_key >= piece_end:
+                        break
+                    overlap_start = max(cursor_key, piece_start)
+                    overlap_end = min(cursor_key + slot, piece_end)
+                    minutes = (
+                        overlap_end - overlap_start
+                    ).total_seconds() / 60.0
+                    if minutes > 0:
+                        bucket = buckets.setdefault(
+                            cursor_key, [cursor, 0.0, 0.0]
+                        )
+                        bucket[1] += minutes
+                        bucket[2] += price * minutes
+                    cursor = self._shift(cursor, slot_minutes)
+            claimed = _merge_claims(claimed, start_key, end_key)
 
         normalized: List[PricePoint] = []
         for cursor_key in sorted(buckets):

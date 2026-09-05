@@ -20,9 +20,10 @@ by class below:
 * no export revenue at risk — ``discharge_to_load`` pins the export limiter to
   0 % (``direct_control.expected_registers``), so PV surplus the plan expected
   to SELL would be curtailed instead.
-* the avoided import must beat wear AND the DP's own valuation of keeping the
-  energy (the terminal rate), otherwise the hedge is not worth taking even when
-  the cloud arrives.
+* the avoided import must beat wear AND what the plan itself says the kWh is
+  worth kept — the better of the horizon-end terminal rate and the best later
+  DISCHARGE slot's own marginal value. Otherwise the hedge, when the cloud
+  actually arrives, spends energy earmarked for a dearer slot.
 """
 
 from __future__ import annotations
@@ -398,15 +399,27 @@ class TestEconomicReservationSurvivesPostprocessing:
 # PV vs load: the three regimes
 # ---------------------------------------------------------------------------
 
-# Three sunny slots at 0.10 EUR/kWh followed by one 2.00 EUR/kWh evening slot,
-# with one slot's worth of usable energy in the pack. The DP reserves that
-# energy for the peak and returns HOLD for the sunny slots, so whatever happens
-# to them afterwards is the hedge's doing and nothing else's.
+# Two horizon shapes, because the two questions pull in opposite directions.
+#
+# SUNNY: three slots where PV covers the load and nothing follows. The DP has
+# no discharge candidate (net load is zero) and no reason to charge, so every
+# slot comes back HOLD with no later slot the energy is owed to. Whatever
+# happens to them is the hedge's doing and nothing else's.
+#
+# SUNNY_THEN_PEAK: the same three slots followed by a 2.00 EUR/kWh evening
+# slot, with one slot's worth of usable energy in the pack. This is the only
+# shape in which the DP HOLDs a slot whose PV does NOT cover the load — and it
+# is also, by construction, a plan whose energy is spoken for, so the hedge is
+# refused twice over.
 PEAK_SLOT = (2.00, 1.0, 0.0)
 
 
+def sunny(pv_kw: float, load_kw: float = 1.0, slots: int = 3):
+    return [(0.10, load_kw, pv_kw)] * slots
+
+
 def sunny_then_peak(pv_kw: float, load_kw: float = 1.0):
-    return [(0.10, load_kw, pv_kw)] * 3 + [PEAK_SLOT]
+    return sunny(pv_kw, load_kw) + [PEAK_SLOT]
 
 
 def hedged(schedule):
@@ -416,23 +429,30 @@ def hedged(schedule):
 class TestPvVersusLoadRegimes:
     """A HOLD slot is convertible only when forecast PV covers forecast load."""
 
-    def _schedule(self, pv_kw: float, **kw):
+    def _sunny(self, pv_kw: float, soc: float = 50.0, **kw):
         opt = HedgeOptimizer(discharge_rate=1.0, **kw)
-        rows = sunny_then_peak(pv_kw)
+        rows = sunny(pv_kw)
         prices = build(opt, rows)
         opt.set_datetime(BASE)
-        schedule = opt.find_optimal_schedule(prices, 0, current_soc=20.0)
-        return opt, schedule, rows
+        return opt, opt.find_optimal_schedule(prices, 0, current_soc=soc), rows
 
     def test_pv_below_load_is_not_converted(self):
         """0 < PV < load: DISCHARGE drains the pack, HOLD does not.
 
-        This is the reproduction's regime. The evening peak is served by the
-        battery precisely because the sunny slots kept it.
+        The reproduction's regime. Refused before any price is looked at — the
+        assertion on ``_cloud_safe_candidates`` pins that it is condition 1
+        doing the work, not the value gate that also happens to apply here.
         """
-        opt, schedule, rows = self._schedule(pv_kw=0.3)
+        opt = HedgeOptimizer(discharge_rate=1.0)
+        rows = sunny_then_peak(0.3)
+        prices = build(opt, rows)
+        opt.set_datetime(BASE)
+        schedule = opt.find_optimal_schedule(prices, 0, current_soc=20.0)
 
         assert hedged(schedule) == []
+        assert _cloud_safe_candidates(
+            schedule, opt._predict_load_kw, opt._predict_pv_kw
+        ) == []
         assert modes(schedule)[:3] == [BatteryMode.HOLD] * 3
         assert schedule[slot(3)].mode is BatteryMode.DISCHARGE
         # 3 x 0.7 kWh imported at 0.10, and nothing at 2.00.
@@ -440,22 +460,25 @@ class TestPvVersusLoadRegimes:
 
     def test_pv_equal_to_load_is_converted(self):
         """PV == load: net load is 0, so neither action moves any energy."""
-        _opt, schedule, _rows = self._schedule(pv_kw=1.0)
+        _opt, schedule, _rows = self._sunny(pv_kw=1.0)
 
         assert hedged(schedule) == [slot(0), slot(1), slot(2)]
         assert all(schedule[t].export_rate == 0 for t in hedged(schedule))
 
     def test_pv_above_load_is_converted_when_the_surplus_is_stored(self):
         """PV > load, surplus below the charge rate, room in the pack."""
-        _opt, schedule, _rows = self._schedule(pv_kw=2.0)
+        _opt, schedule, _rows = self._sunny(pv_kw=2.0)
 
         assert hedged(schedule) == [slot(0), slot(1), slot(2)]
 
-    def test_the_peak_slot_is_never_touched(self):
-        """The hedge only ever rewrites HOLD, never the DP's own DISCHARGE."""
-        for pv_kw in (0.3, 1.0, 2.0):
-            _opt, schedule, _rows = self._schedule(pv_kw=pv_kw)
-            assert slot(3) not in hedged(schedule)
+    def test_the_dps_own_discharge_slots_are_never_touched(self):
+        opt = HedgeOptimizer(discharge_rate=1.0)
+        prices = build(opt, sunny_then_peak(1.0))
+        opt.set_datetime(BASE)
+        schedule = opt.find_optimal_schedule(prices, 0, current_soc=20.0)
+
+        assert schedule[slot(3)].mode is BatteryMode.DISCHARGE
+        assert slot(3) not in hedged(schedule)
 
 
 # ---------------------------------------------------------------------------
@@ -469,13 +492,21 @@ class TestExportRevenueIsNotCurtailed:
     A surplus the DP priced as export revenue would therefore be curtailed, so
     those slots stay HOLD however sunny they are. The two cases differ only in
     whether the surplus fits inside the charge rate.
+
+    Sell price 0.10 - 0.09 = 0.01 EUR/kWh, and a terminal value of 0.05 so the
+    DP neither dumps the pack for that penny nor grid-charges at 0.10. Both sit
+    below the 0.10 avoided import, so only the export test can block the hedge.
     """
 
-    SELLABLE = dict(export_rate_multiplier=1.0, grid_export_fee=0.09)
+    SELLABLE = dict(
+        export_rate_multiplier=1.0,
+        grid_export_fee=0.09,
+        terminal_energy_value_eur_kwh=0.05,
+    )
 
     def _schedule(self, pv_kw: float, **kw):
         opt = HedgeOptimizer(discharge_rate=1.0, **dict(self.SELLABLE, **kw))
-        prices = build(opt, sunny_then_peak(pv_kw))
+        prices = build(opt, sunny(pv_kw))
         opt.set_datetime(BASE)
         return opt, opt.find_optimal_schedule(prices, 0, current_soc=20.0)
 
@@ -483,11 +514,12 @@ class TestExportRevenueIsNotCurtailed:
         """9 kW PV, 1 kW load, 4 kW charge rate: 4 kWh/slot would be sold."""
         _opt, schedule = self._schedule(pv_kw=9.0)
         assert hedged(schedule) == []
+        assert all(m is BatteryMode.HOLD for m in modes(schedule))
 
     def test_a_surplus_the_pack_absorbs_is_still_hedged(self):
         """2 kW PV against a 1 kW load: the 1 kWh surplus never reaches the grid."""
         _opt, schedule = self._schedule(pv_kw=2.0)
-        assert hedged(schedule)
+        assert hedged(schedule) == [slot(0), slot(1), slot(2)]
 
     def test_an_unsellable_surplus_is_hedged_even_when_curtailed(self):
         """With no export remuneration, curtailing the surplus costs nothing."""
@@ -531,22 +563,45 @@ class TestTheHedgeMustBeatTheValueOfKeepingTheEnergy:
         assert hedged(schedule) == []
         assert all(m is BatteryMode.HOLD for m in modes(schedule))
 
-    def test_a_later_expensive_slot_is_still_served_by_the_battery(self):
-        """The hedge must not eat the energy the evening peak was planned on.
+    def _two_slot(self, first_price, second_price):
+        """A convertible sunny slot followed by a DISCHARGE slot of its own.
 
-        Slot 1 is a sunny 0.10 EUR/kWh slot with PV == load (convertible), the
-        battery holds exactly one slot's worth of usable energy, and slot 2 is
-        a 1.00 EUR/kWh slot with no PV. Converting slot 1 is harmless under the
-        forecast; the DISCHARGE in slot 2 must survive it either way.
+        One slot's worth of usable energy, terminal value 0 — the reference
+        installation's setting, and the one that makes the horizon-end salvage
+        value useless as an opportunity cost.
         """
         opt = HedgeOptimizer(discharge_rate=1.0)
-        rows = [(0.10, 1.0, 1.0), (1.00, 1.0, 0.0)]
+        rows = [(first_price, 1.0, 1.0), (second_price, 1.0, 0.0)]
         prices = build(opt, rows)
         opt.set_datetime(BASE)
         schedule = opt.find_optimal_schedule(prices, 0, current_soc=20.0)
-
         assert schedule[slot(1)].mode is BatteryMode.DISCHARGE
+        return opt, schedule, rows
+
+    def test_a_dearer_later_slot_blocks_the_hedge(self):
+        """The hedge must not eat the energy the evening peak is planned on.
+
+        Slot 1 is a sunny 0.10 EUR/kWh slot with PV == load, so converting it
+        is free under the forecast — but if the cloud comes, the pack pays for
+        0.10 of import that the plan had earmarked for a 1.00 EUR/kWh slot.
+        Terminal value is 0, so only the later slot's own marginal value can
+        price that kWh.
+        """
+        opt, schedule, rows = self._two_slot(0.10, 1.00)
+
+        assert hedged(schedule) == []
+        assert schedule[slot(0)].mode is BatteryMode.HOLD
+        assert schedule[slot(1)].marginal_value_eur_kwh == pytest.approx(1.00)
+        # The battery still serves the expensive slot: nothing was imported.
         assert replay_grid_cost(opt, schedule, rows, 20.0) == pytest.approx(0.0)
+
+    def test_a_cheaper_later_slot_leaves_the_hedge_alone(self):
+        """Same shape, prices swapped: spending the kWh here is the better use."""
+        _opt, schedule, _rows = self._two_slot(0.30, 0.10)
+
+        assert hedged(schedule) == [slot(0)]
+        assert schedule[slot(0)].mode is BatteryMode.DISCHARGE
+        assert schedule[slot(1)].marginal_value_eur_kwh == pytest.approx(0.10)
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +684,7 @@ class TestARetainedConversionPreservesTheModel:
 # boundaries stay covered whatever the DP decides.
 
 from battery_optimizer import (  # noqa: E402
+    _best_later_discharge_value,
     _cloud_safe_candidates,
     _cloud_safe_hedge,
     _hold_stores_all_pv_surplus,
@@ -716,6 +772,54 @@ class TestSurplusAbsorption:
             slot_time=slot(0), pv_kw=2.0, load_kw=1.0, fraction=1.0,
             hold_soc_trajectory={}, config=config,
         ) is False
+
+
+class TestBestLaterDischargeValue:
+    """The opportunity cost the value gate uses, read off the plan itself."""
+
+    def _plan(self, spec):
+        schedule = {}
+        for i, (mode, value) in enumerate(spec):
+            entry = _entry(slot(i), mode)
+            entry.marginal_value_eur_kwh = value
+            schedule[slot(i)] = entry
+        return schedule
+
+    def test_only_later_slots_count(self):
+        plan = self._plan([
+            (BatteryMode.DISCHARGE, 1.00),
+            (BatteryMode.HOLD, 0.0),
+            (BatteryMode.DISCHARGE, 0.40),
+        ])
+        best = _best_later_discharge_value(plan)
+
+        assert best[slot(0)] == pytest.approx(0.40)
+        assert best[slot(1)] == pytest.approx(0.40)
+        assert best[slot(2)] == pytest.approx(0.0)
+
+    def test_the_maximum_wins_not_the_next_one(self):
+        plan = self._plan([
+            (BatteryMode.HOLD, 0.0),
+            (BatteryMode.DISCHARGE, 0.10),
+            (BatteryMode.DISCHARGE, 1.00),
+        ])
+        assert _best_later_discharge_value(plan)[slot(0)] == pytest.approx(1.00)
+
+    def test_charge_and_hold_slots_are_not_opportunities(self):
+        plan = self._plan([
+            (BatteryMode.HOLD, 0.0),
+            (BatteryMode.CHARGE, -5.0),
+            (BatteryMode.HOLD, 9.0),
+        ])
+        assert _best_later_discharge_value(plan)[slot(0)] == pytest.approx(0.0)
+
+    def test_a_missing_value_counts_as_zero(self):
+        plan = self._plan([(BatteryMode.HOLD, 0.0), (BatteryMode.DISCHARGE, None)])
+        assert _best_later_discharge_value(plan)[slot(0)] == pytest.approx(0.0)
+
+    def test_a_negative_value_never_drags_it_below_zero(self):
+        plan = self._plan([(BatteryMode.HOLD, 0.0), (BatteryMode.DISCHARGE, -0.5)])
+        assert _best_later_discharge_value(plan)[slot(0)] == pytest.approx(0.0)
 
 
 class TestHedgeAppliedToAFullPack:

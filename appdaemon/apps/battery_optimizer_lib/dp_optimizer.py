@@ -1684,6 +1684,10 @@ class DPOptimizer:
                 reason=reason,
                 marginal_value_eur_kwh=marginal_value,
                 value_basis=value_basis,
+                # The plan's own declaration that this slot runs the pack dry
+                # and that the grid was priced for the remainder. `plan_validation`
+                # checks the continuous replay against it.
+                energy_limited=bool(is_partial),
             )
             if action == BatteryMode.DISCHARGE:
                 entry.export_rate = 100 if is_export else 0

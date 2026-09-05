@@ -12,10 +12,14 @@ reporting 15 % after 15.
 conversion -- through ``slot_energy.simulate_slot``, in continuous energy, and
 reports:
 
-* the prefix conservation inequality, evaluated BEFORE any clamping::
-
-      cumulative stored-DC discharge
-          <= initially usable stored-DC energy + cumulative actual stored-DC charge
+* the conservation check, evaluated on the REQUESTED flow, before clamping: a
+  slot the continuous model cannot serve in full is either one the plan
+  DECLARED energy-limited (``ScheduleEntry.energy_limited``, priced with the
+  grid covering the remainder), or the plan credited the battery with service it
+  does not have. Accumulating ``simulate_slot``'s own clamped outputs and
+  comparing them with the bound those outputs are built to satisfy is an
+  identity -- the brief's pre-fix defect produced zero violations that way --
+  so it is reported (``credited_over_available_kwh``) and is not the test;
 
 * AC energy actually served after inverter loss, not just raw DC totals;
 * the AC demand the plan assigned to the battery that the battery could not
@@ -87,6 +91,8 @@ class PlanReplay:
     total_grid_import_ac_kwh: float = 0.0
     total_grid_export_ac_kwh: float = 0.0
     total_grid_charge_ac_kwh: float = 0.0
+    total_requested_stored_dc_out_kwh: float = 0.0
+    credited_over_available_kwh: float = 0.0
     total_value_eur: float = 0.0
     terminal_value_eur: float = 0.0
 
@@ -204,6 +210,8 @@ def replay_plan(
 
     cum_in = 0.0
     cum_out = 0.0
+    cum_requested_out = 0.0
+    cum_unmet = 0.0
     temp = starting_temp
 
     for slot in order:
@@ -257,11 +265,32 @@ def replay_plan(
 
         cum_in += outcome.stored_dc_in_kwh
         cum_out += outcome.stored_dc_out_kwh
-        if cum_out > replay.initial_usable_kwh + cum_in + CONSERVATION_EPS_KWH:
+        cum_requested_out += outcome.requested_stored_dc_out_kwh
+        cum_unmet += outcome.unmet_battery_ac_kwh
+
+        # THE conservation check, and it has to be able to fail.
+        #
+        # Accumulating `simulate_slot`'s own clamped outputs and comparing them
+        # with the bound those outputs are constructed to satisfy is an
+        # identity: the brief's exact pre-fix defect (a planner deducting 1 %
+        # per slot for a 1.4 %-per-slot load) produced zero violations that way.
+        #
+        # What can fail is the comparison against the PLAN's own statement about
+        # its physics. A slot the continuous model cannot serve in full is
+        # either one the plan DECLARED energy-limited -- priced with the grid
+        # covering the remainder -- or the plan credited the battery with
+        # service it does not have. This is evaluated on the requested flow,
+        # BEFORE the SOC clamp, so clamping an impossible trajectory into range
+        # cannot make it pass.
+        if outcome.unmet_battery_ac_kwh > CONSERVATION_EPS_KWH and not getattr(
+            entry, "energy_limited", False
+        ):
             replay.conservation_violations.append(
-                f"{slot}: cumulative stored-DC discharge {cum_out:.6f} kWh exceeds "
-                f"initial usable {replay.initial_usable_kwh:.6f} + charged "
-                f"{cum_in:.6f} kWh"
+                f"{slot}: the plan credits {outcome.unmet_battery_ac_kwh:.6f} kWh "
+                f"more battery service than the pack holds and does not declare "
+                f"the slot energy-limited (cumulative requested stored-DC out "
+                f"{cum_requested_out:.6f} kWh vs initial usable "
+                f"{replay.initial_usable_kwh:.6f} + charged {cum_in:.6f} kWh)"
             )
 
         energy = outcome.energy_end_kwh
@@ -310,6 +339,14 @@ def replay_plan(
                 )
 
     replay.final_energy_kwh = energy
+    replay.total_requested_stored_dc_out_kwh = cum_requested_out
+    # Reported for the log, not used as the pass/fail test above: with the
+    # clamped flows this is an identity, which is precisely why it is not the
+    # check. It is still the number a reader wants to see next to a violation.
+    replay.credited_over_available_kwh = max(
+        0.0,
+        cum_requested_out - (replay.initial_usable_kwh + cum_in),
+    )
     if terminal_rate:
         replay.terminal_value_eur = terminal_rate * max(
             0.0, energy - params.min_energy_kwh

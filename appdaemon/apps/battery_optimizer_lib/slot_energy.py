@@ -23,8 +23,14 @@ it is billed at neither the import price nor the inverter loss.
 The function is PURE: no clock, no forecasts, no learning engine. Callers pass
 the rate capability they decided on. It is used by
 
-* ``DPOptimizer`` -- indirectly: the DP keeps an inlined, fused hot path and
-  ``tests/test_slot_energy_parity.py`` proves the two agree;
+* ``DPOptimizer`` -- indirectly. The DP keeps an inlined transition fused with
+  the value recursion and the discrete SOC grid, so parity is PROVEN rather than
+  structural: ``tests/test_dp_energy_conservation.py::
+  TestPrefixConservationAcrossConditions::test_no_prefix_creates_energy`` sweeps
+  210 (starting SOC, load, PV, partial-slot) combinations, replays each selected
+  plan through this module and requires the DP's own SOC trajectory to match to
+  1e-6 %. ``tests/test_slot_energy_parity.py`` does the same for
+  ``soc_projection``;
 * the final-plan replay in ``plan_validation.py``, which is what actually
   decides whether a published plan is physically feasible;
 * ``cost_tracker`` / ``soc_projection`` consumers via the SOC view.

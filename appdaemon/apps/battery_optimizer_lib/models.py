@@ -54,6 +54,15 @@ class ScheduleEntry:
     # modeled energy flow is unchanged, so "kept" is still the right basis, and
     # the suffix says why a DISCHARGE row carries it.
 
+    energy_limited: bool = False
+    # The plan DECLARES that the pack runs dry inside this slot and that the
+    # grid was priced to cover the remainder ("until depleted" in the reason).
+    # It is the plan's own statement about its physics, and it is what makes
+    # `plan_validation`'s conservation check falsifiable: a slot the continuous
+    # replay cannot serve in full is either declared here, or the plan credited
+    # the battery with service it does not have. Never infer it from the reason
+    # string -- that is prose.
+
 
 @dataclass
 class LearningStats:

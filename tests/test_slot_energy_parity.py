@@ -5,8 +5,11 @@ Two consumers must agree with it over the whole reachable parameter space:
 * ``soc_projection.project_slot_soc`` -- the SOC view used by the expected
   trajectory, the deviation detector, the schedule formatter and the projected
   cost column;
-* ``DPOptimizer`` -- which keeps an inlined, fused hot path for performance
-  (``tests/test_dp_slot_energy_parity.py``).
+* ``DPOptimizer`` -- which keeps an inlined transition fused with the value
+  recursion. That parity is proven in
+  ``test_dp_energy_conservation.py::TestPrefixConservationAcrossConditions::
+  test_no_prefix_creates_energy``, which replays 210 selected plans through
+  ``simulate_slot`` and requires the DP's own SOC trajectory to match.
 
 Agreement is checked by sweeping the parameters, not by re-deriving the formula
 in the test: a test that copies the implementation reproduces its mistakes.

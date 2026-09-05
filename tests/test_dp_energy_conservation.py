@@ -509,7 +509,45 @@ class TestFinalPlanValidationHook:
         replay = self._validate(app, result.schedule, inflated, 30.0)
         assert replay.trajectory_disagreements
         warnings = [m for m in app.messages if m[0] == "WARNING"]
-        assert warnings and "disagrees with the shared" in warnings[0][1]
+        assert warnings and "disagreed with the shared" in warnings[0][1]
+        assert "publishing the replayed trajectory instead" in warnings[0][1]
+
+    def test_a_disagreement_is_RESOLVED_not_just_logged(self):
+        """The published trajectory must describe the physical model.
+
+        Logging a disagreement and publishing the disagreeing numbers anyway
+        leaves the schedule log, the deviation detector and the projected-cost
+        column all describing a plan that cannot happen.
+        """
+        cfg, result = self._plan()
+        app = _StubApp(cfg)
+        inflated = {
+            slot: (pair[0], pair[1] + 5.0)
+            for slot, pair in result.soc_trajectory.items()
+        }
+        replay = self._validate(app, result.schedule, inflated, 30.0)
+        assert replay.trajectory_disagreements
+        assert replay.corrected is True
+        # What it hands back is the shared model's own answer, per slot.
+        corrected = replay.soc_trajectory()
+        for slot in sorted(result.schedule.keys()):
+            assert corrected[slot][1] == pytest.approx(
+                replay.by_slot[slot].soc_end, abs=1e-12
+            )
+            assert corrected[slot][1] != pytest.approx(inflated[slot][1])
+
+    def test_the_correction_is_verified_by_a_second_replay(self):
+        cfg, result = self._plan()
+        app = _StubApp(cfg)
+        inflated = {
+            slot: (pair[0], pair[1] + 5.0)
+            for slot, pair in result.soc_trajectory.items()
+        }
+        replay = self._validate(app, result.schedule, inflated, 30.0)
+        # The corrected trajectory is replayed again and must agree, so no
+        # ERROR is raised for an ordinary correction.
+        assert not [m for m in app.messages if m[0] == "ERROR"]
+        assert [m for m in app.messages if m[0] == "WARNING"]
 
     def test_the_hook_never_breaks_planning(self):
         cfg, result = self._plan()

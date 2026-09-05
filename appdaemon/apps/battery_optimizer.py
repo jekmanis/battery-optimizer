@@ -1502,7 +1502,7 @@ class BatteryOptimizer(hass.Hass):
         # doubles borrow this method without the full app surface.
         _validate = getattr(self, "_validate_final_plan", None)
         if callable(_validate):
-            _validate(
+            _replay = _validate(
                 schedule=schedule,
                 soc_trajectory=soc_trajectory,
                 starting_soc=current_soc_for_calc,
@@ -1510,8 +1510,15 @@ class BatteryOptimizer(hass.Hass):
                 current_slot=current_slot,
                 minutes_into_slot=minutes_into_slot,
                 prices_sorted=slots_sorted_by_time,
-                planning_temp_by_slot=getattr(result, "planning_temp_by_slot", None),
+                planning_temp_by_slot=planning_temp_by_slot,
             )
+            if _replay is not None and getattr(_replay, "corrected", False):
+                # A material disagreement was resolved: publish what the shared
+                # physical model says the plan does, not what the planner said.
+                self._last_dp_soc_trajectory = _replay.soc_trajectory()
+                self._last_dp_temp_trajectory = (
+                    _replay.temp_trajectory() if current_temp is not None else {}
+                )
 
         return schedule
 
@@ -1917,7 +1924,21 @@ class BatteryOptimizer(hass.Hass):
         anything above it is a model disagreement, not rounding. The tolerance
         is derived from the representation, not fitted to an observed error.
 
-        Non-fatal by design: it reports, it does not silently rewrite a plan.
+        A material disagreement is RESOLVED, not merely mentioned. Publishing
+        numbers the shared model contradicts leaves the schedule log, the
+        deviation detector and the projected-cost column all describing a plan
+        that cannot happen — and the deviation detector then chases the
+        difference. So the replay's own trajectory replaces the planner's
+        (``PlanReplay.corrected``), and the correction is verified by replaying
+        the corrected trajectory once more. Only if THAT still disagrees — which
+        cannot happen for the shared model's own output, so it means something
+        upstream is not deterministic — is an ERROR raised.
+
+        The actions themselves are left alone. Re-solving the DP here would
+        re-enter planning from inside its own tail and would have to re-apply
+        the cloud-safe hedge; the value fields are per-DC-kWh rates and do not
+        depend on the SOC path, so replacing the trajectory is a complete and
+        consistent correction of what gets published.
         """
         if not schedule:
             return None
@@ -1948,12 +1969,35 @@ class BatteryOptimizer(hass.Hass):
                 level="ERROR",
             )
         if replay.trajectory_disagreements:
+            # RESOLVE it: the shared model's own trajectory replaces the
+            # planner's, and the correction is verified by replaying it.
+            corrected_soc = replay.soc_trajectory()
+            recheck = self._replay_schedule(
+                schedule=schedule,
+                starting_soc=starting_soc,
+                starting_temp=starting_temp,
+                current_slot=current_slot,
+                minutes_into_slot=minutes_into_slot,
+                prices_sorted=prices_sorted,
+                planning_temp_by_slot=planning_temp_by_slot,
+                planned_soc_by_slot={
+                    slot: pair[1] for slot, pair in corrected_soc.items()
+                },
+                soc_tolerance=tolerance,
+            )
+            still_wrong = recheck is None or recheck.trajectory_disagreements
+            replay.corrected = not still_wrong
             self.log(
-                "Plan replay: published SOC trajectory disagrees with the shared "
+                "Plan replay: published SOC trajectory disagreed with the shared "
                 f"physical model by more than {tolerance:.4f}% — "
                 + replay.trajectory_disagreements[0]
-                + f" ({len(replay.trajectory_disagreements)} slot(s))",
-                level="WARNING",
+                + f" ({len(replay.trajectory_disagreements)} slot(s)); "
+                + (
+                    "publishing the replayed trajectory instead"
+                    if replay.corrected
+                    else "the replayed trajectory does not reproduce itself either"
+                ),
+                level="WARNING" if replay.corrected else "ERROR",
             )
         if (
             replay.total_unmet_battery_ac_kwh > 1e-6

@@ -445,7 +445,68 @@ class TestPlanReplayAgreesWithTheTemperatureAwarePlan:
         assert replay is not None
         assert replay.conservation_violations == []
         assert replay.trajectory_disagreements == []
+        assert replay.corrected is False
         assert not [m for m in app.messages if m[0] in ("WARNING", "ERROR")]
+
+    def test_a_post_hedge_schedule_is_validated_and_corrected(self):
+        """The hedge rewrites actions after the DP; validation sees the result.
+
+        A HOLD slot turned into ``discharge_to_load`` changes the modelled flow
+        whenever PV does NOT cover the load, so the DP's trajectory no longer
+        describes the plan. The validator must correct what gets published,
+        not merely mention it.
+        """
+        import battery_optimizer as bo
+        from battery_optimizer_lib import BatteryMode as _Mode
+
+        projector = TestSharedThermalModel._projector(ambient=5.0, k1=0.0, k2=6.0)
+        cfg = _config(terminal_energy_value_eur_kwh=1.0)
+        load = lambda dt: 0.0 if _slot_index(dt) < 2 else 2.0
+        opt = DPOptimizer(
+            config=cfg,
+            load_predictor=load,
+            charge_rate_predictor=self._Engine.get_charge_rate_for_soc,
+            temp_after_charge_predictor=lambda t, m: t,
+            temp_after_idle_predictor=lambda t, m: t,
+            pv_predictor=lambda dt: 0.0,
+            temp_projector=projector,
+        )
+        result = opt.optimize(
+            prices=_prices([0.05, 0.05, 0.50, 0.50]),
+            current_slot=BASE,
+            current_soc=60.0,
+            current_temp=20.0,
+        )
+        # Rewrite a HOLD slot the way the orchestrator's hedge would.
+        hedged = None
+        for slot in sorted(result.schedule):
+            entry = result.schedule[slot]
+            if entry.mode is _Mode.HOLD:
+                entry.mode = _Mode.DISCHARGE
+                entry.export_rate = 0
+                hedged = slot
+                break
+
+        app = self._App(cfg, projector, load=0.0, pv=0.0)
+        app._predict_load_kw = load
+        replay = bo.BatteryOptimizer._validate_final_plan(
+            app,
+            schedule=result.schedule,
+            soc_trajectory=result.soc_trajectory,
+            starting_soc=60.0,
+            starting_temp=20.0,
+            current_slot=None,
+            minutes_into_slot=0.0,
+            prices_sorted=None,
+            planning_temp_by_slot=result.planning_temp_by_slot,
+        )
+        assert replay is not None
+        if hedged is not None and replay.trajectory_disagreements:
+            assert replay.corrected is True
+            corrected = replay.soc_trajectory()
+            assert corrected[hedged][1] == pytest.approx(
+                replay.by_slot[hedged].soc_end, abs=1e-12
+            )
 
 
 class TestOneTrajectoryPerPlan:

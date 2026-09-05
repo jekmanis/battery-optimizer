@@ -95,6 +95,9 @@ class PlanReplay:
     credited_over_available_kwh: float = 0.0
     total_value_eur: float = 0.0
     terminal_value_eur: float = 0.0
+    # Set by the caller when the published trajectory was replaced by this
+    # replay's, i.e. when a disagreement was RESOLVED rather than only reported.
+    corrected: bool = False
 
     @property
     def max_battery_ac_available_kwh(self) -> float:
@@ -113,6 +116,27 @@ class PlanReplay:
     @property
     def ok(self) -> bool:
         return not self.conservation_violations and not self.trajectory_disagreements
+
+    def soc_trajectory(self) -> Dict[datetime.datetime, tuple]:
+        """``{slot: (soc_start, soc_end)}`` -- the shape the planner publishes.
+
+        This is the shared physical model's own answer for the final action
+        sequence, so it is what a disagreeing planner trajectory is replaced
+        with rather than merely compared against.
+        """
+        return {
+            slot: (row.soc_start, row.soc_end) for slot, row in self.by_slot.items()
+        }
+
+    def temp_trajectory(self) -> Dict[datetime.datetime, tuple]:
+        """``{slot: (temp_start, temp_end)}``, empty when no temperature is known."""
+        if not self.by_slot or all(
+            row.temp_start is None for row in self.by_slot.values()
+        ):
+            return {}
+        return {
+            slot: (row.temp_start, row.temp_end) for slot, row in self.by_slot.items()
+        }
 
 
 def _params_from_config(config, min_soc=None, max_soc=None) -> SlotEnergyParams:

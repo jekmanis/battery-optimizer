@@ -174,6 +174,10 @@ class RecoveryOptimizer(bo.BatteryOptimizer):
         self._last_executed_monotonic = None
         self._grid_charge_active_until = None
         self._pv_bias_factor = 1.0
+        # What `_restore_previous_schedule_from_sensor()` leaves behind. Real
+        # state rather than a stubbed-out hook: a double that neutralises the
+        # restart-continuity path is a double that cannot fail because of it.
+        self._previous_schedule_from_sensor = None
 
         self.run_in_calls = []
         self.cancelled_timers = []
@@ -256,9 +260,6 @@ class RecoveryOptimizer(bo.BatteryOptimizer):
 
     def _update_schedule_sensor(self):
         self.sensor_updates += 1
-
-    def _preserve_mode_on_restart(self, current_slot):
-        pass
 
     def _check_pv_shortfall(self, current_soc):
         self.shortfall_checks += 1

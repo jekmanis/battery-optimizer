@@ -183,6 +183,21 @@ _HEDGE_ENERGY_EPS = 1e-6     # kWh
 _HEDGE_POWER_EPS = 1e-9      # kW
 
 
+def first_slot_fraction(minutes_into_slot: float, slot_minutes: int) -> float:
+    """How much of the interval running NOW is still ahead of us.
+
+    ONE formula. ``DPOptimizer``'s ``slot_fractions``, ``_compute_slot_fractions``,
+    ``project_schedule_trajectory``, ``plan_validation.replay_plan`` and the
+    pre-solve advance across a current slot the DP does not own all have to
+    agree about the width of the partial first slot, or two of them describe
+    different plans.
+    """
+    return min(
+        1.0,
+        max(0.0, (slot_minutes - minutes_into_slot) / max(1, slot_minutes)),
+    )
+
+
 def _cloud_safe_candidates(schedule, predict_load_kw, predict_pv_kw):
     """HOLD slots where the forecast has PV covering the whole house load.
 
@@ -1378,8 +1393,9 @@ class BatteryOptimizer(hass.Hass):
         # If a source can be asked for the real current price, that is a FETCH
         # and belongs in the price service and the bounded retry, which already
         # re-request whole days.
+        local_tz = self._get_local_timezone()
         current_slot_priced = any(
-            datetimes_match_slot(p.time, current_slot, self._get_local_timezone())
+            datetimes_match_slot(p.time, current_slot, local_tz)
             for p in future_prices
         )
 
@@ -1391,11 +1407,43 @@ class BatteryOptimizer(hass.Hass):
             min_charge_slots = n_slots
 
         # Prepare inputs for optimizer
-        current_soc_for_calc = current_soc if current_soc is not None else 50.0
+        measured_soc = current_soc if current_soc is not None else 50.0
+        measured_temp = self._get_battery_temp()
+        current_soc_for_calc = measured_soc
+        current_temp = measured_temp
         minutes_into_slot = max(0.0, (now - current_slot).total_seconds() / 60.0)
-        current_temp = self._get_battery_temp()
 
-        if not current_slot_priced:
+        # A restart in the middle of a CHARGE or DISCHARGE slot continues that
+        # action for the rest of the slot. That is a CONSTRAINT ON THE SOLVE,
+        # not an edit of its answer: `_preserve_mode_on_restart` used to swap
+        # the current slot's HOLD for the previous mode AFTER
+        # `find_optimal_schedule` had validated, replayed, counted, costed and
+        # logged its result, so a validated `HOLD, DISCHARGE` plan that had
+        # reserved the pack for a 1.00 EUR/kWh slot executed as `DISCHARGE,
+        # DISCHARGE`, moved the import into the expensive slot, and credited
+        # the battery with service it no longer had — while every published
+        # artefact still described the plan that had been replaced.
+        #
+        # Resolved the same way an unpriced current slot is: fix the action,
+        # advance the SOC and temperature across the remaining fraction, and
+        # let the DP plan the rest of the horizon from there.
+        _restart_gate = getattr(self, "_restart_continuation_entry", None)
+        fixed_current_entry = (
+            _restart_gate(current_slot, priced=current_slot_priced)
+            if callable(_restart_gate)
+            else None
+        )
+        if fixed_current_entry is not None:
+            current_soc_for_calc, current_temp = self._advance_current_slot(
+                mode=fixed_current_entry.mode,
+                export_rate=fixed_current_entry.export_rate,
+                current_slot=current_slot,
+                current_soc=current_soc_for_calc,
+                current_temp=current_temp,
+                minutes_into_slot=minutes_into_slot,
+                label=f"restart continuation ({fixed_current_entry.mode.name})",
+            )
+        elif not current_slot_priced:
             # Resolve the current slot BEFORE solving, not after. The callers
             # still STAMP the retained entry (`_retain_current_slot_if_unpriced`,
             # which owns the provenance and the diagnostics state); what happens
@@ -1428,6 +1476,36 @@ class BatteryOptimizer(hass.Hass):
                 )
             )
 
+        # What the DP is asked to solve. A slot whose action is already fixed
+        # is not one of its decisions: it plans the horizon from the NEXT
+        # interval, out of the SOC and temperature the fixed action leaves.
+        dp_prices = future_prices
+        if fixed_current_entry is not None:
+            dp_prices = [
+                p for p in future_prices
+                if not datetimes_match_slot(p.time, current_slot, local_tz)
+            ]
+            if not dp_prices:
+                # A one-interval horizon, and the restart owns that interval.
+                # Nothing is left to solve, so publish the continued action and
+                # the trajectory of exactly that.
+                schedule = {canonical_slot_key(current_slot): fixed_current_entry}
+                soc_trajectory, temp_trajectory = self.project_schedule_trajectory(
+                    schedule,
+                    measured_soc,
+                    starting_temp=measured_temp,
+                    current_slot=current_slot,
+                    minutes_into_slot=minutes_into_slot,
+                )
+                self._last_schedule_counts = count_schedule_modes(schedule)
+                self._last_projected_costs = {}
+                self._last_min_charge_slots = min_charge_slots
+                self._last_dp_soc_trajectory = soc_trajectory
+                self._last_dp_temp_trajectory = (
+                    temp_trajectory if measured_temp is not None else {}
+                )
+                return schedule
+
         # Rate-limited legacy-terminal-value warning. Resolved defensively:
         # several test doubles borrow this method without the full app state.
         _warn_gate = getattr(self, "_should_warn_degenerate_terminal", None)
@@ -1451,7 +1529,7 @@ class BatteryOptimizer(hass.Hass):
 
         # Run optimization
         result = optimizer.optimize(
-            prices=future_prices,
+            prices=dp_prices,
             current_slot=current_slot,
             current_soc=current_soc_for_calc,
             current_temp=current_temp,
@@ -1477,6 +1555,31 @@ class BatteryOptimizer(hass.Hass):
         soc_trajectory = result.soc_trajectory
         temp_trajectory = result.temp_trajectory
 
+        if fixed_current_entry is not None:
+            # The action decided before the solve joins the plan HERE, ahead of
+            # the hedge, the final-plan replay, the census, the projected-cost
+            # column and the decision log — so every one of them describes the
+            # plan that will execute. Its provenance was decided with it: the
+            # published price of the interval, if the interval was published.
+            schedule[canonical_slot_key(current_slot)] = fixed_current_entry
+            # From here on the plan is walked from what was MEASURED, across
+            # the partial current slot. The advanced SOC was an INPUT to the
+            # DP; using it as the starting point of the published trajectory
+            # would count the current slot twice.
+            current_soc_for_calc = measured_soc
+            current_temp = measured_temp
+            soc_trajectory, temp_trajectory = self.project_schedule_trajectory(
+                schedule,
+                measured_soc,
+                starting_temp=measured_temp,
+                current_slot=current_slot,
+                minutes_into_slot=minutes_into_slot,
+            )
+            if measured_temp is None:
+                # Parity with DPOptimizer._build_temp_trajectory: no starting
+                # temperature means no temperature trajectory at all.
+                temp_trajectory = {}
+
         # Cloud-safe hedge: HOLD → DISCHARGE(to load) during PV hours.
         # discharge_to_load charges from PV surplus (confirmed on Growatt WIT),
         # so it behaves identically to HOLD while PV covers the load. But when
@@ -1492,7 +1595,6 @@ class BatteryOptimizer(hass.Hass):
         # slot and left the expensive one to the grid, with exact forecasts and
         # no cloud anywhere. The DP had already chosen the rest of the horizon
         # on the assumption that HOLD preserved that energy.
-        local_tz = self._get_local_timezone()
         slot_fractions = self._compute_slot_fractions(
             slots_sorted_by_time, current_slot, minutes_into_slot, local_tz=local_tz,
         )
@@ -1500,6 +1602,14 @@ class BatteryOptimizer(hass.Hass):
             canonical_slot_key(p.time): slot_fractions[i]
             for i, p in enumerate(slots_sorted_by_time)
         }
+        if fixed_current_entry is not None:
+            # The fixed current slot runs for the remainder of its interval
+            # like any other partial first slot; it is only missing from
+            # `slots_sorted_by_time` when nobody published a price for it.
+            slot_fractions_by_slot.setdefault(
+                canonical_slot_key(current_slot),
+                first_slot_fraction(minutes_into_slot, self.config.slot_minutes),
+            )
         prices_by_slot_map = {
             canonical_slot_key(p.time): p.price for p in slots_sorted_by_time
         }
@@ -1737,18 +1847,43 @@ class BatteryOptimizer(hass.Hass):
         model, with the app's shared thermal projector, so this pre-step cannot
         become a fourth physics implementation.
         """
-        remaining = 1.0 - min(
-            1.0,
-            max(0.0, minutes_into_slot / max(1, self.config.slot_minutes)),
-        )
-        if remaining <= 0.0:
-            return current_soc, current_temp
-
         retained = (
             previous_entry if self._entry_has_real_price(previous_entry) else None
         )
-        mode = retained.mode if retained is not None else BatteryMode.HOLD
-        export_rate = retained.export_rate if retained is not None else None
+        return self._advance_current_slot(
+            mode=retained.mode if retained is not None else BatteryMode.HOLD,
+            export_rate=retained.export_rate if retained is not None else None,
+            current_slot=current_slot,
+            current_soc=current_soc,
+            current_temp=current_temp,
+            minutes_into_slot=minutes_into_slot,
+            label="unpriced current slot",
+        )
+
+    def _advance_current_slot(
+        self,
+        *,
+        mode: BatteryMode,
+        export_rate: Optional[int],
+        current_slot: datetime.datetime,
+        current_soc: float,
+        current_temp: Optional[float],
+        minutes_into_slot: float,
+        label: str,
+    ) -> Tuple[float, Optional[float]]:
+        """SOC and temperature at the END of a current slot the DP does not own.
+
+        Two things fix the current slot's action before the solve — a restart
+        continuing the CHARGE or DISCHARGE it woke up in, and an interval
+        nobody published a price for — and they must advance the pack the same
+        way, through `soc_projection.project_slot_soc` (the ONE slot-SOC model)
+        with the app's shared thermal projector.
+        """
+        remaining = first_slot_fraction(
+            minutes_into_slot, self.config.slot_minutes
+        )
+        if remaining <= 0.0:
+            return current_soc, current_temp
 
         params = SocProjectionParams(
             battery_capacity=self.config.battery_capacity,
@@ -1776,12 +1911,69 @@ class BatteryOptimizer(hass.Hass):
         )
         if abs(transition.soc_end - current_soc) > 1e-9:
             self.log(
-                f"Unpriced current slot {current_slot}: advancing "
+                f"{label} {current_slot}: advancing "
                 f"{remaining * self.config.slot_minutes:.1f} min of "
                 f"{mode.name} before planning — SOC {current_soc:.1f}% -> "
                 f"{transition.soc_end:.1f}%"
             )
         return transition.soc_end, transition.temp_end
+
+    def _restart_continuation_entry(
+        self, current_slot: datetime.datetime, *, priced: bool
+    ) -> Optional[ScheduleEntry]:
+        """The action a restart must go on executing for the rest of this slot.
+
+        AppDaemon can restart in the middle of a CHARGE or DISCHARGE interval,
+        and the plan it wakes up with is gone. `sensor.battery_optimizer` still
+        carries the previous schedule, and `_restore_previous_schedule_from_sensor`
+        reads the mode for the interval the app woke up in; stopping mid-charge
+        or holding through the peak the previous plan was discharging into is a
+        real cost.
+
+        This returns that action as an entry for the current slot, and it is
+        returned BEFORE the DP runs. `_preserve_mode_on_restart` used to apply
+        the same intent AFTER `find_optimal_schedule` had validated, replayed,
+        counted, costed and logged its answer — so the plan that executed was
+        not the plan that was checked. See the comment in `find_optimal_schedule`.
+
+        Provenance is a property of the interval's PRICE, not of the mode: the
+        entry carries `PRICE_SOURCE_MARKET` only when the current interval was
+        actually published. When it was not, `execute_scheduled_mode`'s
+        provenance guard degrades it to HOLD, which is the correct answer for
+        an action nobody can price.
+
+        Consumed once. The restored schedule describes the interval the app
+        woke up in and nothing else; a later re-optimization of the same slot
+        is an ordinary optimization.
+        """
+        previous = getattr(self, "_previous_schedule_from_sensor", None)
+        if previous is None:
+            return None
+        self._previous_schedule_from_sensor = None
+
+        local_tz = self._get_local_timezone()
+        previous_mode = None
+        for prev_slot, mode in previous.items():
+            if datetimes_match_slot(prev_slot, current_slot, local_tz):
+                previous_mode = mode
+                break
+
+        if previous_mode not in (BatteryMode.CHARGE, BatteryMode.DISCHARGE):
+            return None
+
+        name = previous_mode.name.lower()
+        self.log(
+            f"Restart continuity: the previous plan was {previous_mode.name} "
+            f"for {current_slot} — fixing that action for the rest of the slot "
+            f"and planning the remaining horizon from where it leaves the pack"
+            + ("" if priced else " (interval unpriced: no provenance)")
+        )
+        return ScheduleEntry(
+            time=current_slot,
+            mode=previous_mode,
+            reason=f"continuing_{name}_from_restart",
+            price_source=PRICE_SOURCE_MARKET if priced else None,
+        )
 
     def _retain_current_slot_if_unpriced(
         self,
@@ -1810,8 +2002,14 @@ class BatteryOptimizer(hass.Hass):
         """
         if local_tz is None:
             local_tz = self._get_local_timezone()
-        if lookup_by_time(schedule, current_slot, local_tz) is not None:
-            return "planned"
+        existing = lookup_by_time(schedule, current_slot, local_tz)
+        if existing is not None:
+            # "The planner owns it" is a claim about the PRICE, not about the
+            # key being present. A restart continuation fixed before the solve
+            # puts an entry here too, and on an unpriced interval that entry
+            # cannot vouch for a price — `execute_scheduled_mode` will degrade
+            # it to HOLD, which is the fallback outcome, so say so.
+            return "planned" if self._entry_has_real_price(existing) else "fallback"
         if not self._entry_has_real_price(previous_entry):
             return "fallback"
 
@@ -1842,7 +2040,9 @@ class BatteryOptimizer(hass.Hass):
     ) -> List[float]:
         """Compute fraction of each slot that is usable (partial first slot)."""
         n_slots = len(slots_sorted_by_time)
-        first_fraction = min(1.0, max(0.0, (self.config.slot_minutes - minutes_into_slot) / max(1, self.config.slot_minutes)))
+        first_fraction = first_slot_fraction(
+            minutes_into_slot, self.config.slot_minutes
+        )
         slot_fractions = [1.0] * n_slots
         if local_tz is None:
             local_tz = self._get_local_timezone()
@@ -1955,9 +2155,8 @@ class BatteryOptimizer(hass.Hass):
             slot_minutes=self.config.slot_minutes,
         )
         # Same partial-slot formula as _compute_slot_fractions / DPOptimizer.
-        first_fraction = min(
-            1.0,
-            max(0.0, (self.config.slot_minutes - minutes_into_slot) / max(1, self.config.slot_minutes)),
+        first_fraction = first_slot_fraction(
+            minutes_into_slot, self.config.slot_minutes
         )
         local_tz = None
         if current_slot is not None:
@@ -2408,8 +2607,12 @@ class BatteryOptimizer(hass.Hass):
             current_slot, entry_state == "planned", entry_state
         )
 
-        # On restart, preserve CHARGE/DISCHARGE intent for current slot if it was active before
-        self._preserve_mode_on_restart(current_slot)
+        # Restart continuity is NOT applied here. It is a constraint the DP
+        # solves around (`_restart_continuation_entry`, consumed inside
+        # `find_optimal_schedule` before the solve), because an action change
+        # after validation leaves the replay, the trajectory, the census, the
+        # cost column and the decision log describing a plan that no longer
+        # exists.
 
         # Calculate expected SOC and temperature trajectory. The current slot is
         # already partially elapsed, so only its remaining fraction is projected
@@ -3870,81 +4073,6 @@ class BatteryOptimizer(hass.Hass):
 
         except Exception as e:
             self.log(f"Could not restore previous schedule: {e}", level="WARNING")
-
-    def _preserve_mode_on_restart(self, current_slot: datetime.datetime):
-        """
-        If restarting mid-hour during a CHARGE or DISCHARGE slot, preserve that mode.
-
-        The DP algorithm sees only remaining time in the current slot and may decide HOLD
-        is optimal when only minutes remain. But if this was meant to be a charging or
-        discharging hour, we should continue to maintain the original intent.
-
-        This prevents wasteful scenarios like:
-        - Stopping mid-charge and losing the slot's charging opportunity
-        - Holding during expensive grid hours when we should be discharging cheap battery energy
-        """
-        if self._previous_schedule_from_sensor is None:
-            return  # Not a restart with previous schedule
-
-        # Find the previous mode for the current slot (handle timezone variations)
-        previous_mode = None
-        slot_naive = current_slot.replace(tzinfo=None) if current_slot.tzinfo else current_slot
-
-        for prev_hour, prev_mode in self._previous_schedule_from_sensor.items():
-            prev_naive = prev_hour.replace(tzinfo=None) if prev_hour.tzinfo else prev_hour
-            if prev_naive == slot_naive:
-                previous_mode = prev_mode
-                break
-            # Also match by date and hour if exact match fails
-            if (prev_naive.date() == slot_naive.date() and
-                prev_naive.hour == slot_naive.hour and
-                prev_naive.minute == slot_naive.minute):
-                previous_mode = prev_mode
-                break
-
-        if previous_mode not in (BatteryMode.CHARGE, BatteryMode.DISCHARGE):
-            return  # Previous slot wasn't charging or discharging, nothing to preserve
-
-        # Find current slot in new schedule
-        current_entry = None
-        current_key = None
-        for sched_hour, entry in self.schedule.items():
-            sched_naive = sched_hour.replace(tzinfo=None) if sched_hour.tzinfo else sched_hour
-            if sched_naive == slot_naive:
-                current_entry = entry
-                current_key = sched_hour
-                break
-            if (sched_naive.date() == slot_naive.date() and
-                sched_naive.hour == slot_naive.hour and
-                sched_naive.minute == slot_naive.minute):
-                current_entry = entry
-                current_key = sched_hour
-                break
-
-        if current_entry is None:
-            return  # Current slot not in schedule
-
-        if current_entry.mode == BatteryMode.HOLD:
-            # Override to previous mode to maintain continuity
-            mode_name = previous_mode.name
-            self.log(
-                f"Preserving {mode_name} mode for current slot {current_slot.strftime('%H:%M')} "
-                f"(was {mode_name.lower()}ing before restart, algorithm chose HOLD due to partial slot)"
-            )
-            self.schedule[current_key] = ScheduleEntry(
-                time=current_entry.time,
-                mode=previous_mode,
-                reason=f"continuing_{mode_name.lower()}_from_restart",
-                # Provenance is a property of the SLOT's price, not of the mode
-                # chosen for it. This entry replaces one the planner built from
-                # a published interval, so it inherits that; dropping it here
-                # would make `execute_scheduled_mode` refuse the very restart
-                # continuity this method exists to provide.
-                price_source=current_entry.price_source,
-            )
-
-        # Clear the previous schedule after first use (only needed for startup)
-        self._previous_schedule_from_sensor = None
 
     def _save_load_profile(self):
         """Persist load profile to Home Assistant entity"""

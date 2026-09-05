@@ -149,6 +149,7 @@ PartialSlotOptimizer._entry_has_real_price = BatteryOptimizer._entry_has_real_pr
 PartialSlotOptimizer._advance_across_unpriced_current_slot = (
     BatteryOptimizer._advance_across_unpriced_current_slot
 )
+PartialSlotOptimizer._advance_current_slot = BatteryOptimizer._advance_current_slot
 
 
 def _make_price_points():

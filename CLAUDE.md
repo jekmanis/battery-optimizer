@@ -17,6 +17,7 @@ appdaemon/apps/
 │   │                              #   (except direct_control and price_horizon,
 │   │                              #    imported by module path)
 │   ├── config.py                  # BatteryOptimizerConfig dataclass
+│   ├── callback_lock.py           # App-wide re-entrant lock behind every callback
 │   ├── models.py                  # Data classes and enums
 │   ├── dp_optimizer.py            # Dynamic programming optimizer
 │   ├── learning_engine.py         # Self-learning charge rate tracker
@@ -408,12 +409,15 @@ containing `.py` files), not by the files in `apps/` — which is why its log
 wording does not match master.
 
 ### Scheduled Tasks
-- **13:15 daily**: Full optimization (after Nord Pool prices publish)
-- **Startup**: Initial optimization
+Everything below is registered in `initialize` (`run_daily` / `run_every`); there is no
+separate safety-check job and nothing runs hourly.
+- **`tomorrow_prices_hour` + 15 min daily (14:15 with the default 14)**: Full optimization, after Nord Pool publishes tomorrow's prices
+- **Startup**: Initial optimization (from `_init_battery_cost`, once the battery cost is loaded)
+- **Every slot (`slot_minutes`, 15 min)**: `execute_scheduled_mode` — the slot's mode is sent and verified; battery temperature is sampled for the ambient window
 - **Every `pv_sample_seconds` (60s)**: PV power sampling + slot close + bias refresh
-- **Every 15 min**: Adaptive re-evaluation + schedule change logging + price-horizon health check
-- **Every 5 min**: Safety checks
-- **Hourly**: Mode execution + battery cost update
+- **Every `adaptive_recalc_minutes` (15)**: Adaptive re-evaluation + schedule change logging + price-horizon health check (evaluates the last snapshot, never fetches)
+- **Every `load_observation_minutes` (15)**: load observation for the load profile
+- **On state change**: SOC listener (deviation detection), energy-counter listeners (battery cost update), enable / override / manual-mode listeners
 - **On demand, bounded backoff (30s / 2min / 5min / 15min)**: price recovery —
   `_price_recovery_retry`, armed by whichever path noticed the unusable horizon
 

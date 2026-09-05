@@ -2,7 +2,7 @@
 
 An [AppDaemon](https://appdaemon.readthedocs.io/) application for Home Assistant that uses **Nord Pool** day‑ahead electricity prices (and optionally **Solcast** PV forecasts) to compute and execute a low‑cost battery **charge / hold / discharge** schedule for a Growatt **WIT** hybrid inverter.
 
-It plans with dynamic programming over SOC, learns your house load and real charge rates over time, tracks the stored‑energy cost, and drives the inverter both in real time (via a `set_wit_mode` service) and autonomously (by writing the inverter's Time‑of‑Use registers so it keeps following the plan even if Home Assistant goes offline).
+It plans with dynamic programming over SOC, learns your house load and real charge rates over time, tracks the stored‑energy cost, and drives the inverter in real time through the Growatt integration's `set_wit_mode` service.
 
 > ⚠️ This software actively controls battery hardware (grid charging, export, discharge). Use at your own risk and verify behaviour on your own system. See [Disclaimer](#disclaimer).
 
@@ -10,8 +10,8 @@ It plans with dynamic programming over SOC, learns your house load and real char
 
 ## Features
 
-- **DP price optimizer** — dynamic programming over discretised SOC searches charge/hold/discharge sequences for the next ~48 h at 15‑minute resolution. The physics of every transition is exact; the search is not, because one path is kept per SOC bucket. See [what is exact and what is approximate](docs/scheduling-algorithm.md#conservative-quantization-bucket-label-plus-exact-path-energy).
-- **Self‑learning** — learns actual charge rates per SOC band and round‑trip efficiency from observed behaviour; builds a statistical, time‑of‑day **load profile**.
+- **DP price optimizer** — dynamic programming over discretised SOC searches charge/hold/discharge sequences for every 15‑minute slot up to the end of the published price horizon (about 35 h once tomorrow's prices are in). The physics of every transition is exact; the search is not, because one path is kept per SOC bucket. See [what is exact and what is approximate](docs/scheduling-algorithm.md#conservative-quantization-bucket-label-plus-exact-path-energy).
+- **Self‑learning** — learns actual charge rates per SOC and temperature band from observed behaviour (efficiency is configured, not learned — there is no independent AC meter to learn it from); builds a statistical, time‑of‑day **load profile**.
 - **Temperature‑aware charge rates** — predicts slower charging when the battery is cold for more accurate scheduling.
 - **PV‑aware** — uses Solcast forecasts and a live PV sensor to avoid grid‑charging when solar will cover it.
 - **Battery cost tracking** — weighted-average landed cost of stored energy, persisted across restarts and exposed for reporting; the DP optimizes forecast cash flows directly.
@@ -24,7 +24,7 @@ It plans with dynamic programming over SOC, learns your house load and real char
 
 ```
 Nord Pool prices ─┐
-Solcast PV       ─┼─► DP optimizer ─► schedule (96 × 15‑min slots)
+Solcast PV       ─┼─► DP optimizer ─► schedule (15‑min slots to horizon)
 learned load     ─┤        │
 battery SOC/cost ─┘        └─► real‑time execution  → growatt_modbus/set_wit_mode
 ```
@@ -38,7 +38,7 @@ The optimizer re‑plans on a schedule and adapts when reality drifts from the p
 - **Home Assistant** with the **AppDaemon 4** add‑on.
 - **Nord Pool** prices — the built‑in HA Nord Pool integration (config entry) or the [HACS Nord Pool](https://github.com/custom-components/nordpool) integration.
 - **Growatt Modbus integration with WIT `set_wit_mode` support.** The stock upstream integration does **not** include `set_wit_mode`; this optimizer depends on the WIT‑enabled fork:
-  **[jekmanis/Growatt_ModbusTCP](https://github.com/jekmanis/Growatt_ModbusTCP)** (branch `main`, v0.9.3+). It must expose the `growatt_modbus/set_wit_mode` service.
+  **[jekmanis/Growatt_ModbusTCP](https://github.com/jekmanis/Growatt_ModbusTCP)** (branch `main`, v1.9.6 or later). It must expose the `growatt_modbus/set_wit_mode` service.
 - *(Optional)* **Solcast PV Forecast** (HACS) for PV‑aware planning.
 - A long‑lived HA access token (used by the app to read Nord Pool prices via the REST API).
 
@@ -57,6 +57,8 @@ cp -r appdaemon/apps/battery_optimizer.py \
       appdaemon/apps/battery_optimizer_lib \
       <your_appdaemon>/apps/
 ```
+
+On an existing install use `scripts/deploy.ps1` (rehearse with `-DryRun`): it backs up the share, **stops the add‑on**, copies, verifies by SHA256, restarts and checks the running version. Stop AppDaemon yourself if you copy by hand — it hot‑reloads on every `.py` write and will import a new module against its old peers mid‑copy. See `scripts/README.md`.
 
 ### 3. Configure the app
 Copy the example config and fill in your values:
@@ -113,9 +115,10 @@ Restart Home Assistant, then restart the AppDaemon add‑on. Watch **Settings �
 ## Usage
 
 ### Automatic operation
-- **Full optimization** daily at ~13:15 (after Nord Pool publishes tomorrow's prices) and at startup.
-- **Adaptive re‑evaluation** every 15 minutes (re‑plans if prices/SOC/load drift).
-- **Safety checks** every 5 minutes.
+- **Full optimization** daily at `tomorrow_prices_hour` + 15 min (14:15 with the default, after Nord Pool publishes tomorrow's prices) and at startup.
+- **Schedule execution** every slot (15 min): the slot's mode is sent through `set_wit_mode` and verified after `verify_delay_seconds`.
+- **Adaptive re‑evaluation** every `adaptive_recalc_minutes` (15): checks the price horizon and re‑plans on SOC deviation, PV shortfall or new prices. It never fetches prices itself; a bounded retry does that when the horizon is unusable.
+- **Sampling**: PV power every `pv_sample_seconds` (60 s), battery temperature and load every slot; battery cost updates on every change of the inverter's energy counters.
 
 ### Manual controls
 
@@ -151,8 +154,9 @@ Common parameters (see `apps.yaml.example` for the full, commented list):
 | `solcast_today_entity` / `_tomorrow_entity` | `sensor.solcast_*` | Optional PV forecast |
 | `device_id` | `""` | **Empty = dry‑run** (logs decisions, no inverter writes) |
 | `set_wit_mode_timeout_seconds` | 15 | Per‑call `hass_timeout`. This call **blocks the AppDaemon callback thread** — see *AppDaemon threads* |
-| `verify_delay_seconds` | 90 | Delay before the first verify‑after‑set read of the Inverter Mode sensor |
+| `verify_delay_seconds` | 90 | Delay before the first verify‑after‑set read of the configured `verify_source` (holding registers by default) |
 | `verify_recheck_seconds` | 60 | Delay of the single re‑check performed after a resend |
+| `verify_source` | `auto` | `registers` / `mode_sensor` / `none` / `auto` (registers whenever `device_id` is set, otherwise none — never the mode sensor by default) |
 | `callback_warn_seconds` | 10 | Warn when one of this app's callbacks blocks for longer than this |
 | `tomorrow_prices_hour` | 14 | Local hour from which tomorrow's intervals are expected. Before it, a today‑only reply is complete; from it, a missing tomorrow is an incomplete horizon |
 | `price_retry_enabled` | true | Retry a failed or incomplete price fetch automatically — see *Price recovery* |
@@ -270,6 +274,7 @@ appdaemon/apps/
 ├── apps.yaml.example             # Config template (copy to apps.yaml)
 └── battery_optimizer_lib/
     ├── config.py                 # Typed config loader
+    ├── callback_lock.py          # App‑wide re‑entrant lock behind every callback
     ├── models.py                 # BatteryMode, ScheduleEntry, … data types
     ├── dp_optimizer.py           # Dynamic‑programming SOC scheduler
     ├── slot_energy.py            # The one pure slot transition (named units)
@@ -279,6 +284,8 @@ appdaemon/apps/
     ├── thermal_model.py          # Shared battery temperature model (k1/k2)
     ├── ambient_service.py        # T_ambient(t) across the horizon
     ├── load_profile.py           # Statistical load forecasting
+    ├── pv_profile.py             # Statistical PV production profile
+    ├── load_prediction_tracker.py # Predicted vs actual load accuracy
     ├── pv_forecast_service.py    # Solcast PV forecast integration
     ├── pv_bias_tracker.py        # Sliding PV forecast bias
     ├── price_service.py          # Nord Pool price fetching
@@ -287,6 +294,7 @@ appdaemon/apps/
     ├── cost_tracker.py           # Stored‑energy cost tracking
     ├── schedule_formatter.py     # Schedule → sensor/dashboard formatting
     ├── soc_deviation.py          # Detects unexpected SOC changes
+    ├── slot_outcome_tracker.py   # Per‑slot outcome and mode compliance
     ├── ha_helpers.py             # HA state reading helpers
     └── timezone_utils.py         # TZ‑aware datetime helpers
 homeassistant/packages/

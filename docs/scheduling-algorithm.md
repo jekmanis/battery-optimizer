@@ -1276,10 +1276,26 @@ slots; its SOC from 10:30 onwards was ten points low.
 
 What happens instead:
 
-- **The modelled horizon is a contiguous slot sequence** from the first
-  interval the DP is given to the LAST PRICED one (`modeled_horizon`). It is
-  not extended past that: a gap at the *end* of the horizon is the horizon
-  ending, and modelling beyond it would invent slots as well as prices.
+- **The modelled horizon is a contiguous slot sequence** from the lower bound
+  below to the LAST PRICED interval (`modeled_horizon`). It is not extended
+  past that: a gap at the *end* of the horizon is the horizon ending, and
+  modelling beyond it would invent slots as well as prices.
+- **The lower bound is the current slot, or the one after it.** The caller
+  states it; it is not the first priced point. When the current interval is
+  priced the DP starts there and solves it at its remaining fraction; when it
+  is not, the DP starts at the slot immediately AFTER it, because that
+  interval is owned by `_resolve_unpriced_current_slot`.
+
+  Inferring the bound from the first priced point instead lost a **leading run
+  of unpublished slots**, since the current-slot mechanism owns exactly one
+  interval. A reply holding only 10:00-10:15 at 0.50 and 10:45-11:00 at 1.00,
+  read at 10:17, left 10:30 in neither mechanism: not in the DP, not in the
+  replay, not in the schedule at all. With 4 kW of PV forecast at 10:30 and
+  4 kW of load at 10:45 the plan then imported a full kWh at 1.00 EUR/kWh -
+  the kWh the missing slot's own sun stores for nothing - and the published
+  trajectory was ten SOC points low from 10:45 on. The identical hole one slot
+  earlier, *inside* the horizon, was already planned correctly; where the
+  sequence starts must not change what the physics does.
 - **An unpriced slot enters the DP with `price=None`** and is a **forced
   HOLD**:
   - only the HOLD transition is evaluated - nothing may be chosen at a price
@@ -1333,10 +1349,11 @@ interval means the data is genuinely missing.
 
 What happens instead:
 
-- **Planning starts at the next validated interval.** The DP is given the
-  prices as fetched; it finds no index for the current slot, so it solves the
-  remaining slots at full width with no partial first slot. The horizon is not
-  lost because one interval is.
+- **Planning starts at the next SLOT** - published or not. The DP finds no
+  index for the current slot, so it solves the remaining slots at full width
+  with no partial first slot. The horizon is not lost because one interval is,
+  and an unpublished slot immediately after the current one is modelled like
+  any other gap (see the lower bound above).
 - **The current slot is resolved BEFORE the solve, not after it — the whole
   decision.** `_resolve_unpriced_current_slot` picks the entry that will run
   for the rest of this quarter hour (the retained one, or the `HOLD` fallback,

@@ -40,7 +40,6 @@ from typing import Optional
 
 from .models import BatteryMode
 from .slot_energy import params_from_soc_projection, simulate_slot
-from .thermal_model import battery_power_for_entry
 
 
 @dataclass(frozen=True)
@@ -214,20 +213,16 @@ def project_slot_soc(
     soc_end = energy_params.soc_of(outcome.energy_end_kwh)
 
     if temp_projector is not None and temp_start is not None:
-        # One thermal model for every mode. |P_bat| is derived by the same
-        # helper the DP trajectory uses, so the two can never disagree.
-        power_kw = battery_power_for_entry(
-            mode,
-            charge_rate_kw=charge_rate,
-            load_kw=load_kw,
-            pv_kw=pv_kw,
-            discharge_rate_kw=params.discharge_rate,
-            export_discharge_rate_kw=params.effective_export_discharge_rate,
-            export_rate=export_rate,
-            inverter_efficiency=inv_eff,
-        )
+        # One thermal model for every mode, driven by the energy that ACTUALLY
+        # moved. This used to call `thermal_model.battery_power_for_entry`,
+        # which models the REQUESTED flow and knows nothing about SOC limits --
+        # three lines after `simulate_slot` had already computed the real one.
+        # A full pack ordered to charge therefore warmed as if it had taken a
+        # full slot of energy, in every consumer of this projection, and which
+        # convention the published temperature used depended on which code path
+        # built it. Imaginary power must not manufacture future capability.
         temp_end = temp_projector.project(
-            temp_start, slot_time, duration_minutes, power_kw
+            temp_start, slot_time, duration_minutes, outcome.battery_power_kw
         )
 
     return SocTransition(

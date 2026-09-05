@@ -104,11 +104,20 @@ def battery_power_for_entry(
     export_rate: Optional[float] = None,
     inverter_efficiency: float = 1.0,
 ) -> float:
-    """Magnitude of the DC power through the battery for a scheduled slot (kW).
+    """Magnitude of the DC power a scheduled slot REQUESTS from the battery (kW).
 
-    This mirrors ``soc_projection.project_slot_soc``'s energy split exactly so
-    the thermal model and the SOC model never disagree about what the battery is
-    doing:
+    **This is the requested flow, not the actual one.** It takes no SOC and no
+    capacity limits, so it reports a full slot of charging power for a pack that
+    is already at ``max_soc`` and cannot take a joule. Anything that needs the
+    energy that really moved must use ``slot_energy.simulate_slot``'s
+    ``battery_power_kw``, which is capped by headroom and by available energy;
+    ``soc_projection.project_slot_soc`` now does, and every consumer of the
+    shared projection with it. Warming an idle pack because the schedule asked
+    it to do something impossible is exactly how imaginary power manufactures
+    future charging capability.
+
+    The mode split below mirrors ``project_slot_soc``'s energy split so the two
+    never disagree about what the battery is being ASKED to do:
 
     * ``CHARGE``            -> the (learned) charge rate
     * ``DISCHARGE`` export  -> the export discharge rate, DC side

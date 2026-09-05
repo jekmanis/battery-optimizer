@@ -17,7 +17,6 @@ if TYPE_CHECKING:
 from .models import BatteryMode, PricePoint, ScheduleEntry
 from .charge_rate_utils import compute_charge_rates_per_slot
 from .slot_energy import SlotEnergyParams, simulate_slot
-from .thermal_model import battery_power_for_entry
 from .timezone_utils import canonical_slot_key, instant_key
 
 

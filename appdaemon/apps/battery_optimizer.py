@@ -215,11 +215,31 @@ def first_slot_fraction(minutes_into_slot: float, slot_minutes: int) -> float:
     )
 
 
+# How far a modelled sequence may reach, in ELAPSED HOURS from its first slot.
+#
+# The runaway guard exists for one case: a source handing us an interval a
+# decade out must not spin here. It used to be a slot COUNT
+# (`len(priced) * 4 + 1000`), which is not a horizon - it allowed 252 hours for
+# a two-point reply and 346 for a full day of quarter hours - and it truncated
+# in silence.
+#
+# A week is far outside anything a price source publishes: the horizon the app
+# can even require ends at the end of TOMORROW
+# (`PriceHorizonMonitor.required_horizon_end`), under 48 hours out, and
+# `price_retain_max_age_hours` is clamped to the same week. It is deliberately
+# generous - a source that starts publishing further ahead should get planned,
+# not truncated - while still being three orders of magnitude short of the
+# decade the guard is there for.
+MODELED_HORIZON_MAX_HOURS = 168.0
+
+
 def modeled_horizon(
     priced_sorted: List[PricePoint],
     slot_minutes: int,
     *,
     start: Optional[datetime.datetime] = None,
+    max_hours: float = MODELED_HORIZON_MAX_HOURS,
+    log_fn=None,
 ) -> List[PricePoint]:
     """The contiguous slot sequence the plan describes.
 
@@ -234,7 +254,7 @@ def modeled_horizon(
     slot before it - and the final replay skipped it for the same reason, so it
     validated a trajectory that was wrong from the gap onwards.
 
-    Two boundaries, both deliberate:
+    Three boundaries, all deliberate:
 
     * It does not extend PAST the last priced interval. A gap at the END of the
       horizon is the horizon ending; modelling beyond it would invent slots as
@@ -253,6 +273,11 @@ def modeled_horizon(
       left 10:30 in no mechanism at all - not in the DP, not in the replay, not
       in the schedule - and the plan then imported at 1.00 EUR/kWh the kWh
       10:30's own sun would have stored for nothing.
+
+    * It stops after ``max_hours`` of ELAPSED TIME (`MODELED_HORIZON_MAX_HOURS`)
+      and says so at WARNING. The priced intervals past that point are DROPPED
+      - the caller drops them from its own price list too - rather than left
+      to look like a horizon that was modelled.
 
     Priced points earlier than ``start`` stay out of the sequence; they are the
     caller's to account for (the retained or fallback current-slot entry), and
@@ -283,8 +308,8 @@ def modeled_horizon(
     # below stops immediately, and extending past the last price is exactly
     # what the end-of-horizon rule forbids.
     key = instant_key(slot)
-    # A source handing us an interval a decade out must not spin here.
-    max_slots = len(priced_sorted) * 4 + 1000
+    # Elapsed time, not a count of points: see MODELED_HORIZON_MAX_HOURS.
+    max_slots = 1 + max(0, int((max_hours * 60) // max(1, slot_minutes)))
     while key <= last_key and len(modeled) < max_slots:
         published = by_instant.get(key)
         modeled.append(
@@ -298,6 +323,22 @@ def modeled_horizon(
             # hands us an unaligned one, follow the elapsed-time key rather
             # than silently planning a different interval.
             slot = key
+    if key <= last_key:
+        # The budget ran out before the last priced interval. Whatever is out
+        # there is unreachable: say so, and let the caller drop it. Ending the
+        # sequence quietly published a horizon that had been shortened without
+        # a word - and a timestamp this far out is corrupt far more often than
+        # it is a market that started publishing a week ahead.
+        dropped = [p for p in priced_sorted if instant_key(p.time) >= key]
+        if log_fn is not None:
+            log_fn(
+                f"Price data reaches beyond the {max_hours:.0f}h modelling "
+                f"budget from {modeled[0].time if modeled else slot}: "
+                f"dropping {len(dropped)} priced interval(s) from "
+                f"{dropped[0].time if dropped else '?'} on and planning the "
+                f"{len(modeled)} slots inside it",
+                level="WARNING",
+            )
     return modeled
 
 
@@ -1539,8 +1580,23 @@ class BatteryOptimizer(hass.Hass):
             else slot_offset(current_slot, self.config.slot_minutes, 1, local_tz)
         )
         modeled_slots = modeled_horizon(
-            slots_sorted_by_time, self.config.slot_minutes, start=modeled_from,
+            slots_sorted_by_time,
+            self.config.slot_minutes,
+            start=modeled_from,
+            log_fn=self.log,
         )
+        if modeled_slots:
+            # A priced interval past the modelling budget is DROPPED, not left
+            # in the price list: the replay, the projected-cost column, the
+            # decision log and the provenance stamp all derive from this list,
+            # and an interval the DP never saw must not appear in any of them.
+            # (An ordinary reply never reaches the budget - see
+            # `MODELED_HORIZON_MAX_HOURS`.)
+            horizon_end_key = instant_key(modeled_slots[-1].time)
+            slots_sorted_by_time = [
+                p for p in slots_sorted_by_time
+                if instant_key(p.time) <= horizon_end_key
+            ]
         n_slots = len(slots_sorted_by_time)
         min_charge_slots = max(0, int(charge_hours_needed))
         if min_charge_slots > n_slots:
@@ -1668,7 +1724,9 @@ class BatteryOptimizer(hass.Hass):
         # cannot. Stamped against the price keys rather than blanket-set: if a
         # synthetic price is ever reintroduced upstream, its slot will not
         # silently inherit the marker.
-        real_price_keys = {canonical_slot_key(p.time) for p in future_prices}
+        real_price_keys = {
+            canonical_slot_key(p.time) for p in slots_sorted_by_time
+        }
         for slot_key, entry in schedule.items():
             if slot_key in real_price_keys:
                 entry.price_source = PRICE_SOURCE_MARKET

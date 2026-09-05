@@ -1296,6 +1296,14 @@ What happens instead:
   trajectory was ten SOC points low from 10:45 on. The identical hole one slot
   earlier, *inside* the horizon, was already planned correctly; where the
   sequence starts must not change what the physics does.
+- **A runaway timestamp is dropped, loudly.** The sequence is bounded by
+  ELAPSED TIME - a week from its first slot (`MODELED_HORIZON_MAX_HOURS`),
+  against a horizon the app can only ever require to the end of tomorrow. A
+  priced interval beyond the budget is dropped from the modelled sequence *and*
+  from the price list the replay, the cost column, the decision log and the
+  provenance stamp derive from, with a WARNING naming how many and from when.
+  The bound used to be a slot COUNT that grew with the size of the reply, and
+  it shortened the horizon in silence.
 - **An unpriced slot enters the DP with `price=None`** and is a **forced
   HOLD**:
   - only the HOLD transition is evaluated - nothing may be chosen at a price

@@ -146,10 +146,18 @@ PartialSlotOptimizer._compute_slot_fractions = BatteryOptimizer._compute_slot_fr
 # the HOLD fallback) advances the SOC across the rest of the slot, so the DP
 # plans the next interval from where the pack will actually be.
 PartialSlotOptimizer._entry_has_real_price = BatteryOptimizer._entry_has_real_price
-PartialSlotOptimizer._advance_across_unpriced_current_slot = (
-    BatteryOptimizer._advance_across_unpriced_current_slot
+PartialSlotOptimizer._resolve_unpriced_current_slot = (
+    BatteryOptimizer._resolve_unpriced_current_slot
 )
 PartialSlotOptimizer._advance_current_slot = BatteryOptimizer._advance_current_slot
+PartialSlotOptimizer._note_current_slot_state = (
+    BatteryOptimizer._note_current_slot_state
+)
+# The resolved entry joins the plan before the hedge and the validation, and
+# the published trajectory is rebuilt from the MEASURED SOC across it.
+PartialSlotOptimizer.project_schedule_trajectory = (
+    BatteryOptimizer.project_schedule_trajectory
+)
 
 
 def _make_price_points():
@@ -192,13 +200,15 @@ def test_partial_slot_supports_configured_finer_soc_steps():
     assert schedule[base].mode == BatteryMode.DISCHARGE
 
 
-def test_missing_current_slot_is_left_unplanned():
+def test_missing_current_slot_is_not_planned_on_an_invented_price():
     """The current slot is never given a price the source did not publish.
 
     This used to assert the opposite: `_ensure_current_slot_price` copied
     yesterday's same-clock price (0.071 here) into the current slot and the DP
-    planned on it. The slot is now simply absent from the schedule, and the
-    orchestrator resolves it (retained real-priced entry, else HOLD/no_price).
+    planned on it. The DP is now not given the interval at all; the slot gets
+    the pre-solve HOLD/`no_price` fallback (there is nothing real-priced to
+    retain here), which carries no provenance and so cannot be executed as
+    anything but HOLD.
     """
     base, prices = _make_price_points()
     current = base
@@ -207,6 +217,9 @@ def test_missing_current_slot_is_left_unplanned():
 
     schedule = optimizer.find_optimal_schedule(future, 0, current_soc=36.0)
 
-    assert current not in schedule
-    assert schedule, "the rest of the horizon is still planned"
-    assert min(schedule) == min(p.time for p in future)
+    entry = schedule[current]
+    assert entry.mode == BatteryMode.HOLD
+    assert entry.reason == "no_price"
+    assert entry.price_source is None
+    assert len(schedule) > 1, "the rest of the horizon is still planned"
+    assert min(p.time for p in future) in schedule

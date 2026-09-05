@@ -373,18 +373,34 @@ def charge_rate_for_span(
     slot starts at, because temperature evolves between slots through
     ``thermal_model.TemperatureProjector`` and the DP's 1-D energy state cannot
     carry it. That is conservative when the pack WARMS during the slot -- the
-    physical case while charging -- and over-credits a pack that cools while
-    charging, bounded by
+    physical case while charging -- and it MAY OVER-CREDIT a pack that cools
+    while charging, bounded by
     ``(rate(T_start) - rate(T_end)) * duration_h * efficiency`` **only when the
-    rate is NON-DECREASING in temperature over the range the slot traverses**.
-    That is the direction that makes the bound mean anything: a rate that only
-    ever falls as the pack cools stays between ``rate(T_end)`` and
-    ``rate(T_start)``, so the difference of the endpoints caps the over-credit.
-    Under the opposite condition the model cannot over-credit a cooling pack at
-    all -- every temperature it visits is at least as fast as the one the rate
-    was looked up at -- so the bound would be describing a case that does not
-    arise. That bound compares two endpoints, so a rate that is non-monotone in
-    temperature breaks it outright: a pack cooling 20 -> 5 C on a curve of
+    rate is NON-DECREASING in temperature over the range the slot traverses and
+    monotone over the SOC span the slot covers**.
+
+    The temperature half is the direction that makes the bound mean anything: a
+    rate that only ever falls as the pack cools stays between ``rate(T_end)``
+    and ``rate(T_start)``, so the difference of the endpoints caps the
+    over-credit. Under the opposite condition the model cannot over-credit a
+    cooling pack at all -- every rate it visits is at least as high as the one
+    the rate was looked up at -- so the bound would be describing a case that
+    does not arise.
+
+    The SOC half is not free either. This helper probes TWO SOCs at ONE
+    temperature, so the endpoint pair the bound is stated over moves as soon as
+    the rate depends on SOC. A curve that DIPS in SOC between the two probes
+    and recovers by the reached SOC passes the minimum test unchanged: 4 kW
+    outside 11-19 %, 0.1 kW inside it, plus a 0.008 kW/C slope, cooling
+    20 -> 5 C from 10 % over-credits by 8.59 SOC points against an endpoint
+    bound of 0.30 -- a factor of 29. And "never under-credits a cooling pack"
+    holds only for SOC-independent curves: a plain 4 -> 1 kW taper at 26 % with
+    the same slope, from 20 %, UNDER-credits by 4.15 points, because the
+    reached-SOC probe lands past the taper and the slow rate is then applied to
+    the whole slot. Both stay inside the identity bound.
+
+    The temperature bound compares two endpoints, so a rate that is non-monotone
+    in temperature breaks it outright: a pack cooling 20 -> 5 C on a curve of
     2.0 kW at or above 19 C, 0.1 kW from 11 to 19 C and 1.9 kW below 11 C has
     both endpoints fast and the middle slow -- the model says 25.0 %, the
     sub-stepped truth is 22.4 %, and the endpoint bound allows 0.25. Outside

@@ -33,13 +33,16 @@ fallback once prices come back.
 
 from __future__ import annotations
 
+import ast
 import datetime
+import inspect
+import textwrap
 
 import pytest
 
 import battery_optimizer as bo
 from battery_optimizer_lib import BatteryMode, ScheduleEntry
-from battery_optimizer_lib.models import PRICE_SOURCE_MARKET
+from battery_optimizer_lib.models import PRICE_SOURCE_MARKET, count_schedule_modes
 
 from tests.test_current_slot_price import (
     PlanningOptimizer,
@@ -265,3 +268,121 @@ class TestTheFallbackEntryStillBehavesLikeAFallback:
         assert rebuilt is True
         assert app.schedule[SLOT_10_00].reason != "no_price"
         assert app.schedule[SLOT_10_00].price_source == PRICE_SOURCE_MARKET
+
+
+# ===========================================================================
+# The current slot joins the plan BEFORE it is validated, not after
+# ===========================================================================
+
+def _artefacts_cover_the_current_slot(app):
+    """The census, the replay and the cost column all describe the whole plan.
+
+    The retain/fallback decision used to run in the CALLERS, after
+    ``find_optimal_schedule`` had validated, replayed, counted and costed its
+    answer. Measured on this fixture: ``_last_schedule_counts`` said 0 charge
+    while the schedule held a retained CHARGE, ``_last_plan_replay`` covered
+    55 of 56 slots -- the one missing being the slot sent to the inverter --
+    and ``_last_projected_costs`` had no row for it.
+    """
+    assert SLOT_10_00 in app.schedule, "the interval that RUNS must be planned"
+
+    assert app._last_schedule_counts is not None
+    assert (
+        app._last_schedule_counts.summary_parts()
+        == count_schedule_modes(app.schedule).summary_parts()
+    )
+
+    replay = app._last_plan_replay
+    assert replay is not None
+    assert set(replay.by_slot) == set(app.schedule), (
+        "the slot sent to the inverter was never validated"
+    )
+    assert replay.by_slot[SLOT_10_00].mode == app.schedule[SLOT_10_00].mode
+
+    assert SLOT_10_00 in app._last_projected_costs
+
+
+class TestNothingIsWrittenToTheScheduleAfterValidation:
+    def test_a_retained_charge_is_counted_replayed_and_costed(self):
+        app = _app(previous_mode=BatteryMode.CHARGE)
+
+        app.full_optimize(None)
+
+        assert app.schedule[SLOT_10_00].mode == BatteryMode.CHARGE
+        assert app._last_schedule_counts.charge >= 1
+        _artefacts_cover_the_current_slot(app)
+
+    def test_the_hold_fallback_is_counted_replayed_and_costed(self):
+        app = _app(pv_kw=3.0)
+
+        app.full_optimize(None)
+
+        assert app.schedule[SLOT_10_00].reason == "no_price"
+        _artefacts_cover_the_current_slot(app)
+
+    def test_the_recalculate_path_publishes_the_same_way(self):
+        app = _app(previous_mode=BatteryMode.CHARGE)
+
+        app._recalculate_remaining_schedule(START_SOC)
+
+        assert app.schedule[SLOT_10_00].mode == BatteryMode.CHARGE
+        _artefacts_cover_the_current_slot(app)
+
+
+class TestTheSourceCannotWriteToTheScheduleAfterValidation:
+    """The orchestrator is not unit-tested (CLAUDE.md), so this reads its source."""
+
+    def _find_optimal_schedule_tree(self):
+        source = textwrap.dedent(
+            inspect.getsource(bo.BatteryOptimizer.find_optimal_schedule)
+        )
+        return ast.parse(source).body[0]
+
+    def test_the_last_schedule_write_precedes_the_final_validation(self):
+        fn = self._find_optimal_schedule_tree()
+
+        validate_lines = [
+            node.lineno
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Constant)
+            and node.value == "_validate_final_plan"
+        ]
+        assert validate_lines, (
+            "the final validation is no longer resolved by name here - update "
+            "this test"
+        )
+        validate_line = min(validate_lines)
+
+        writes = []
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Subscript)
+                    and isinstance(node.ctx, ast.Store)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "schedule"):
+                writes.append(node.lineno)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                target = node.func.value
+                if (isinstance(target, ast.Name)
+                        and target.id == "schedule"
+                        and node.func.attr in
+                        ("update", "pop", "setdefault", "clear")):
+                    writes.append(node.lineno)
+
+        assert writes, "no schedule write found at all - update this test"
+        for lineno in writes:
+            assert lineno < validate_line, (
+                f"a schedule entry is written at line {lineno}, after the "
+                f"final validation at line {validate_line}: the census, the "
+                f"replay and the cost column would describe a different plan"
+            )
+
+    def test_the_post_solve_retain_step_is_gone(self):
+        assert not hasattr(
+            bo.BatteryOptimizer, "_retain_current_slot_if_unpriced"
+        ), (
+            "the retain/fallback decision belongs before the solve; a method "
+            "the planning paths call afterwards is the defect"
+        )
+        for name in ("full_optimize", "_recalculate_remaining_schedule"):
+            source = inspect.getsource(getattr(bo.BatteryOptimizer, name))
+            assert "_retain_current_slot_if_unpriced" not in source, name

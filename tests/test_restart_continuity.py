@@ -1,32 +1,34 @@
-"""Restart continuity is decided BEFORE the plan is validated, not after it.
+"""A restart does not override the DP: the partial slot IS the continuity.
 
 Defect (pre-fix)
 ----------------
 
-``full_optimize`` called ``_preserve_mode_on_restart`` *after*
-``find_optimal_schedule`` had validated, replayed, counted, costed and logged
-its result.  That method replaced the current slot's ``HOLD`` with the
-``CHARGE``/``DISCHARGE`` the previous run had been executing, and let it inherit
-the slot's published-price provenance -- so the rewritten entry executed.
+``find_optimal_schedule`` read the previous plan back from
+``sensor.battery_optimizer`` and FIXED the CHARGE or DISCHARGE it woke up in for
+the whole remainder of the current slot, unconditionally, before solving. Two
+measured counterexamples:
 
-The maintainer's reproduction, and the fixture below: a validated
-``HOLD, DISCHARGE`` plan reserves the pack for a 1.00 EUR/kWh slot and imports
-during the 0.10 one.  Restart preservation turns it into ``DISCHARGE,
-DISCHARGE``: the import moves to the expensive slot and the plan credits the
-battery with service it no longer has, while ``_last_dp_soc_trajectory``, the
-mode census, the projected-cost column, the decision log and
-``_last_plan_replay`` all still describe the plan that was replaced.
+* prices 2.00 / 0.05 / 0.05, previous CHARGE, restart one minute into the slot
+  with 59 minutes left and 50 % on a 10 kWh pack: the forced CHARGE imports
+  3.93 kWh at 2.00 EUR/kWh -- about 7.87 EUR -- where the DP left to itself
+  discharges and buys the same energy two slots later at 0.05.
+* prices -0.50 / 1.00 / 1.00, previous DISCHARGE: the forced DISCHARGE spends
+  the pack while the grid is PAYING to take energy, where the DP charges.
+
+And on an interval nobody published a price for, the continuation had no
+provenance, so ``execute_scheduled_mode`` refused it and applied HOLD -- while
+the plan had already advanced the pack across a CHARGE that never ran. On the
+fixture below that is a 20-point SOC error in the published trajectory, and
+every later discharge is scheduled on energy that will not exist.
 
 Policy under test
 -----------------
 
-Restart continuity is a constraint on the solve, not an edit of its answer.
-When the previous run was CHARGE or DISCHARGE for the interval the app wakes up
-in, that action is FIXED for the remainder of the slot, the SOC and temperature
-are advanced across it through the shared slot model, and the DP solves the
-rest of the horizon from there -- exactly as the unpriced current slot is
-handled.  Nothing changes an action after ``find_optimal_schedule`` has
-validated one.
+There is no restart override. The DP's partial-slot fraction is the continuity
+mechanism: it evaluates the remaining minutes of the current slot at the real
+price, from the measured SOC, so a forced continuation can only duplicate its
+answer or contradict it. Whatever the DP decides for the interval the app woke
+up in is what runs.
 
 Everything here is deterministic: the settable clock and AppDaemon double from
 ``test_price_recovery``, the REAL planner and the REAL final-plan validation.
@@ -35,12 +37,13 @@ Everything here is deterministic: the settable clock and AppDaemon double from
 from __future__ import annotations
 
 import datetime
+import inspect
 
 import pytest
 
 import battery_optimizer as bo
-from battery_optimizer_lib import BatteryMode, PricePoint
-from battery_optimizer_lib.models import count_schedule_modes
+from battery_optimizer_lib import BatteryMode, PricePoint, ScheduleEntry
+from battery_optimizer_lib.models import PRICE_SOURCE_MARKET, count_schedule_modes
 
 from tests.test_current_slot_price import PlanningOptimizer
 from tests.test_price_recovery import TZ
@@ -105,10 +108,28 @@ def _slots(now, count=2):
 
 
 def _app(now, prices, *, previous_mode=None, soc=25.0, load_kw=1.0):
+    """An app that has just restarted mid-slot, previously running *previous_mode*.
+
+    The previous plan is installed BOTH ways a restart could offer it: the
+    parsed snapshot the deleted ``_restore_previous_schedule_from_sensor``
+    used to leave behind, and a real priced entry in ``self.schedule`` for the
+    interval the app woke up in. Neither may select an action any more --
+    setting them is how these tests stay red if the override comes back under
+    any name.
+    """
     app = RestartOptimizer(now, prices=prices, soc=soc, load_kw=load_kw)
     if previous_mode is not None:
         current_slot = app._align_to_slot(now)
         app._previous_schedule_from_sensor = {current_slot: previous_mode}
+        app.schedule = {
+            bo.canonical_slot_key(current_slot): ScheduleEntry(
+                time=current_slot,
+                mode=previous_mode,
+                reason="prior plan",
+                export_rate=0 if previous_mode == BatteryMode.DISCHARGE else None,
+                price_source=PRICE_SOURCE_MARKET,
+            )
+        }
     return app
 
 
@@ -176,7 +197,7 @@ def _assert_everything_describes_the_executed_plan(app):
 
 
 # ===========================================================================
-# The maintainer's reproduction
+# The maintainer's reproduction: a reservation the restart used to spend
 # ===========================================================================
 
 @pytest.fixture
@@ -191,21 +212,30 @@ def cheap_then_expensive():
     return now, slot_0, slot_1, prices
 
 
-class TestRestartPreservationNeverRewritesAValidatedPlan:
-    def test_the_plan_the_dp_validated_is_the_plan_that_executes(
+class TestThePlanTheDpValidatedIsThePlanThatExecutes:
+    def test_the_reservation_survives_a_previous_discharge(
         self, cheap_then_expensive
     ):
+        """``HOLD, DISCHARGE`` stays ``HOLD, DISCHARGE``.
+
+        The pack is reserved for the 1.00 EUR/kWh slot and the grid covers the
+        0.10 one. The forced continuation turned this into
+        ``DISCHARGE, DISCHARGE``, moving the import into the expensive slot.
+        """
         now, slot_0, slot_1, prices = cheap_then_expensive
         app = _app(now, prices, previous_mode=BatteryMode.DISCHARGE)
 
         app.full_optimize(None)
 
+        assert app.schedule[slot_0].mode == BatteryMode.HOLD
+        assert app.schedule[slot_1].mode == BatteryMode.DISCHARGE
+        assert "restart" not in app.schedule[slot_0].reason
         _assert_everything_describes_the_executed_plan(app)
 
     def test_no_unavailable_battery_service_is_credited(
         self, cheap_then_expensive
     ):
-        """The pre-fix rewrite spent the pack an hour early.
+        """The forced rewrite spent the pack an hour early.
 
         With 1.5 kWh usable above ``min_soc`` and 1 kWh of load per slot, a
         plan that discharges in BOTH slots asks the battery for 2 kWh. The DP
@@ -220,68 +250,142 @@ class TestRestartPreservationNeverRewritesAValidatedPlan:
 
         replay = _replay_final_plan(app)
         assert replay is not None
-        assert replay.conservation_violations == [], (
-            "the executing plan credits battery service that was never "
-            "validated"
-        )
+        assert replay.conservation_violations == []
 
-    def test_the_current_slot_continues_the_previous_action(
-        self, cheap_then_expensive
-    ):
-        """Continuity is kept -- as a constraint the DP solved around."""
-        now, slot_0, slot_1, prices = cheap_then_expensive
-        app = _app(now, prices, previous_mode=BatteryMode.DISCHARGE)
+    def test_a_previous_charge_does_not_import_at_two_euros(self):
+        """Measured: 3.93 kWh at 2.00 EUR/kWh, about 7.87 EUR of forced import.
+
+        59 minutes of the slot are left, the pack charges at 4 kW, and the two
+        following slots are priced at 0.05. Continuing the previous CHARGE
+        buys now what the DP buys later for one fortieth of the price.
+        """
+        now = datetime.datetime(2024, 1, 15, 10, 1, tzinfo=TZ)
+        slot_0, slot_1, slot_2 = _slots(now, 3)
+        prices = [
+            PricePoint(time=slot_0, price=2.00),
+            PricePoint(time=slot_1, price=0.05),
+            PricePoint(time=slot_2, price=0.05),
+        ]
+        app = _app(now, prices, previous_mode=BatteryMode.CHARGE, soc=50.0)
+
+        app.full_optimize(None)
+
+        assert app.schedule[slot_0].mode != BatteryMode.CHARGE, (
+            "the previous CHARGE was forced through a 2.00 EUR/kWh interval"
+        )
+        assert app.applied[-1].mode != BatteryMode.CHARGE
+        # The DP's own answer: serve the load from the pack while the grid is
+        # expensive, and refill in the cheap slots.
+        assert app.schedule[slot_0].mode == BatteryMode.DISCHARGE
+        _assert_everything_describes_the_executed_plan(app)
+
+    def test_a_previous_discharge_does_not_block_a_negative_price(self):
+        """Measured: -0.50 EUR/kWh now, 1.00 later. The grid PAYS to charge."""
+        now = datetime.datetime(2024, 1, 15, 10, 1, tzinfo=TZ)
+        slot_0, slot_1, slot_2 = _slots(now, 3)
+        prices = [
+            PricePoint(time=slot_0, price=-0.50),
+            PricePoint(time=slot_1, price=1.00),
+            PricePoint(time=slot_2, price=1.00),
+        ]
+        app = _app(now, prices, previous_mode=BatteryMode.DISCHARGE, soc=50.0)
+
+        app.full_optimize(None)
+
+        assert app.schedule[slot_0].mode == BatteryMode.CHARGE, (
+            "the previous DISCHARGE was forced through a negative price"
+        )
+        assert app.applied[-1].mode == BatteryMode.CHARGE
+        _assert_everything_describes_the_executed_plan(app)
+
+
+# ===========================================================================
+# A restart in the middle of a CHARGE the DP itself wants to continue
+# ===========================================================================
+
+class TestARestartMidChargeStartsFromTheMeasuredSoc:
+    def test_the_partial_fraction_is_the_continuity_mechanism(self):
+        """Cheap now, expensive later: the DP charges the current slot itself.
+
+        Continuity needs no override -- the DP solves the remaining 30 minutes
+        of the interval at its real price, from the SOC that was MEASURED, and
+        the rest of the horizon starts where that leaves the pack.
+        """
+        now = datetime.datetime(2024, 1, 15, 10, 30, tzinfo=TZ)
+        slot_0, slot_1, slot_2 = _slots(now, 3)
+        prices = [
+            PricePoint(time=slot_0, price=0.05),
+            PricePoint(time=slot_1, price=2.00),
+            PricePoint(time=slot_2, price=2.00),
+        ]
+        # Nearly empty and 2 kW of load ahead through two 2.00 EUR/kWh slots:
+        # buying now at 0.05 is the DP's own answer, not a continuation.
+        app = _app(now, prices, previous_mode=BatteryMode.CHARGE, soc=15.0,
+                   load_kw=2.0)
 
         app.full_optimize(None)
 
         entry = app.schedule[slot_0]
-        assert entry.mode == BatteryMode.DISCHARGE
-        assert "restart" in entry.reason
-        # And the DP knew: the slot it planned starts from the SOC the
-        # continued discharge leaves behind, not from the measured 25 %.
-        assert app._last_dp_soc_trajectory[slot_1][0] == pytest.approx(
+        assert entry.mode == BatteryMode.CHARGE
+        assert "restart" not in entry.reason, (
+            "the DP chose this CHARGE; no override may claim it"
+        )
+        # Starts from the MEASURED SOC ...
+        assert app._last_dp_soc_trajectory[slot_0][0] == pytest.approx(
             15.0, abs=1e-6
         )
-
-    def test_the_previous_schedule_is_consumed_once(self, cheap_then_expensive):
-        now, slot_0, slot_1, prices = cheap_then_expensive
-        app = _app(now, prices, previous_mode=BatteryMode.DISCHARGE)
-
-        app.full_optimize(None)
-        assert app._previous_schedule_from_sensor is None
-
-        # A second pass is an ordinary optimization: nothing forces the slot.
-        app.full_optimize(None)
-        assert app.schedule[slot_0].mode == BatteryMode.HOLD
-        _assert_everything_describes_the_executed_plan(app)
-
-
-# ===========================================================================
-# A restart in the middle of a CHARGE slot
-# ===========================================================================
-
-class TestARestartMidChargeKeepsCharging:
-    def test_the_dp_plans_the_horizon_from_the_charge_it_continues(self):
-        """Half a slot of charging is 2 kWh the rest of the plan must see."""
-        now = datetime.datetime(2024, 1, 15, 10, 30, tzinfo=TZ)
-        slot_0, slot_1 = _slots(now)
-        # Expensive throughout and the pack already at min SOC, so the DP left
-        # to itself would HOLD both slots: any mode change here is the restart
-        # continuation, not an economic choice.
-        prices = [
-            PricePoint(time=slot_0, price=1.00),
-            PricePoint(time=slot_1, price=1.00),
-        ]
-        app = _app(now, prices, previous_mode=BatteryMode.CHARGE, soc=MIN_SOC)
-
-        app.full_optimize(None)
-
-        assert app.schedule[slot_0].mode == BatteryMode.CHARGE
-        # 4 kW for the remaining 30 minutes on a 10 kWh pack at efficiency 1.0.
+        # ... and gains exactly the remaining half slot: 4 kW x 0.5 h on a
+        # 10 kWh pack at efficiency 1.0 is 20 SOC points.
         assert app._last_dp_soc_trajectory[slot_1][0] == pytest.approx(
-            MIN_SOC + 4.0 * 0.5 / CAPACITY * 100.0, abs=1e-6
+            15.0 + 4.0 * 0.5 / CAPACITY * 100.0, abs=1e-6
         )
         _assert_everything_describes_the_executed_plan(app)
+
+
+# ===========================================================================
+# A restart into an interval nobody published a price for
+# ===========================================================================
+
+class TestARestartIntoAnUnpricedIntervalHoldsConsistently:
+    def test_the_fallback_is_hold_no_price_and_the_trajectory_matches(self):
+        """No advance through an action ``execute_scheduled_mode`` refuses.
+
+        The continuation carried no provenance on an unpriced interval, so the
+        provenance guard degraded it to HOLD -- after the plan had already
+        walked the pack through 30 minutes of 4 kW CHARGE. 20 SOC points the
+        pack never gained, and every later DISCHARGE planned on them.
+        """
+        now = datetime.datetime(2024, 1, 15, 10, 30, tzinfo=TZ)
+        slot_0, slot_1, slot_2 = _slots(now, 3)
+        # The interval the app woke up in is absent from the data.
+        prices = [
+            PricePoint(time=slot_1, price=1.00),
+            PricePoint(time=slot_2, price=1.00),
+        ]
+        app = _app(now, prices, previous_mode=BatteryMode.CHARGE, soc=50.0)
+        # A restart has no plan at all: the sensor snapshot is the only thing
+        # that survived, and nothing may be retained from it.
+        app.schedule = {}
+
+        app.full_optimize(None)
+
+        entry = bo.lookup_by_time(
+            app.schedule, slot_0, app._get_local_timezone()
+        )
+        assert entry is not None, "the interval that is RUNNING must be in the plan"
+        assert entry.mode == BatteryMode.HOLD
+        assert entry.reason == "no_price"
+        assert entry.price_source is None
+        assert app.applied[-1].mode == BatteryMode.HOLD
+        assert app.applied[-1].reason == "no_price", (
+            "a continuation the guard refuses is not a fallback the retry sees"
+        )
+        assert app._price_retry_pending()
+        # HOLD without PV moves nothing: the pack is where it was measured.
+        assert app.expected_soc_schedule[slot_1] == pytest.approx(50.0, abs=1e-6)
+        assert app._last_dp_soc_trajectory[slot_1][0] == pytest.approx(
+            50.0, abs=1e-6
+        )
 
 
 # ===========================================================================
@@ -299,13 +403,34 @@ class TestNoPreviousScheduleChangesNothing:
         assert app.schedule[slot_1].mode == BatteryMode.DISCHARGE
         _assert_everything_describes_the_executed_plan(app)
 
-    def test_a_previous_hold_is_not_a_continuation(self, cheap_then_expensive):
-        """Only CHARGE and DISCHARGE are worth continuing across a restart."""
+    def test_the_answer_is_identical_with_and_without_restart_state(
+        self, cheap_then_expensive
+    ):
+        """The previous plan is not an input to anything."""
         now, slot_0, slot_1, prices = cheap_then_expensive
-        app = _app(now, prices, previous_mode=BatteryMode.HOLD)
+        plain = _app(now, prices, previous_mode=None)
+        restarted = _app(now, prices, previous_mode=BatteryMode.DISCHARGE)
 
-        app.full_optimize(None)
+        plain.full_optimize(None)
+        restarted.full_optimize(None)
 
-        assert app.schedule[slot_0].mode == BatteryMode.HOLD
-        assert app.schedule[slot_1].mode == BatteryMode.DISCHARGE
-        _assert_everything_describes_the_executed_plan(app)
+        assert {s: e.mode for s, e in restarted.schedule.items()} == {
+            s: e.mode for s, e in plain.schedule.items()
+        }
+
+
+# ===========================================================================
+# The override is gone, not merely unreachable
+# ===========================================================================
+
+class TestNothingSelectsAnActionFromTheSensorSnapshot:
+    def test_the_restart_override_and_its_state_are_removed(self):
+        assert not hasattr(bo.BatteryOptimizer, "_restart_continuation_entry")
+        assert not hasattr(
+            bo.BatteryOptimizer, "_restore_previous_schedule_from_sensor"
+        )
+        source = inspect.getsource(bo)
+        assert "_previous_schedule_from_sensor" not in source, (
+            "the restored sensor snapshot has no consumer; it must not be "
+            "carried as state either"
+        )

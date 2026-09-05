@@ -57,6 +57,12 @@ from .ha_helpers import SensorReader
 from .cost_tracker import BatteryCostTracker, BatteryCostConfig
 from .charge_rate_utils import compute_charge_rates_per_slot
 from .soc_projection import SocProjectionParams, SocTransition, project_slot_soc
+from .slot_energy import (
+    SlotEnergyParams,
+    SlotEnergyResult,
+    simulate_slot,
+    params_from_soc_projection,
+)
 from .soc_deviation import SocDeviationDetector, SocDeviationConfig
 from .schedule_formatter import ScheduleFormatter, ScheduleFormatterConfig
 from .load_prediction_tracker import LoadPredictionTracker
@@ -123,6 +129,11 @@ __all__ = [
     "SocProjectionParams",
     "SocTransition",
     "project_slot_soc",
+    # Slot energy flows (shared pure transition, named units)
+    "SlotEnergyParams",
+    "SlotEnergyResult",
+    "simulate_slot",
+    "params_from_soc_projection",
     # SOC deviation detection
     "SocDeviationDetector",
     "SocDeviationConfig",

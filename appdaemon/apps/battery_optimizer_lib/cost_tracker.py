@@ -747,10 +747,14 @@ class BatteryCostTracker:
                 soc_start=baseline_soc,
                 soc_end=current_soc,
                 duration_minutes=duration_minutes,
-                energy_from_grid_kwh=(
-                    energy_kwh / self._config.efficiency
-                    if charge_source != "pv" else None
-                ),
+                # NOT an efficiency measurement. This used to pass
+                # ``energy_kwh / self._config.efficiency``, whose quotient with
+                # ``energy_kwh`` is the configured efficiency by construction --
+                # a tautology dressed up as an observation. There is no
+                # independent AC meter reading for the charge interval here, so
+                # nothing is offered and ``learned_efficiency`` stays at the
+                # configured value until one exists.
+                energy_from_grid_kwh=None,
                 charge_price=charge_cost,
                 battery_temp=battery_temp,
                 battery_temp_start=self._last_sig_temp,
@@ -1099,7 +1103,7 @@ class BatteryCostTracker:
                 None when unknown.
             learning_engine: Optional BatteryLearningEngine. Together with
                 ``starting_temp`` it makes the CHARGE slots use
-                ``predict_charge_energy_with_warming`` — the same per-slot,
+                ``predict_charge_input_dc_energy`` — the same per-slot,
                 temperature-evolving learned rate the expected-SOC trajectory
                 uses. Without both, the shared model falls back to the flat
                 ``charge_rate * efficiency * duration`` and this column would
@@ -1190,14 +1194,12 @@ class BatteryCostTracker:
                 slot_time=hour,
             )
 
-            # Only stored energy moves the cost basis, and only up to the
-            # headroom the shared model's max_soc clamp actually allows.
-            headroom_kwh = max(
-                0.0,
-                self._soc_to_energy_kwh(self._get_max_soc())
-                - self._soc_to_energy_kwh(current_soc),
-            )
-            energy_added = max(0.0, min(transition.dc_energy_in_kwh, headroom_kwh))
+            # Only stored energy moves the cost basis. `dc_energy_in_kwh` is
+            # now the energy the pack ACTUALLY took (the shared transition
+            # applies the max_soc cap and reports the request separately), so
+            # this no longer re-derives the headroom to work around a field
+            # that reported an uncapped request as delivered energy.
+            energy_added = max(0.0, transition.dc_energy_in_kwh)
 
             if entry.mode == BatteryMode.CHARGE:
                 old_energy = max(0.0, self._soc_to_energy_kwh(current_soc))

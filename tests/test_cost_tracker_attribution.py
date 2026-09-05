@@ -252,8 +252,15 @@ class TestEndToEndBasisMovement:
         assert source == "grid-command"
         assert cost > tracker._avg_cost
 
-    def test_learning_engine_sees_grid_energy_for_a_non_pv_charge(self):
-        """energy_from_grid_kwh must be populated whenever the source is grid."""
+    def test_learning_engine_is_offered_no_synthetic_grid_energy(self):
+        """A grid charge must NOT hand the engine a derived AC figure.
+
+        This used to pass ``energy_kwh / config.efficiency``, whose quotient
+        with ``energy_kwh`` is the configured efficiency by construction. The
+        engine then "learned" the constant it was configured with and reported
+        it as an observation. There is no independent AC meter reading for the
+        charge interval, so nothing is offered.
+        """
         recorded = {}
         tracker, _ = _make_tracker(pv_w=0.0)
         tracker._current_mode = BatteryMode.HOLD
@@ -274,7 +281,10 @@ class TestEndToEndBasisMovement:
             now=datetime.datetime(2026, 9, 2, 5, 15, 10),
         )
 
-        assert recorded["energy_from_grid_kwh"] is not None
+        assert recorded["energy_from_grid_kwh"] is None
+        # The stored-side measurement is still handed over: that one IS a
+        # measurement, and it is what the charge-rate curve is learned from.
+        assert recorded["energy_to_battery_kwh"] == pytest.approx(0.1)
 
 
 class TestLearningBaselineOwnership:

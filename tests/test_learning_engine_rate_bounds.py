@@ -330,8 +330,13 @@ class TestPoisonedPersistedFile:
         # >20C bucket now has only 2 usable observations -> falls through to the
         # SOC-only fallback (median of [2.7, 2.8, 2.9, 2.806, 5.959]) instead of
         # answering 14308.71 kW.
+        #
+        # The median is 2.806 kW of STORED-energy growth; the lookup returns the
+        # terminal power that produced it, 2.806 / 0.95 (see the charge-rate
+        # unit contract in learning_engine's module docstring). What this test
+        # pins is that the poison never surfaces, not the conversion.
         rate = engine.get_charge_rate_for_soc(10.0, 21.9)
-        assert rate == pytest.approx(2.806)
+        assert rate == pytest.approx(2.806 / 0.95)
         assert rate <= engine.max_plausible_rate_kw
 
     def test_bound_holds_even_without_the_load_time_filter(self):

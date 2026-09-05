@@ -69,6 +69,69 @@ value is avoided import or net export revenue, less wear cost per discharged DC
 kWh. Fixed monthly connection/capacity charges are excluded because a schedule
 cannot change them.
 
+### Charge-rate units — the one contract
+
+Two different quantities were both called "the charge rate", and the confusion
+cost a factor of `efficiency` on every learned observation.
+
+| Name | Meaning | Where it appears |
+| --- | --- | --- |
+| `charge_input_dc_kw` | DC power at the battery terminal, **before** retention | `charge_rate_kw` in `apps.yaml`, `SocProjectionParams.charge_rate`, the DP's per-slot rate, `|P_bat|` for the thermal model |
+| `stored_charge_kw` | rate at which **stored** energy grows | every learning observation, persisted as-is |
+| `grid_charge_ac_kwh` | AC energy purchased to charge | the import cost |
+
+```text
+stored_charge_kw    = charge_input_dc_kw * efficiency
+grid_charge_ac_kwh  = grid_charge_dc_kwh / inverter_efficiency
+                    = stored_kwh / (efficiency * inverter_efficiency)
+```
+
+Storing 1 kWh from the grid at `efficiency=0.85` and `inverter_efficiency=0.97`
+therefore imports **1.21286 kWh** AC. DC-coupled PV surplus charges the pack
+without the grid inverter conversion and is billed at neither the import price
+nor that loss.
+
+**`BatteryLearningEngine.get_charge_rate_for_soc` is the boundary.** It returns
+`charge_input_dc_kw`, for both the nominal fallback (already a terminal power)
+and learned observations (stored-side, divided by the configured
+`efficiency` on the way out). Every consumer can then keep doing
+`rate * efficiency * duration`, and a nominal rate and an equivalent learned
+observation predict identical physics.
+
+Consequences worth stating, because the defect was invisible without them:
+
+- Replaying a learned observation reproduces it. A 40 % → 50 % charge in 15 min
+  on a 10 kWh pack projects to 50 %, not 48.5 % as before.
+- The conversion uses the **configured** `efficiency`, not `learned_efficiency`,
+  because that is the constant every consumer multiplies back in. Dividing out
+  with one factor and multiplying back with another would reintroduce the
+  mismatch.
+- Persisted learning files are **unchanged**: observations always were, and
+  remain, `stored_charge_kw`. There is no migration and no repeated division on
+  reload. `tests/test_charge_rate_units.py` pins save → load → save → load.
+- `learned_efficiency` is **not** currently a measurement. The only input it
+  could be learned from is an independent AC meter reading for the charge
+  interval, and there is none; `cost_tracker` used to pass
+  `stored_energy / configured_efficiency`, whose quotient with the stored energy
+  is the configured constant by construction. That input was removed, the
+  tautological value is rejected, and `learned_efficiency` stays at the
+  configured value until a real measurement exists.
+
+### The shared slot transition (`slot_energy.py`)
+
+`slot_energy.simulate_slot` is the one pure function that answers *where every
+kWh of a slot came from and went to*: stored energy in/out, the PV and grid
+shares of a charge, AC served, grid import, export, and the AC demand a plan
+credited to the battery that the battery could not supply
+(`unmet_battery_ac_kwh`). It has no clock, no forecast and no learning engine —
+callers pass the rate capability they decided on.
+
+`soc_projection.project_slot_soc` delegates to it, so the SOC view and the
+energy view of a slot cannot drift apart. It reports what the pack **actually**
+stored or delivered; the uncapped request is kept separately in
+`requested_dc_energy_*`. Treating a request as delivered energy is precisely how
+credited energy gets created out of nothing.
+
 ## SOC transitions and discretization
 
 The state is `(time, discretized stored energy)`. Each reachable state retains

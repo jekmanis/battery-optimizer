@@ -3,6 +3,34 @@ Self-learning battery performance tracking engine.
 
 Learns actual charge rates, SOC-dependent behavior, temperature effects,
 and round-trip efficiency from observed battery performance.
+
+Charge-rate units -- THE contract
+---------------------------------
+
+Two different quantities were both called "the charge rate", and the confusion
+cost a factor of ``efficiency`` on every learned observation::
+
+    charge_input_dc_kw   DC power at the battery terminal, BEFORE retention.
+                         This is what ``charge_rate_kw`` in apps.yaml means and
+                         what the inverter is commanded to.
+    stored_charge_kw     rate at which STORED energy grows
+                         = charge_input_dc_kw * storage_efficiency
+
+An observation is measured on the STORED side: a SOC delta, or the inverter's
+"energy to battery" counter, divided by the interval. It is recorded and
+persisted in exactly those units -- unchanged from every previous version of
+this file, so no migration and no repeated division on reload.
+
+:meth:`BatteryLearningEngine.get_charge_rate_for_soc` is the API boundary and
+returns ``charge_input_dc_kw``, because that is what every consumer multiplies
+by ``efficiency`` to obtain stored energy (the DP, ``soc_projection``,
+``charge_rate_utils``, ``cost_tracker``) and what the thermal model wants as
+``|P_bat|``. The nominal fallback is already in those units; a learned
+stored-side observation is divided by :attr:`storage_efficiency` on the way out.
+
+Consequence, and the reason the defect was invisible: replaying an observation
+of 40 % -> 50 % in 15 min on a 10 kWh pack used to predict 48.5 %, not 50 %.
+``tests/test_charge_rate_units.py`` is that replay.
 """
 
 import datetime
@@ -180,6 +208,34 @@ class BatteryLearningEngine:
         }
 
     # ------------------------------------------------------------------
+    # Unit conversion boundary (see the module docstring)
+    # ------------------------------------------------------------------
+
+    @property
+    def storage_efficiency(self) -> float:
+        """Charge-retention factor used to convert stored <-> input DC rates.
+
+        This is the CONFIGURED ``efficiency``, not :attr:`learned_efficiency`,
+        and deliberately so: it is the same constant every consumer multiplies
+        back in (``rate * efficiency * duration``), so an observation replayed
+        through them reproduces itself exactly. Converting out with one factor
+        and back in with another would reintroduce the very mismatch this
+        boundary exists to remove.
+        """
+        eff = float(self.nominal_efficiency or 0.0)
+        if not math.isfinite(eff) or eff <= 0.0:
+            return 1.0
+        return min(1.0, eff)
+
+    def stored_to_input_dc_kw(self, stored_charge_kw: float) -> float:
+        """``stored_charge_kw`` -> ``charge_input_dc_kw``."""
+        return stored_charge_kw / self.storage_efficiency
+
+    def input_dc_to_stored_kw(self, charge_input_dc_kw: float) -> float:
+        """``charge_input_dc_kw`` -> ``stored_charge_kw``."""
+        return charge_input_dc_kw * self.storage_efficiency
+
+    # ------------------------------------------------------------------
     # The one plausibility bound on a learned battery power
     # ------------------------------------------------------------------
 
@@ -198,6 +254,13 @@ class BatteryLearningEngine:
         it is routinely the largest of the three: judging those genuine samples
         against the (smaller) load-discharge rate would reject the very slots
         the DP plans the export around.
+
+        UNITS: this bound is expressed in ``charge_input_dc_kw`` (the configured
+        rates are terminal powers). The ingest filters compare it against
+        stored-side observations, which is the LOOSER of the two comparisons --
+        deliberately, so that reloading a persisted file never discards history
+        an earlier version kept. The strict comparison happens once, at the API
+        boundary, in :meth:`_bounded_input_dc_rate`.
         """
         nominal = max(
             float(self.nominal_charge_rate or 0.0),
@@ -346,7 +409,12 @@ class BatteryLearningEngine:
             soc_start: SOC at start of charging
             soc_end: SOC at end of charging
             duration_minutes: How long charging took
-            energy_from_grid_kwh: Energy drawn from grid (if available from meter)
+            energy_from_grid_kwh: INDEPENDENTLY MEASURED AC energy drawn from
+                the grid for this charge interval (a meter reading). It is the
+                only input from which efficiency can be learned. A value
+                derived as ``stored / configured_efficiency`` is not a
+                measurement -- it re-derives the configured constant -- and is
+                rejected.
             charge_price: Price paid per kWh
             battery_temp: Battery temperature in Celsius (if available) - used for charge rate bucketing
             battery_temp_start: Battery temperature at start of charging (for warming rate tracking)
@@ -367,7 +435,12 @@ class BatteryLearningEngine:
         if duration_minutes <= 0 or soc_end <= soc_start:
             return
 
-        # Use measured energy if available, otherwise calculate from SOC
+        # STORED-DC energy, both ways. The SOC delta is unambiguous by
+        # definition; the inverter's "energy to battery" counter is the pack's
+        # own accumulator and is likewise stored-side (it is the same quantity
+        # `cost_tracker` weights the stored-energy cost basis by). Neither is a
+        # terminal power: the conversion to `charge_input_dc_kw` happens once,
+        # in `get_charge_rate_for_soc` (see the module docstring).
         if energy_to_battery_kwh is not None and energy_to_battery_kwh > 0:
             energy_added = energy_to_battery_kwh
             energy_source = "inverter"
@@ -389,7 +462,7 @@ class BatteryLearningEngine:
             )
             return
 
-        # Calculate observed charge rate
+        # Observed STORED-side rate (stored_charge_kw). Persisted as such.
         charge_rate = energy_added / (duration_minutes / 60)
 
         if not self.is_plausible_rate(charge_rate):
@@ -402,9 +475,17 @@ class BatteryLearningEngine:
             )
             return
 
-        # Calculate efficiency if grid energy known
+        # Efficiency is only learnable from an INDEPENDENT measurement of the
+        # energy that entered the conversion chain. Passing
+        # ``stored / configured_efficiency`` here is a tautology: it returns the
+        # configured constant and would present it as an observation. The
+        # caller (`cost_tracker`) therefore passes None until a real grid/AC
+        # meter reading for the charge interval is available; the guard below
+        # rejects a synthetic value that reproduces the configured factor.
         if energy_from_grid_kwh and energy_from_grid_kwh > 0:
             observed_efficiency = energy_added / energy_from_grid_kwh
+            if abs(observed_efficiency - self.nominal_efficiency) < 1e-9:
+                observed_efficiency = 0.0  # tautological: not a measurement
             if 0.5 < observed_efficiency < 1.0:
                 self.learned_efficiency = (
                     self.ema_alpha * observed_efficiency +
@@ -1014,7 +1095,16 @@ class BatteryLearningEngine:
 
     def get_charge_rate_for_soc(self, soc: float, battery_temp: Optional[float] = None) -> float:
         """
-        Get predicted charge rate for a given SOC level and optional temperature.
+        Predicted ``charge_input_dc_kw`` for a SOC level and optional temperature.
+
+        UNITS -- this is the API boundary of the module docstring's contract.
+        Learned observations are stored-side (``stored_charge_kw``); they are
+        divided by :attr:`storage_efficiency` here so that every consumer can
+        keep doing ``rate * efficiency * duration``. The nominal fallback is
+        already a terminal power and is returned unconverted, which is what
+        makes a nominal rate and an equivalent learned observation predict
+        identical physics.
+
         Uses learned data with fallback chain:
         1. Exact SOC+temp match (>=3 plausible observations) -> median of last 10
         2. SOC match, aggregate all temps
@@ -1048,7 +1138,7 @@ class BatteryLearningEngine:
                 temp_data = self.stats.charge_rates_by_soc_temp[soc_range]
                 exact = self._plausible_rates(temp_data.get(temp_range))
                 if len(exact) >= 3:
-                    return self._bounded_median(exact[-10:], soc_range)
+                    return self._bounded_input_dc_rate(exact[-10:], soc_range)
 
                 # Fallback 2: Aggregate all temps for this SOC range
                 all_rates = []
@@ -1056,24 +1146,43 @@ class BatteryLearningEngine:
                     # Last 10 usable observations from each temp bucket
                     all_rates.extend(self._plausible_rates(rates)[-10:])
                 if len(all_rates) >= 3:
-                    return self._bounded_median(all_rates, soc_range)
+                    return self._bounded_input_dc_rate(all_rates, soc_range)
 
         # Fallback 3: Use SOC-only data (when temperature unavailable)
         if soc_range in self.stats.charge_rates_by_soc:
             observations = self._plausible_rates(self.stats.charge_rates_by_soc[soc_range])
             if len(observations) >= 3:
-                return self._bounded_median(observations[-10:], soc_range)
+                return self._bounded_input_dc_rate(observations[-10:], soc_range)
 
-        # Fallback 4: Use configured nominal charge rate
+        # Fallback 4: Use configured nominal charge rate (already input DC)
+        return self._nominal_input_dc_rate(soc_range)
+
+    def get_stored_charge_rate_for_soc(
+        self, soc: float, battery_temp: Optional[float] = None
+    ) -> float:
+        """``stored_charge_kw`` for a SOC level -- the observed-side view.
+
+        Reporting/diagnostics only. Planning consumers want the terminal power
+        and must call :meth:`get_charge_rate_for_soc`.
+        """
+        return self.input_dc_to_stored_kw(
+            self.get_charge_rate_for_soc(soc, battery_temp)
+        )
+
+    def _nominal_input_dc_rate(self, soc_range: str) -> float:
         multiplier = self.soc_charge_multipliers.get(soc_range, 1.0)
         return self.nominal_charge_rate * multiplier
 
-    def _bounded_median(self, rates: List[float], soc_range: str) -> float:
-        """Median of already-filtered observations, clamped as a last resort."""
-        clamped = self.clamp_learned_rate(statistics.median(rates))
+    def _bounded_input_dc_rate(self, stored_rates: List[float], soc_range: str) -> float:
+        """Median of stored-side observations, converted and bounded.
+
+        The conversion is the module docstring's contract; the clamp is applied
+        AFTER it, because :attr:`max_plausible_rate_kw` is a terminal power.
+        """
+        median_stored = statistics.median(stored_rates)
+        clamped = self.clamp_learned_rate(self.stored_to_input_dc_kw(median_stored))
         if clamped is None:
-            multiplier = self.soc_charge_multipliers.get(soc_range, 1.0)
-            return self.nominal_charge_rate * multiplier
+            return self._nominal_input_dc_rate(soc_range)
         return clamped
 
     def get_warming_rate(self, starting_temp: float) -> Optional[float]:
@@ -1223,7 +1332,7 @@ class BatteryLearningEngine:
 
         return (target_temp - start_temp) / warming_rate
 
-    def predict_charge_energy_with_warming(
+    def predict_charge_input_dc_energy(
         self,
         current_soc: float,
         start_temp: float,
@@ -1237,6 +1346,13 @@ class BatteryLearningEngine:
         This method calculates total energy by splitting the duration into
         cold and warm periods.
 
+        UNITS: the returned energy is ``charge_input_dc_kwh`` -- DC energy at
+        the battery terminal, BEFORE storage retention, because it is the time
+        integral of :meth:`get_charge_rate_for_soc`. Callers obtain stored
+        energy by multiplying by ``efficiency``. It was previously named
+        ``predict_charge_energy_with_warming`` and its result was bound to a
+        variable called ``energy_ac``, which it never was.
+
         Args:
             current_soc: Current state of charge (%)
             start_temp: Starting battery temperature (°C)
@@ -1244,7 +1360,7 @@ class BatteryLearningEngine:
             temp_threshold: Temperature above which faster charging occurs (°C)
 
         Returns:
-            Tuple of (total_energy_kwh, end_temperature)
+            Tuple of (charge_input_dc_kwh, end_temperature)
         """
         total_energy = 0.0
         remaining_minutes = duration_minutes

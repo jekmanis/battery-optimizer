@@ -147,10 +147,25 @@ expected-SOC trajectory (`soc_projection`), the schedule formatter and
    34.6 C over 3 h at 0 kW) and made `record_cooling` reject every summer
    cooling sample as `temp_end < ambient`.
 
-The temperature trajectory in `DPOptimizerResult` is reporting-only; temperature
-changes DP decisions solely through `compute_charge_rates_per_slot`. Details,
-the `k1`/`k2` units and the calibration/bootstrap rules are in
-`docs/scheduling-algorithm.md` § Thermal model.
+3. Charge rates match the SOC and temperature the plan actually reaches. SOC
+   dependence is evaluated **per candidate transition**, never from a
+   time-indexed array built by pretending charging runs continuously from now —
+   that array both warmed a cold pack with imaginary charging and pushed
+   low-SOC paths into an imaginary taper. Temperature is handled by a **bounded
+   solve/replay/refine**: pass 0 uses the *idle* profile (no heat from an
+   action the plan has not committed to), each pass replays the selected plan
+   through `TemperatureProjector` with warming from **actual** battery flow,
+   and it stops on a fixed point, an oscillation, or
+   `MAX_RATE_REFINEMENT_PASSES` plus one conservative fallback solve. The
+   fallback is conservative only where the rate is non-decreasing in
+   temperature; say so rather than calling it a bound. Forecasts are fixed for
+   the whole solve so a moving input cannot look like non-convergence.
+
+The temperature trajectory in `DPOptimizerResult` is reporting-only in the sense
+that it is built by the same replay the refinement uses. Details, the `k1`/`k2`
+units, the refinement's limits and its measured runtime are in
+`docs/scheduling-algorithm.md` § Thermal model and § Charge rates that match the
+SOC and temperature the plan reaches.
 
 `min_charge_slots_required` is reporting-only: it estimates the aggregate energy deficit but does not constrain the DP. Feasibility comes from SOC-state transitions and power limits.
 

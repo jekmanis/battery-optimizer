@@ -216,9 +216,93 @@ anything quantization could explain, so a breach is a model disagreement.
 A breach is reported (ERROR for conservation, WARNING for trajectory
 disagreement) and never silently rewrites the plan.
 
-Temperature-aware charge rates are predicted before the DP from the learned
-SOC/temperature model. These are planning estimates; actual SOC deviation can
-trigger a re-optimization.
+### Charge rates that match the SOC and temperature the plan reaches
+
+The rate used to come from a time-indexed array built by advancing SOC and
+temperature *as if charging ran continuously from now*, and the DP then applied
+that one number to every reachable state at that time. Both halves were wrong,
+in opposite directions:
+
+- imaginary charging warmed a cold pack, so a later planned charge looked faster
+  than the selected path could achieve;
+- imaginary charging pushed SOC into a taper region, so paths that stayed low or
+  discharged were denied capability they actually had.
+
+**SOC dependence is now exact.** The rate is evaluated per candidate transition,
+from that state's own energy, memoized by `(soc, slot temperature)`. When the
+rate turns out not to vary across the SOC grid — a fresh install on the nominal
+rate, or a flat learned curve — the per-slot energies are hoisted back out of
+the state loop. That is a performance hint only, and
+`tests/test_dp_rate_compatibility.py` pins that the two paths produce identical
+plans.
+
+**Temperature depends on history**, which a one-dimensional energy state cannot
+carry, so it needs an explicit design decision. The chosen one is a **bounded
+solve / replay / refine**:
+
+| Pass | What it plans with |
+| --- | --- |
+| 0 | the **idle** temperature profile — the pack is only as warm as it would be with no battery activity at all, so no heat can come from an action the plan has not committed to |
+| n | the profile produced by replaying the *selected* plan through the shared `TemperatureProjector`, with warming driven by **actual** battery flow |
+
+It stops on a fixed point, on a repeated profile (oscillation), or on the pass
+budget (`MAX_RATE_REFINEMENT_PASSES = 3`, plus at most one conservative final
+solve). Two profiles count as the same when their temperatures agree within
+0.25 C **or** when they imply the same charge capability at every state of the
+DP's SOC grid — temperature only reaches the plan through the rate, and a pack
+that keeps warming inside one temperature bucket would otherwise never settle.
+
+On oscillation or exhaustion it falls back to the pass-0 idle profile and solves
+once more. **Limits of that fallback, stated rather than implied:**
+
+- It is conservative only where the rate is non-decreasing in temperature — the
+  physical case, and the one the learning engine's temperature buckets describe.
+  With a non-monotonic learned curve it is an approximation, not a bound, and
+  what catches that is the final replay, not this loop.
+- A fixed point is not a proof of global optimality. **The solver is exact for
+  its discretized model given a temperature profile; the profile itself is an
+  outer approximation.**
+- A conservative fallback under-charges rather than over-charges. The final
+  replay does not flag that, because it is the safe direction.
+
+Warming follows `simulate_slot`'s actual `battery_power_kw`, so a full pack
+ordered to charge — or an empty one ordered to discharge — moves nothing and
+warms nothing. Imaginary power must not manufacture future charging capability.
+Forecasts are computed once and reused across every refinement pass, so a moving
+input cannot masquerade as a failure to converge.
+
+**Within-slot approximation.** The DP charges a slot at the rate implied by the
+temperature at its *start*, and the replay does the same, so the two agree
+exactly. A threshold crossed mid-slot is therefore mis-modelled by at most
+`(warm_rate - cold_rate) * slot_hours` of stored energy in that slot. The
+expected-SOC trajectory's `predict_charge_input_dc_energy` splits the slot into
+a cold and a warm phase, which is finer; the difference is bounded by the same
+quantity.
+
+Two designs were rejected:
+
+- **Discretized temperature in the DP state.** The clearest formulation, but it
+  multiplies the state count by the number of temperature buckets, and the
+  partial-first-slot lookahead already runs the whole DP once per candidate. The
+  normal 132-slot horizon would go from ~140 ms to well over a second on the
+  single AppDaemon thread.
+- **A fixed conservative temperature.** "Coldest plausible" is not a valid bound
+  over reachable conditions once SOC tapering and non-monotonic rate behaviour
+  are in play, and it would refuse to plan the warm-pack charging the
+  installation actually does.
+
+**Runtime**, 132-slot horizon (33 h at 15-minute slots), 14.3 kWh pack, median
+of five runs, with and without a partial first slot:
+
+| Rate curve | 1 % step (91 states) | 0.5 % (181) | 0.25 % (361) |
+| --- | --- | --- | --- |
+| flat | 36 / 140 ms | 74 / 267 ms | 143 / 602 ms |
+| SOC taper | 56 / 200 ms | 110 / 425 ms | 208 / 842 ms |
+| SOC + temperature, converges in 1 pass | 61 / 202 ms | 117 / 416 ms | 236 / 829 ms |
+| worst case: 3 refinement passes + fallback | 185 / 728 ms | 198 / 734 ms | 389 / 1456 ms |
+
+These are planning estimates; an actual SOC deviation still triggers a
+re-optimization.
 
 ### One bound on the learned charge rate
 

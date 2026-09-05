@@ -986,6 +986,7 @@ class BatteryOptimizer(hass.Hass):
                 current_slot=current_slot,
                 minutes_into_slot=minutes_into_slot,
                 prices_sorted=slots_sorted_by_time,
+                planning_temp_by_slot=getattr(result, "planning_temp_by_slot", None),
             )
 
         return schedule
@@ -1273,6 +1274,7 @@ class BatteryOptimizer(hass.Hass):
         current_slot: Optional[datetime.datetime],
         minutes_into_slot: float,
         prices_sorted: Optional[List[PricePoint]] = None,
+        planning_temp_by_slot: Optional[Dict[datetime.datetime, Optional[float]]] = None,
     ) -> Optional["PlanReplay"]:
         """Replay the published plan and report physical disagreement.
 
@@ -1316,9 +1318,14 @@ class BatteryOptimizer(hass.Hass):
                 starting_soc=starting_soc,
                 predict_load_kw=self._predict_load_kw,
                 predict_pv_kw=self._predict_pv_kw,
+                # Rates are looked up at the temperature the PLAN was built
+                # with, per slot, falling back to the replay's own temperature.
+                # Using a different temperature here would turn a deliberately
+                # conservative planning profile into a reported disagreement.
                 charge_rate_for=(
                     lambda slot, soc, temp: self.learning_engine.get_charge_rate_for_soc(
-                        soc, temp
+                        soc,
+                        (planning_temp_by_slot or {}).get(slot, temp),
                     )
                 ),
                 current_slot=current_slot,

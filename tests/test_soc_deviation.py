@@ -1463,6 +1463,18 @@ class TestRecalculateRemainingScheduleWithExtraSlots:
         # schedule is generated, so the whole remaining horizon is planned on
         # the corrected forecast.
         MockRecalculateOptimizer._refresh_pv_bias_factor = BatteryOptimizer._refresh_pv_bias_factor
+        # A rebuild also decides what happens to a current slot the planner
+        # could not price (retain the previous real-priced entry, else leave it
+        # to the HOLD fallback).
+        MockRecalculateOptimizer._retain_current_slot_if_unpriced = (
+            BatteryOptimizer._retain_current_slot_if_unpriced
+        )
+        MockRecalculateOptimizer._entry_has_real_price = (
+            BatteryOptimizer._entry_has_real_price
+        )
+        MockRecalculateOptimizer._note_current_slot_state = (
+            BatteryOptimizer._note_current_slot_state
+        )
 
         opt = MockRecalculateOptimizer()
         opt._pv_bias_factor = 1.0

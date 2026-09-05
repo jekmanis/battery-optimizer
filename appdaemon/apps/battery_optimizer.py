@@ -82,7 +82,11 @@ from battery_optimizer_lib.plan_validation import (
     PlanReplay,
     replay_plan,
 )
-from battery_optimizer_lib.models import ScheduleModeCounts, count_schedule_modes
+from battery_optimizer_lib.models import (
+    PRICE_SOURCE_MARKET,
+    ScheduleModeCounts,
+    count_schedule_modes,
+)
 from battery_optimizer_lib.pv_profile import PvProfile
 from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
 
@@ -937,6 +941,12 @@ class BatteryOptimizer(hass.Hass):
         self._price_retry_seq: int = 0
         self._price_retry_handle = None
         self._terminated: bool = False
+        # How the slot currently on the inverter got its entry, for the
+        # diagnostics payload. Stored WITH the slot it describes: "retained"
+        # is a statement about one interval, and a payload that kept reporting
+        # it after the clock moved on would be describing a decision that is no
+        # longer running. (slot_key, priced, "planned"|"retained"|"fallback").
+        self._current_slot_state: Optional[Tuple] = None
 
     def _price_retry_pending(self) -> bool:
         return getattr(self, "_price_retry_token", None) is not None
@@ -1168,7 +1178,38 @@ class BatteryOptimizer(hass.Hass):
         monitor = getattr(self, "_price_horizon", None)
         if monitor is None:
             return {}
-        return monitor.diagnostics(retry_pending=self._price_retry_pending())
+        priced, entry_state = self._current_slot_state_for()
+        return monitor.diagnostics(
+            retry_pending=self._price_retry_pending(),
+            current_slot_priced=priced,
+            current_slot_entry=entry_state,
+        )
+
+    def _note_current_slot_state(
+        self, slot: datetime.datetime, priced: bool, entry_state: str
+    ) -> None:
+        """Record how the slot at *slot* got its entry, for diagnostics."""
+        self._current_slot_state = (slot, bool(priced), entry_state)
+
+    def _current_slot_state_for(
+        self, now: Optional[datetime.datetime] = None
+    ) -> Tuple[Optional[bool], Optional[str]]:
+        """(priced, entry state) for the slot running NOW, else (None, None).
+
+        Scoped to its slot on purpose: the recorded state describes one
+        interval, and reporting last quarter-hour's "retained" against the
+        current one would name a decision that is no longer in force.
+        """
+        recorded = getattr(self, "_current_slot_state", None)
+        if not recorded:
+            return None, None
+        slot, priced, entry_state = recorded
+        now = now if now is not None else self.datetime()
+        if not datetimes_match_slot(
+            slot, self._align_to_slot(now), self._get_local_timezone()
+        ):
+            return None, None
+        return priced, entry_state
 
     # =========================================================================
     # Optimization Algorithm
@@ -1270,8 +1311,36 @@ class BatteryOptimizer(hass.Hass):
         if not future_prices:
             return {}
 
-        # Ensure current slot is included (Nord Pool may exclude current hour as "past")
-        future_prices = self._ensure_current_slot_price(prices, future_prices, current_slot)
+        # NOTHING is synthesized for the current slot. The old code substituted
+        # yesterday's same-clock price, else the most recent past price, else
+        # the NEXT price, on the premise that "Nord Pool may exclude the current
+        # hour as past". That premise does not hold for either fetch path:
+        # `_get_prices_via_service` asks `nordpool.get_price_indices_for_date`
+        # for whole DATES and `_get_prices_via_sensor` reads the whole-day
+        # `raw_today` / `raw_tomorrow` attributes. Both deliver the elapsed part
+        # of the day too, so an absent current interval means the data is
+        # genuinely missing - and the substitution then planned, logged and
+        # EXECUTED the live slot on a number nobody published. With yesterday at
+        # 0.01 and the real next interval at 1.00, that is a grid-charge command
+        # issued at a price that does not exist.
+        #
+        # Planning simply starts at the next validated interval instead: the DP
+        # finds no index for `current_slot`, so `has_partial` is False and it
+        # solves the remaining slots at full width. The horizon is not lost, and
+        # the current slot is resolved by the callers (retain a real-priced
+        # entry, else HOLD/no_price) rather than by a price guess here.
+        #
+        # If a source can be asked for the real current price, that is a FETCH
+        # and belongs in the price service and the bounded retry, which already
+        # re-request whole days.
+        if not any(datetimes_match_slot(p.time, current_slot, self._get_local_timezone())
+                   for p in future_prices):
+            self.log(
+                f"No published price for the current slot {current_slot}; "
+                f"planning from the next validated interval and leaving this "
+                f"slot to the retained entry or the HOLD fallback",
+                level="WARNING",
+            )
 
         # Calculate min_charge_slots for informational purposes
         slots_sorted_by_time = sorted(future_prices, key=lambda p: instant_key(p.time))
@@ -1316,6 +1385,19 @@ class BatteryOptimizer(hass.Hass):
         )
 
         schedule = result.schedule
+
+        # Provenance. Every price the DP was handed is an interval a source
+        # actually published, so every entry it produced was planned on a real
+        # price — but the schedule has to be able to SAY so, because
+        # `execute_scheduled_mode` refuses to send a current-slot entry that
+        # cannot. Stamped against the price keys rather than blanket-set: if a
+        # synthetic price is ever reintroduced upstream, its slot will not
+        # silently inherit the marker.
+        real_price_keys = {canonical_slot_key(p.time) for p in future_prices}
+        for slot_key, entry in schedule.items():
+            if slot_key in real_price_keys:
+                entry.price_source = PRICE_SOURCE_MARKET
+
         # Reported trajectories. Rebuilt below if the schedule is modified after
         # the DP ran — they must describe the plan that will actually execute.
         soc_trajectory = result.soc_trajectory
@@ -1521,88 +1603,73 @@ class BatteryOptimizer(hass.Hass):
 
         return schedule
 
-    def _ensure_current_slot_price(
+    # ------------------------------------------------------------------
+    # The current slot when nobody published a price for it
+    #
+    # `_ensure_current_slot_price` used to live here and manufactured one
+    # (yesterday's same-clock price, else the last past price, else the next
+    # price). It is gone: see the comment at the top of `find_optimal_schedule`
+    # for why the premise it rested on is not true of either fetch path, and
+    # what replaces it. What remains is a decision about the EXISTING plan,
+    # taken from the horizon monitor's verdict - there is no second heuristic.
+    # ------------------------------------------------------------------
+
+    def _entry_has_real_price(self, entry: Optional[ScheduleEntry]) -> bool:
+        """True when *entry* declares it was planned on a published price."""
+        return (
+            entry is not None
+            and getattr(entry, "price_source", None) == PRICE_SOURCE_MARKET
+        )
+
+    def _retain_current_slot_if_unpriced(
         self,
-        all_prices: List[PricePoint],
-        future_prices: List[PricePoint],
+        schedule: Dict[datetime.datetime, ScheduleEntry],
+        previous_entry: Optional[ScheduleEntry],
         current_slot: datetime.datetime,
-    ) -> List[PricePoint]:
+        local_tz=None,
+    ) -> str:
+        """Resolve a current slot the planner could not price.
+
+        Returns the state for the diagnostics payload:
+
+        * ``"planned"``  - the interval was published; the planner owns it.
+        * ``"retained"`` - it was not, but the plan already held an entry built
+          from a real price, so that decision stands. It is still subject to
+          every execution guard (enabled, manual override, min/max SOC): this
+          keeps a decision that was made on real data, it does not exempt it.
+        * ``"fallback"`` - nothing can vouch for a price, so the slot is left
+          unplanned and `execute_scheduled_mode` applies HOLD/`no_price`.
+
+        Shared by every planning path (`full_optimize`,
+        `_recalculate_remaining_schedule` and therefore SOC deviation, PV
+        shortfall, depletion, price recovery and the adaptive horizon
+        extension), because a rule applied in one of them is a rule the other
+        four break.
         """
-        Ensure current slot is included in future_prices.
+        if local_tz is None:
+            local_tz = self._get_local_timezone()
+        if lookup_by_time(schedule, current_slot, local_tz) is not None:
+            return "planned"
+        if not self._entry_has_real_price(previous_entry):
+            return "fallback"
 
-        Nord Pool may exclude current hour as "past", so we try to
-        synthesize the price from yesterday's data or previous prices.
-        """
-        local_tz = self._get_local_timezone()
-
-        def prices_contains_slot(prices_list, slot):
-            return any(datetimes_match_slot(p.time, slot, local_tz)
-                       for p in prices_list)
-
-        if prices_contains_slot(future_prices, current_slot):
-            return future_prices
-
-        # Current slot missing - try yesterday's Nord Pool data (timezone shift around midnight)
-        tz = local_tz
-        yesterday = current_slot.date() - datetime.timedelta(days=1)
-        yesterday_prices = self._price_service.get_prices_for_date(yesterday, tz)
-
-        def find_same_clock_price(prices_list, slot):
-            """Find yesterday's equivalent local clock slot, ignoring its date."""
-            local_slot = ensure_local_tz(slot, tz)
-            candidates = []
-            for point in prices_list:
-                local_point = ensure_local_tz(point.time, tz)
-                if (local_point.hour, local_point.minute) == (local_slot.hour, local_slot.minute):
-                    candidates.append((local_point, point))
-            if not candidates:
-                return None
-            # On an autumn-fold day prefer the corresponding occurrence.
-            for local_point, point in candidates:
-                if local_point.fold == local_slot.fold:
-                    return point
-            return candidates[0][1]
-
-        slot_price_point = find_same_clock_price(yesterday_prices, current_slot)
-        if slot_price_point is not None:
-            synth_price = slot_price_point.price
-            self.log(
-                f"Added missing current slot {current_slot} using yesterday's price "
-                f"{synth_price:.4f} EUR/kWh from {slot_price_point.time}"
-            )
-        else:
-            # If still missing, synthesize using most recent past price if available
-            prev_price_point = None
-            for p in all_prices:
-                if dt_ge(current_slot, p.time, tz):
-                    if (prev_price_point is None or
-                            dt_ge(p.time, prev_price_point.time, tz)):
-                        prev_price_point = p
-
-            if prev_price_point is not None:
-                synth_price = prev_price_point.price
-                self.log(
-                    f"Added missing current slot {current_slot} using previous price "
-                    f"{synth_price:.4f} EUR/kWh from {prev_price_point.time}"
-                )
-            else:
-                # Fallback: use first available future price
-                synth_price = min(future_prices, key=lambda p: instant_key(p.time)).price
-                self.log(f"Added missing current slot {current_slot} using next price {synth_price:.4f} EUR/kWh")
-
-        # Normalize timezone to match existing prices (avoid mixing aware/naive)
-        if future_prices:
-            sample_hour = future_prices[0].time
-            if sample_hour.tzinfo is not None and current_slot.tzinfo is None:
-                # Prices are aware, current_slot is naive - add timezone
-                tz = self._get_local_timezone()
-                current_slot = ensure_local_tz(current_slot, tz)
-            elif sample_hour.tzinfo is None and current_slot.tzinfo is not None:
-                # Prices are naive, current_slot is aware - strip timezone
-                current_slot = current_slot.replace(tzinfo=None)
-
-        current_slot_price = PricePoint(time=current_slot, price=synth_price)
-        return future_prices + [current_slot_price]
+        retained = ScheduleEntry(
+            time=previous_entry.time,
+            mode=previous_entry.mode,
+            reason=previous_entry.reason,
+            export_rate=previous_entry.export_rate,
+            ac_charge_mode=previous_entry.ac_charge_mode,
+            marginal_value_eur_kwh=previous_entry.marginal_value_eur_kwh,
+            value_basis=previous_entry.value_basis,
+            energy_limited=previous_entry.energy_limited,
+            price_source=PRICE_SOURCE_MARKET,
+        )
+        schedule[canonical_slot_key(retained.time)] = retained
+        self.log(
+            f"Current slot {current_slot} has no published price - keeping the "
+            f"existing {retained.mode.name} entry, which was planned on one"
+        )
+        return "retained"
 
     def _compute_slot_fractions(
         self,
@@ -2043,8 +2110,19 @@ class BatteryOptimizer(hass.Hass):
         charge_hours_needed = self.calculate_min_charge_slots_for_horizon(current_soc, future_prices)
         self.log(f"Current SOC: {current_soc}%, min charge slots needed: {charge_hours_needed}")
 
-        # Generate schedule
+        # Generate schedule. The current slot's existing entry is read BEFORE
+        # the replacement: when the interval turns out to be unpriced it is the
+        # only thing that can legitimately drive this slot, and assigning
+        # `self.schedule` destroys it.
+        local_tz = self._get_local_timezone()
+        previous_current_entry = lookup_by_time(self.schedule, current_slot, local_tz)
         self.schedule = self.find_optimal_schedule(future_prices, charge_hours_needed, current_soc)
+        entry_state = self._retain_current_slot_if_unpriced(
+            self.schedule, previous_current_entry, current_slot, local_tz
+        )
+        self._note_current_slot_state(
+            current_slot, entry_state == "planned", entry_state
+        )
 
         # On restart, preserve CHARGE/DISCHARGE intent for current slot if it was active before
         self._preserve_mode_on_restart(current_slot)
@@ -2289,6 +2367,21 @@ class BatteryOptimizer(hass.Hass):
         now_slot = self._align_to_slot(now)
         prices = self.get_prices()
 
+        # One owner judges every fetch. A rebuild triggered by an SOC
+        # deviation, a PV shortfall or a depletion can be the first path to see
+        # a horizon that has lost its current interval; without this it would
+        # plan the future correctly and leave NOTHING armed to go and fetch the
+        # missing price, because only `full_optimize`, the slot execution and
+        # the adaptive pass reviewed. `_note_price_horizon_failure` still
+        # refuses to advance the backoff while a retry is armed, so the extra
+        # call sites cannot turn into a retry storm.
+        #
+        # getattr, like `_validate_final_plan` above: several test doubles
+        # borrow this method without the price-recovery state.
+        _review = getattr(self, "_review_price_horizon", None)
+        if callable(_review):
+            _review(prices, now, context="recalculate")
+
         # Filter to future prices only
         future_prices = [p for p in prices if dt_ge(p.time, now_slot, local_tz)]
 
@@ -2311,8 +2404,17 @@ class BatteryOptimizer(hass.Hass):
                      f"(base={charge_hours_needed}, total={charge_hours_needed + extra_charge_slots})")
             charge_hours_needed += extra_charge_slots
 
-        # Generate new schedule for remaining time
+        # Generate new schedule for remaining time. Read the current slot's
+        # entry first: the deletion below is what makes a rebuild lose it, and
+        # an unpriced current interval has nothing else to fall back on.
+        previous_current_entry = lookup_by_time(self.schedule, now_slot, local_tz)
         new_schedule = self.find_optimal_schedule(future_prices, charge_hours_needed, current_soc)
+        entry_state = self._retain_current_slot_if_unpriced(
+            new_schedule, previous_current_entry, now_slot, local_tz
+        )
+        self._note_current_slot_state(
+            now_slot, entry_state == "planned", entry_state
+        )
 
         # Remove all future entries and replace with new schedule
         # This prevents stale entries from persisting if price list shrinks
@@ -2467,14 +2569,64 @@ class BatteryOptimizer(hass.Hass):
             # never invent a cheap price and force charging. But an empty
             # current slot IS a coverage failure, so ask for prices again on a
             # bounded backoff instead of holding until the next daily run.
+            #
+            # Two different failures, named apart because they need different
+            # answers: `no_price` means the interval we are living in was never
+            # published, so the retry has to fetch it; `no_schedule` means the
+            # prices are fine and the PLAN ran out, which a rebuild fixes. The
+            # horizon monitor decides which, from the last known snapshot.
+            #
+            # `last_health is None` is a THIRD state and is not `no_price`: the
+            # app has restarted and has never looked at prices, so an empty
+            # snapshot says nothing about whether this interval was published.
+            # Claiming the slot is unpriced there would report a price problem
+            # for every restart. That case keeps the pre-existing `no_schedule`,
+            # which is not a coverage reason and so survives a healthy review.
+            monitor = self._price_horizon
+            health = (
+                monitor.evaluate(monitor.retained_prices, now)
+                if monitor.last_health is not None
+                else None
+            )
+            unpriced = health is not None and not health.has_current
             entry = ScheduleEntry(
                 time=current_slot,
                 mode=BatteryMode.HOLD,
-                reason="no_schedule",
+                reason="no_price" if unpriced else "no_schedule",
             )
+            self._note_current_slot_state(current_slot, not unpriced, "fallback")
             self._note_price_horizon_failure(
-                "no_schedule", now, context="execute_scheduled_mode"
+                health.reason if unpriced else "no_schedule",
+                now,
+                health if unpriced else None,
+                context="execute_scheduled_mode",
             )
+        else:
+            # An entry EXISTS for the current slot. It may only be sent if it
+            # can show it was planned on a published price. After the removal
+            # of the synthetic current-slot price there should be none that
+            # cannot - this is the guard that makes that statement falsifiable
+            # rather than a claim about code that might change. HOLD is exempt
+            # because HOLD is what the failure mode degrades to anyway.
+            if (entry.mode != BatteryMode.HOLD
+                    and not self._entry_has_real_price(entry)):
+                self.log(
+                    f"Refusing to send {entry.mode.name} for {current_slot}: the "
+                    f"entry carries no published-price provenance (reason "
+                    f"'{entry.reason}') - applying HOLD instead",
+                    level="WARNING",
+                )
+                entry = ScheduleEntry(
+                    time=entry.time,
+                    mode=BatteryMode.HOLD,
+                    reason="unpriced_slot",
+                )
+                self._note_current_slot_state(current_slot, False, "fallback")
+            elif self._current_slot_state_for(now) == (None, None):
+                # The timer reached a slot no rebuild has described (the plan
+                # already covered it). It carries a real price or it would not
+                # have got past the guard above.
+                self._note_current_slot_state(current_slot, True, "planned")
 
         self.log(f"Executing scheduled mode for {current_slot}: {entry.mode.name} ({entry.reason})")
 
@@ -3443,7 +3595,13 @@ class BatteryOptimizer(hass.Hass):
             self.schedule[current_key] = ScheduleEntry(
                 time=current_entry.time,
                 mode=previous_mode,
-                reason=f"continuing_{mode_name.lower()}_from_restart"
+                reason=f"continuing_{mode_name.lower()}_from_restart",
+                # Provenance is a property of the SLOT's price, not of the mode
+                # chosen for it. This entry replaces one the planner built from
+                # a published interval, so it inherits that; dropping it here
+                # would make `execute_scheduled_mode` refuse the very restart
+                # continuity this method exists to provide.
+                price_source=current_entry.price_source,
             )
 
         # Clear the previous schedule after first use (only needed for startup)

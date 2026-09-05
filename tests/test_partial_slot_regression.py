@@ -141,32 +141,7 @@ class PartialSlotOptimizer:
 
 
 PartialSlotOptimizer.find_optimal_schedule = BatteryOptimizer.find_optimal_schedule
-PartialSlotOptimizer._ensure_current_slot_price = BatteryOptimizer._ensure_current_slot_price
 PartialSlotOptimizer._compute_slot_fractions = BatteryOptimizer._compute_slot_fractions
-
-
-class MissingPriceOptimizer:
-    def __init__(self, yesterday_prices):
-        self._yesterday_prices = yesterday_prices
-
-    def _get_local_timezone(self):
-        return None
-
-    @property
-    def _price_service(self):
-        points = self._yesterday_prices
-
-        class Service:
-            def get_prices_for_date(self, date, tz):
-                return points
-
-        return Service()
-
-    def log(self, *args, **kwargs):
-        pass
-
-
-MissingPriceOptimizer._ensure_current_slot_price = BatteryOptimizer._ensure_current_slot_price
 
 
 def _make_price_points():
@@ -209,13 +184,21 @@ def test_partial_slot_supports_configured_finer_soc_steps():
     assert schedule[base].mode == BatteryMode.DISCHARGE
 
 
-def test_missing_current_slot_uses_yesterday_same_clock_price():
-    current = datetime.datetime(2026, 1, 24, 16, 0)
-    yesterday = PricePoint(datetime.datetime(2026, 1, 23, 16, 0), 0.071)
-    future = [PricePoint(datetime.datetime(2026, 1, 24, 17, 0), 0.2)]
-    optimizer = MissingPriceOptimizer([yesterday])
+def test_missing_current_slot_is_left_unplanned():
+    """The current slot is never given a price the source did not publish.
 
-    result = optimizer._ensure_current_slot_price(future, future, current)
+    This used to assert the opposite: `_ensure_current_slot_price` copied
+    yesterday's same-clock price (0.071 here) into the current slot and the DP
+    planned on it. The slot is now simply absent from the schedule, and the
+    orchestrator resolves it (retained real-priced entry, else HOLD/no_price).
+    """
+    base, prices = _make_price_points()
+    current = base
+    future = [p for p in prices if p.time > current]
+    optimizer = PartialSlotOptimizer(now=current, soc_step_percent=1.0)
 
-    synthetic = next(p for p in result if p.time == current)
-    assert synthetic.price == 0.071
+    schedule = optimizer.find_optimal_schedule(future, 0, current_soc=36.0)
+
+    assert current not in schedule
+    assert schedule, "the rest of the horizon is still planned"
+    assert min(schedule) == min(p.time for p in future)

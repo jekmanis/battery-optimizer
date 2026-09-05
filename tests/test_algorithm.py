@@ -222,7 +222,6 @@ from battery_optimizer import BatteryOptimizer
 
 # Bind the actual algorithm to our mock
 MockOptimizer.find_optimal_schedule = BatteryOptimizer.find_optimal_schedule
-MockOptimizer._ensure_current_slot_price = BatteryOptimizer._ensure_current_slot_price
 MockOptimizer._compute_slot_fractions = BatteryOptimizer._compute_slot_fractions
 
 

@@ -234,7 +234,6 @@ from battery_optimizer import BatteryOptimizer  # noqa: E402
 HedgeOptimizer.find_optimal_schedule = BatteryOptimizer.find_optimal_schedule
 HedgeOptimizer.project_schedule_trajectory = BatteryOptimizer.project_schedule_trajectory
 HedgeOptimizer._replay_schedule = BatteryOptimizer._replay_schedule
-HedgeOptimizer._ensure_current_slot_price = BatteryOptimizer._ensure_current_slot_price
 HedgeOptimizer._compute_slot_fractions = BatteryOptimizer._compute_slot_fractions
 
 

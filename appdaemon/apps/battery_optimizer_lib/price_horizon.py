@@ -501,10 +501,30 @@ class PriceHorizonMonitor:
     def _iso(dt: Optional[datetime.datetime]) -> Optional[str]:
         return dt.isoformat() if dt is not None else None
 
-    def diagnostics(self, retry_pending: bool) -> Dict:
-        """Payload for `sensor.battery_optimizer`."""
+    def diagnostics(
+        self,
+        retry_pending: bool,
+        current_slot_priced: Optional[bool] = None,
+        current_slot_entry: Optional[str] = None,
+    ) -> Dict:
+        """Payload for `sensor.battery_optimizer`.
+
+        Args:
+            current_slot_priced: whether a published interval covers the slot
+                being executed right now. `ok` does not answer this: a horizon
+                can be short (`tomorrow_missing`) with the current interval
+                perfectly well priced, and `missing_current_interval` can clear
+                for the NEXT slot while the one on the inverter never had a
+                price at all.
+            current_slot_entry: how that slot got its entry - "planned",
+                "retained" (a decision made earlier on a real price) or
+                "fallback" (HOLD/no_price). Without it, a HOLD on the dashboard
+                cannot be told from a plan.
+        """
         health = self.last_health
         return {
+            "current_slot_priced": current_slot_priced,
+            "current_slot_entry": current_slot_entry,
             "ok": bool(health.ok) if health is not None else None,
             "reason": health.reason if health is not None else None,
             "horizon_end": self._iso(health.horizon_end) if health else None,

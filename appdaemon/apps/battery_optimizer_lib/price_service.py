@@ -30,6 +30,31 @@ except ImportError:
 # `NordPoolPriceService._warn_malformed_record`.
 MALFORMED_WARNING_INTERVAL_S = 3600
 
+
+class _MalformedEnd:
+    """Sentinel: the source PUBLISHED an ``end`` and it cannot be used.
+
+    `_parse_interval_end` used to answer ``None`` both for a record that
+    carries no ``end`` and for one whose ``end`` is ``"not-a-timestamp"``.
+    Those are opposite statements. An absent end is a normal case with a
+    documented answer - one `slot_minutes` slot - and collapsing the second
+    into the first handed that slot of coverage to a record whose own width
+    field is garbage. A cheap current record with an unreadable end therefore
+    reported `has_current=True` and was planned as CHARGE carrying
+    `PRICE_SOURCE_MARKET`.
+
+    Three states, so the caller can tell them apart: a datetime, ``None`` for
+    absent, this for published-and-unusable.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return "<malformed interval end>"
+
+
+MALFORMED_END = _MalformedEnd()
+
 Span = Tuple[datetime.datetime, datetime.datetime]
 
 
@@ -255,6 +280,14 @@ class NordPoolPriceService:
             end = end.astimezone(tz)
         return end.replace(tzinfo=None)
 
+    def _reject_malformed_end(self, start, raw) -> None:
+        """Say, once an hour, that a record declared an unusable ``end``."""
+        self._warn_malformed_record(
+            f"Price record for {start} declares an end of {raw!r}, which is "
+            f"not a usable timestamp; dropping it. The interval it claimed is "
+            f"a gap until a source publishes it properly."
+        )
+
     def _interval_end(
         self,
         start: datetime.datetime,
@@ -273,9 +306,17 @@ class NordPoolPriceService:
         price for that interval on the strength of a field saying the opposite,
         and coverage is what the schedule, the horizon monitor and the
         provenance guard are all built on.
+
+        An end that was PUBLISHED but cannot be read (`MALFORMED_END`, or any
+        value that is not a datetime) is the same kind of evidence and gets the
+        same answer. Both parsers already drop such a record where they build
+        it; this is the second gate, for a `PricePoint` assembled anywhere else.
         """
         if end is None:
             return self._shift(start, self.slot_minutes)
+        if not isinstance(end, datetime.datetime):
+            self._reject_malformed_end(start, end)
+            return None
         end = self._match_awareness(end, start)
         if instant_key(end) > instant_key(start):
             return end
@@ -634,16 +675,22 @@ class NordPoolPriceService:
                 elif tz:
                     start_dt = start_dt.replace(tzinfo=tz)
 
+                # How far this price REACHES, as published. Dropping it left
+                # `_normalize_prices` guessing the width from the spacing of
+                # whatever records survived, which prices the gaps.
+                interval_end = self._parse_interval_end(entry.get("end"), tz)
+                if interval_end is MALFORMED_END:
+                    # Published and unreadable: the record is corrupt, and one
+                    # slot of coverage for it is a price nobody stated.
+                    self._reject_malformed_end(start_dt, entry.get("end"))
+                    continue
+
                 # Convert EUR/MWh to EUR/kWh
                 price_kwh = float(price_mwh) / 1000.0
                 prices.append(PricePoint(
                     time=start_dt,
                     price=price_kwh,
-                    # How far this price REACHES, as published. Dropping it
-                    # left `_normalize_prices` guessing the width from the
-                    # spacing of whatever records survived, which prices the
-                    # gaps.
-                    end=self._parse_interval_end(entry.get("end"), tz),
+                    end=interval_end,
                 ))
 
             except (ValueError, TypeError) as e:
@@ -652,25 +699,34 @@ class NordPoolPriceService:
 
         return prices
 
-    def _parse_interval_end(self, value, tz) -> Optional[datetime.datetime]:
-        """The source's ``end`` field as a local datetime, or None.
+    def _parse_interval_end(self, value, tz):
+        """The source's ``end`` field, TRI-STATE.
 
-        An unparseable or absent end is not fatal and is not guessed at: the
-        point then covers exactly one slot (`_interval_end`).
+        * a local datetime -- the source said how far this price reaches;
+        * ``None`` -- the source said NOTHING, and the record then covers
+          exactly one slot (`_interval_end`);
+        * `MALFORMED_END` -- the source published an ``end`` and it is not a
+          timestamp: an empty string, a bare number, a list, garbage.
+
+        The third case used to answer ``None``, which is the second case's
+        answer, so a record whose own width field was unreadable was granted a
+        slot of coverage anyway. Both are "no usable end", but only one of them
+        is a record saying so on purpose. See `_MalformedEnd`.
         """
         if value is None:
             return None
         try:
-            if isinstance(value, str):
-                end_dt = datetime.datetime.fromisoformat(
-                    value.replace("Z", "+00:00")
-                )
-            elif isinstance(value, datetime.datetime):
+            if isinstance(value, datetime.datetime):
                 end_dt = value
+            elif isinstance(value, str) and value.strip():
+                end_dt = datetime.datetime.fromisoformat(
+                    value.strip().replace("Z", "+00:00")
+                )
             else:
-                return None
+                # A bool, an int, an empty string, a list: published, unusable.
+                return MALFORMED_END
         except (ValueError, TypeError):
-            return None
+            return MALFORMED_END
         if tz and end_dt.tzinfo:
             return end_dt.astimezone(tz)
         if tz:
@@ -730,13 +786,21 @@ class NordPoolPriceService:
                             dt = dt.astimezone(tz)
                         elif tz:
                             dt = dt.replace(tzinfo=tz)
+                        # The raw attributes publish an `end`; keeping it is
+                        # what stops a missing record from being filled in from
+                        # its neighbour's spacing.
+                        interval_end = self._parse_interval_end(
+                            entry.get("end"), tz
+                        )
+                        if interval_end is MALFORMED_END:
+                            # Published and unreadable: drop it, exactly as the
+                            # service path does.
+                            self._reject_malformed_end(dt, entry.get("end"))
+                            continue
                         prices.append(PricePoint(
                             time=dt,
                             price=float(price),
-                            # The raw attributes publish an `end`; keeping it
-                            # is what stops a missing record from being filled
-                            # in from its neighbour's spacing.
-                            end=self._parse_interval_end(entry.get("end"), tz),
+                            end=interval_end,
                         ))
                     except (ValueError, TypeError):
                         pass

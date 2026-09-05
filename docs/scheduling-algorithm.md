@@ -1466,6 +1466,14 @@ The rules, in full:
 
 - `PricePoint.end` carries the source's own end. Both parsers now set it.
 - A point with **no** `end` covers exactly one `slot_minutes` slot.
+- A record whose `end` was **published but cannot be read** — `"not-a-timestamp"`,
+  an empty string, a bare number, a list — is **dropped**, with the same
+  once-an-hour WARNING. `_parse_interval_end` is tri-state for this reason: a
+  datetime, `None` for an end the source never stated, and a `MALFORMED_END`
+  sentinel for one it stated unusably. Answering `None` for both gave the
+  corrupt record the absent-end rule's one slot of coverage, so a cheap current
+  record with an unreadable end reported `has_current=True` and was planned as
+  CHARGE carrying `price_source="market"`.
 - A record whose `start` and `end` disagree about being timezone-aware is
   normalized to ONE awareness - its start's, through the local zone - before
   anything is compared. With no timezone configured in AppDaemon both parsers

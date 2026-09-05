@@ -650,7 +650,7 @@ class TestWarmingRateTracking:
         assert time is not None
         assert abs(time - 20.0) < 1.0
 
-    def test_predict_charge_energy_with_warming(self):
+    def test_predict_charge_input_dc_energy(self):
         """
         Verify charge energy prediction accounts for warming-induced rate increase.
 
@@ -693,7 +693,7 @@ class TestWarmingRateTracking:
 
         # Predict energy for 30 minutes starting at 14°C
         # With warming: first ~10 min at cold rate, then ~20 min at warm rate
-        energy, end_temp = engine.predict_charge_energy_with_warming(
+        energy, end_temp = engine.predict_charge_input_dc_energy(
             current_soc=50.0,
             start_temp=14.0,
             duration_minutes=30.0,

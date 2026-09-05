@@ -29,6 +29,8 @@ appdaemon/apps/
 │   ├── schedule_formatter.py      # Schedule logging/formatting
 │   ├── thermal_model.py           # Shared battery temperature model (k1/k2)
 │   ├── ambient_service.py         # Time-varying ambient temperature T_ambient(t)
+│   ├── slot_energy.py             # Shared pure slot energy-flow transition
+│   ├── plan_validation.py         # Continuous replay of the final plan
 │   ├── soc_projection.py          # Shared slot SOC transition model
 │   ├── soc_deviation.py           # SOC deviation detection
 │   ├── load_prediction_tracker.py # Predicted vs actual load accuracy
@@ -63,6 +65,8 @@ tests/
 | `schedule_formatter.py` | ScheduleFormatter, ScheduleFormatterConfig | Schedule logging and HA sensor formatting |
 | `thermal_model.py` | TemperatureProjector, step_temperature, battery_power_for_entry | The ONE battery temperature model. Warming depends on `\|P_bat\|`, never on the scheduled mode |
 | `ambient_service.py` | AmbientTemperatureService, AmbientServiceConfig | `T_ambient(t)` across the horizon: weather forecast → outdoor sensor → diurnal profile |
+| `slot_energy.py` | simulate_slot, SlotEnergyParams, SlotEnergyResult | The ONE pure slot transition: every energy flow with its measurement boundary in the name |
+| `plan_validation.py` | replay_plan, PlanReplay | Continuous replay of the FINAL plan; prefix energy conservation before clamping |
 | `soc_projection.py` | project_slot_soc, SocProjectionParams | Single slot-SOC transition model shared by the expected-SOC trajectory and the deviation detector (the DP keeps its own inlined transition; `tests/test_soc_projection.py` guards that they agree) |
 | `soc_deviation.py` | SocDeviationDetector, SocDeviationConfig | Detects unexpected SOC changes for revalidation |
 | `load_prediction_tracker.py` | LoadPredictionTracker | Predicted vs actual load accuracy tracking |
@@ -104,6 +108,14 @@ Uses **dynamic programming** with SOC state tracking:
 
 `efficiency` is the charge-retention factor, not a complete round-trip figure. `inverter_efficiency` applies on grid AC-to-DC charging and battery DC-to-AC discharge, so the modeled grid-charge round trip is approximately `efficiency * inverter_efficiency^2`.
 
+**One charge-rate unit.** A "charge rate" is always `charge_input_dc_kw` — DC power at the battery terminal, BEFORE retention — everywhere a planner touches it: `charge_rate_kw` in apps.yaml, `SocProjectionParams.charge_rate`, the DP's per-slot rate, `|P_bat|` for the thermal model, and everything `BatteryLearningEngine.get_charge_rate_for_soc` returns. Stored energy is `rate * efficiency * duration`; grid AC is `grid_dc / inverter_efficiency`. Learning *observations* are the other quantity — `stored_charge_kw`, a SOC delta or the inverter's energy counter over an interval — and are recorded and persisted in those units unchanged. The single conversion happens at the API boundary in `get_charge_rate_for_soc`. Applying storage retention to a rate that already described stored-energy growth made a learned 40 %→50 % observation replay as 48.5 %; `tests/test_charge_rate_units.py` is that replay. Do not "simplify" by removing the `* efficiency` at a consumer — that fixes learned rates and breaks the nominal fallback, grid costs and PV limits, which is why the contract is named rather than inferred.
+
+`learned_efficiency` is NOT a measurement. It can only be learned from an independent AC meter reading for the charge interval, and there is none; the synthetic `stored / configured_efficiency` input that used to feed it is a tautology and is rejected.
+
+**One slot-energy model.** `slot_energy.simulate_slot` is the pure transition that names every flow (stored in/out, PV vs grid share of a charge, AC served, import, export, `unmet_battery_ac_kwh`). `soc_projection.project_slot_soc` delegates to it. Its `dc_energy_in_kwh`/`dc_energy_out_kwh` are what the pack ACTUALLY moved; the uncapped request lives in `requested_dc_energy_*`. Never report a request as delivered energy.
+
+**Conservative quantization.** A DP state carries a floored bucket *label* and the *exact* energy of the best path reaching it; every transition is computed from the exact energy. Nearest rounding on the grid was not zero-mean for a constant load on a constant slot length — it credited 2.8 kWh of service from a 2.0 kWh battery and published 15 % SOC for a pack its own model had emptied. Pure floor-to-grid is safe but throws away 30 % of the usable energy at 1 % steps, so it is not the answer either. Physics is now exact; what `soc_step_percent` controls is only how aggressively distinct paths are MERGED (ties broken toward more energy — a dominance rule). Energy-limited discharges deliver what the pack has and the grid pays for the rest; no threshold decides whether a slot "counts". `plan_validation.replay_plan`, called last in `find_optimal_schedule`, re-walks the FINAL action sequence and checks prefix conservation before any clamping.
+
 **One slot-SOC model.** The expected-SOC trajectory, the SOC deviation detector
 and the schedule log's fallback trajectory
 (`ScheduleFormatter._format_expected_trajectory`) must all go through
@@ -137,10 +149,25 @@ expected-SOC trajectory (`soc_projection`), the schedule formatter and
    34.6 C over 3 h at 0 kW) and made `record_cooling` reject every summer
    cooling sample as `temp_end < ambient`.
 
-The temperature trajectory in `DPOptimizerResult` is reporting-only; temperature
-changes DP decisions solely through `compute_charge_rates_per_slot`. Details,
-the `k1`/`k2` units and the calibration/bootstrap rules are in
-`docs/scheduling-algorithm.md` § Thermal model.
+3. Charge rates match the SOC and temperature the plan actually reaches. SOC
+   dependence is evaluated **per candidate transition**, never from a
+   time-indexed array built by pretending charging runs continuously from now —
+   that array both warmed a cold pack with imaginary charging and pushed
+   low-SOC paths into an imaginary taper. Temperature is handled by a **bounded
+   solve/replay/refine**: pass 0 uses the *idle* profile (no heat from an
+   action the plan has not committed to), each pass replays the selected plan
+   through `TemperatureProjector` with warming from **actual** battery flow,
+   and it stops on a fixed point, an oscillation, or
+   `MAX_RATE_REFINEMENT_PASSES` plus one conservative fallback solve. The
+   fallback is conservative only where the rate is non-decreasing in
+   temperature; say so rather than calling it a bound. Forecasts are fixed for
+   the whole solve so a moving input cannot look like non-convergence.
+
+The temperature trajectory in `DPOptimizerResult` is reporting-only in the sense
+that it is built by the same replay the refinement uses. Details, the `k1`/`k2`
+units, the refinement's limits and its measured runtime are in
+`docs/scheduling-algorithm.md` § Thermal model and § Charge rates that match the
+SOC and temperature the plan reaches.
 
 `min_charge_slots_required` is reporting-only: it estimates the aggregate energy deficit but does not constrain the DP. Feasibility comes from SOC-state transitions and power limits.
 

@@ -69,6 +69,69 @@ value is avoided import or net export revenue, less wear cost per discharged DC
 kWh. Fixed monthly connection/capacity charges are excluded because a schedule
 cannot change them.
 
+### Charge-rate units — the one contract
+
+Two different quantities were both called "the charge rate", and the confusion
+cost a factor of `efficiency` on every learned observation.
+
+| Name | Meaning | Where it appears |
+| --- | --- | --- |
+| `charge_input_dc_kw` | DC power at the battery terminal, **before** retention | `charge_rate_kw` in `apps.yaml`, `SocProjectionParams.charge_rate`, the DP's per-slot rate, `|P_bat|` for the thermal model |
+| `stored_charge_kw` | rate at which **stored** energy grows | every learning observation, persisted as-is |
+| `grid_charge_ac_kwh` | AC energy purchased to charge | the import cost |
+
+```text
+stored_charge_kw    = charge_input_dc_kw * efficiency
+grid_charge_ac_kwh  = grid_charge_dc_kwh / inverter_efficiency
+                    = stored_kwh / (efficiency * inverter_efficiency)
+```
+
+Storing 1 kWh from the grid at `efficiency=0.85` and `inverter_efficiency=0.97`
+therefore imports **1.21286 kWh** AC. DC-coupled PV surplus charges the pack
+without the grid inverter conversion and is billed at neither the import price
+nor that loss.
+
+**`BatteryLearningEngine.get_charge_rate_for_soc` is the boundary.** It returns
+`charge_input_dc_kw`, for both the nominal fallback (already a terminal power)
+and learned observations (stored-side, divided by the configured
+`efficiency` on the way out). Every consumer can then keep doing
+`rate * efficiency * duration`, and a nominal rate and an equivalent learned
+observation predict identical physics.
+
+Consequences worth stating, because the defect was invisible without them:
+
+- Replaying a learned observation reproduces it. A 40 % → 50 % charge in 15 min
+  on a 10 kWh pack projects to 50 %, not 48.5 % as before.
+- The conversion uses the **configured** `efficiency`, not `learned_efficiency`,
+  because that is the constant every consumer multiplies back in. Dividing out
+  with one factor and multiplying back with another would reintroduce the
+  mismatch.
+- Persisted learning files are **unchanged**: observations always were, and
+  remain, `stored_charge_kw`. There is no migration and no repeated division on
+  reload. `tests/test_charge_rate_units.py` pins save → load → save → load.
+- `learned_efficiency` is **not** currently a measurement. The only input it
+  could be learned from is an independent AC meter reading for the charge
+  interval, and there is none; `cost_tracker` used to pass
+  `stored_energy / configured_efficiency`, whose quotient with the stored energy
+  is the configured constant by construction. That input was removed, the
+  tautological value is rejected, and `learned_efficiency` stays at the
+  configured value until a real measurement exists.
+
+### The shared slot transition (`slot_energy.py`)
+
+`slot_energy.simulate_slot` is the one pure function that answers *where every
+kWh of a slot came from and went to*: stored energy in/out, the PV and grid
+shares of a charge, AC served, grid import, export, and the AC demand a plan
+credited to the battery that the battery could not supply
+(`unmet_battery_ac_kwh`). It has no clock, no forecast and no learning engine —
+callers pass the rate capability they decided on.
+
+`soc_projection.project_slot_soc` delegates to it, so the SOC view and the
+energy view of a slot cannot drift apart. It reports what the pack **actually**
+stored or delivered; the uncapped request is kept separately in
+`requested_dc_energy_*`. Treating a request as delivered energy is precisely how
+credited energy gets created out of nothing.
+
 ## SOC transitions and discretization
 
 The state is `(time, discretized stored energy)`. Each reachable state retains
@@ -76,14 +139,170 @@ the best cumulative value and a predecessor for backtracking. Transitions obey
 `min_soc`, `max_soc`, charge/discharge power limits, PV availability, and the
 remaining fraction of the current interval.
 
-Continuous energy is mapped conservatively to the discrete grid: a transition
-must never credit energy that is not physically present. A smaller
-`soc_step_percent` reduces this conservative quantization error at the cost of
-more states and CPU time.
+### Conservative quantization: bucket label plus exact path energy
 
-Temperature-aware charge rates are predicted before the DP from the learned
-SOC/temperature model. These are planning estimates; actual SOC deviation can
-trigger a re-optimization.
+A DP state used to *be* the energy of its grid point, and a discharge was
+rounded to the **nearest** grid point. Nearest rounding is unbiased only for a
+random signal. A constant load on a constant slot length produces the same
+error with the same sign in every slot: at 0.14 kWh per slot on a 0.10 kWh grid
+the planner deducted 0.10 kWh twenty times and credited 2.8 kWh of battery
+service from a battery holding 2.0 kWh, publishing 15 % SOC after 15 slots for
+a pack its own model had already emptied. The old no-free-lunch guard caught
+only the sub-step case, never the systematic one.
+
+Rounding **down** instead is safe but far too pessimistic on its own. Measured
+on that same reproduction, floor-to-grid serves 1.40 kWh of the 2.00 kWh
+available and discards 30 % of it, discharging for 10 slots instead of 15. A
+15-minute slot on the reference installation routinely moves barely two grid
+steps, so that is the normal case. Buying the accuracy back by shrinking
+`soc_step_percent` costs proportionally more states and CPU — over a 132-slot
+horizon with a partial first slot: 1 % → 125 ms, 0.5 % → 241 ms, 0.25 % →
+527 ms.
+
+So the grid stays where it is and each state carries **both**:
+
+- an **index**, floored, so a state's label never claims energy the path does
+  not hold. The index is what merges paths — it is the resolution of the
+  *optimization*.
+- `dp_energy[idx]`, the **exact** continuous energy of the best path reaching
+  that bucket. Every transition is computed from it.
+
+The consequences are worth being precise about:
+
+- **Physics is exact.** No transition can create a joule; the initial observed
+  energy is kept exactly; replaying the backtracked plan continuously reproduces
+  the planner's own trajectory to floating-point precision.
+- **The merging is the approximation.** Two paths in one bucket differ by up to
+  one step and only the better-valued one survives. Ties are broken toward the
+  path holding more energy, which is a genuine dominance rule (more energy can
+  only widen later options). The optimality gap is bounded by one step times the
+  marginal value of a kWh; the solver is exact for its discretized model, and an
+  approximation of the continuous problem.
+- **Energy-limited candidates pay the grid.** A discharge delivers what the pack
+  has; whatever it cannot cover is charged to the grid at the import price in the
+  same slot. No threshold decides whether a slot "counts" — the energy does. The
+  old `> min_energy + dc * 0.5` and `* 0.3` thresholds are gone.
+- **The published SOC trajectory is built from the path's energies**, not from
+  grid indices.
+
+`soc_step_percent` therefore now controls only how aggressively distinct paths
+are merged, not how much energy the plan may invent.
+
+### Final-plan replay
+
+`plan_validation.replay_plan` walks the **final** action sequence — after any
+orchestrator postprocessing — through `slot_energy.simulate_slot` in continuous
+energy, and `BatteryOptimizer._validate_final_plan` runs it as the last step of
+`find_optimal_schedule`, on the plan that will actually execute. It checks, at
+every prefix and **before** any SOC clamping:
+
+```text
+cumulative stored-DC discharge
+    <= initially usable stored-DC energy + cumulative actual stored-DC charge
+```
+
+plus the AC energy served after inverter loss, the AC demand the plan assigned
+to the battery that the battery could not supply, and agreement with the
+trajectory about to be published.
+
+The trajectory tolerance is one tenth of a DP grid step. That number is derived
+from the representation, not fitted to an observed error: the planner and the
+replay evaluate the same closed-form transition on the same fixed forecasts and
+the same per-slot rates, so they can differ only by floating-point accumulation
+— on the order of `n_slots * 2.2e-16 * capacity`, about 1e-12 SOC % over a
+132-slot horizon. A tenth of a step is astronomically above that and far below
+anything quantization could explain, so a breach is a model disagreement.
+
+A breach is reported (ERROR for conservation, WARNING for trajectory
+disagreement) and never silently rewrites the plan.
+
+### Charge rates that match the SOC and temperature the plan reaches
+
+The rate used to come from a time-indexed array built by advancing SOC and
+temperature *as if charging ran continuously from now*, and the DP then applied
+that one number to every reachable state at that time. Both halves were wrong,
+in opposite directions:
+
+- imaginary charging warmed a cold pack, so a later planned charge looked faster
+  than the selected path could achieve;
+- imaginary charging pushed SOC into a taper region, so paths that stayed low or
+  discharged were denied capability they actually had.
+
+**SOC dependence is now exact.** The rate is evaluated per candidate transition,
+from that state's own energy, memoized by `(soc, slot temperature)`. When the
+rate turns out not to vary across the SOC grid — a fresh install on the nominal
+rate, or a flat learned curve — the per-slot energies are hoisted back out of
+the state loop. That is a performance hint only, and
+`tests/test_dp_rate_compatibility.py` pins that the two paths produce identical
+plans.
+
+**Temperature depends on history**, which a one-dimensional energy state cannot
+carry, so it needs an explicit design decision. The chosen one is a **bounded
+solve / replay / refine**:
+
+| Pass | What it plans with |
+| --- | --- |
+| 0 | the **idle** temperature profile — the pack is only as warm as it would be with no battery activity at all, so no heat can come from an action the plan has not committed to |
+| n | the profile produced by replaying the *selected* plan through the shared `TemperatureProjector`, with warming driven by **actual** battery flow |
+
+It stops on a fixed point, on a repeated profile (oscillation), or on the pass
+budget (`MAX_RATE_REFINEMENT_PASSES = 3`, plus at most one conservative final
+solve). Two profiles count as the same when their temperatures agree within
+0.25 C **or** when they imply the same charge capability at every state of the
+DP's SOC grid — temperature only reaches the plan through the rate, and a pack
+that keeps warming inside one temperature bucket would otherwise never settle.
+
+On oscillation or exhaustion it falls back to the pass-0 idle profile and solves
+once more. **Limits of that fallback, stated rather than implied:**
+
+- It is conservative only where the rate is non-decreasing in temperature — the
+  physical case, and the one the learning engine's temperature buckets describe.
+  With a non-monotonic learned curve it is an approximation, not a bound, and
+  what catches that is the final replay, not this loop.
+- A fixed point is not a proof of global optimality. **The solver is exact for
+  its discretized model given a temperature profile; the profile itself is an
+  outer approximation.**
+- A conservative fallback under-charges rather than over-charges. The final
+  replay does not flag that, because it is the safe direction.
+
+Warming follows `simulate_slot`'s actual `battery_power_kw`, so a full pack
+ordered to charge — or an empty one ordered to discharge — moves nothing and
+warms nothing. Imaginary power must not manufacture future charging capability.
+Forecasts are computed once and reused across every refinement pass, so a moving
+input cannot masquerade as a failure to converge.
+
+**Within-slot approximation.** The DP charges a slot at the rate implied by the
+temperature at its *start*, and the replay does the same, so the two agree
+exactly. A threshold crossed mid-slot is therefore mis-modelled by at most
+`(warm_rate - cold_rate) * slot_hours` of stored energy in that slot. The
+expected-SOC trajectory's `predict_charge_input_dc_energy` splits the slot into
+a cold and a warm phase, which is finer; the difference is bounded by the same
+quantity.
+
+Two designs were rejected:
+
+- **Discretized temperature in the DP state.** The clearest formulation, but it
+  multiplies the state count by the number of temperature buckets, and the
+  partial-first-slot lookahead already runs the whole DP once per candidate. The
+  normal 132-slot horizon would go from ~140 ms to well over a second on the
+  single AppDaemon thread.
+- **A fixed conservative temperature.** "Coldest plausible" is not a valid bound
+  over reachable conditions once SOC tapering and non-monotonic rate behaviour
+  are in play, and it would refuse to plan the warm-pack charging the
+  installation actually does.
+
+**Runtime**, 132-slot horizon (33 h at 15-minute slots), 14.3 kWh pack, median
+of five runs, with and without a partial first slot:
+
+| Rate curve | 1 % step (91 states) | 0.5 % (181) | 0.25 % (361) |
+| --- | --- | --- | --- |
+| flat | 36 / 140 ms | 74 / 267 ms | 143 / 602 ms |
+| SOC taper | 56 / 200 ms | 110 / 425 ms | 208 / 842 ms |
+| SOC + temperature, converges in 1 pass | 61 / 202 ms | 117 / 416 ms | 236 / 829 ms |
+| worst case: 3 refinement passes + fallback | 185 / 728 ms | 198 / 734 ms | 389 / 1456 ms |
+
+These are planning estimates; an actual SOC deviation still triggers a
+re-optimization.
 
 ### One bound on the learned charge rate
 

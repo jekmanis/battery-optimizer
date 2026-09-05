@@ -25,6 +25,13 @@ Invariants (see also docs/scheduling-algorithm.md):
    serves ``max(0, load - pv)`` and stores ``max(0, pv - load)``.
 3. Battery-side (DC) energy is what moves the SOC. AC load served is converted
    with ``inverter_efficiency``; storage retention uses ``efficiency``.
+
+Charge-rate units: ``params.charge_rate`` and anything returned by
+``learning_engine.get_charge_rate_for_soc`` are ``charge_input_dc_kw`` --
+terminal power BEFORE retention. Stored energy is ``rate * efficiency *
+duration``. See ``learning_engine``'s module docstring for the full contract and
+``slot_energy.simulate_slot`` for the same transition with every grid/PV flow
+named.
 """
 
 import datetime  # noqa: F401  (kept for type-hint friendliness of callers)
@@ -32,6 +39,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .models import BatteryMode
+from .slot_energy import params_from_soc_projection, simulate_slot
 from .thermal_model import battery_power_for_entry
 
 
@@ -41,7 +49,7 @@ class SocProjectionParams:
 
     battery_capacity: float          # kWh
     efficiency: float                # storage retention factor (0-1)
-    charge_rate: float               # kW (nominal, used when no learned rate)
+    charge_rate: float               # charge_input_dc_kw (nominal fallback)
     discharge_rate: float            # kW (AC side, self-consumption cap)
     export_discharge_rate: float = 0.0   # kW (0 = fall back to discharge_rate)
     inverter_efficiency: float = 1.0     # AC<->DC conversion efficiency
@@ -65,12 +73,23 @@ class SocProjectionParams:
 
 @dataclass
 class SocTransition:
-    """Result of projecting a single slot."""
+    """Result of projecting a single slot.
+
+    ``dc_energy_in_kwh`` / ``dc_energy_out_kwh`` are what the battery ACTUALLY
+    stored and delivered, after the SOC limits truncated the request. The
+    request is kept separately in ``requested_dc_energy_*`` for consumers that
+    need to show "wanted 1.0 kWh, got 0.04". Reporting the request as delivered
+    energy is how credited energy gets created out of nothing -- ``cost_tracker``
+    used to re-derive the cap itself to work around it.
+    """
 
     soc_end: float
     temp_end: Optional[float] = None
     dc_energy_in_kwh: float = 0.0
     dc_energy_out_kwh: float = 0.0
+    requested_dc_energy_in_kwh: float = 0.0
+    requested_dc_energy_out_kwh: float = 0.0
+    unmet_battery_ac_kwh: float = 0.0
 
 
 def _effective_charge_rate(
@@ -147,46 +166,52 @@ def project_slot_soc(
     rate_soc = rate_lookup_soc if rate_lookup_soc is not None else soc_start
     charge_rate = _effective_charge_rate(params, rate_soc, temp_start, learning_engine)
 
-    capacity = params.battery_capacity if params.battery_capacity > 0 else 1e-9
     inv_eff = params.inverter_efficiency if params.inverter_efficiency > 0 else 1.0
-
-    dc_in = 0.0
-    dc_out = 0.0
     temp_end = temp_start
 
-    if mode == BatteryMode.CHARGE:
-        if temp_start is not None and learning_engine is not None:
-            energy_ac, temp_end = learning_engine.predict_charge_energy_with_warming(
+    # The charge capability this slot is planned with, in charge_input_dc_kw.
+    # With temperature AND a learning engine the rate varies WITHIN the slot
+    # (cold phase then warm phase), so the warming-aware energy is converted
+    # back to the equivalent constant terminal power for the shared transition.
+    slot_charge_input_dc_kw = charge_rate
+    if (
+        mode == BatteryMode.CHARGE
+        and temp_start is not None
+        and learning_engine is not None
+    ):
+        # charge_input_dc_kwh: DC energy at the battery terminal, before
+        # retention. Multiplying by `efficiency` gives stored energy. (The
+        # variable used to be called `energy_ac`, which it never was.)
+        charge_input_dc_kwh, temp_end = (
+            learning_engine.predict_charge_input_dc_energy(
                 rate_soc,
                 temp_start,
                 duration_minutes,
                 temp_threshold=temp_threshold,
             )
-            dc_in = energy_ac * params.efficiency
-        else:
-            # No temperature and/or no learning engine: flat rate, temp unknown.
-            dc_in = charge_rate * params.efficiency * duration_hours
-        soc_end = min(params.max_soc, soc_start + (dc_in / capacity) * 100)
-
-    elif mode == BatteryMode.DISCHARGE and export_rate is not None and export_rate > 0:
-        # Grid export: battery discharges at the export rate regardless of load.
-        dc_out = params.effective_export_discharge_rate * duration_hours / inv_eff
-        soc_end = max(params.min_soc, soc_start - (dc_out / capacity) * 100)
+        )
+        if duration_hours > 0:
+            slot_charge_input_dc_kw = charge_input_dc_kwh / duration_hours
+    elif mode != BatteryMode.CHARGE:
         temp_end = _idle_temp(learning_engine, temp_start, duration_minutes)
 
-    elif mode == BatteryMode.DISCHARGE:
-        # Self-consumption: battery serves the net load; PV surplus charges it.
-        ac_served = min(net_load_kw, params.discharge_rate) * duration_hours
-        dc_out = ac_served / inv_eff
-        dc_in = min(pv_surplus_kw, charge_rate) * params.efficiency * duration_hours
-        soc = min(params.max_soc, soc_start + (dc_in / capacity) * 100)
-        soc_end = max(params.min_soc, soc - (dc_out / capacity) * 100)
-        temp_end = _idle_temp(learning_engine, temp_start, duration_minutes)
-
-    else:  # HOLD
-        dc_in = min(pv_surplus_kw, charge_rate) * params.efficiency * duration_hours
-        soc_end = min(params.max_soc, soc_start + (dc_in / capacity) * 100)
-        temp_end = _idle_temp(learning_engine, temp_start, duration_minutes)
+    # THE physical transition. Delegated rather than re-derived, so the SOC view
+    # and the energy view of a slot cannot drift apart (they did: this function
+    # reported the uncapped request as delivered energy).
+    energy_params = params_from_soc_projection(params)
+    outcome = simulate_slot(
+        stored_energy_kwh=soc_start / 100.0 * params.battery_capacity,
+        mode=mode,
+        params=energy_params,
+        charge_input_dc_kw=slot_charge_input_dc_kw,
+        load_kw=load_kw,
+        pv_kw=pv_kw,
+        fraction=fraction,
+        is_export=bool(export_rate is not None and export_rate > 0),
+    )
+    dc_in = outcome.stored_dc_in_kwh
+    dc_out = outcome.stored_dc_out_kwh
+    soc_end = energy_params.soc_of(outcome.energy_end_kwh)
 
     if temp_projector is not None and temp_start is not None:
         # One thermal model for every mode. |P_bat| is derived by the same
@@ -210,6 +235,11 @@ def project_slot_soc(
         temp_end=temp_end,
         dc_energy_in_kwh=dc_in,
         dc_energy_out_kwh=dc_out,
+        requested_dc_energy_in_kwh=(
+            outcome.requested_charge_input_dc_kwh * params.efficiency
+        ),
+        requested_dc_energy_out_kwh=outcome.requested_stored_dc_out_kwh,
+        unmet_battery_ac_kwh=outcome.unmet_battery_ac_kwh,
     )
 
 

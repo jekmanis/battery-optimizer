@@ -79,6 +79,7 @@ from battery_optimizer_lib import (
     AmbientServiceConfig,
 )
 from battery_optimizer_lib.direct_control import ApplyOutcome
+from battery_optimizer_lib.plan_validation import PlanReplay, replay_plan
 from battery_optimizer_lib.models import ScheduleModeCounts, count_schedule_modes
 from battery_optimizer_lib.pv_profile import PvProfile
 from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
@@ -1487,6 +1488,26 @@ class BatteryOptimizer(hass.Hass):
         self._last_dp_soc_trajectory = soc_trajectory
         self._last_dp_temp_trajectory = temp_trajectory
 
+        # Replay the FINAL action sequence — after any postprocessing — through
+        # the shared physical model and check it against the trajectory about to
+        # be published. Deliberately the last thing this method does, so it sees
+        # the plan that executes and not an intermediate generation.
+        #
+        # getattr, like the terminal-value warning gate above: several test
+        # doubles borrow this method without the full app surface.
+        _validate = getattr(self, "_validate_final_plan", None)
+        if callable(_validate):
+            _validate(
+                schedule=schedule,
+                soc_trajectory=soc_trajectory,
+                starting_soc=current_soc_for_calc,
+                starting_temp=current_temp,
+                current_slot=current_slot,
+                minutes_into_slot=minutes_into_slot,
+                prices_sorted=slots_sorted_by_time,
+                planning_temp_by_slot=getattr(result, "planning_temp_by_slot", None),
+            )
+
         return schedule
 
     def _ensure_current_slot_price(
@@ -1761,6 +1782,114 @@ class BatteryOptimizer(hass.Hass):
             current_temp = transition.temp_end
 
         return soc_trajectory, temp_trajectory
+
+    def _validate_final_plan(
+        self,
+        *,
+        schedule: Dict[datetime.datetime, ScheduleEntry],
+        soc_trajectory: Dict[datetime.datetime, Tuple[float, float]],
+        starting_soc: float,
+        starting_temp: Optional[float],
+        current_slot: Optional[datetime.datetime],
+        minutes_into_slot: float,
+        prices_sorted: Optional[List[PricePoint]] = None,
+        planning_temp_by_slot: Optional[Dict[datetime.datetime, Optional[float]]] = None,
+    ) -> Optional["PlanReplay"]:
+        """Replay the published plan and report physical disagreement.
+
+        A schedule is chosen on a discrete SOC grid and then published: the log,
+        the expected-SOC trajectory, the projected cost column and the deviation
+        detector all describe it, and they all inherit the planner's arithmetic.
+        Clamping the reported SOC into range hides an infeasible path entirely.
+        So the FINAL action sequence is walked once more through
+        ``slot_energy.simulate_slot`` in continuous energy, and the result is
+        compared with the trajectory about to be published.
+
+        Tolerance: the two evaluate the same closed-form transition on the same
+        fixed forecasts and the same per-slot rates, so they should differ only
+        by floating-point accumulation — bounded by roughly
+        ``n_slots * 2.2e-16 * capacity``, i.e. ~1e-12 SOC % over a 132-slot
+        horizon. A tenth of one DP grid step is therefore orders of magnitude
+        above float noise while still being far too small to be quantization:
+        anything above it is a model disagreement, not rounding. The tolerance
+        is derived from the representation, not fitted to an observed error.
+
+        Non-fatal by design: it reports, it does not silently rewrite a plan.
+        """
+        if not schedule:
+            return None
+        try:
+            dp_config = DPOptimizerConfig.from_main_config(
+                self.config, min_soc=self.min_soc, max_soc=self.max_soc
+            )
+            prices_by_slot = None
+            if prices_sorted:
+                prices_by_slot = {
+                    canonical_slot_key(p.time): p.price for p in prices_sorted
+                }
+            planned_end_soc = {
+                slot: pair[1] for slot, pair in (soc_trajectory or {}).items()
+            }
+            tolerance = max(1e-6, 0.1 * self.config.soc_step_percent)
+            replay = replay_plan(
+                schedule=schedule,
+                config=dp_config,
+                starting_soc=starting_soc,
+                predict_load_kw=self._predict_load_kw,
+                predict_pv_kw=self._predict_pv_kw,
+                # Rates are looked up at the temperature the PLAN was built
+                # with, per slot, falling back to the replay's own temperature.
+                # Using a different temperature here would turn a deliberately
+                # conservative planning profile into a reported disagreement.
+                charge_rate_for=(
+                    lambda slot, soc, temp: self.learning_engine.get_charge_rate_for_soc(
+                        soc,
+                        (planning_temp_by_slot or {}).get(slot, temp),
+                    )
+                ),
+                current_slot=current_slot,
+                minutes_into_slot=minutes_into_slot,
+                starting_temp=starting_temp,
+                temp_projector=getattr(self, "_temp_projector", None),
+                prices_by_slot=prices_by_slot,
+                planned_soc_by_slot=planned_end_soc or None,
+                soc_tolerance=tolerance,
+                slot_matcher=lambda slot, target: datetimes_match_slot(
+                    slot, target, self._get_local_timezone()
+                ),
+            )
+        except Exception as err:  # pragma: no cover - never break planning
+            self.log(f"Plan replay validation skipped: {err}", level="DEBUG")
+            return None
+
+        self._last_plan_replay = replay
+        if replay.conservation_violations:
+            self.log(
+                "Plan replay: the published plan discharges more than it holds — "
+                + replay.conservation_violations[0]
+                + f" ({len(replay.conservation_violations)} slot(s))",
+                level="ERROR",
+            )
+        if replay.trajectory_disagreements:
+            self.log(
+                "Plan replay: published SOC trajectory disagrees with the shared "
+                f"physical model by more than {tolerance:.4f}% — "
+                + replay.trajectory_disagreements[0]
+                + f" ({len(replay.trajectory_disagreements)} slot(s))",
+                level="WARNING",
+            )
+        if (
+            replay.total_unmet_battery_ac_kwh > 1e-6
+            and getattr(self.config, "decision_log_level", 0) >= 1
+        ):
+            self.log(
+                "Plan replay: "
+                f"{replay.total_unmet_battery_ac_kwh:.3f} kWh of planned battery "
+                "service runs the pack dry and is covered by the grid "
+                f"(battery serves {replay.total_battery_ac_served_kwh:.2f} kWh, "
+                f"imports {replay.total_grid_import_ac_kwh:.2f} kWh)"
+            )
+        return replay
 
     # =========================================================================
     # Schedule Execution

@@ -1151,7 +1151,7 @@ class _WarmingChargeEngine:
     def get_charge_rate_for_soc(self, soc, temp=None):
         return None  # force the flat branch to use the configured nominal rate
 
-    def predict_charge_energy_with_warming(
+    def predict_charge_input_dc_energy(
         self, current_soc, start_temp, duration_minutes, temp_threshold=16.0
     ):
         self.warming_calls.append((current_soc, start_temp, duration_minutes))
@@ -1169,7 +1169,7 @@ class TestProjectCostsUsesTheLearnedChargeModel:
     and ``temp_start``, so its CHARGE slots silently fell back to the flat
     ``charge_rate * efficiency * duration`` while
     ``project_schedule_trajectory`` - which passes both - used
-    ``predict_charge_energy_with_warming``.  One log then carried two different
+    ``predict_charge_input_dc_energy``.  One log then carried two different
     charge models, the contradiction that adopting the shared model was
     supposed to remove.
     """

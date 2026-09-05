@@ -87,8 +87,9 @@ def compute_charge_rates_per_slot(
                 projected_temp, slot.time, slot_duration_minutes, rate
             )
             if project_soc:
-                energy_kwh = rate * efficiency * slot_hours * slot_fractions[i]
-                projected_soc = min(max_soc, projected_soc + (energy_kwh / battery_capacity) * 100)
+                # `rate` is charge_input_dc_kw; * efficiency = stored energy.
+                stored_kwh = rate * efficiency * slot_hours * slot_fractions[i]
+                projected_soc = min(max_soc, projected_soc + (stored_kwh / battery_capacity) * 100)
     else:
         # Fallback: project SOC only (no temperature data)
         projected_soc = current_soc
@@ -96,7 +97,8 @@ def compute_charge_rates_per_slot(
             rate = get_charge_rate_for_soc(projected_soc, None)
             charge_rates.append(rate)
             if project_soc:
-                energy_kwh = rate * efficiency * slot_hours * slot_fractions[i]
-                projected_soc = min(max_soc, projected_soc + (energy_kwh / battery_capacity) * 100)
+                # `rate` is charge_input_dc_kw; * efficiency = stored energy.
+                stored_kwh = rate * efficiency * slot_hours * slot_fractions[i]
+                projected_soc = min(max_soc, projected_soc + (stored_kwh / battery_capacity) * 100)
 
     return charge_rates

@@ -8,7 +8,7 @@ dynamic programming with temperature-aware charge rate predictions.
 import datetime
 import math
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -16,8 +16,69 @@ if TYPE_CHECKING:
 
 from .models import BatteryMode, PricePoint, ScheduleEntry
 from .charge_rate_utils import compute_charge_rates_per_slot
+from .slot_energy import SlotEnergyParams, simulate_slot
 from .thermal_model import battery_power_for_entry
 from .timezone_utils import canonical_slot_key, instant_key
+
+
+# ---------------------------------------------------------------------------
+# Charge rates that match the SOC and temperature the plan actually reaches
+# ---------------------------------------------------------------------------
+#
+# The rate used to come from a time-indexed array built by advancing SOC and
+# temperature "as if charging ran continuously from now", and `_run_dp` then
+# applied that one number to every reachable state at that time. Both halves
+# were wrong in opposite directions: imaginary charging warmed a cold pack, so
+# a later planned charge looked faster than the selected path could achieve;
+# and imaginary charging pushed SOC into a taper region, so paths that stayed
+# low or discharged were denied capability they had.
+#
+# SOC dependence is now exact: the rate is evaluated per candidate transition,
+# from that state's own energy, cached by (soc, slot temperature).
+#
+# Temperature depends on HISTORY, which a 1-D energy state cannot carry. Of the
+# three designs available, this is a BOUNDED SOLVE / REPLAY / REFINE:
+#
+#   pass 0  plan with the IDLE temperature profile -- the pack is only as warm
+#           as it would be with no battery activity at all, so no heat can come
+#           from an action the plan has not committed to;
+#   pass n  replay the selected plan through the shared TemperatureProjector
+#           (warming from ACTUAL battery flow, so a full pack ordered to charge
+#           contributes nothing), re-derive the profile, and solve again;
+#   stop    on a fixed point (profiles agree within TEMP_FIXED_POINT_C), on a
+#           repeated profile (oscillation), or on the pass budget.
+#
+# On oscillation or exhaustion it falls back to the pass-0 idle profile and
+# solves once more. Limits of that fallback, stated rather than implied:
+#
+#   * It is CONSERVATIVE only where the rate is non-decreasing in temperature --
+#     the physical case, and the one the learning engine's temperature buckets
+#     describe (a cold pack charges slower). With a non-monotonic learned curve
+#     it is an approximation, not a bound, and what catches that is the final
+#     replay in `plan_validation`, not this loop.
+#   * A fixed point is not a proof of global optimality. The solver is exact for
+#     its discretized model GIVEN a temperature profile; the profile itself is
+#     an outer approximation.
+#
+# Rejected: putting discretized temperature in the DP state. It is the clearest
+# formulation, but it multiplies the state count by the number of temperature
+# buckets, and the partial-first-slot lookahead already runs the whole DP once
+# per candidate -- the normal 132-slot horizon would go from ~125 ms to well
+# over a second on the single AppDaemon thread.
+#
+# Also rejected: a fixed conservative temperature. "Coldest plausible" is not a
+# valid bound over reachable conditions once SOC tapering and non-monotonic rate
+# behaviour are in play, and it would refuse to plan the warm-pack charging the
+# installation actually does.
+
+# Solves per optimize() call: this many, plus at most one conservative final
+# solve when the refinement oscillates or runs out of passes.
+MAX_RATE_REFINEMENT_PASSES = 3
+
+# Two temperature profiles are "the same" within this much (C). Coarser than
+# the thermal model's resolution and far finer than the learning engine's 5 C
+# temperature buckets, so it terminates without changing which bucket is used.
+TEMP_FIXED_POINT_C = 0.25
 
 
 def _energy_to_index(
@@ -34,9 +95,9 @@ def _energy_to_index(
         min_energy: Minimum energy bound in kWh
         step_kwh: Energy step size in kWh
         n_states: Number of DP states
-        direction: "floor" (after charge — never credit energy that was not
-            stored), "round" (neutral). Discharge transitions go through
-            _discharge_index, which wraps "round" with a no-free-lunch guard.
+        direction: "floor" for every state transition — a state's LABEL must
+            never claim more energy than the path holds. "round"/"ceil" survive
+            for reporting helpers only.
 
     Returns:
         Clamped index in [0, n_states - 1]
@@ -53,26 +114,42 @@ def _energy_to_index(
     return min(max(idx, 0), n_states - 1)
 
 
-def _discharge_index(
-    new_energy: float,
-    start_idx: int,
-    min_energy: float,
-    step_kwh: float,
-    n_states: int,
-) -> int:
-    """Post-discharge state index: nearest rounding with a no-free-lunch guard.
-
-    Nearest rounding keeps the quantization error zero-mean so the DP is not
-    systematically biased against discharging. The guard prevents a sub-step
-    discharge from rounding back to (or above) its starting state, which would
-    let the DP serve load repeatedly with no SOC cost.
-    """
-    idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "round")
-    if idx >= start_idx:
-        idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "floor")
-        if idx >= start_idx:
-            idx = max(0, start_idx - 1)
-    return idx
+# ---------------------------------------------------------------------------
+# The state representation: bucket LABEL + the path's EXACT energy
+# ---------------------------------------------------------------------------
+#
+# A DP state used to be identified with the energy of its grid point, and a
+# discharge was rounded to the NEAREST grid point. That is only unbiased for a
+# random signal. A constant load on a constant slot length produces the same
+# error, with the same sign, in every slot: at 0.14 kWh per slot on a 0.10 kWh
+# grid the DP deducted 0.10 kWh twenty times and credited 2.8 kWh of service
+# from a 2.0 kWh battery. `_discharge_index`'s no-free-lunch guard caught only
+# the sub-step case, never the systematic one.
+#
+# Rounding DOWN instead is safe but far too pessimistic to use on its own:
+# measured on the same reproduction, floor-to-grid serves 1.40 kWh of the
+# 2.00 kWh the pack holds and throws 30 % of it away, discharging for 10 slots
+# instead of 15. A 15-minute slot on the reference installation routinely moves
+# barely two grid steps, so this is the normal case, not an edge case. Reaching
+# an acceptable loss by shrinking `soc_step_percent` costs proportionally more
+# states and CPU (measured over a 132-slot horizon with a partial first slot:
+# 1 % -> 125 ms, 0.5 % -> 241 ms, 0.25 % -> 527 ms).
+#
+# So the grid stays where it is and the state carries BOTH:
+#
+#   * an index, floored, so a state's label never claims energy the path does
+#     not hold; the index is what merges paths, i.e. it is the resolution of
+#     the OPTIMIZATION;
+#   * `dp_energy[idx]`, the EXACT continuous energy of the best path reaching
+#     that bucket, which is what every transition is computed from.
+#
+# Physics is therefore exact: no transition can create a joule, and replaying
+# the backtracked plan continuously reproduces the planner's own trajectory to
+# floating-point precision. What remains approximate is the MERGING: two paths
+# in one bucket differ by up to one step, and only the better-valued one
+# survives (ties are broken toward the one with more energy, which is a genuine
+# dominance rule). That is an approximation of the optimum, bounded by one step
+# times the marginal value of a kWh -- not a licence to invent energy.
 
 
 @dataclass
@@ -140,6 +217,16 @@ class DPOptimizerResult:
     export_slot_count: int = 0
     self_consume_slot_count: int = 0
     terminal_value_eur_kwh: Optional[float] = None
+    # Rate/temperature refinement diagnostics (see the module header).
+    rate_refinement_passes: int = 1
+    rate_refinement_converged: bool = True
+    rate_refinement_fallback: bool = False
+    # Start-of-slot temperature the plan was BUILT with, per slot. The final
+    # replay must look rates up at these, or a conservative fallback profile
+    # would read as a trajectory disagreement.
+    planning_temp_by_slot: Dict[datetime.datetime, Optional[float]] = field(
+        default_factory=dict
+    )
 
 
 class DPOptimizer:
@@ -179,6 +266,9 @@ class DPOptimizer:
         # the legacy mode-specific predictors are used so existing callers and
         # tests keep working.
         self._temp_projector = temp_projector
+        # (soc, temperature) -> charge_input_dc_kw, reset per optimize() call.
+        self._rate_cache: Dict[Tuple[float, Optional[float]], float] = {}
+        self._rate_soc_dependent = True
         # Whether a terminal value pinned to 0 (legacy/degenerate mode) is
         # surfaced at WARNING from this optimizer instance. The orchestrator
         # sets it only for the daily/full optimization so the adaptive
@@ -274,17 +364,18 @@ class DPOptimizer:
                 current_slot_index = i
                 break
 
-        # Pre-compute temperature-aware charge rates for each slot
-        charge_rates_per_slot = self._compute_charge_rates_per_slot(
-            slots_sorted_by_time, slot_fractions, current_soc, current_temp
-        )
-
-        # Pre-compute load and PV per slot
+        # Pre-compute load and PV per slot. Fixed for the whole solve, including
+        # every refinement pass: a forecast that moved mid-refinement would be
+        # indistinguishable from a failure to converge.
         load_kw = [self._predict_load_kw(p.time) for p in slots_sorted_by_time]
         pv_kw = (
             [self._predict_pv_kw(p.time) for p in slots_sorted_by_time]
             if self._predict_pv_kw else None
         )
+
+        # Rate lookups are cached for this call only; the cache key is what
+        # actually determines the answer, (state SOC, slot temperature).
+        self._rate_cache = {}
 
         terminal_rate = self._derive_terminal_rate(slots_sorted_by_time)
         if self._decision_log_level >= 1:
@@ -315,36 +406,123 @@ class DPOptimizer:
                     f"net-load slots worth less than this are HELD"
                 )
 
-        # Run DP to build schedule
-        schedule, idx_trajectory, best_value = self._build_schedule(
-            slots_sorted_by_time=slots_sorted_by_time,
-            load_kw=load_kw,
-            charge_rates_per_slot=charge_rates_per_slot,
-            slot_fractions=slot_fractions,
-            current_slot_index=current_slot_index,
-            start_energy=start_energy,
-            min_energy=min_energy,
-            max_energy=max_energy,
-            step_kwh=step_kwh,
-            n_states=n_states,
-            energy_levels=energy_levels,
-            pv_kw=pv_kw,
+        # ------------------------------------------------------------------
+        # Bounded solve / replay / refine over the temperature profile
+        # ------------------------------------------------------------------
+        temp_profile = self._idle_temp_profile(
+            slots_sorted_by_time, slot_fractions, current_temp
         )
+        idle_profile = list(temp_profile)
+        refine = self._rate_is_temperature_sensitive(current_temp)
+        state_socs = (
+            [e / cfg.battery_capacity * 100 for e in energy_levels]
+            if cfg.battery_capacity else []
+        )
+        # Hoisting hint for the hot loop, not a modelling choice: when the rate
+        # is the same at every state, the per-slot derived energies are real
+        # constants again.
+        self._rate_soc_dependent = self._rate_is_soc_dependent(
+            state_socs, current_temp
+        )
+        seen_profiles: List[List[Optional[float]]] = []
+        passes = 0
+        converged = True
+        fallback_used = False
+
+        while True:
+            passes += 1
+            schedule, idx_trajectory, energy_trajectory, best_value = self._build_schedule(
+                slots_sorted_by_time=slots_sorted_by_time,
+                load_kw=load_kw,
+                temp_profile=temp_profile,
+                slot_fractions=slot_fractions,
+                current_slot_index=current_slot_index,
+                start_energy=start_energy,
+                min_energy=min_energy,
+                max_energy=max_energy,
+                step_kwh=step_kwh,
+                n_states=n_states,
+                energy_levels=energy_levels,
+                pv_kw=pv_kw,
+            )
+            if not refine:
+                break
+
+            replayed_profile, temp_pairs = self._replay_plan_temps(
+                slots_sorted_by_time,
+                slot_fractions,
+                schedule,
+                energy_trajectory,
+                start_energy,
+                current_temp,
+                load_kw,
+                pv_kw,
+                temp_profile,
+            )
+            if self._profiles_agree(replayed_profile, temp_profile, state_socs):
+                temp_profile = replayed_profile
+                break
+            if any(self._profiles_agree(replayed_profile, p, state_socs) for p in seen_profiles) \
+                    or passes >= MAX_RATE_REFINEMENT_PASSES:
+                # Oscillating, or out of budget. Plan on the profile that
+                # assumes no heat from any action the plan has not committed
+                # to, and stop.
+                converged = False
+                fallback_used = True
+                temp_profile = idle_profile
+                passes += 1
+                schedule, idx_trajectory, energy_trajectory, best_value = self._build_schedule(
+                    slots_sorted_by_time=slots_sorted_by_time,
+                    load_kw=load_kw,
+                    temp_profile=temp_profile,
+                    slot_fractions=slot_fractions,
+                    current_slot_index=current_slot_index,
+                    start_energy=start_energy,
+                    min_energy=min_energy,
+                    max_energy=max_energy,
+                    step_kwh=step_kwh,
+                    n_states=n_states,
+                    energy_levels=energy_levels,
+                    pv_kw=pv_kw,
+                )
+                break
+            seen_profiles.append(list(temp_profile))
+            temp_profile = replayed_profile
+
+        if fallback_used and self._decision_log_level >= 1:
+            self._log(
+                "Charge-rate refinement did not settle within "
+                f"{MAX_RATE_REFINEMENT_PASSES} passes; planning on the idle "
+                "temperature profile (no heat credited to actions the plan has "
+                "not committed to)."
+            )
 
         # Build SOC trajectory
         soc_trajectory = self._build_soc_trajectory(
-            slots_sorted_by_time, idx_trajectory, start_energy, min_energy, step_kwh, n_states
+            slots_sorted_by_time, energy_trajectory, start_energy
         )
 
-        # Build temperature trajectory
-        temp_trajectory = self._build_temp_trajectory(
+        # Build temperature trajectory from the FINAL plan, through the same
+        # replay the refinement uses — one thermal implementation, not two.
+        _final_profile, temp_pairs = self._replay_plan_temps(
             slots_sorted_by_time,
-            schedule,
             slot_fractions,
+            schedule,
+            energy_trajectory,
+            start_energy,
             current_temp,
-            charge_rates_per_slot=charge_rates_per_slot,
-            load_kw=load_kw,
-            pv_kw=pv_kw,
+            load_kw,
+            pv_kw,
+            temp_profile,
+        )
+        temp_trajectory = (
+            {}
+            if current_temp is None
+            else {
+                p.time: temp_pairs[i]
+                for i, p in enumerate(slots_sorted_by_time)
+                if i < len(temp_pairs)
+            }
         )
 
         # Count actions
@@ -366,6 +544,13 @@ class DPOptimizer:
             export_slot_count=export_slot_count,
             self_consume_slot_count=self_consume_slot_count,
             terminal_value_eur_kwh=terminal_rate,
+            rate_refinement_passes=passes,
+            rate_refinement_converged=converged,
+            rate_refinement_fallback=fallback_used,
+            planning_temp_by_slot={
+                p.time: (temp_profile[i] if i < len(temp_profile) else None)
+                for i, p in enumerate(slots_sorted_by_time)
+            },
         )
 
     def _buy_price(self, price: float) -> float:
@@ -431,6 +616,241 @@ class DPOptimizer:
             median_buy * cfg.inverter_efficiency - cfg.battery_wear_cost,
         )
 
+    # ------------------------------------------------------------------
+    # Charge rate: evaluated per candidate transition (see the module header)
+    # ------------------------------------------------------------------
+
+    def _rate_for(self, soc: float, temp: Optional[float]) -> float:
+        """``charge_input_dc_kw`` at this SOC and temperature, memoized.
+
+        The cache key is what actually determines the answer. A state's SOC is
+        rounded to 1e-6 % only so that float noise does not defeat the cache;
+        the temperature is used exactly, because a synthetic or learned rate
+        curve may have a threshold anywhere.
+        """
+        key = (round(soc, 6), temp)
+        cached = self._rate_cache.get(key)
+        if cached is None:
+            cached = max(0.0, float(self._get_charge_rate_for_soc(soc, temp) or 0.0))
+            self._rate_cache[key] = cached
+        return cached
+
+    def _probe_temps(self, current_temp: Optional[float]) -> List[Optional[float]]:
+        if current_temp is None:
+            return [None]
+        return [
+            current_temp - 5, current_temp, current_temp + 5,
+            current_temp + 10, current_temp + 15, current_temp + 25,
+        ]
+
+    def _rate_is_soc_dependent(
+        self, state_socs: List[float], current_temp: Optional[float]
+    ) -> bool:
+        """Whether the rate varies across the DP's own SOC grid.
+
+        When it does not -- a fresh install on the nominal rate, or a flat
+        learned curve -- the slot's rate is a genuine constant and the derived
+        per-slot energies can be hoisted out of the state loop, which is worth
+        about a third of the DP's runtime.
+
+        Sampled at the DP's own state resolution and at the same temperatures
+        the refinement can reach. A rate curve that differs ONLY strictly
+        between two adjacent grid points would be missed; that is a feature
+        narrower than the resolution the whole DP works at.
+        """
+        if not state_socs:
+            return False
+        for temp in self._probe_temps(current_temp):
+            base = self._rate_for(state_socs[0], temp)
+            for soc in state_socs[1:]:
+                if abs(self._rate_for(soc, temp) - base) > 1e-9:
+                    return True
+        return False
+
+    def _rate_is_temperature_sensitive(self, current_temp: Optional[float]) -> bool:
+        """Whether refinement can change anything at all.
+
+        With no temperature reading, or a rate curve that ignores temperature,
+        the profile cannot affect the plan and one solve is the whole answer.
+        Probing costs a handful of lookups and saves a whole extra DP pass in
+        the common case.
+        """
+        if current_temp is None:
+            return False
+        cfg = self._config
+        socs = [cfg.min_soc, (cfg.min_soc + cfg.max_soc) / 2, cfg.max_soc]
+        probes = self._probe_temps(current_temp)
+        for soc in socs:
+            base = self._rate_for(soc, probes[0])
+            for temp in probes[1:]:
+                if abs(self._rate_for(soc, temp) - base) > 1e-9:
+                    return True
+        return False
+
+    def _idle_temp_profile(
+        self,
+        slots_sorted_by_time: List[PricePoint],
+        slot_fractions: List[float],
+        current_temp: Optional[float],
+    ) -> List[Optional[float]]:
+        """Start-of-slot temperatures with NO battery activity at all.
+
+        This is pass 0 and the conservative fallback: heat can only come from
+        actions the plan has actually committed to.
+        """
+        if current_temp is None:
+            return [None] * len(slots_sorted_by_time)
+        profile: List[Optional[float]] = []
+        temp = current_temp
+        for i, slot in enumerate(slots_sorted_by_time):
+            profile.append(temp)
+            duration = self._config.slot_minutes * slot_fractions[i]
+            temp = self._step_temp(temp, slot.time, duration, 0.0, is_charge=False)
+        return profile
+
+    def _step_temp(
+        self,
+        temp: Optional[float],
+        slot_time,
+        duration_minutes: float,
+        battery_power_kw: float,
+        is_charge: bool,
+    ) -> Optional[float]:
+        """One thermal step, shared model first, legacy predictors second."""
+        if temp is None:
+            return None
+        if self._temp_projector is not None:
+            return self._temp_projector.project(
+                temp, slot_time, duration_minutes, battery_power_kw
+            )
+        # Legacy two-predictor interface. Warming still follows ACTUAL battery
+        # flow: an inverter told to charge a full pack moves no energy, so it
+        # gets the idle predictor, not the charging one.
+        if is_charge and battery_power_kw > 1e-9:
+            return self._predict_temp_after_duration(temp, duration_minutes)
+        return self._predict_temp_after_idle(temp, duration_minutes)
+
+    def _replay_plan_temps(
+        self,
+        slots_sorted_by_time: List[PricePoint],
+        slot_fractions: List[float],
+        schedule: Dict[datetime.datetime, ScheduleEntry],
+        energy_trajectory: List[float],
+        start_energy: float,
+        current_temp: Optional[float],
+        load_kw: List[float],
+        pv_kw: Optional[List[float]],
+        planning_profile: List[Optional[float]],
+    ) -> Tuple[List[Optional[float]], List[Tuple[Optional[float], Optional[float]]]]:
+        """Temperatures the SELECTED plan actually produces.
+
+        Warming is driven by ``simulate_slot``'s ``battery_power_kw``, i.e. the
+        energy that really moved. A full pack ordered to charge, or an empty one
+        ordered to discharge, moves nothing and warms nothing -- imaginary power
+        must not manufacture future charging capability.
+
+        Returns ``(start_of_slot_profile, [(start, end)] per slot)``.
+        """
+        cfg = self._config
+        params = SlotEnergyParams(
+            battery_capacity=cfg.battery_capacity,
+            efficiency=cfg.efficiency,
+            discharge_rate=cfg.discharge_rate,
+            export_discharge_rate=cfg.export_discharge_rate,
+            inverter_efficiency=cfg.inverter_efficiency,
+            min_soc=cfg.min_soc,
+            max_soc=cfg.max_soc,
+            slot_minutes=cfg.slot_minutes,
+        )
+        profile: List[Optional[float]] = []
+        pairs: List[Tuple[Optional[float], Optional[float]]] = []
+        temp = current_temp
+        energy = start_energy
+        for i, price_point in enumerate(slots_sorted_by_time):
+            entry = schedule.get(price_point.time)
+            mode = entry.mode if entry is not None else BatteryMode.HOLD
+            is_export = bool(
+                entry is not None
+                and entry.export_rate is not None
+                and entry.export_rate > 0
+            )
+            fraction = slot_fractions[i]
+            profile.append(temp)
+            soc = energy / cfg.battery_capacity * 100 if cfg.battery_capacity else 0.0
+            # The rate the plan was built with for this slot, evaluated at the
+            # path's own SOC: the replay must not silently use a different
+            # capability than the candidate transition did.
+            rate = self._rate_for(
+                soc,
+                planning_profile[i] if i < len(planning_profile) else temp,
+            )
+            outcome = simulate_slot(
+                stored_energy_kwh=energy,
+                mode=mode,
+                params=params,
+                charge_input_dc_kw=rate,
+                load_kw=load_kw[i] if i < len(load_kw) else 0.0,
+                pv_kw=pv_kw[i] if pv_kw is not None and i < len(pv_kw) else 0.0,
+                fraction=fraction,
+                is_export=is_export,
+            )
+            start_temp = temp
+            temp = self._step_temp(
+                temp,
+                price_point.time,
+                cfg.slot_minutes * fraction,
+                outcome.battery_power_kw,
+                is_charge=(mode == BatteryMode.CHARGE),
+            )
+            pairs.append((start_temp, temp))
+            # The DP's own path energy is authoritative for the SOC the plan
+            # reaches; the simulation above exists for the battery POWER.
+            energy = (
+                energy_trajectory[i]
+                if i < len(energy_trajectory)
+                else outcome.energy_end_kwh
+            )
+        return profile, pairs
+
+    def _profiles_agree(
+        self,
+        a: List[Optional[float]],
+        b: List[Optional[float]],
+        state_socs: Optional[List[float]] = None,
+    ) -> bool:
+        """Whether two temperature profiles are the same plan.
+
+        Two criteria, either of which stops the refinement:
+
+        1. The temperatures themselves agree within ``TEMP_FIXED_POINT_C``.
+        2. They imply the SAME charge capability at every state of the DP's SOC
+           grid. Temperature only reaches the plan through the rate, so two
+           profiles that produce identical rates produce identical plans -- and
+           a pack that keeps warming inside one temperature bucket would
+           otherwise never reach a fixed point at all.
+
+        Criterion 2 is evaluated at the grid SOCs. A rate curve with a
+        discontinuity strictly between two adjacent grid points could be missed;
+        that is the same 1 %-of-capacity resolution the whole DP works at, and
+        the final replay in ``plan_validation`` is what catches a genuine
+        disagreement.
+        """
+        if len(a) != len(b):
+            return False
+        for i, (x, y) in enumerate(zip(a, b)):
+            if x is None or y is None:
+                if x is not y:
+                    return False
+                continue
+            if abs(x - y) <= TEMP_FIXED_POINT_C:
+                continue
+            if state_socs is None:
+                return False
+            for soc in state_socs:
+                if abs(self._rate_for(soc, x) - self._rate_for(soc, y)) > 1e-9:
+                    return False
+        return True
+
     def _compute_charge_rates_per_slot(
         self,
         slots_sorted_by_time: List[PricePoint],
@@ -438,7 +858,13 @@ class DPOptimizer:
         current_soc: float,
         current_temp: Optional[float],
     ) -> List[float]:
-        """Pre-compute temperature and SOC-aware charge rates for each slot."""
+        """Legacy time-indexed rate array.
+
+        NOT what the DP plans with any more -- ``_run_dp`` evaluates the rate
+        per candidate transition. Kept because the orchestrator still uses the
+        same helper as a fallback for the projected-cost column, where the real
+        per-slot rate is re-derived from the learning engine anyway.
+        """
         return compute_charge_rates_per_slot(
             slots_sorted_by_time=slots_sorted_by_time,
             slot_fractions=slot_fractions,
@@ -458,105 +884,38 @@ class DPOptimizer:
     def _build_soc_trajectory(
         self,
         slots_sorted_by_time: List[PricePoint],
-        idx_trajectory: List[int],
+        energy_trajectory: List[float],
         start_energy: float,
-        min_energy: float,
-        step_kwh: float,
-        n_states: int,
     ) -> Dict[datetime.datetime, Tuple[float, float]]:
-        """Convert idx_trajectory to SOC trajectory."""
+        """SOC trajectory from the chosen path's EXACT energies.
+
+        Derived from ``energy_trajectory``, not from the grid indices: the
+        published trajectory must describe the plan's real energy, or it
+        reports 15 % for a pack the same plan has already emptied.
+        """
         soc_trajectory: Dict[datetime.datetime, Tuple[float, float]] = {}
         cfg = self._config
+        capacity = cfg.battery_capacity if cfg.battery_capacity > 0 else 1e-9
 
-        if idx_trajectory and len(idx_trajectory) == len(slots_sorted_by_time):
-            start_idx = _energy_to_index(start_energy, min_energy, step_kwh, n_states, "round")
-
+        if energy_trajectory and len(energy_trajectory) == len(slots_sorted_by_time):
             for t, price_point in enumerate(slots_sorted_by_time):
                 hour = price_point.time
-                if t == 0:
-                    slot_start_idx = start_idx
-                else:
-                    slot_start_idx = idx_trajectory[t - 1]
-                slot_end_idx = idx_trajectory[t]
-
-                start_soc = cfg.min_soc + (slot_start_idx * step_kwh / cfg.battery_capacity) * 100
-                end_soc = cfg.min_soc + (slot_end_idx * step_kwh / cfg.battery_capacity) * 100
-                soc_trajectory[hour] = (start_soc, end_soc)
+                slot_start_energy = (
+                    start_energy if t == 0 else energy_trajectory[t - 1]
+                )
+                slot_end_energy = energy_trajectory[t]
+                soc_trajectory[hour] = (
+                    slot_start_energy / capacity * 100,
+                    slot_end_energy / capacity * 100,
+                )
 
         return soc_trajectory
-
-    def _build_temp_trajectory(
-        self,
-        slots_sorted_by_time: List[PricePoint],
-        schedule: Dict[datetime.datetime, ScheduleEntry],
-        slot_fractions: List[float],
-        current_temp: Optional[float],
-        charge_rates_per_slot: Optional[List[float]] = None,
-        load_kw: Optional[List[float]] = None,
-        pv_kw: Optional[List[float]] = None,
-    ) -> Dict[datetime.datetime, Tuple[Optional[float], Optional[float]]]:
-        """Build temperature trajectory for the chosen schedule.
-
-        With a shared ``temp_projector`` the temperature evolves from the POWER
-        through the battery, not from the mode label: a 5.9 kW discharge heats
-        the pack just like a charge does. The old implementation branched on
-        ``mode == CHARGE`` only, so a horizon without a single CHARGE slot — the
-        production case — produced a monotonically non-increasing, practically
-        flat trajectory.
-
-        Note that this runs AFTER ``_build_schedule``: the trajectory is
-        reporting-only. Temperature influences DP decisions solely through
-        ``_compute_charge_rates_per_slot``.
-        """
-        temp_trajectory: Dict[datetime.datetime, Tuple[Optional[float], Optional[float]]] = {}
-        cfg = self._config
-
-        if current_temp is None:
-            return temp_trajectory
-
-        projected_temp = current_temp
-        for t, price_point in enumerate(slots_sorted_by_time):
-            hour = price_point.time
-            start_temp = projected_temp
-            slot_duration_minutes = cfg.slot_minutes * slot_fractions[t]
-            entry = schedule.get(hour)
-
-            if self._temp_projector is not None:
-                mode = entry.mode if entry is not None else BatteryMode.HOLD
-                charge_rate = (
-                    charge_rates_per_slot[t]
-                    if charge_rates_per_slot is not None and t < len(charge_rates_per_slot)
-                    else 0.0
-                )
-                slot_load = load_kw[t] if load_kw is not None and t < len(load_kw) else 0.0
-                slot_pv = pv_kw[t] if pv_kw is not None and t < len(pv_kw) else 0.0
-                power_kw = battery_power_for_entry(
-                    mode,
-                    charge_rate_kw=charge_rate,
-                    load_kw=slot_load,
-                    pv_kw=slot_pv,
-                    discharge_rate_kw=cfg.discharge_rate,
-                    export_discharge_rate_kw=cfg.effective_export_discharge_rate,
-                    export_rate=entry.export_rate if entry is not None else None,
-                    inverter_efficiency=cfg.inverter_efficiency,
-                )
-                projected_temp = self._temp_projector.project(
-                    projected_temp, hour, slot_duration_minutes, power_kw
-                )
-            elif entry is not None and entry.mode == BatteryMode.CHARGE:
-                projected_temp = self._predict_temp_after_duration(projected_temp, slot_duration_minutes)
-            else:
-                projected_temp = self._predict_temp_after_idle(projected_temp, slot_duration_minutes)
-
-            temp_trajectory[hour] = (start_temp, projected_temp)
-
-        return temp_trajectory
 
     def _run_dp(
         self,
         slots_list: List[PricePoint],
         load_kw_list: List[float],
-        charge_rates_list: List[float],
+        temp_profile_list: List[Optional[float]],
         slot_fractions_list: List[float],
         start_energy_kwh: float,
         min_energy: float,
@@ -566,17 +925,23 @@ class DPOptimizer:
         energy_levels: List[float],
         start_idx_override: Optional[int] = None,
         pv_kw_list: Optional[List[float]] = None,
-    ) -> Tuple[List[BatteryMode], List[bool], List[bool], float, List[int]]:
+    ) -> Tuple[List[BatteryMode], List[bool], List[bool], float, List[int], List[float]]:
         """
         Core DP algorithm.
 
         Returns:
-            (actions, partial_flags, export_flags, best_value, idx_trajectory)
+            (actions, partial_flags, export_flags, best_value, idx_trajectory,
+             energy_trajectory)
+
+        ``energy_trajectory`` holds the EXACT end-of-slot stored energy of the
+        backtracked path, which is what the reported SOC trajectory is built
+        from. Deriving it from the grid index instead is what let a published
+        trajectory read 15 % while the modelled pack was already empty.
         """
         cfg = self._config
         n_list_slots = len(slots_list)
         if n_list_slots == 0:
-            return [], [], [], 0.0, []
+            return [], [], [], 0.0, [], []
 
         neg_inf = -1e18
         tie_val_eps = 1e-6
@@ -589,32 +954,64 @@ class DPOptimizer:
 
         # Allocate 1D DP buffers and template row for efficient reset
         _neg_inf_row = [neg_inf] * n_states
+        _min_energy_row = [min_energy] * n_states
         dp_a = [neg_inf] * n_states
         dp_b = [neg_inf] * n_states
         dp_tie_a = [neg_inf] * n_states
         dp_tie_b = [neg_inf] * n_states
+        # Exact stored energy of the best path reaching each bucket.
+        en_a = [min_energy] * n_states
+        en_b = [min_energy] * n_states
 
+        # The observed starting energy is kept EXACTLY; only its bucket label
+        # is floored. `start_idx_override` is accepted for backward
+        # compatibility and clamped, but the energy is never re-derived from it.
+        start_energy_local = min(max_energy, max(min_energy, start_energy_kwh))
         if start_idx_override is None:
-            start_idx_local = _energy_to_index(start_energy_kwh, min_energy, step_kwh, n_states, "round")
+            start_idx_local = _energy_to_index(
+                start_energy_local, min_energy, step_kwh, n_states, "floor"
+            )
         else:
             start_idx_local = min(max(start_idx_override, 0), n_states - 1)
 
         # Initialize starting state in dp_a
         dp_a[start_idx_local] = 0.0
         dp_tie_a[start_idx_local] = 0.0
+        en_a[start_idx_local] = start_energy_local
         dp, next_dp = dp_a, dp_b
         dp_tie, next_dp_tie = dp_tie_a, dp_tie_b
+        dp_energy, next_energy = en_a, en_b
 
         prev_idx = [None] * n_list_slots
         prev_action = [None] * n_list_slots
         prev_partial = [None] * n_list_slots
         prev_export = [None] * n_list_slots
+        # End-of-slot energy per state, kept so backtracking recovers the exact
+        # energy of the chosen path rather than its grid label.
+        energy_by_slot: List[List[float]] = [None] * n_list_slots
 
-        def _should_update(curr_val: float, curr_tie: float, cand_val: float, cand_tie: float) -> bool:
+        def _should_update(
+            curr_val: float,
+            curr_tie: float,
+            cand_val: float,
+            cand_tie: float,
+            curr_energy: float = 0.0,
+            cand_energy: float = 0.0,
+        ) -> bool:
             if cand_val > curr_val + tie_val_eps:
                 return True
-            if abs(cand_val - curr_val) <= tie_val_eps and cand_tie > curr_tie + tie_tie_eps:
-                return True
+            if abs(cand_val - curr_val) <= tie_val_eps:
+                if cand_tie > curr_tie + tie_tie_eps:
+                    return True
+                # Dominance: same value, same tie bias -> keep the path holding
+                # more energy. It can only widen the options of every later
+                # slot, and it makes the merge deterministic instead of
+                # "whichever candidate was evaluated first".
+                if (
+                    abs(cand_tie - curr_tie) <= tie_tie_eps
+                    and cand_energy > curr_energy + 1e-9
+                ):
+                    return True
             return False
 
         dp_trace_slots = []
@@ -633,12 +1030,14 @@ class DPOptimizer:
             discharge_kwh = min(net_load_kw, cfg.discharge_rate) * cfg.slot_hours * fraction
             # DC energy battery must provide (higher due to inverter DC→AC loss)
             dc_discharge_kwh = discharge_kwh / inv_eff
-            slot_charge_rate = charge_rates_list[t]
-            charge_energy_kwh = slot_charge_rate * cfg.efficiency * cfg.slot_hours * fraction
-            # DC energy into battery from all sources (grid + PV)
-            charge_dc_kwh = slot_charge_rate * cfg.slot_hours * fraction
-            # PV surplus charges battery for free (pv_priority, DC→DC); grid covers rest
-            pv_free_charge_kwh = min(pv_surplus_kw, slot_charge_rate) * cfg.slot_hours * fraction
+            # The charge rate is NOT a slot constant: it depends on the SOC of
+            # the candidate state. Only the temperature is fixed per slot (see
+            # the module header), so the rate lookup happens inside the state
+            # loop and everything derived from it with it.
+            slot_temp = (
+                temp_profile_list[t] if t < len(temp_profile_list) else None
+            )
+            slot_hours_fraction = cfg.slot_hours * fraction
             net_load_kwh = net_load_kw * cfg.slot_hours * fraction
 
             # Export variables — NNS contract: sell price floor at 0
@@ -652,18 +1051,30 @@ class DPOptimizer:
             # Reset next_dp buffers using slice assignment (faster than nested loop)
             next_dp[:] = _neg_inf_row
             next_dp_tie[:] = _neg_inf_row
+            next_energy[:] = _min_energy_row
             next_prev_idx = [None] * n_states
             next_prev_action = [None] * n_states
             next_prev_partial = [False] * n_states
             next_prev_export = [False] * n_states
 
-            # HOLD precomputation (slot-level constants)
+            # HOLD precomputation (the genuinely rate-independent part)
             hold_grid_cost = buy_price * net_load_kwh
-            # PV surplus charges battery for free (up to charge rate), rest exports
-            hold_pv_charge_kw = min(pv_surplus_kw, slot_charge_rate)
-            hold_pv_charge_max = hold_pv_charge_kw * cfg.efficiency * cfg.slot_hours * fraction
-            hold_excess_pv_kwh = max(0.0, pv_surplus_kw - slot_charge_rate) * cfg.slot_hours * fraction
             hold_sell = sell_price  # already floored at 0
+            rate_for = self._rate_for
+            rate_cache_slot = {}
+            soc_dependent = self._rate_soc_dependent
+            const_slot_rate = None
+            if not soc_dependent:
+                const_slot_rate = rate_for(cfg.min_soc, slot_temp)
+                const_charge_dc_kwh = const_slot_rate * slot_hours_fraction
+                const_charge_energy_kwh = const_charge_dc_kwh * cfg.efficiency
+                const_pv_free_charge_kwh = (
+                    min(pv_surplus_kw, const_slot_rate) * slot_hours_fraction
+                )
+                const_hold_pv_charge_max = const_pv_free_charge_kwh * cfg.efficiency
+                const_hold_excess_pv_kwh = (
+                    max(0.0, pv_surplus_kw - const_slot_rate) * slot_hours_fraction
+                )
 
             slot_trace = []
             trace_this_slot = self._decision_log_level >= 3 and fraction > 0.5
@@ -673,29 +1084,61 @@ class DPOptimizer:
                 if val <= neg_inf / 2:
                     continue
                 curr_tie = dp_tie[idx]
-                curr_soc = cfg.min_soc + (idx * step_kwh / cfg.battery_capacity) * 100
+                # The path's EXACT energy, not its grid point.
+                curr_energy = dp_energy[idx]
+                curr_soc = (curr_energy / cfg.battery_capacity) * 100
+                headroom = max(0.0, max_energy - curr_energy)
+                available = max(0.0, curr_energy - min_energy)
+
+                # Charge capability of THIS state, at THIS slot's temperature.
+                if const_slot_rate is not None:
+                    slot_charge_rate = const_slot_rate
+                    charge_dc_kwh = const_charge_dc_kwh
+                    charge_energy_kwh = const_charge_energy_kwh
+                    pv_free_charge_kwh = const_pv_free_charge_kwh
+                    hold_pv_charge_max = const_hold_pv_charge_max
+                    hold_excess_pv_kwh = const_hold_excess_pv_kwh
+                else:
+                    slot_charge_rate = rate_cache_slot.get(idx)
+                    if slot_charge_rate is None:
+                        slot_charge_rate = rate_for(curr_soc, slot_temp)
+                        rate_cache_slot[idx] = slot_charge_rate
+                    charge_dc_kwh = slot_charge_rate * slot_hours_fraction
+                    charge_energy_kwh = charge_dc_kwh * cfg.efficiency
+                    # PV surplus charges battery for free (pv_priority, DC→DC)
+                    pv_free_charge_kwh = (
+                        min(pv_surplus_kw, slot_charge_rate) * slot_hours_fraction
+                    )
+                    hold_pv_charge_max = pv_free_charge_kwh * cfg.efficiency
+                    hold_excess_pv_kwh = (
+                        max(0.0, pv_surplus_kw - slot_charge_rate) * slot_hours_fraction
+                    )
 
                 # HOLD - no grid charge; PV covers load, surplus charges battery for free
                 hold_updated = False
                 if hold_pv_charge_max > 0:
-                    new_energy = min(max_energy, energy_levels[idx] + hold_pv_charge_max)
-                    actual_stored = new_energy - energy_levels[idx]
+                    actual_stored = min(hold_pv_charge_max, headroom)
+                    new_energy = curr_energy + actual_stored
                     # PV that couldn't be stored (battery full) + excess beyond charge rate → export
-                    if actual_stored < hold_pv_charge_max - 1e-9:
-                        unused_kwh = (hold_pv_charge_max - actual_stored) / cfg.efficiency
-                    else:
-                        unused_kwh = 0.0
+                    unused_kwh = (hold_pv_charge_max - actual_stored) / cfg.efficiency
                     export_revenue = hold_sell * (hold_excess_pv_kwh + unused_kwh)
                     hold_next_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "floor")
                 else:
+                    new_energy = curr_energy
                     export_revenue = hold_sell * hold_excess_pv_kwh
                     hold_next_idx = idx
                 hold_val = val - hold_grid_cost + export_revenue
-                if _should_update(next_dp[hold_next_idx], next_dp_tie[hold_next_idx], hold_val, curr_tie):
+                if _should_update(
+                    next_dp[hold_next_idx], next_dp_tie[hold_next_idx], hold_val, curr_tie,
+                    next_energy[hold_next_idx], new_energy,
+                ):
                     next_dp[hold_next_idx] = hold_val
                     next_dp_tie[hold_next_idx] = curr_tie
+                    next_energy[hold_next_idx] = new_energy
                     next_prev_idx[hold_next_idx] = idx
                     next_prev_action[hold_next_idx] = BatteryMode.HOLD
+                    next_prev_partial[hold_next_idx] = False
+                    next_prev_export[hold_next_idx] = False
                     hold_updated = True
 
                 discharge_attempted = False
@@ -707,74 +1150,71 @@ class DPOptimizer:
                 # CHARGE (grid_charge): only when grid is actually needed to supplement PV
                 # When PV surplus fully covers charge rate, HOLD already handles it
                 if charge_energy_kwh > 0 and pv_free_charge_kwh < charge_dc_kwh - 1e-6:
-                    new_energy = energy_levels[idx] + charge_energy_kwh
-                    actual_charge_energy = charge_energy_kwh
-                    actual_charge_dc = charge_dc_kwh
-
-                    if new_energy > max_energy + 1e-6:
-                        headroom = max_energy - energy_levels[idx]
-                        if headroom >= step_kwh:
-                            actual_charge_energy = headroom
-                            actual_charge_dc = headroom / cfg.efficiency
-                            new_energy = max_energy
-                        else:
-                            actual_charge_energy = 0
-
-                    if actual_charge_energy > 0:
+                    # Headroom truncates the stored energy; the terminal energy
+                    # and the grid share follow from what was actually stored.
+                    actual_charge_energy = min(charge_energy_kwh, headroom)
+                    actual_charge_dc = actual_charge_energy / cfg.efficiency
+                    grid_charge_dc = max(0.0, actual_charge_dc - pv_free_charge_kwh)
+                    # Skip CHARGE when PV fully covers it — HOLD already handles PV charging
+                    if actual_charge_energy > 1e-9 and grid_charge_dc >= 1e-6:
+                        new_energy = curr_energy + actual_charge_energy
                         next_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "floor")
-                        # DC energy from grid (total DC minus PV contribution)
-                        grid_charge_dc = max(0.0, actual_charge_dc - pv_free_charge_kwh)
-                        # Skip CHARGE when PV fully covers it — HOLD already handles PV charging
-                        if grid_charge_dc < 1e-6:
-                            actual_charge_energy = 0
-
-                    if actual_charge_energy > 0:
                         # AC energy from grid = DC / inverter_efficiency
                         grid_charge_ac = grid_charge_dc / inv_eff
                         next_val = val - (buy_price * grid_charge_ac) - (buy_price * net_load_kwh)
                         charge_tie_bias = (-price * tie_price_weight) + (t * tie_time_weight)
                         next_tie = curr_tie + charge_tie_bias
-                        if _should_update(next_dp[next_idx], next_dp_tie[next_idx], next_val, next_tie):
+                        if _should_update(
+                            next_dp[next_idx], next_dp_tie[next_idx], next_val, next_tie,
+                            next_energy[next_idx], new_energy,
+                        ):
                             next_dp[next_idx] = next_val
                             next_dp_tie[next_idx] = next_tie
+                            next_energy[next_idx] = new_energy
                             next_prev_idx[next_idx] = idx
                             next_prev_action[next_idx] = BatteryMode.CHARGE
+                            next_prev_partial[next_idx] = False
+                            next_prev_export[next_idx] = False
 
                 # DISCHARGE (self-consumption)
                 # Battery provides DC energy; inverter converts to AC to serve load.
                 # dc_discharge_kwh = AC load / inverter_eff (battery works harder).
                 if dc_discharge_kwh > 0:
                     discharge_attempted = True
-                    new_energy = energy_levels[idx] - dc_discharge_kwh
-                    is_partial = False
-                    actual_dc_kwh = dc_discharge_kwh
-
-                    if new_energy >= min_energy - 1e-6:
-                        next_idx = _discharge_index(new_energy, idx, min_energy, step_kwh, n_states)
-                        grid_import_kwh = max(0.0, net_load_kwh - discharge_kwh)
-                        next_val = val - (buy_price * grid_import_kwh) - (discharge_cost_per_kwh * actual_dc_kwh)
-                    elif energy_levels[idx] > min_energy + dc_discharge_kwh * 0.5:
-                        is_partial = True
-                        actual_dc_kwh = energy_levels[idx] - min_energy
+                    if available > 1e-9:
+                        # A candidate delivers what the pack HAS. When that is
+                        # less than the load asked for, the grid pays for the
+                        # rest — the plan must not be scored as if the battery
+                        # had covered it. No threshold decides whether the slot
+                        # "counts": the energy does.
+                        actual_dc_kwh = min(dc_discharge_kwh, available)
+                        is_partial = actual_dc_kwh < dc_discharge_kwh - 1e-9
                         ac_served = actual_dc_kwh * inv_eff
                         grid_import_kwh = max(0.0, net_load_kwh - ac_served)
+                        new_energy = curr_energy - actual_dc_kwh
+                        next_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "floor")
                         next_val = val - (buy_price * grid_import_kwh) - (discharge_cost_per_kwh * actual_dc_kwh)
-                        next_idx = 0
-                        new_energy = min_energy
                     else:
-                        discharge_blocked_reason = f"would_hit_min_soc ({new_energy:.2f} < {min_energy:.2f})"
+                        discharge_blocked_reason = (
+                            f"at_min_soc ({curr_energy:.3f} <= {min_energy:.3f})"
+                        )
                         next_val = None
                         next_idx = None
 
                     if next_val is not None:
                         discharge_next_idx = next_idx
                         discharge_next_val = next_val
-                        if _should_update(next_dp[next_idx], next_dp_tie[next_idx], next_val, curr_tie):
+                        if _should_update(
+                            next_dp[next_idx], next_dp_tie[next_idx], next_val, curr_tie,
+                            next_energy[next_idx], new_energy,
+                        ):
                             next_dp[next_idx] = next_val
                             next_dp_tie[next_idx] = curr_tie
+                            next_energy[next_idx] = new_energy
                             next_prev_idx[next_idx] = idx
                             next_prev_action[next_idx] = BatteryMode.DISCHARGE
                             next_prev_partial[next_idx] = is_partial
+                            next_prev_export[next_idx] = False
                             discharge_updated = True
                         else:
                             discharge_blocked_reason = (
@@ -783,39 +1223,32 @@ class DPOptimizer:
 
                 # DISCHARGE_EXPORT (full rate discharge with grid export)
                 # SOC transition uses DC energy; export revenue uses AC output.
-                if sell_price > 0 and exported_kwh_full > 0:
-                    new_energy = energy_levels[idx] - dc_export_discharge_kwh
-                    is_partial_export = False
-                    actual_dc_export = dc_export_discharge_kwh
+                if sell_price > 0 and exported_kwh_full > 0 and available > 1e-9:
+                    actual_dc_export = min(dc_export_discharge_kwh, available)
+                    is_partial_export = actual_dc_export < dc_export_discharge_kwh - 1e-9
+                    ac_from_battery = actual_dc_export * inv_eff
+                    actual_exported = max(0.0, ac_from_battery + pv_kwh - load_kwh)
+                    remaining_load = max(0.0, load_kwh - pv_kwh - ac_from_battery)
+                    new_energy = curr_energy - actual_dc_export
+                    next_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "floor")
+                    next_val = (
+                        val
+                        + sell_price * actual_exported
+                        - buy_price * remaining_load
+                        - discharge_cost_per_kwh * actual_dc_export
+                    )
 
-                    if new_energy >= min_energy - 1e-6:
-                        next_idx = _discharge_index(new_energy, idx, min_energy, step_kwh, n_states)
-                        next_val = val + sell_price * exported_kwh_full - (discharge_cost_per_kwh * actual_dc_export)
-                    elif energy_levels[idx] > min_energy + dc_export_discharge_kwh * 0.3:
-                        is_partial_export = True
-                        actual_dc_export = energy_levels[idx] - min_energy
-                        ac_from_battery = actual_dc_export * inv_eff
-                        remaining_load = max(0.0, load_kwh - pv_kwh - ac_from_battery)
-                        actual_exported = max(0.0, ac_from_battery + pv_kwh - load_kwh)
-                        if remaining_load > 0:
-                            # Battery + PV can't cover load — grid covers rest
-                            next_val = val - (buy_price * remaining_load) - (discharge_cost_per_kwh * actual_dc_export)
-                        else:
-                            next_val = val + sell_price * actual_exported - (discharge_cost_per_kwh * actual_dc_export)
-                        next_idx = 0
-                        new_energy = min_energy
-                    else:
-                        next_val = None
-                        next_idx = None
-
-                    if next_val is not None:
-                        if _should_update(next_dp[next_idx], next_dp_tie[next_idx], next_val, curr_tie):
-                            next_dp[next_idx] = next_val
-                            next_dp_tie[next_idx] = curr_tie
-                            next_prev_idx[next_idx] = idx
-                            next_prev_action[next_idx] = BatteryMode.DISCHARGE
-                            next_prev_partial[next_idx] = is_partial_export
-                            next_prev_export[next_idx] = True
+                    if _should_update(
+                        next_dp[next_idx], next_dp_tie[next_idx], next_val, curr_tie,
+                        next_energy[next_idx], new_energy,
+                    ):
+                        next_dp[next_idx] = next_val
+                        next_dp_tie[next_idx] = curr_tie
+                        next_energy[next_idx] = new_energy
+                        next_prev_idx[next_idx] = idx
+                        next_prev_action[next_idx] = BatteryMode.DISCHARGE
+                        next_prev_partial[next_idx] = is_partial_export
+                        next_prev_export[next_idx] = True
 
                 # Trace collection for logging
                 if trace_this_slot and discharge_attempted:
@@ -856,6 +1289,8 @@ class DPOptimizer:
             # Swap buffers instead of reassigning
             dp, next_dp = next_dp, dp
             dp_tie, next_dp_tie = next_dp_tie, dp_tie
+            dp_energy, next_energy = next_energy, dp_energy
+            energy_by_slot[t] = list(dp_energy)
             prev_idx[t] = next_prev_idx
             prev_action[t] = next_prev_action
             prev_partial[t] = next_prev_partial
@@ -870,13 +1305,19 @@ class DPOptimizer:
         best_tie = neg_inf
         best_idx = None
 
+        best_energy = min_energy
         for i in range(n_states):
             if dp[i] > neg_inf / 2:
-                terminal_value = terminal_value_per_kwh * max(0.0, energy_levels[i] - min_energy)
+                # Salvage the path's exact remaining energy, not its grid point.
+                terminal_value = terminal_value_per_kwh * max(0.0, dp_energy[i] - min_energy)
                 candidate_value = dp[i] + terminal_value
-                if _should_update(best_val, best_tie, candidate_value, dp_tie[i]):
+                if _should_update(
+                    best_val, best_tie, candidate_value, dp_tie[i],
+                    best_energy, dp_energy[i],
+                ):
                     best_val = candidate_value
                     best_tie = dp_tie[i]
+                    best_energy = dp_energy[i]
                     best_idx = i
 
         # Backtrack to extract actions
@@ -884,6 +1325,7 @@ class DPOptimizer:
         partial_flags: List[bool] = []
         export_flags: List[bool] = []
         idx_trajectory: List[int] = []
+        energy_trajectory: List[float] = []
         idx = best_idx if best_idx is not None else start_idx_local
 
         if self._decision_log_level >= 3:
@@ -898,6 +1340,10 @@ class DPOptimizer:
             partial_flags.append(is_partial)
             export_flags.append(is_export)
             idx_trajectory.append(idx)
+            slot_energies = energy_by_slot[t]
+            energy_trajectory.append(
+                slot_energies[idx] if slot_energies is not None else min_energy
+            )
             prev_i = prev_idx[t][idx]
 
             if t < 5 and self._decision_log_level >= 3:
@@ -913,6 +1359,7 @@ class DPOptimizer:
         partial_flags.reverse()
         export_flags.reverse()
         idx_trajectory.reverse()
+        energy_trajectory.reverse()
 
         if backtrack_trace and self._decision_log_level >= 3:
             self._log("[DeepTrace] Backtrack path (first 5 slots):")
@@ -950,13 +1397,20 @@ class DPOptimizer:
                         )
             self._log("=" * 70)
 
-        return actions, partial_flags, export_flags, best_val, idx_trajectory
+        return (
+            actions,
+            partial_flags,
+            export_flags,
+            best_val,
+            idx_trajectory,
+            energy_trajectory,
+        )
 
     def _build_schedule(
         self,
         slots_sorted_by_time: List[PricePoint],
         load_kw: List[float],
-        charge_rates_per_slot: List[float],
+        temp_profile: List[Optional[float]],
         slot_fractions: List[float],
         current_slot_index: Optional[int],
         start_energy: float,
@@ -966,12 +1420,12 @@ class DPOptimizer:
         n_states: int,
         energy_levels: List[float],
         pv_kw: Optional[List[float]] = None,
-    ) -> Tuple[Dict[datetime.datetime, ScheduleEntry], List[int], float]:
+    ) -> Tuple[Dict[datetime.datetime, ScheduleEntry], List[int], List[float], float]:
         """
         Build schedule using DP with greedy lookahead for partial first slot.
 
         Returns:
-            (schedule, idx_trajectory, best_value)
+            (schedule, idx_trajectory, energy_trajectory, best_value)
         """
         cfg = self._config
         neg_inf = -1e18
@@ -997,7 +1451,17 @@ class DPOptimizer:
             pv_surplus_kw = max(0.0, slot_pv_kw - slot_load_kw)
             discharge_kwh = min(net_load_kw, cfg.discharge_rate) * cfg.slot_hours * fraction
             dc_discharge_kwh = discharge_kwh / inv_eff
-            slot_charge_rate = charge_rates_per_slot[partial_index]
+            # Same contract as the DP transition: the rate is evaluated at the
+            # SOC this partial slot actually starts from, and at this slot's
+            # temperature — not read out of a time-indexed array.
+            partial_soc = (
+                start_energy / cfg.battery_capacity * 100
+                if cfg.battery_capacity else 0.0
+            )
+            slot_charge_rate = self._rate_for(
+                partial_soc,
+                temp_profile[partial_index] if partial_index < len(temp_profile) else None,
+            )
             charge_energy_kwh = slot_charge_rate * cfg.efficiency * cfg.slot_hours * fraction
             charge_dc_kwh = slot_charge_rate * cfg.slot_hours * fraction
             pv_free_charge_kwh = min(pv_surplus_kw, slot_charge_rate) * cfg.slot_hours * fraction
@@ -1007,83 +1471,70 @@ class DPOptimizer:
             remaining_slice = slice(partial_index + 1, None)
             slots_remaining = slots_sorted_by_time[remaining_slice]
             load_remaining = load_kw[remaining_slice]
-            charge_rates_remaining = charge_rates_per_slot[remaining_slice]
+            temp_profile_remaining = temp_profile[remaining_slice]
             slot_fractions_remaining = slot_fractions[remaining_slice]
             pv_kw_remaining = pv_kw[remaining_slice] if pv_kw is not None else None
 
-            # Candidates: (action, new_energy, immediate_val, start_idx_override, is_partial, is_export)
+            # Candidates: (action, new_energy, immediate_val, is_partial, is_export)
+            #
+            # The observed starting energy is used EXACTLY here — this is the
+            # one explicitly continuous transition — and every candidate's
+            # result is mapped conservatively (floored label, exact energy) by
+            # `_run_dp` when the remaining horizon continues from it.
             candidates = []
-            greedy_start_idx = _energy_to_index(start_energy, min_energy, step_kwh, n_states, "round")
+            headroom = max(0.0, max_energy - start_energy)
+            available = max(0.0, start_energy - min_energy)
 
             # HOLD — no grid charge; PV covers load, surplus charges battery for free
             sell_price = self._sell_price(price)
             hold_pv_charge_kw = min(pv_surplus_kw, slot_charge_rate)
             hold_pv_energy = hold_pv_charge_kw * cfg.efficiency * cfg.slot_hours * fraction
-            hold_new_energy = min(max_energy, start_energy + hold_pv_energy)
-            hold_actual_stored = hold_new_energy - start_energy
+            hold_actual_stored = min(hold_pv_energy, headroom)
+            hold_new_energy = start_energy + hold_actual_stored
             # PV that couldn't be stored + excess beyond charge rate → export
-            hold_unused_kwh = (hold_pv_energy - hold_actual_stored) / cfg.efficiency if hold_actual_stored < hold_pv_energy - 1e-9 else 0.0
+            hold_unused_kwh = (hold_pv_energy - hold_actual_stored) / cfg.efficiency
             hold_excess_pv = max(0.0, pv_surplus_kw - slot_charge_rate) * cfg.slot_hours * fraction
             hold_export_revenue = sell_price * (hold_excess_pv + hold_unused_kwh)
             hold_grid_cost = buy_price * net_load_kwh
-            hold_idx_override = _energy_to_index(hold_new_energy, min_energy, step_kwh, n_states, "floor") if hold_pv_energy > 0 else None
-            candidates.append((BatteryMode.HOLD, hold_new_energy, -hold_grid_cost + hold_export_revenue, hold_idx_override, False, False))
+            candidates.append((
+                BatteryMode.HOLD,
+                hold_new_energy,
+                -hold_grid_cost + hold_export_revenue,
+                False,
+                False,
+            ))
 
             # CHARGE (grid_charge): only when grid is actually needed to supplement PV
             if charge_energy_kwh > 0 and pv_free_charge_kwh < charge_dc_kwh - 1e-6:
-                new_energy = start_energy + charge_energy_kwh
-                actual_charge_energy = charge_energy_kwh
-                actual_charge_dc = charge_dc_kwh
-                if new_energy > max_energy + 1e-6:
-                    headroom = max_energy - start_energy
-                    if headroom >= step_kwh:
-                        actual_charge_energy = headroom
-                        actual_charge_dc = headroom / cfg.efficiency
-                        new_energy = max_energy
-                    else:
-                        actual_charge_energy = 0
-                if actual_charge_energy > 0:
-                    start_idx_override = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "floor")
-                    grid_charge_dc = max(0.0, actual_charge_dc - pv_free_charge_kwh)
+                actual_charge_energy = min(charge_energy_kwh, headroom)
+                actual_charge_dc = actual_charge_energy / cfg.efficiency
+                grid_charge_dc = max(0.0, actual_charge_dc - pv_free_charge_kwh)
+                if actual_charge_energy > 1e-9 and grid_charge_dc >= 1e-6:
+                    new_energy = start_energy + actual_charge_energy
                     grid_charge_ac = grid_charge_dc / inv_eff
                     charge_immediate_cost = -buy_price * grid_charge_ac - buy_price * net_load_kwh
                     candidates.append((
                         BatteryMode.CHARGE,
                         new_energy,
                         charge_immediate_cost,
-                        start_idx_override,
                         False,
                         False,
                     ))
 
             # DISCHARGE (self-consumption)
-            if dc_discharge_kwh > 0:
-                new_energy = start_energy - dc_discharge_kwh
-                if new_energy >= min_energy - 1e-6:
-                    start_idx_override = _discharge_index(new_energy, greedy_start_idx, min_energy, step_kwh, n_states)
-                    grid_import_kwh = max(0.0, net_load_kwh - discharge_kwh)
-                    discharge_cost = -buy_price * grid_import_kwh - discharge_cost_per_kwh * dc_discharge_kwh
-                    candidates.append((
-                        BatteryMode.DISCHARGE,
-                        new_energy,
-                        discharge_cost,
-                        start_idx_override,
-                        False,
-                        False,
-                    ))
-                elif start_energy > min_energy + dc_discharge_kwh * 0.5:
-                    dc_available = start_energy - min_energy
-                    ac_served = dc_available * inv_eff
-                    grid_import_kwh = max(0.0, net_load_kwh - ac_served)
-                    partial_value = -buy_price * grid_import_kwh - discharge_cost_per_kwh * dc_available
-                    candidates.append((
-                        BatteryMode.DISCHARGE,
-                        min_energy,
-                        partial_value,
-                        0,
-                        True,
-                        False,
-                    ))
+            if dc_discharge_kwh > 0 and available > 1e-9:
+                actual_dc_kwh = min(dc_discharge_kwh, available)
+                is_partial_candidate = actual_dc_kwh < dc_discharge_kwh - 1e-9
+                ac_served = actual_dc_kwh * inv_eff
+                grid_import_kwh = max(0.0, net_load_kwh - ac_served)
+                discharge_cost = -buy_price * grid_import_kwh - discharge_cost_per_kwh * actual_dc_kwh
+                candidates.append((
+                    BatteryMode.DISCHARGE,
+                    start_energy - actual_dc_kwh,
+                    discharge_cost,
+                    is_partial_candidate,
+                    False,
+                ))
 
             # DISCHARGE_EXPORT (full rate with grid selling, PV adds to export)
             export_discharge_kwh = cfg.effective_export_discharge_rate * cfg.slot_hours * fraction
@@ -1092,36 +1543,26 @@ class DPOptimizer:
             pv_kwh_slot = slot_pv_kw * cfg.slot_hours * fraction
             exported_kwh = max(0.0, export_discharge_kwh + pv_kwh_slot - load_kwh_slot)
 
-            if sell_price > 0 and exported_kwh > 0:
-                new_energy = start_energy - dc_export_discharge_kwh
-                if new_energy >= min_energy - 1e-6:
-                    start_idx_override = _discharge_index(new_energy, greedy_start_idx, min_energy, step_kwh, n_states)
-                    export_value = sell_price * exported_kwh - discharge_cost_per_kwh * dc_export_discharge_kwh
-                    candidates.append((
-                        BatteryMode.DISCHARGE,
-                        new_energy,
-                        export_value,
-                        start_idx_override,
-                        False,
-                        True,
-                    ))
-                elif start_energy > min_energy + dc_export_discharge_kwh * 0.3:
-                    dc_available = start_energy - min_energy
-                    ac_from_battery = dc_available * inv_eff
-                    remaining_load = max(0.0, load_kwh_slot - pv_kwh_slot - ac_from_battery)
-                    actual_exported = max(0.0, ac_from_battery + pv_kwh_slot - load_kwh_slot)
-                    if remaining_load > 0:
-                        export_value = -buy_price * remaining_load - discharge_cost_per_kwh * dc_available
-                    else:
-                        export_value = sell_price * actual_exported - discharge_cost_per_kwh * dc_available
-                    candidates.append((
-                        BatteryMode.DISCHARGE,
-                        min_energy,
-                        export_value,
-                        0,
-                        True,
-                        True,
-                    ))
+            if sell_price > 0 and exported_kwh > 0 and available > 1e-9:
+                actual_dc_export = min(dc_export_discharge_kwh, available)
+                is_partial_export_candidate = (
+                    actual_dc_export < dc_export_discharge_kwh - 1e-9
+                )
+                ac_from_battery = actual_dc_export * inv_eff
+                actual_exported = max(0.0, ac_from_battery + pv_kwh_slot - load_kwh_slot)
+                remaining_load = max(0.0, load_kwh_slot - pv_kwh_slot - ac_from_battery)
+                export_value = (
+                    sell_price * actual_exported
+                    - buy_price * remaining_load
+                    - discharge_cost_per_kwh * actual_dc_export
+                )
+                candidates.append((
+                    BatteryMode.DISCHARGE,
+                    start_energy - actual_dc_export,
+                    export_value,
+                    is_partial_export_candidate,
+                    True,
+                ))
 
             best_action = BatteryMode.HOLD
             best_is_partial = False
@@ -1130,19 +1571,27 @@ class DPOptimizer:
             best_partial_flags_remaining: List[bool] = []
             best_export_flags_remaining: List[bool] = []
             best_idx_trajectory_remaining: List[int] = []
-            best_first_slot_end_idx: int = greedy_start_idx
+            best_energy_trajectory_remaining: List[float] = []
+            best_first_slot_end_energy: float = start_energy
             best_value = neg_inf
 
             if self._decision_log_level >= 3:
                 self._log(f"[GreedyLookahead] Partial slot {price_point.time.strftime('%H:%M')} @ {price:.4f}")
-                self._log(f"  Candidates: {[(c[0].name + ('[EXP]' if c[5] else ''), c[2]) for c in candidates]}")
+                self._log(f"  Candidates: {[(c[0].name + ('[EXP]' if c[4] else ''), c[2]) for c in candidates]}")
 
             greedy_results = []
-            for action, new_energy, immediate_val, start_idx_override, is_partial, is_export in candidates:
-                actions_remaining, partial_flags_remaining, export_flags_remaining, future_val, idx_traj_remaining = self._run_dp(
+            for action, new_energy, immediate_val, is_partial, is_export in candidates:
+                (
+                    actions_remaining,
+                    partial_flags_remaining,
+                    export_flags_remaining,
+                    future_val,
+                    idx_traj_remaining,
+                    energy_traj_remaining,
+                ) = self._run_dp(
                     slots_remaining,
                     load_remaining,
-                    charge_rates_remaining,
+                    temp_profile_remaining,
                     slot_fractions_remaining,
                     new_energy,
                     min_energy,
@@ -1150,7 +1599,6 @@ class DPOptimizer:
                     step_kwh,
                     n_states,
                     energy_levels,
-                    start_idx_override=start_idx_override,
                     pv_kw_list=pv_kw_remaining,
                 )
                 if not slots_remaining:
@@ -1164,12 +1612,6 @@ class DPOptimizer:
                 total_val = immediate_val + future_val
                 label = action.name + ("[EXP]" if is_export else "")
                 greedy_results.append((label, immediate_val, future_val, total_val))
-                if action == BatteryMode.CHARGE:
-                    first_slot_end_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "floor")
-                elif action == BatteryMode.DISCHARGE:
-                    first_slot_end_idx = _discharge_index(new_energy, greedy_start_idx, min_energy, step_kwh, n_states)
-                else:
-                    first_slot_end_idx = _energy_to_index(new_energy, min_energy, step_kwh, n_states, "round")
                 if total_val > best_value:
                     best_value = total_val
                     best_action = action
@@ -1179,7 +1621,8 @@ class DPOptimizer:
                     best_partial_flags_remaining = partial_flags_remaining
                     best_export_flags_remaining = export_flags_remaining
                     best_idx_trajectory_remaining = idx_traj_remaining
-                    best_first_slot_end_idx = first_slot_end_idx
+                    best_energy_trajectory_remaining = energy_traj_remaining
+                    best_first_slot_end_energy = new_energy
 
             if self._decision_log_level >= 3:
                 for name, imm, fut, tot in greedy_results:
@@ -1208,12 +1651,25 @@ class DPOptimizer:
             actions = [best_action] + best_actions_remaining
             partial_flags = [best_is_partial] + best_partial_flags_remaining
             export_flags = [best_is_export] + best_export_flags_remaining
+            best_first_slot_end_idx = _energy_to_index(
+                best_first_slot_end_energy, min_energy, step_kwh, n_states, "floor"
+            )
             idx_trajectory = [best_first_slot_end_idx] + best_idx_trajectory_remaining
+            energy_trajectory = (
+                [best_first_slot_end_energy] + best_energy_trajectory_remaining
+            )
         else:
-            actions, partial_flags, export_flags, best_value, idx_trajectory = self._run_dp(
+            (
+                actions,
+                partial_flags,
+                export_flags,
+                best_value,
+                idx_trajectory,
+                energy_trajectory,
+            ) = self._run_dp(
                 slots_sorted_by_time,
                 load_kw,
-                charge_rates_per_slot,
+                temp_profile,
                 slot_fractions,
                 start_energy,
                 min_energy,
@@ -1268,4 +1724,4 @@ class DPOptimizer:
                 entry.ac_charge_mode = "pv_priority"
             schedule_local[hour] = entry
 
-        return schedule_local, idx_trajectory, best_value
+        return schedule_local, idx_trajectory, energy_trajectory, best_value

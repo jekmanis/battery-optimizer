@@ -142,6 +142,13 @@ class PartialSlotOptimizer:
 
 PartialSlotOptimizer.find_optimal_schedule = BatteryOptimizer.find_optimal_schedule
 PartialSlotOptimizer._compute_slot_fractions = BatteryOptimizer._compute_slot_fractions
+# An unpriced current slot is resolved BEFORE the solve: the retained action (or
+# the HOLD fallback) advances the SOC across the rest of the slot, so the DP
+# plans the next interval from where the pack will actually be.
+PartialSlotOptimizer._entry_has_real_price = BatteryOptimizer._entry_has_real_price
+PartialSlotOptimizer._advance_across_unpriced_current_slot = (
+    BatteryOptimizer._advance_across_unpriced_current_slot
+)
 
 
 def _make_price_points():

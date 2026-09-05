@@ -73,6 +73,7 @@ class SocDeviationDetector:
         config: SocDeviationConfig,
         learning_engine: Optional[object] = None,
         log_func: Optional[Callable[..., None]] = None,
+        temp_projector: Optional[object] = None,
     ):
         """
         Initialize the detector.
@@ -81,9 +82,23 @@ class SocDeviationDetector:
             config: Configuration parameters
             learning_engine: Optional BatteryLearningEngine for temperature-aware rates
             log_func: Optional logging function
+            temp_projector: The app's shared
+                ``thermal_model.TemperatureProjector``. It is not optional in
+                spirit: without it the detector's multi-slot charge projection
+                simply does not evolve temperature, which is far better than
+                the alternative it used to have — falling through to
+                ``learning_engine.predict_temp_after_duration``, a SECOND
+                thermal model (linear learned warming, no ambient relaxation,
+                blind to the power that actually flowed). Over three 15-minute
+                CHARGE slots that answered 32.5 % where the published
+                trajectory said 17.5 %, and that number drove
+                ``projected_final_soc``, the ``>= max_soc - 5`` guard, the
+                "projected to reach X%" log line and the extra-charge-slot
+                calculation.
         """
         self.config = config
         self.learning_engine = learning_engine
+        self.temp_projector = temp_projector
         self._log = log_func or (lambda *args, **kwargs: None)
 
     def check_deviation(
@@ -354,6 +369,9 @@ class SocDeviationDetector:
             # The inverter's charge rate depends on the ACTUAL SOC, not the
             # planned one — keep the historical lookup basis.
             rate_lookup_soc=current_soc,
+            # The ONE thermal model, same instance the app projects with.
+            temp_projector=self.temp_projector,
+            slot_time=current_slot,
         ).soc_end
 
     def _project_charge_completion(
@@ -427,6 +445,9 @@ class SocDeviationDetector:
                 temp_start=projected_temp,
                 learning_engine=self.learning_engine,
                 rate_lookup_soc=current_soc,
+                # The ONE thermal model. This walk is multi-slot, so a second
+                # one does not merely differ — it compounds.
+                temp_projector=self.temp_projector,
                 slot_time=future_hour,
             )
             projected_soc = transition.soc_end

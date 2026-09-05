@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
 from .models import BatteryMode, ScheduleEntry
-from .slot_energy import SlotEnergyParams, simulate_slot
+from .slot_energy import SlotEnergyParams, charge_rate_for_span, simulate_slot
 from .timezone_utils import instant_key
 
 # Energy tolerance (kWh) for the conservation inequality. It exists for
@@ -186,7 +186,9 @@ def replay_plan(
             becomes indistinguishable from a moving input.
         charge_rate_for: ``(slot_time, soc, temp) -> charge_input_dc_kw``. This
             is the Task 4 contract: the rate depends on the SOC and temperature
-            the plan actually reaches, not on a time-indexed array.
+            the plan actually reaches, not on a time-indexed array. It is a
+            LOOKUP, not the slot's rate: the slot's rate is derived from it by
+            ``slot_energy.charge_rate_for_span``, exactly as in the planner.
         current_slot / minutes_into_slot: Partial first slot, same formula as
             the planner.
         prices_by_slot: When given, each slot's cash flow is scored with the
@@ -246,11 +248,23 @@ def replay_plan(
             partial_applied = True
 
         soc_start = params.soc_of(energy)
-        rate = (
-            charge_rate_for(slot, soc_start, temp)
-            if charge_rate_for is not None
-            else getattr(config, "charge_rate", 0.0)
-        )
+        # THE within-slot charge model, and the same one the planner used: the
+        # rate over the SPAN the slot covers, not a single lookup frozen at the
+        # start SOC. Evaluating the frozen model here is why this replay could
+        # not catch the planner over-crediting a taper-crossing slot -- both
+        # sides were computing the same wrong number.
+        if charge_rate_for is not None:
+            rate = charge_rate_for_span(
+                lambda soc, t, _slot=slot: charge_rate_for(_slot, soc, t) or 0.0,
+                soc_start=soc_start,
+                temp=temp,
+                duration_h=params.slot_hours * fraction,
+                efficiency=params.efficiency,
+                capacity=params.battery_capacity,
+                max_soc=params.max_soc,
+            )
+        else:
+            rate = getattr(config, "charge_rate", 0.0)
         is_export = bool(entry.export_rate is not None and entry.export_rate > 0)
 
         outcome = simulate_slot(

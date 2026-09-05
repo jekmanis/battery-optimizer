@@ -20,7 +20,12 @@ if TYPE_CHECKING:
     from .config import BatteryOptimizerConfig
 
 from .models import BatteryMode, PricePoint, ScheduleEntry
-from .slot_energy import ENERGY_EPS, SlotEnergyParams, simulate_slot
+from .slot_energy import (
+    ENERGY_EPS,
+    SlotEnergyParams,
+    charge_rate_for_span,
+    simulate_slot,
+)
 from .timezone_utils import canonical_slot_key, instant_key
 
 
@@ -817,6 +822,27 @@ class DPOptimizer:
             self._rate_cache[key] = cached
         return cached
 
+    def _span_rate(self, rate_fn, soc: float, temp, duration_h: float) -> float:
+        """THE within-slot rate for a candidate transition.
+
+        ``slot_energy.charge_rate_for_span``: the minimum of the rate at this
+        state's SOC and the rate at the SOC that rate would reach. Two lookups
+        per state per slot instead of one, and both go through ``_rate_for``'s
+        cache. A single lookup at the start SOC over-credited every slot that
+        crossed a learned SOC-taper bucket, and neither replay could catch it
+        because both evaluated the same frozen model.
+        """
+        cfg = self._config
+        return charge_rate_for_span(
+            rate_fn,
+            soc_start=soc,
+            temp=temp,
+            duration_h=duration_h,
+            efficiency=cfg.efficiency,
+            capacity=cfg.battery_capacity,
+            max_soc=cfg.max_soc,
+        )
+
     # NOTE: there is deliberately no "is the rate SOC-independent, so hoist it
     # out of the state loop" fast path. There was one, decided from a fixed
     # probe set around the CURRENT temperature, and it was wrong in exactly the
@@ -1051,7 +1077,11 @@ class DPOptimizer:
             # The capability the pack really has here: its own SOC, its own
             # temperature. Looking it up at the PLANNING temperature instead is
             # what made this check compare the planner with its own assumption.
-            rate = self._rate_for(soc, temp)
+            # Same span rule as `_run_dp`, or the feasibility check would be
+            # measuring the plan against a different within-slot model.
+            rate = self._span_rate(
+                self._rate_for, soc, temp, cfg.slot_hours * fraction
+            )
             outcome = simulate_slot(
                 stored_energy_kwh=energy,
                 mode=mode,
@@ -1327,6 +1357,16 @@ class DPOptimizer:
             hold_grid_cost = buy_price * net_load_kwh
             hold_sell = sell_price  # already floored at 0
             rate_for = self._rate_for
+            # ``(soc, temp) -> rate`` for THIS slot. The conservative fallback
+            # replaces the temperature lookup with "the minimum over every
+            # profile seen this call"; the span rule is applied to whichever of
+            # the two is in force, so both paths share one within-slot model.
+            if slot_rate_fn is not None:
+                def slot_rate_lookup(soc, _temp, _fn=slot_rate_fn):
+                    return _fn(soc)
+            else:
+                slot_rate_lookup = rate_for
+            span_rate = self._span_rate
             rate_cache_slot = {}
 
             slot_trace = []
@@ -1343,13 +1383,12 @@ class DPOptimizer:
                 headroom = max(0.0, max_energy - curr_energy)
                 available = max(0.0, curr_energy - min_energy)
 
-                # Charge capability of THIS state, at THIS slot's temperature.
+                # Charge capability of THIS state, at THIS slot's temperature,
+                # over the SPAN this slot covers (see `_span_rate`).
                 slot_charge_rate = rate_cache_slot.get(idx)
                 if slot_charge_rate is None:
-                    slot_charge_rate = (
-                        slot_rate_fn(curr_soc)
-                        if slot_rate_fn is not None
-                        else rate_for(curr_soc, slot_temp)
+                    slot_charge_rate = span_rate(
+                        slot_rate_lookup, curr_soc, slot_temp, slot_hours_fraction
                     )
                     rate_cache_slot[idx] = slot_charge_rate
                 charge_dc_kwh = slot_charge_rate * slot_hours_fraction
@@ -1708,13 +1747,24 @@ class DPOptimizer:
                 start_energy / cfg.battery_capacity * 100
                 if cfg.battery_capacity else 0.0
             )
+            partial_temp = (
+                temp_profile[partial_index]
+                if partial_index < len(temp_profile)
+                else None
+            )
             if rate_fns is not None and partial_index < len(rate_fns):
-                slot_charge_rate = rate_fns[partial_index](partial_soc)
+                _partial_fn = rate_fns[partial_index]
+
+                def partial_rate_lookup(soc, _temp, _fn=_partial_fn):
+                    return _fn(soc)
             else:
-                slot_charge_rate = self._rate_for(
-                    partial_soc,
-                    temp_profile[partial_index] if partial_index < len(temp_profile) else None,
-                )
+                partial_rate_lookup = self._rate_for
+            slot_charge_rate = self._span_rate(
+                partial_rate_lookup,
+                partial_soc,
+                partial_temp,
+                cfg.slot_hours * fraction,
+            )
             charge_energy_kwh = slot_charge_rate * cfg.efficiency * cfg.slot_hours * fraction
             charge_dc_kwh = slot_charge_rate * cfg.slot_hours * fraction
             pv_free_charge_kwh = min(pv_surplus_kw, slot_charge_rate) * cfg.slot_hours * fraction

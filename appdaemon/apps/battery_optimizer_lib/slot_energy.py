@@ -47,6 +47,10 @@ from .models import BatteryMode
 # Tolerance used when comparing energies at a grid/limit boundary (kWh).
 ENERGY_EPS = 1e-9
 
+# How far back from the SOC a slot REACHES the end-of-span rate is probed, as a
+# fraction of the span. See ``charge_rate_for_span``.
+SPAN_ENDPOINT_EPS = 1e-9
+
 
 @dataclass(frozen=True)
 class SlotEnergyParams:
@@ -157,7 +161,11 @@ def simulate_slot(
         params: Battery/inverter parameters.
         charge_input_dc_kw: Charge capability at the battery terminal for this
             slot (see the unit contract above). For HOLD and self-consumption
-            DISCHARGE it caps how much PV surplus the pack can absorb.
+            DISCHARGE it caps how much PV surplus the pack can absorb. Callers
+            must derive it with ``charge_rate_for_span`` rather than by a bare
+            ``rate(soc_start, temp)`` lookup -- that is the ONE within-slot
+            charge model, and freezing the rate at the start SOC over-credits
+            every slot that crosses a learned SOC-taper boundary.
         load_kw: Household load (AC).
         pv_kw: PV production (AC-equivalent; DC-coupled surplus charges the pack).
         fraction: Fraction of the slot to simulate (0..1).
@@ -316,11 +324,96 @@ def clamp_soc(params: SlotEnergyParams, soc: float) -> float:
     return min(params.max_soc, max(params.min_soc, soc))
 
 
+def charge_rate_for_span(
+    rate_fn,
+    soc_start: float,
+    temp,
+    duration_h: float,
+    efficiency: float,
+    capacity: float,
+    max_soc: float = 100.0,
+) -> float:
+    """THE constant charge rate one (partial) slot is modelled at.
+
+    A slot still runs at ONE rate -- the DP's inner loop, `simulate_slot`,
+    `project_slot_soc` and both replays all depend on that. What changed is
+    WHICH one: the rate is evaluated at the SOC the slot starts from *and* at
+    the SOC that rate would reach (capped at ``max_soc``), and the MINIMUM of
+    the two is used for the whole slot.
+
+    Freezing it at the start SOC over-credited every slot that crossed one of
+    the learning engine's SOC-taper buckets (25 / 50 / 75 / 90 %), and no
+    validation could catch it: `plan_validation.replay_plan` and
+    `DPOptimizer._replay_plan` evaluated the same frozen model. Measured on the
+    reference 10 kWh pack with a 4 kW -> 1 kW taper at 90 % and a 15-minute
+    slot from 88 %: sub-stepped truth 92.0 %, frozen model 98.0 % -- six SOC
+    points of energy credited to a plan that could not take it.
+
+    What this rule is, precisely:
+
+    * **exact** for a piecewise-constant bucket rate when at most one bucket
+      boundary falls inside the slot. On the reference pack a 15-minute slot
+      moves at most ~8 SOC points against 25-point buckets, so that is the
+      normal case rather than a lucky one;
+    * **conservative** (never over-credits) when the rate is monotone over the
+      span the slot covers -- the minimum of the endpoints is then a lower
+      bound on every rate the slot visits;
+    * an **approximation** otherwise. A curve that dips between the two
+      endpoints and recovers is still over-credited; the only statement that
+      always holds is the identity bound
+      ``(max rate visited - min rate visited) * duration_h * efficiency``.
+
+    Temperature is NOT spanned: the rate is looked up at the temperature the
+    slot starts at, because temperature evolves between slots through
+    ``thermal_model.TemperatureProjector`` and the DP's 1-D energy state cannot
+    carry it. That is conservative when the pack WARMS during the slot -- the
+    physical case while charging -- and over-credits a pack that cools while
+    charging, bounded by
+    ``(rate(T_start) - rate(T_end)) * duration_h * efficiency``.
+
+    See ``docs/scheduling-algorithm.md`` SS Within-slot charge model and
+    ``tests/test_within_slot_charge_model.py``.
+
+    Args:
+        rate_fn: ``(soc, temp) -> charge_input_dc_kw``.
+        soc_start: SOC (%) the slot starts from -- the rate lookup basis.
+        temp: Battery temperature at the start of the slot (may be None).
+        duration_h: Length of the (possibly partial) slot in hours.
+        efficiency: Storage retention factor, so the reached SOC is the SOC the
+            pack would really hold.
+        capacity: Battery capacity (kWh).
+        max_soc: Upper SOC bound; the reached SOC is a physical SOC, never an
+            extrapolation past the pack's own ceiling.
+    """
+    start_rate = max(0.0, float(rate_fn(soc_start, temp) or 0.0))
+    if start_rate <= 0.0 or duration_h <= 0.0 or capacity <= 0.0:
+        return start_rate
+    eff = efficiency if efficiency > 0 else 0.0
+    reached_soc = min(
+        max_soc, soc_start + start_rate * duration_h * eff / capacity * 100.0
+    )
+    if reached_soc <= soc_start + 1e-12:
+        return start_rate
+    # The span the pack actually spends time in is the HALF-OPEN interval
+    # ``[soc_start, reached_soc)``: it is at ``reached_soc`` for zero seconds.
+    # Probing the closed endpoint would make a slot that exactly fills a learned
+    # bucket -- the shape of a clean calibration observation, 40 % -> 50 % in
+    # 15 minutes -- run at the NEXT bucket's rate for its whole length and stop
+    # replaying its own measurement. The relative step back is large enough to
+    # survive the float error in ``reached_soc`` (order 1e-15 of the span) and
+    # small enough that any boundary strictly inside the span is still found.
+    probe_soc = soc_start + (reached_soc - soc_start) * (1.0 - SPAN_ENDPOINT_EPS)
+    end_rate = max(0.0, float(rate_fn(probe_soc, temp) or 0.0))
+    return min(start_rate, end_rate)
+
+
 __all__ = [
+    "SPAN_ENDPOINT_EPS",
     "ENERGY_EPS",
     "SlotEnergyParams",
     "SlotEnergyResult",
     "simulate_slot",
+    "charge_rate_for_span",
     "params_from_soc_projection",
     "clamp_soc",
 ]

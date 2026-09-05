@@ -831,12 +831,20 @@ class TestLogScheduleUsesLearnedRate:
 
         # Record charging at high rate ~6.8 kW (need at least 3 observations)
         # 1% SOC = 0.143 kWh, in 1.26 min -> 0.143 / (1.26/60) = 6.8 kW
-        for _ in range(5):
-            learning_engine.record_charging(
-                soc_start=50.0,
-                soc_end=51.0,
-                duration_minutes=1.26  # 1% in 1.26 min = ~6.8 kW
-            )
+        #
+        # Recorded in EVERY bucket this hour-long charge passes through
+        # (55 % -> 100 %), not only in 50-75. The within-slot rate is the
+        # minimum over the SOC span the slot covers, so a curve that is only
+        # learned in the first bucket is deliberately modelled at the nominal
+        # rate for the whole slot -- which would make this test unable to tell
+        # the learned rate from the configured one at all.
+        for soc_start in (50.0, 60.0, 70.0, 80.0, 90.0, 95.0, 99.0):
+            for _ in range(5):
+                learning_engine.record_charging(
+                    soc_start=soc_start,
+                    soc_end=soc_start + 1.0,
+                    duration_minutes=1.26  # 1% in 1.26 min = ~6.8 kW
+                )
 
         # Create formatter with the learning engine
         formatter = ScheduleFormatter(

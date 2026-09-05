@@ -132,24 +132,40 @@ in `docs/scheduling-algorithm.md` § SOC transitions and discretization.
 Divergence here caused a production recalculation loop, not a threshold problem.
 
 **One within-slot charge model.** A CHARGE slot runs at a *constant*
-`charge_input_dc_kw` looked up at the temperature the slot **starts** at — in
-the DP's candidate transition, in `simulate_slot`, in
-`plan_validation.replay_plan`, in `project_slot_soc` (expected SOC and the
-deviation detector) and in `cost_tracker.project_costs`. The rate never changes
-inside a slot; temperature changes only *between* slots, through
-`TemperatureProjector`. `learning_engine.predict_charge_input_dc_energy` splits
-a slot into a cold and a warm phase using a second thermal model; it is
-**diagnostic only** and must not be called from a planning or projection path.
-It was, from `project_slot_soc`, and on one 15-minute slot crossing 1 kW → 4 kW
-the DP said 12.5 % while the published trajectory said 16.25 %. The bound on the
-constant-rate approximation, and why it errs conservative, is in
+`charge_input_dc_kw` for its whole length, and **which** constant is decided in
+exactly one place: `slot_energy.charge_rate_for_span`. It evaluates the rate at
+the SOC the slot starts from and at the SOC that rate would reach (capped at
+`max_soc`) and takes the **minimum** — used by the DP's candidate transition and
+partial-slot lookahead, `DPOptimizer._replay_plan`, `simulate_slot`,
+`plan_validation.replay_plan`, `project_slot_soc` (expected SOC and the
+deviation detector) and `cost_tracker.project_costs`. Never call
+`rate(soc_start, temp)` directly at a consumer: freezing the rate at the start
+SOC over-credited every slot crossing a learned SOC-taper bucket
+(25 / 50 / 75 / 90 %) — 98.0 % against a sub-stepped truth of 92.0 % on a
+15-minute slot from 88 % with a 4 kW → 1 kW taper at 90 % — and *no validation
+could catch it*, because `replay_plan` and `_replay_plan` evaluated the same
+frozen model. The rate never changes inside a slot; temperature changes only
+*between* slots, through `TemperatureProjector`.
+`learning_engine.predict_charge_input_dc_energy` splits a slot into a cold and a
+warm phase using a second thermal model; it is **diagnostic only** and must not
+be called from a planning or projection path. It was, from `project_slot_soc`,
+and on one 15-minute slot crossing 1 kW → 4 kW the DP said 12.5 % while the
+published trajectory said 16.25 %. What the model claims — the identity bound,
+the direction claims and the monotonicity they need, and the pinned
+non-monotonic counterexample where only the identity holds — is in
 `docs/scheduling-algorithm.md` § Within-slot charge model.
 
 **One thermal model.** Battery temperature is projected only by
 `thermal_model.TemperatureProjector`, shared by the DP's rate refinement
 (`_idle_temp_profile`, `_replay_plan_temps`), the expected-SOC trajectory
-(`soc_projection`) and the schedule formatter. Two invariants must not be
-broken:
+(`soc_projection`), the SOC deviation detector and the schedule formatter.
+`project_slot_soc` has **no fallback**: without an injected projector it returns
+the starting temperature unchanged. It used to fall through to the learning
+engine's own `predict_temp_after_duration` / `predict_temp_after_idle`, and
+`SocDeviationDetector._project_charge_completion` — a multi-slot walk, so the
+error compounded — reached that path on every projection, answering 32.5 % where
+the published trajectory said 17.5 %. Anything that needs a temperature to move
+must be handed the app's projector. Two further invariants must not be broken:
 
 1. Warming is a function of `|P_bat|`, not of the mode — discharging heats the
    pack. Never reintroduce a `mode == CHARGE` branch in a temperature path. And

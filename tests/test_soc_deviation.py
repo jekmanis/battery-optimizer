@@ -7,6 +7,8 @@ These tests verify that:
 3. Recalculation is still triggered when actually needed
 """
 
+from __future__ import annotations
+
 import datetime
 from typing import Dict, List, Optional
 from unittest.mock import MagicMock

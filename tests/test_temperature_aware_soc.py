@@ -7,6 +7,8 @@ These tests verify that the optimizer correctly:
 - Falls back gracefully when temperature data is unavailable
 """
 
+from __future__ import annotations
+
 import datetime
 import math
 from typing import Dict, List

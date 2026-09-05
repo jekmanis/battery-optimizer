@@ -5,6 +5,8 @@ These tests verify the core dynamic programming optimization algorithm
 without requiring AppDaemon or Home Assistant.
 """
 
+from __future__ import annotations
+
 import datetime
 from typing import Dict, List
 

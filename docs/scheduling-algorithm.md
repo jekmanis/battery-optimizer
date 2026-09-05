@@ -1263,17 +1263,27 @@ What happens instead:
   prices as fetched; it finds no index for the current slot, so it solves the
   remaining slots at full width with no partial first slot. The horizon is not
   lost because one interval is.
-- **The current slot is resolved BEFORE the solve, not after it.** Whatever is
-  going to run for the rest of this quarter hour — the retained entry, or the
-  `HOLD` fallback, which still absorbs PV surplus — is walked through
-  `soc_projection.project_slot_soc` for the remaining fraction of the slot, and
-  the DP is handed the SOC and temperature that walk ends at. Solving from the
-  SOC measured mid-slot modelled the retained action as doing nothing: a
-  retained `CHARGE` running 10:07 → 10:15 at 4.5 kW × 0.85 adds about 3.6 SOC
-  points on the 14.3 kWh reference pack that the plan never saw, and a retained
-  `DISCHARGE` errs the other way. The retain-or-fall-back decision is the same
-  one `_retain_current_slot_if_unpriced` makes and is taken from the same test,
-  so the slot that gets advanced is the slot that gets stamped.
+- **The current slot is resolved BEFORE the solve, not after it — the whole
+  decision.** `_resolve_unpriced_current_slot` picks the entry that will run
+  for the rest of this quarter hour (the retained one, or the `HOLD` fallback,
+  which still absorbs PV surplus), that entry is walked through
+  `soc_projection.project_slot_soc` for the remaining fraction of the slot, the
+  DP is handed the SOC and temperature that walk ends at, and the entry joins
+  the schedule **before** the cloud-safe hedge, `_validate_final_plan`, the
+  mode census, the projected-cost column and the decision log.
+
+  Solving from the SOC measured mid-slot modelled the retained action as doing
+  nothing: a retained `CHARGE` running 10:07 → 10:15 at 4.5 kW × 0.85 adds
+  about 3.6 SOC points on the 14.3 kWh reference pack that the plan never saw,
+  and a retained `DISCHARGE` errs the other way.
+
+  Deciding the entry *afterwards*, in the two planning paths, was the same
+  ordering defect one step later: on the 10:07 fixture the mode census reported
+  0 charge slots against a schedule holding a retained `CHARGE`, the final-plan
+  replay covered 55 of 56 slots — the missing one being the slot actually sent
+  to the inverter — and the projected-cost column had no row for it. **Nothing
+  writes to the schedule after `_validate_final_plan`**, and no planning path
+  adds an entry the planner did not produce.
 - **A previously planned entry is retained** if it was itself built from a
   published price. `ScheduleEntry.price_source` records that provenance
   (`"market"`), stamped when the schedule is built against the price keys the

@@ -454,7 +454,15 @@ restart from the measured SOC and skip the quarter hour the DP was handed
 `schedule` is the one source of truth for what runs; the paths that used to key
 off the absence test `_is_no_price_fallback` instead, so the retry arming, the
 `current_slot_entry: fallback` diagnostics and the horizon extension are
-unchanged. `execute_scheduled_mode`
+unchanged. **That whole decision is taken before the solve**
+(`_resolve_unpriced_current_slot`), and the entry joins the schedule ahead of
+the hedge and `_validate_final_plan`. Taken afterwards, in the two planning
+paths, it left `_last_schedule_counts` at 0 charge against a retained CHARGE,
+`_last_plan_replay` covering 55 of 56 slots (the missing one being the slot
+sent to the inverter) and no projected-cost row for it — so **nothing writes to
+`schedule` after `_validate_final_plan`**, and no planning path adds an entry
+the planner did not produce (`tests/test_unpriced_slot_expected_soc.py` scans
+the source for it). `execute_scheduled_mode`
 refuses to send any non-HOLD current-slot entry without that provenance. Asking a
 source for the missing interval is a **fetch** and belongs in the price service
 and the retry, never a substitution at planning time. See

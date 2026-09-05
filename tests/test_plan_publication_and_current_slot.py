@@ -214,9 +214,9 @@ for _name in (
     "_resolve_plan_shortfall",
     "_compute_slot_fractions",
     "_entry_has_real_price",
-    "_retain_current_slot_if_unpriced",
-    "_advance_across_unpriced_current_slot",
+    "_resolve_unpriced_current_slot",
     "_advance_current_slot",
+    "_note_current_slot_state",
     "_rate_refinement_diagnostics",
 ):
     setattr(PlannerApp, _name, getattr(BatteryOptimizer, _name, None))
@@ -473,7 +473,11 @@ def _future_prices():
 
 
 class TestTheUnpricedCurrentSlotIsResolvedBeforeSolving:
-    """The DP must start from the SOC the retained action will actually leave."""
+    """The DP must start from the SOC the retained action will actually leave.
+
+    And the entry that action belongs to joins the plan in the same step, so
+    the census, the replay and the cost column all describe it.
+    """
 
     def test_a_retained_charge_advances_the_starting_soc(self):
         app = _unpriced_app()
@@ -482,13 +486,22 @@ class TestTheUnpricedCurrentSlotIsResolvedBeforeSolving:
             _future_prices(), 0, current_soc=START_SOC,
             previous_current_entry=retained,
         )
-        assert SLOT_10_00 not in schedule  # unpriced: the planner does not own it
+        # The DP was not given the interval, but the plan says what runs in it.
+        assert schedule[SLOT_10_00].mode == BatteryMode.CHARGE
+        assert schedule[SLOT_10_00].price_source == PRICE_SOURCE_MARKET
+        assert app._last_schedule_counts.charge >= 1
+        assert SLOT_10_00 in app._last_plan_replay.by_slot
 
         gained = CHARGE_KW * REMAINING_H * EFFICIENCY / CAPACITY * 100
         expected = START_SOC + gained
         assert expected == pytest.approx(43.5664, abs=1e-3)
         assert app._last_dp_soc_trajectory[SLOT_10_15][0] == pytest.approx(
             expected, abs=1e-6
+        )
+        # The published trajectory starts from what was MEASURED and walks the
+        # partial current slot; the advanced SOC was an INPUT to the DP.
+        assert app._last_dp_soc_trajectory[SLOT_10_00][0] == pytest.approx(
+            START_SOC, abs=1e-9
         )
 
     def test_a_retained_discharge_advances_the_other_way(self):
@@ -499,7 +512,7 @@ class TestTheUnpricedCurrentSlotIsResolvedBeforeSolving:
             _future_prices(), 0, current_soc=START_SOC,
             previous_current_entry=retained,
         )
-        assert SLOT_10_00 not in schedule
+        assert schedule[SLOT_10_00].mode == BatteryMode.DISCHARGE
         drained = 2.0 * REMAINING_H / CAPACITY * 100
         expected = START_SOC - drained
         assert app._last_dp_soc_trajectory[SLOT_10_15][0] == pytest.approx(
@@ -512,10 +525,13 @@ class TestTheUnpricedCurrentSlotIsResolvedBeforeSolving:
         app = _unpriced_app()
         app.pv_by_slot = {SLOT_10_00: 3.0}
         unpriced_previous = _entry(SLOT_10_00, BatteryMode.CHARGE, priced=False)
-        app.find_optimal_schedule(
+        schedule = app.find_optimal_schedule(
             _future_prices(), 0, current_soc=START_SOC,
             previous_current_entry=unpriced_previous,
         )
+        assert schedule[SLOT_10_00].mode == BatteryMode.HOLD
+        assert schedule[SLOT_10_00].reason == "no_price"
+        assert schedule[SLOT_10_00].price_source is None
         gained = 3.0 * REMAINING_H * EFFICIENCY / CAPACITY * 100
         assert app._last_dp_soc_trajectory[SLOT_10_15][0] == pytest.approx(
             START_SOC + gained, abs=1e-6
@@ -523,9 +539,10 @@ class TestTheUnpricedCurrentSlotIsResolvedBeforeSolving:
 
     def test_no_previous_entry_holds_and_changes_nothing_without_pv(self):
         app = _unpriced_app()
-        app.find_optimal_schedule(
+        schedule = app.find_optimal_schedule(
             _future_prices(), 0, current_soc=START_SOC, previous_current_entry=None
         )
+        assert schedule[SLOT_10_00].reason == "no_price"
         assert app._last_dp_soc_trajectory[SLOT_10_15][0] == pytest.approx(
             START_SOC, abs=1e-9
         )

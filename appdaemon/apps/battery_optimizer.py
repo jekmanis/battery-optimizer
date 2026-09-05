@@ -1360,16 +1360,16 @@ class BatteryOptimizer(hass.Hass):
 
         Args:
             previous_current_entry: The existing plan's entry for the interval
-                running NOW. Defaults to reading it out of ``self.schedule``,
-                which both callers still hold unreplaced at this point — they
-                read the same entry for their own
-                ``_retain_current_slot_if_unpriced`` call afterwards. It matters
-                only when nobody published a price for that interval: the
-                current slot is then resolved BEFORE the solve (retain it if it
-                was itself planned on a real price, else HOLD) and the
-                SOC/temperature are advanced across the remaining fraction of
-                it, so the DP plans the rest of the horizon from where the
-                current slot will actually leave the pack.
+                running NOW. Both callers pass the one they read before they
+                replace ``self.schedule``; it defaults to reading it out of
+                ``self.schedule``, which they still hold unreplaced here. It
+                matters only when nobody published a price for that interval:
+                the current slot is then resolved BEFORE the solve (retain it
+                if it was itself planned on a real price, else HOLD/`no_price`),
+                the SOC/temperature are advanced across the remaining fraction
+                of it so the DP plans the rest of the horizon from where the
+                slot will actually leave the pack, and the resulting entry
+                joins the schedule ahead of the hedge and the final validation.
         """
         if not prices:
             return {}
@@ -1445,13 +1445,25 @@ class BatteryOptimizer(hass.Hass):
         # energy that would not exist.
         #
         # The partial-slot fraction IS the continuity mechanism.
+        current_slot_entry: Optional[ScheduleEntry] = None
+        current_slot_state = "planned"
         if not current_slot_priced:
-            # Resolve the current slot BEFORE solving, not after. The callers
-            # still STAMP the retained entry (`_retain_current_slot_if_unpriced`,
-            # which owns the provenance and the diagnostics state); what happens
-            # here is the part that has to happen first, because the DP cannot
-            # plan the rest of the horizon from a SOC the current slot is still
-            # moving. Solving from the mid-slot reading pretended the retained
+            # The current slot is resolved BEFORE solving — the whole decision,
+            # not half of it. Which entry runs (the retained real-priced one,
+            # else the HOLD/`no_price` fallback) and the SOC/temperature it
+            # leaves the pack at are the same question, and the answer has to
+            # be in the plan before the hedge, `_validate_final_plan`, the mode
+            # census, the projected-cost column and the decision log — every
+            # one of which describes "the plan".
+            #
+            # It used to be taken afterwards, in the two callers. Measured on
+            # the 10:07 unpriced fixture: `_last_schedule_counts` reported 0
+            # charge while the schedule held a retained CHARGE,
+            # `_last_plan_replay` covered 55 of 56 slots (the missing one being
+            # the slot sent to the inverter) and `_last_projected_costs` had no
+            # row for it.
+            #
+            # Solving from the mid-slot reading also pretended the retained
             # action did nothing: a retained CHARGE running 10:07 -> 10:15 at
             # 4.5 kW x 0.85 adds ~3.6 SOC points on the 14.3 kWh reference pack
             # that the plan never saw, and a retained DISCHARGE errs the other
@@ -1468,15 +1480,30 @@ class BatteryOptimizer(hass.Hass):
                     current_slot,
                     self._get_local_timezone(),
                 )
-            current_soc_for_calc, current_temp = (
-                self._advance_across_unpriced_current_slot(
-                    previous_entry=previous_current_entry,
-                    current_slot=current_slot,
-                    current_soc=current_soc_for_calc,
-                    current_temp=current_temp,
-                    minutes_into_slot=minutes_into_slot,
+            current_slot_entry, current_slot_state = (
+                self._resolve_unpriced_current_slot(
+                    previous_current_entry, current_slot
                 )
             )
+            current_soc_for_calc, current_temp = self._advance_current_slot(
+                mode=current_slot_entry.mode,
+                export_rate=current_slot_entry.export_rate,
+                current_slot=current_slot,
+                current_soc=current_soc_for_calc,
+                current_temp=current_temp,
+                minutes_into_slot=minutes_into_slot,
+                label="unpriced current slot",
+            )
+        # Diagnostics for the interval this solve describes. Recorded here
+        # rather than in the callers, because this is where the answer is
+        # decided and both planning paths must report it identically.
+        #
+        # getattr, like the terminal-value warning gate and the final-plan
+        # validation below: several test doubles borrow this method without the
+        # full app surface.
+        _note_slot_state = getattr(self, "_note_current_slot_state", None)
+        if callable(_note_slot_state):
+            _note_slot_state(current_slot, current_slot_priced, current_slot_state)
 
         # Rate-limited legacy-terminal-value warning. Resolved defensively:
         # several test doubles borrow this method without the full app state.
@@ -1527,6 +1554,32 @@ class BatteryOptimizer(hass.Hass):
         soc_trajectory = result.soc_trajectory
         temp_trajectory = result.temp_trajectory
 
+        if current_slot_entry is not None:
+            # The current slot the DP was not given joins the plan HERE, ahead
+            # of the hedge, the final-plan replay, the census, the
+            # projected-cost column and the decision log — so every one of them
+            # describes the plan that will execute. Its provenance was decided
+            # with it: `PRICE_SOURCE_MARKET` for a retained entry that really
+            # was planned on a published price, nothing for the fallback.
+            schedule[canonical_slot_key(current_slot)] = current_slot_entry
+            # From here on the plan is walked from what was MEASURED, across
+            # the partial current slot. The advanced SOC was an INPUT to the
+            # DP; using it as the starting point of the published trajectory
+            # would count the current slot twice.
+            current_soc_for_calc = measured_soc
+            current_temp = measured_temp
+            soc_trajectory, temp_trajectory = self.project_schedule_trajectory(
+                schedule,
+                measured_soc,
+                starting_temp=measured_temp,
+                current_slot=current_slot,
+                minutes_into_slot=minutes_into_slot,
+            )
+            if measured_temp is None:
+                # Parity with DPOptimizer._build_temp_trajectory: no starting
+                # temperature means no temperature trajectory at all.
+                temp_trajectory = {}
+
         # Cloud-safe hedge: HOLD → DISCHARGE(to load) during PV hours.
         # discharge_to_load charges from PV surplus (confirmed on Growatt WIT),
         # so it behaves identically to HOLD while PV covers the load. But when
@@ -1549,6 +1602,15 @@ class BatteryOptimizer(hass.Hass):
             canonical_slot_key(p.time): slot_fractions[i]
             for i, p in enumerate(slots_sorted_by_time)
         }
+        if current_slot_entry is not None:
+            # The unpriced current slot runs for the remainder of its interval
+            # like any other partial first slot; it is missing from
+            # `slots_sorted_by_time` precisely because nobody published a price
+            # for it, and the hedge and the cost column both need its fraction.
+            slot_fractions_by_slot.setdefault(
+                canonical_slot_key(current_slot),
+                first_slot_fraction(minutes_into_slot, self.config.slot_minutes),
+            )
         prices_by_slot_map = {
             canonical_slot_key(p.time): p.price for p in slots_sorted_by_time
         }
@@ -1775,45 +1837,6 @@ class BatteryOptimizer(hass.Hass):
             and not self._entry_has_real_price(entry)
         )
 
-    def _advance_across_unpriced_current_slot(
-        self,
-        *,
-        previous_entry: Optional[ScheduleEntry],
-        current_slot: datetime.datetime,
-        current_soc: float,
-        current_temp: Optional[float],
-        minutes_into_slot: float,
-    ) -> Tuple[float, Optional[float]]:
-        """SOC and temperature at the END of an unpriced current slot.
-
-        The DP is not given this interval — nobody published a price for it, so
-        it plans from the NEXT one. But something is still going to run here for
-        the rest of the quarter hour: the retained entry, if the existing plan
-        held one built on a real price, and otherwise HOLD. Handing the DP the
-        SOC measured mid-slot models that action as doing nothing.
-
-        The decision is the same one `_retain_current_slot_if_unpriced` makes
-        and is deliberately made from the same test (`_entry_has_real_price`),
-        so the slot that gets stamped "retained" is the slot that was advanced.
-        HOLD is not a no-op either: it still absorbs PV surplus.
-
-        The transition is `soc_projection.project_slot_soc` — the ONE slot-SOC
-        model, with the app's shared thermal projector, so this pre-step cannot
-        become a fourth physics implementation.
-        """
-        retained = (
-            previous_entry if self._entry_has_real_price(previous_entry) else None
-        )
-        return self._advance_current_slot(
-            mode=retained.mode if retained is not None else BatteryMode.HOLD,
-            export_rate=retained.export_rate if retained is not None else None,
-            current_slot=current_slot,
-            current_soc=current_soc,
-            current_temp=current_temp,
-            minutes_into_slot=minutes_into_slot,
-            label="unpriced current slot",
-        )
-
     def _advance_current_slot(
         self,
         *,
@@ -1872,57 +1895,59 @@ class BatteryOptimizer(hass.Hass):
             )
         return transition.soc_end, transition.temp_end
 
-    def _retain_current_slot_if_unpriced(
+    def _resolve_unpriced_current_slot(
         self,
-        schedule: Dict[datetime.datetime, ScheduleEntry],
         previous_entry: Optional[ScheduleEntry],
         current_slot: datetime.datetime,
-        local_tz=None,
-    ) -> str:
-        """Resolve a current slot the planner could not price.
+    ) -> Tuple[ScheduleEntry, str]:
+        """The entry that will run a current slot the planner could not price.
 
-        Returns the state for the diagnostics payload:
+        Called BEFORE the solve and returns the entry rather than writing it,
+        so `find_optimal_schedule` can put it into the plan at the one point
+        where everything downstream still describes it: ahead of the hedge,
+        `_validate_final_plan`, the mode census, the projected-cost column and
+        the decision log. Taken afterwards, in the callers, it left the census
+        reporting 0 charge against a retained CHARGE, the replay covering every
+        slot but the one actually sent to the inverter, and the cost column
+        with no row for it.
 
-        * ``"planned"``  - the interval was published; the planner owns it.
-        * ``"retained"`` - it was not, but the plan already held an entry built
-          from a real price, so that decision stands. It is still subject to
-          every execution guard (enabled, manual override, min/max SOC): this
-          keeps a decision that was made on real data, it does not exempt it.
+        The second element is the state for the diagnostics payload:
+
+        * ``"retained"`` - the plan already held an entry built from a real
+          price, so that decision stands. It is still subject to every
+          execution guard (enabled, manual override, min/max SOC): this keeps a
+          decision that was made on real data, it does not exempt it.
         * ``"fallback"`` - nothing can vouch for a price, so the slot gets a
           HOLD/`no_price` entry with no provenance. It is an ENTRY, not an
-          absence: the pre-solve step already advanced the pack across this
-          interval (a HOLD still absorbs PV surplus), and a schedule that omits
-          it makes `expected_soc_schedule` restart from the measured SOC and
-          skip the interval, contradicting the SOC the DP was handed. Every
-          path that treated the absence as the signal - the `no_price` retry
-          arming in `execute_scheduled_mode`, the diagnostics, the horizon
-          extension - now tests `_is_no_price_fallback` instead.
+          absence: the pre-solve step advances the pack across this interval (a
+          HOLD still absorbs PV surplus), and a schedule that omits it makes
+          `expected_soc_schedule` restart from the measured SOC and skip the
+          interval, contradicting the SOC the DP was handed. Every path that
+          treated the absence as the signal - the `no_price` retry arming in
+          `execute_scheduled_mode`, the diagnostics, the horizon extension -
+          tests `_is_no_price_fallback` instead.
 
-        Shared by every planning path (`full_optimize`,
+        (``"planned"`` is the third state and is decided by the caller: the
+        interval was published and the DP owns it.)
+
+        One decision for every planning path (`full_optimize`,
         `_recalculate_remaining_schedule` and therefore SOC deviation, PV
         shortfall, depletion, price recovery and the adaptive horizon
         extension), because a rule applied in one of them is a rule the other
         four break.
         """
-        if local_tz is None:
-            local_tz = self._get_local_timezone()
-        existing = lookup_by_time(schedule, current_slot, local_tz)
-        if existing is not None:
-            # "The planner owns it" is a claim about the PRICE, not about the
-            # key being present. An entry that cannot vouch for a price is one
-            # `execute_scheduled_mode` will degrade to HOLD, which is the
-            # fallback outcome, so say so.
-            return "planned" if self._entry_has_real_price(existing) else "fallback"
         if not self._entry_has_real_price(previous_entry):
-            schedule[canonical_slot_key(current_slot)] = ScheduleEntry(
-                time=current_slot,
-                mode=BatteryMode.HOLD,
-                reason=NO_PRICE_REASON,
+            return (
+                ScheduleEntry(
+                    time=current_slot,
+                    mode=BatteryMode.HOLD,
+                    reason=NO_PRICE_REASON,
+                ),
+                "fallback",
             )
-            return "fallback"
 
         retained = ScheduleEntry(
-            time=previous_entry.time,
+            time=current_slot,
             mode=previous_entry.mode,
             reason=previous_entry.reason,
             export_rate=previous_entry.export_rate,
@@ -1932,12 +1957,11 @@ class BatteryOptimizer(hass.Hass):
             energy_limited=previous_entry.energy_limited,
             price_source=PRICE_SOURCE_MARKET,
         )
-        schedule[canonical_slot_key(retained.time)] = retained
         self.log(
             f"Current slot {current_slot} has no published price - keeping the "
             f"existing {retained.mode.name} entry, which was planned on one"
         )
-        return "retained"
+        return retained, "retained"
 
     def _compute_slot_fractions(
         self,
@@ -2504,15 +2528,17 @@ class BatteryOptimizer(hass.Hass):
         # Generate schedule. The current slot's existing entry is read BEFORE
         # the replacement: when the interval turns out to be unpriced it is the
         # only thing that can legitimately drive this slot, and assigning
-        # `self.schedule` destroys it.
+        # `self.schedule` destroys it. The planner resolves that slot before it
+        # solves, so nothing here has to add to the plan afterwards — a write
+        # after the validation would leave the replay, the census and the cost
+        # column describing a plan that is not the one being published.
         local_tz = self._get_local_timezone()
         previous_current_entry = lookup_by_time(self.schedule, current_slot, local_tz)
-        self.schedule = self.find_optimal_schedule(future_prices, charge_hours_needed, current_soc)
-        entry_state = self._retain_current_slot_if_unpriced(
-            self.schedule, previous_current_entry, current_slot, local_tz
-        )
-        self._note_current_slot_state(
-            current_slot, entry_state == "planned", entry_state
+        self.schedule = self.find_optimal_schedule(
+            future_prices,
+            charge_hours_needed,
+            current_soc,
+            previous_current_entry=previous_current_entry,
         )
 
         # Nothing overrides the current slot on a restart. The DP's partial
@@ -2820,14 +2846,15 @@ class BatteryOptimizer(hass.Hass):
 
         # Generate new schedule for remaining time. Read the current slot's
         # entry first: the deletion below is what makes a rebuild lose it, and
-        # an unpriced current interval has nothing else to fall back on.
+        # an unpriced current interval has nothing else to fall back on. The
+        # planner resolves that slot before it solves; nothing is added to the
+        # plan after it has been validated, counted and costed.
         previous_current_entry = lookup_by_time(self.schedule, now_slot, local_tz)
-        new_schedule = self.find_optimal_schedule(future_prices, charge_hours_needed, current_soc)
-        entry_state = self._retain_current_slot_if_unpriced(
-            new_schedule, previous_current_entry, now_slot, local_tz
-        )
-        self._note_current_slot_state(
-            now_slot, entry_state == "planned", entry_state
+        new_schedule = self.find_optimal_schedule(
+            future_prices,
+            charge_hours_needed,
+            current_soc,
+            previous_current_entry=previous_current_entry,
         )
 
         # Remove all future entries and replace with new schedule
@@ -3132,7 +3159,7 @@ class BatteryOptimizer(hass.Hass):
         # safety HOLD the SOC sits pinned at max, so no further SOC event
         # arrives -- and the interval is then unpriced, so a rebuild retains
         # the previous real-priced CHARGE entry
-        # (`_retain_current_slot_if_unpriced`) and sends CHARGE into a full
+        # (`_resolve_unpriced_current_slot`) and sends CHARGE into a full
         # pack with nothing left to correct it. Exactly the min-SOC failure
         # with the signs flipped.
         if (entry.mode == BatteryMode.CHARGE

@@ -1432,7 +1432,8 @@ class TestRecalculateRemainingScheduleWithExtraSlots:
             def calculate_min_charge_slots_for_horizon(self, soc, prices):
                 return 1  # Base requirement
 
-            def find_optimal_schedule(self, prices, min_charge_slots, soc):
+            def find_optimal_schedule(self, prices, min_charge_slots, soc,
+                                      previous_current_entry=None):
                 self._min_charge_slots_used = min_charge_slots
                 self._bias_factor_at_generate = self._pv_bias_factor
                 return {}
@@ -1471,10 +1472,10 @@ class TestRecalculateRemainingScheduleWithExtraSlots:
         # the corrected forecast.
         MockRecalculateOptimizer._refresh_pv_bias_factor = BatteryOptimizer._refresh_pv_bias_factor
         # A rebuild also decides what happens to a current slot the planner
-        # could not price (retain the previous real-priced entry, else leave it
-        # to the HOLD fallback).
-        MockRecalculateOptimizer._retain_current_slot_if_unpriced = (
-            BatteryOptimizer._retain_current_slot_if_unpriced
+        # could not price (retain the previous real-priced entry, else the HOLD
+        # fallback) - inside `find_optimal_schedule`, before the solve.
+        MockRecalculateOptimizer._resolve_unpriced_current_slot = (
+            BatteryOptimizer._resolve_unpriced_current_slot
         )
         MockRecalculateOptimizer._entry_has_real_price = (
             BatteryOptimizer._entry_has_real_price

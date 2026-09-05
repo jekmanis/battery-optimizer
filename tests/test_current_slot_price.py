@@ -342,8 +342,13 @@ class TestNoInventedCurrentSlotPrice:
         schedule = app.find_optimal_schedule(unfiltered, 0, current_soc=50.0)
 
         entry = bo.lookup_by_time(schedule, current_slot, app._get_local_timezone())
-        assert entry is None, (
-            "an unpriced current slot must not appear in a generated schedule"
+        assert entry is not None, (
+            "the interval that is RUNNING is in the plan, as a fallback"
+        )
+        assert entry.mode == BatteryMode.HOLD
+        assert entry.reason == "no_price"
+        assert entry.price_source is None, (
+            "an unpriced current slot must never claim a published price"
         )
 
     def test_the_planner_never_sees_a_synthetic_current_price(self, scenario_now):

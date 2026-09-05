@@ -265,7 +265,8 @@ class RecoveryOptimizer(bo.BatteryOptimizer):
     def calculate_min_charge_slots_for_horizon(self, current_soc, prices):
         return 0
 
-    def find_optimal_schedule(self, prices, charge_hours_needed, current_soc=None):
+    def find_optimal_schedule(self, prices, charge_hours_needed, current_soc=None,
+                              previous_current_entry=None):
         self.planner_calls.append(
             {"count": len(prices), "soc": current_soc, "now": self._now}
         )

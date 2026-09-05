@@ -224,7 +224,6 @@ from battery_optimizer import BatteryOptimizer
 MockOptimizer.find_optimal_schedule = BatteryOptimizer.find_optimal_schedule
 MockOptimizer._ensure_current_slot_price = BatteryOptimizer._ensure_current_slot_price
 MockOptimizer._compute_slot_fractions = BatteryOptimizer._compute_slot_fractions
-MockOptimizer._compute_charge_rates_per_slot = BatteryOptimizer._compute_charge_rates_per_slot
 
 
 class TestFindOptimalSchedule:

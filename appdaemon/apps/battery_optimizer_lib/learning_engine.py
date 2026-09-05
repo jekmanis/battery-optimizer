@@ -24,7 +24,7 @@ this file, so no migration and no repeated division on reload.
 :meth:`BatteryLearningEngine.get_charge_rate_for_soc` is the API boundary and
 returns ``charge_input_dc_kw``, because that is what every consumer multiplies
 by ``efficiency`` to obtain stored energy (the DP, ``soc_projection``,
-``charge_rate_utils``, ``cost_tracker``) and what the thermal model wants as
+``dp_optimizer``, ``cost_tracker``) and what the thermal model wants as
 ``|P_bat|``. The nominal fallback is already in those units; a learned
 stored-side observation is divided by :attr:`storage_efficiency` on the way out.
 
@@ -67,7 +67,7 @@ THERMAL_UNITS_VERSION = 7
 # Learned-rate plausibility bounds — THE one sanity bound
 # ---------------------------------------------------------------------------
 # Every consumer of a learned battery power (the DP through
-# ``charge_rate_utils``, the expected-SOC trajectory through
+# ``DPOptimizer._rate_for``, the expected-SOC trajectory through
 # ``soc_projection._effective_charge_rate``, the deviation detector through
 # ``_project_charge_completion`` / ``_calculate_extra_charge_slots``) reaches it
 # via :meth:`BatteryLearningEngine.get_charge_rate_for_soc`. The bound therefore
@@ -1128,7 +1128,7 @@ class BatteryLearningEngine:
         4. Nominal rate
 
         THIS IS THE ONE GATE every consumer of a learned charge rate passes
-        through — the DP (via ``charge_rate_utils``), the expected-SOC
+        through — the DP (via ``DPOptimizer._rate_for``), the expected-SOC
         trajectory (via ``soc_projection._effective_charge_rate``) and the SOC
         deviation detector. Implausible observations are filtered out of every
         median (see :meth:`_plausible_rates`) and the result is clamped to
@@ -1245,8 +1245,8 @@ class BatteryLearningEngine:
         flat ``+0.1 °C/min``.
 
         The result is capped at ``MAX_BATTERY_TEMP_C``. Without that cap,
-        ``charge_rate_utils.compute_charge_rates_per_slot`` projected 132 slots
-        of unbounded linear warming and reached ~230 °C by the end of a 33 h
+        the historical charge-rate precomputation projected 132 slots of
+        unbounded linear warming and reached ~230 °C by the end of a 33 h
         horizon.
 
         Args:

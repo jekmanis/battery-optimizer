@@ -263,7 +263,6 @@ MockOptimizer._replay_schedule = BatteryOptimizer._replay_schedule
 MockOptimizer.find_optimal_schedule = BatteryOptimizer.find_optimal_schedule
 MockOptimizer._ensure_current_slot_price = BatteryOptimizer._ensure_current_slot_price
 MockOptimizer._compute_slot_fractions = BatteryOptimizer._compute_slot_fractions
-MockOptimizer._compute_charge_rates_per_slot = BatteryOptimizer._compute_charge_rates_per_slot
 
 
 class TestTemperatureAwareSOCProjection:
@@ -646,102 +645,13 @@ class TestLogScheduleTemperatureDisplay:
         assert "C->" not in log_text
 
 
-class TestChargeRateSOCProjection:
-    """Tests that charge rates decline as projected SOC increases."""
-
-    def test_rates_decline_with_soc_projection(self):
-        """With SOC-dependent charge rate, later slots should see lower rates."""
-        from battery_optimizer_lib.charge_rate_utils import compute_charge_rates_per_slot
-
-        base = datetime.datetime(2024, 6, 15, 12, 0)
-        slots = [PricePoint(time=base + datetime.timedelta(minutes=15 * i), price=0.05) for i in range(8)]
-        fractions = [1.0] * 8
-
-        # Simulate BMS behaviour: charge rate drops with SOC
-        def charge_rate_by_soc(soc, temp):
-            if soc < 50:
-                return 7.4
-            elif soc < 80:
-                return 5.0
-            else:
-                return 2.5
-
-        rates = compute_charge_rates_per_slot(
-            slots_sorted_by_time=slots,
-            slot_fractions=fractions,
-            slot_minutes=15,
-            current_soc=20.0,
-            current_temp=25.0,
-            get_charge_rate_for_soc=charge_rate_by_soc,
-            predict_temp_after_duration=lambda t, d: t,  # constant temp
-            battery_capacity=14.3,
-            efficiency=0.85,
-            max_soc=100.0,
-        )
-
-        # First slots should have high rate (low SOC)
-        assert rates[0] == 7.4
-        # Later slots should have lower rates as SOC climbs
-        assert rates[-1] < rates[0], f"Last rate {rates[-1]} should be < first rate {rates[0]}"
-        # Rates should be monotonically non-increasing
-        for i in range(1, len(rates)):
-            assert rates[i] <= rates[i - 1], f"Rate at slot {i} ({rates[i]}) > slot {i-1} ({rates[i-1]})"
-
-    def test_rates_constant_without_capacity(self):
-        """Without battery_capacity (legacy), rates stay at initial SOC."""
-        from battery_optimizer_lib.charge_rate_utils import compute_charge_rates_per_slot
-
-        base = datetime.datetime(2024, 6, 15, 12, 0)
-        slots = [PricePoint(time=base + datetime.timedelta(minutes=15 * i), price=0.05) for i in range(4)]
-        fractions = [1.0] * 4
-
-        def charge_rate_by_soc(soc, temp):
-            return 7.4 if soc < 50 else 2.5
-
-        rates = compute_charge_rates_per_slot(
-            slots_sorted_by_time=slots,
-            slot_fractions=fractions,
-            slot_minutes=15,
-            current_soc=20.0,
-            current_temp=None,
-            get_charge_rate_for_soc=charge_rate_by_soc,
-            predict_temp_after_duration=lambda t, d: t,
-            # battery_capacity=0 (default) → no SOC projection
-        )
-
-        # All rates should be at the low-SOC rate
-        assert all(r == 7.4 for r in rates)
-
-    def test_soc_capped_at_max(self):
-        """SOC projection should not exceed max_soc."""
-        from battery_optimizer_lib.charge_rate_utils import compute_charge_rates_per_slot
-
-        base = datetime.datetime(2024, 6, 15, 12, 0)
-        slots = [PricePoint(time=base + datetime.timedelta(minutes=15 * i), price=0.05) for i in range(20)]
-        fractions = [1.0] * 20
-
-        soc_values_seen = []
-
-        def charge_rate_tracker(soc, temp):
-            soc_values_seen.append(soc)
-            return 4.5
-
-        compute_charge_rates_per_slot(
-            slots_sorted_by_time=slots,
-            slot_fractions=fractions,
-            slot_minutes=15,
-            current_soc=80.0,
-            current_temp=25.0,
-            get_charge_rate_for_soc=charge_rate_tracker,
-            predict_temp_after_duration=lambda t, d: t,
-            battery_capacity=14.3,
-            efficiency=0.85,
-            max_soc=100.0,
-        )
-
-        # SOC should never exceed max_soc
-        assert all(s <= 100.0 + 0.01 for s in soc_values_seen), \
-            f"SOC exceeded max: {max(soc_values_seen):.1f}%"
+# NOTE: TestChargeRateSOCProjection lived here. It exercised
+# `charge_rate_utils.compute_charge_rates_per_slot`, which projected SOC along
+# an imaginary continuous charge to produce one rate per TIME slot. The DP now
+# evaluates the rate per candidate STATE, so "rates decline as projected SOC
+# rises" is no longer a property of a time-indexed array -- it is a property of
+# the transition, and it is asserted there:
+# tests/test_dp_rate_compatibility.py::TestSocDependenceIsPerState.
 
 
 class TestDischargeWarmsTheBattery:
@@ -962,7 +872,17 @@ class TestSharedProjectionAcrossConsumers:
 
 
 class TestChargeRateProjectionIsBounded:
-    """The one place where the temperature forecast changes DP decisions."""
+    """The temperature the DP plans a horizon at must not run away.
+
+    The forecast reaches the DP through ``DPOptimizer._idle_temp_profile`` --
+    the pass-0 profile of the solve/replay/refine loop -- and through the
+    replay of the selected plan. It used to reach it through
+    ``charge_rate_utils.compute_charge_rates_per_slot``, which projected SOC and
+    temperature along an imaginary continuous charge; that helper is gone and
+    its subject, "a rate compatible with the SOC and temperature the plan
+    reaches", is covered by ``tests/test_dp_rate_compatibility.py``. What
+    survives here is the bound.
+    """
 
     @staticmethod
     def _slots(n):
@@ -972,83 +892,66 @@ class TestChargeRateProjectionIsBounded:
             for i in range(n)
         ]
 
-    def test_legacy_projection_diverges(self):
-        """Documents the defect: unbounded linear warming across 33 h."""
-        from battery_optimizer_lib.charge_rate_utils import compute_charge_rates_per_slot
+    @staticmethod
+    def _optimizer(projector=None, charge_predictor=None):
+        from battery_optimizer_lib import DPOptimizer, DPOptimizerConfig
 
-        seen = []
-
-        def rate(soc, temp):
-            seen.append(temp)
-            return 4.5
-
-        compute_charge_rates_per_slot(
-            slots_sorted_by_time=self._slots(132),
-            slot_fractions=[1.0] * 132,
+        cfg = DPOptimizerConfig(
+            battery_capacity=14.3,
+            min_soc=10.0,
+            max_soc=100.0,
+            efficiency=0.85,
+            discharge_rate=4.5,
             slot_minutes=15,
-            current_soc=30.0,
-            current_temp=33.0,
-            get_charge_rate_for_soc=rate,
-            # The historical default: +0.1 C/min, no ambient, no ceiling.
-            predict_temp_after_duration=lambda t, d: t + 0.1 * d,
+            soc_step_percent=1.0,
         )
+        return DPOptimizer(
+            config=cfg,
+            load_predictor=lambda dt: 0.5,
+            charge_rate_predictor=lambda soc, temp: 4.5,
+            temp_after_charge_predictor=charge_predictor or (lambda t, d: t),
+            temp_after_idle_predictor=lambda t, d: t,
+            pv_predictor=lambda dt: 0.0,
+            temp_projector=projector,
+        )
+
+    def test_legacy_projection_diverges(self):
+        """Documents the defect: unbounded linear warming across 33 h.
+
+        Reproduced directly rather than through the deleted helper: an
+        unbounded per-minute warming callback applied for 132 slots.
+        """
+        temp = 33.0
+        seen = []
+        for _ in range(132):
+            seen.append(temp)
+            temp = temp + 0.1 * 15  # the historical default: +0.1 C/min
         assert max(seen) > 200.0
 
     def test_shared_projector_does_not_diverge(self, learning_engine):
-        from battery_optimizer_lib.charge_rate_utils import compute_charge_rates_per_slot
-
         projector = TemperatureProjector(
             learning_engine=learning_engine,
             ambient_provider=DiurnalAmbient(mean=31.0, amplitude=4.0),
         )
-        seen = []
+        opt = self._optimizer(projector=projector)
+        slots = self._slots(132)
+        profile = opt._idle_temp_profile(slots, [1.0] * 132, 33.0)
 
-        def rate(soc, temp):
-            seen.append(temp)
-            return 4.5
-
-        compute_charge_rates_per_slot(
-            slots_sorted_by_time=self._slots(132),
-            slot_fractions=[1.0] * 132,
-            slot_minutes=15,
-            current_soc=30.0,
-            current_temp=33.0,
-            get_charge_rate_for_soc=rate,
-            project_temp=projector.project,
-            battery_capacity=14.3,
-            efficiency=0.85,
-            max_soc=100.0,
-        )
-
-        assert len(seen) == 132
-        assert max(seen) < 60.0
+        assert len(profile) == 132
+        assert max(profile) < 60.0
         # ...and it tracks the ambient profile instead of climbing forever.
-        assert max(seen) - min(seen) > 1.0
+        assert max(profile) - min(profile) > 1.0
 
     def test_projector_wins_over_legacy_callback(self, learning_engine):
         """When both are supplied, the shared model is authoritative."""
-        from battery_optimizer_lib.charge_rate_utils import compute_charge_rates_per_slot
-
         projector = TemperatureProjector(
             learning_engine=learning_engine, ambient_provider=FixedAmbient(27.0)
         )
-        seen = []
-
-        def rate(soc, temp):
-            seen.append(temp)
-            return 4.5
-
-        compute_charge_rates_per_slot(
-            slots_sorted_by_time=self._slots(10),
-            slot_fractions=[1.0] * 10,
-            slot_minutes=15,
-            current_soc=30.0,
-            current_temp=33.0,
-            get_charge_rate_for_soc=rate,
-            predict_temp_after_duration=lambda t, d: 999.0,
-            project_temp=projector.project,
+        opt = self._optimizer(
+            projector=projector, charge_predictor=lambda t, d: 999.0
         )
-        assert max(seen) < 60.0
+        profile = opt._idle_temp_profile(self._slots(10), [1.0] * 10, 33.0)
+        assert max(profile) < 60.0
 
 
 class TestCloudSafeConversionRebuildsTrajectories:

@@ -1081,9 +1081,11 @@ class BatteryCostTracker:
         prices_by_slot: Dict[datetime.datetime, float],
         predict_load_func: Callable[[datetime.datetime], float],
         predict_pv_func: Optional[Callable[[datetime.datetime], float]] = None,
-        charge_rates_by_slot: Optional[Dict[datetime.datetime, float]] = None,
         slot_fractions_by_slot: Optional[Dict[datetime.datetime, float]] = None,
         starting_temp: Optional[float] = None,
+        planning_temp_by_slot: Optional[
+            Dict[datetime.datetime, Optional[float]]
+        ] = None,
         learning_engine: Optional["BatteryLearningEngine"] = None,
         temp_projector=None,
     ) -> Tuple[Dict[datetime.datetime, float], float]:
@@ -1097,10 +1099,12 @@ class BatteryCostTracker:
             prices_by_slot: Dict mapping datetime to electricity price
             predict_load_func: Function that takes datetime and returns predicted load in kW
             predict_pv_func: Optional function returning predicted PV generation in kW
-            charge_rates_by_slot: Optional dict mapping datetime to charge rate (kW)
             slot_fractions_by_slot: Optional dict mapping datetime to slot fraction (0-1)
             starting_temp: Battery temperature (C) at the projection instant, or
                 None when unknown.
+            planning_temp_by_slot: Temperatures the PLAN was built with, per
+                slot. Charge rates are looked up at those, so this column
+                describes the same plan as the SOC and deviation columns.
             learning_engine: Optional BatteryLearningEngine. Together with
                 ``starting_temp`` it makes the CHARGE slots use
                 ``predict_charge_input_dc_energy`` — the same per-slot,
@@ -1151,11 +1155,12 @@ class BatteryCostTracker:
                 if slot_fractions_by_slot is not None
                 else 1.0
             )
-            slot_charge_rate = (
-                charge_rates_by_slot.get(hour, self._config.charge_rate)
-                if charge_rates_by_slot is not None
-                else self._config.charge_rate
-            )
+            # Nominal fallback only: `project_slot_soc` asks the learning
+            # engine for the rate at the SOC and temperature this slot actually
+            # reaches, and `_effective_charge_rate` always prefers it. A
+            # time-indexed array used to be passed in here and never reached
+            # the column.
+            slot_charge_rate = self._config.charge_rate
             load_kw = max(0.0, predict_load_func(hour))
             pv_kw = max(0.0, predict_pv_func(hour)) if predict_pv_func is not None else 0.0
             pv_surplus_kw = max(0.0, pv_kw - load_kw)
@@ -1189,6 +1194,11 @@ class BatteryCostTracker:
                 # passes, so the projected-cost column cannot be built from a
                 # different charge model than the SOC/deviation columns.
                 temp_start=current_temp,
+                rate_lookup_temp=(
+                    (planning_temp_by_slot or {}).get(hour)
+                    if planning_temp_by_slot
+                    else None
+                ),
                 learning_engine=learning_engine,
                 temp_projector=temp_projector,
                 slot_time=hour,

@@ -54,8 +54,6 @@ from battery_optimizer_lib import (
     # Cost tracker
     BatteryCostTracker,
     BatteryCostConfig,
-    # Charge rate utilities
-    compute_charge_rates_per_slot,
     # Shared slot SOC transition model
     SocProjectionParams,
     project_slot_soc,
@@ -1426,13 +1424,14 @@ class BatteryOptimizer(hass.Hass):
             # local_tz / slot_fractions / prices were computed for the hedge
             # above; recomputing them here would be a second source of truth
             # for the same partial-first-slot fraction.
-            charge_rates_per_slot = self._compute_charge_rates_per_slot(
-                slots_sorted_by_time, slot_fractions, current_soc_for_calc, current_temp
-            )
-            slot_charge_rates_by_slot = {
-                canonical_slot_key(p.time): charge_rates_per_slot[i]
-                for i, p in enumerate(slots_sorted_by_time)
-            }
+            #
+            # No per-slot rate array is passed: `project_costs` walks the
+            # schedule through `project_slot_soc`, which asks the learning
+            # engine for the rate at the SOC and temperature each slot actually
+            # reaches. A time-indexed array never reached the column at all --
+            # `_effective_charge_rate` always preferred the engine — while
+            # building it cost a 132-slot projection plus a lookup per slot on
+            # the planning path.
             projected_costs, _ = self._cost_tracker.project_costs(
                 schedule,
                 current_soc_for_calc,
@@ -1440,12 +1439,12 @@ class BatteryOptimizer(hass.Hass):
                 prices_by_slot_map,
                 predict_load_func=self._predict_load_kw,
                 predict_pv_func=self._predict_pv_kw,
-                charge_rates_by_slot=slot_charge_rates_by_slot,
                 slot_fractions_by_slot=slot_fractions_by_slot,
                 # Same CHARGE/thermal model as project_schedule_trajectory, so
                 # the projected-cost column cannot disagree with the SOC and
                 # temperature ones.
                 starting_temp=current_temp,
+                planning_temp_by_slot=planning_temp_by_slot,
                 learning_engine=getattr(self, "learning_engine", None),
                 # getattr, like project_schedule_trajectory above: the test
                 # doubles for this method construct neither attribute.
@@ -1625,34 +1624,6 @@ class BatteryOptimizer(hass.Hass):
                 break
 
         return slot_fractions
-
-    def _compute_charge_rates_per_slot(
-        self,
-        slots_sorted_by_time: List[PricePoint],
-        slot_fractions: List[float],
-        current_soc: float,
-        current_temp: Optional[float],
-    ) -> List[float]:
-        """Pre-compute temperature-aware charge rates for each slot.
-
-        This is the only path where the temperature forecast changes DP
-        decisions, so it uses the shared projector (time-varying ambient,
-        bounded) rather than the unbounded linear warming projection.
-        """
-        projector = getattr(self, "_temp_projector", None)
-        return compute_charge_rates_per_slot(
-            slots_sorted_by_time=slots_sorted_by_time,
-            slot_fractions=slot_fractions,
-            slot_minutes=self.config.slot_minutes,
-            current_soc=current_soc,
-            current_temp=current_temp,
-            get_charge_rate_for_soc=self.learning_engine.get_charge_rate_for_soc,
-            predict_temp_after_duration=self.learning_engine.predict_temp_after_duration,
-            project_temp=projector.project if projector is not None else None,
-            battery_capacity=self.config.battery_capacity,
-            efficiency=self.config.efficiency,
-            max_soc=self.max_soc,
-        )
 
     def calculate_expected_soc_schedule(
         self,

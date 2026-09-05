@@ -236,7 +236,6 @@ HedgeOptimizer.project_schedule_trajectory = BatteryOptimizer.project_schedule_t
 HedgeOptimizer._replay_schedule = BatteryOptimizer._replay_schedule
 HedgeOptimizer._ensure_current_slot_price = BatteryOptimizer._ensure_current_slot_price
 HedgeOptimizer._compute_slot_fractions = BatteryOptimizer._compute_slot_fractions
-HedgeOptimizer._compute_charge_rates_per_slot = BatteryOptimizer._compute_charge_rates_per_slot
 
 
 # ---------------------------------------------------------------------------

@@ -12,7 +12,9 @@ warming a function of the scheduled MODE rather than of the power:
 * ``BatteryOptimizer.calculate_expected_soc_schedule`` (via
   ``soc_projection._idle_temp``) — cooled in ``DISCHARGE``/``HOLD``
 * ``ScheduleFormatter._format_*_trajectory`` — same split again
-* ``charge_rate_utils.compute_charge_rates_per_slot`` — unbounded linear warming
+* ``charge_rate_utils.compute_charge_rates_per_slot`` — unbounded linear
+  warming (that module is gone; the DP's temperature profile now comes from
+  ``DPOptimizer._idle_temp_profile`` and ``_replay_plan_temps``)
 
 Because the optimizer scheduled zero CHARGE slots over a 33 h production window,
 the resulting trajectory was monotonically non-increasing and, with the ambient

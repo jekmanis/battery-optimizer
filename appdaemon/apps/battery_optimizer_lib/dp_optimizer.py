@@ -15,7 +15,6 @@ if TYPE_CHECKING:
     from .config import BatteryOptimizerConfig
 
 from .models import BatteryMode, PricePoint, ScheduleEntry
-from .charge_rate_utils import compute_charge_rates_per_slot
 from .slot_energy import SlotEnergyParams, simulate_slot
 from .timezone_utils import canonical_slot_key, instant_key
 
@@ -837,36 +836,6 @@ class DPOptimizer:
                 if abs(self._rate_for(soc, x) - self._rate_for(soc, y)) > 1e-9:
                     return False
         return True
-
-    def _compute_charge_rates_per_slot(
-        self,
-        slots_sorted_by_time: List[PricePoint],
-        slot_fractions: List[float],
-        current_soc: float,
-        current_temp: Optional[float],
-    ) -> List[float]:
-        """Legacy time-indexed rate array.
-
-        NOT what the DP plans with any more -- ``_run_dp`` evaluates the rate
-        per candidate transition. Kept because the orchestrator still uses the
-        same helper as a fallback for the projected-cost column, where the real
-        per-slot rate is re-derived from the learning engine anyway.
-        """
-        return compute_charge_rates_per_slot(
-            slots_sorted_by_time=slots_sorted_by_time,
-            slot_fractions=slot_fractions,
-            slot_minutes=self._config.slot_minutes,
-            current_soc=current_soc,
-            current_temp=current_temp,
-            get_charge_rate_for_soc=self._get_charge_rate_for_soc,
-            predict_temp_after_duration=self._predict_temp_after_duration,
-            project_temp=(
-                self._temp_projector.project if self._temp_projector is not None else None
-            ),
-            battery_capacity=self._config.battery_capacity,
-            efficiency=self._config.efficiency,
-            max_soc=self._config.max_soc,
-        )
 
     def _build_soc_trajectory(
         self,

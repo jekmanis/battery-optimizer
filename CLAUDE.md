@@ -444,7 +444,10 @@ the current hour as past". Both fetch paths request whole days
 premise is false and an absent current interval means the data is missing — and
 the substitution planned, logged and EXECUTED the live slot on a number nobody
 published (yesterday at 0.01 against a real 1.00 next slot produced a grid-charge
-command). Planning now starts at the next validated interval; the current slot
+command). Planning now models every slot from the current one to the last
+published one — unpublished slots, leading or inside the horizon, enter the DP
+as forced `HOLD` with `price=None` (PV absorption still modelled, no invented
+price; see `modeled_horizon`) — and the current slot
 either keeps an existing entry that carries `ScheduleEntry.price_source ==
 "market"` provenance or gets a real `HOLD/no_price` entry with no provenance —
 an ENTRY, not an absence, because the pre-solve step advanced the pack across

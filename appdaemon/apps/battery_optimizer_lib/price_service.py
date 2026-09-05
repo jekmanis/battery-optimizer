@@ -12,7 +12,12 @@ import traceback
 from typing import Callable, Dict, List, Optional
 
 from .models import PricePoint
-from .timezone_utils import instant_key, normalize_tz_pair
+from .timezone_utils import (
+    ensure_local_tz,
+    instant_key,
+    is_aware,
+    normalize_tz_pair,
+)
 
 try:
     import requests
@@ -178,8 +183,41 @@ class NordPoolPriceService:
         self._last_malformed_warning = now
         self.log(message, level="WARNING")
 
-    def _interval_end(self, point: PricePoint) -> Optional[datetime.datetime]:
-        """Exclusive end of the interval *point* actually covers, or None.
+    def _match_awareness(
+        self, end: datetime.datetime, start: datetime.datetime
+    ) -> datetime.datetime:
+        """*end* expressed with the same awareness as its own *start*.
+
+        A record whose two fields disagree is not exotic: with no timezone
+        configured in AppDaemon, both parsers leave `start` and `end` with
+        whatever awareness their own ISO strings carried, so a source
+        publishing one bare and the other with an offset produces exactly this
+        pair. Comparing them raised `TypeError` out of `_normalize_prices` and
+        out of `get_prices`, which does not catch it -- one malformed record
+        cost the whole reply and the fetch that would have noticed.
+
+        The conversion goes through the local zone when there is one, so an end
+        published as 08:00Z against a +03:00 clock is read as 11:00 local, not
+        as a span that runs backwards.
+        """
+        if is_aware(end) == is_aware(start):
+            return end
+        tz = self.get_timezone()
+        if is_aware(start):
+            # Naive end: local wall time, like every other naive value here.
+            return end.replace(tzinfo=tz or start.tzinfo)
+        # Aware end against a naive start: convert to local time, then drop the
+        # offset so the two describe the same clock.
+        if tz is not None:
+            end = end.astimezone(tz)
+        return end.replace(tzinfo=None)
+
+    def _interval_end(
+        self,
+        start: datetime.datetime,
+        end: Optional[datetime.datetime],
+    ) -> Optional[datetime.datetime]:
+        """Exclusive end of the interval a record actually covers, or None.
 
         The source's own ``end`` when it published one. Otherwise exactly ONE
         `slot_minutes` slot -- never a width guessed from how far away the next
@@ -193,13 +231,13 @@ class NordPoolPriceService:
         and coverage is what the schedule, the horizon monitor and the
         provenance guard are all built on.
         """
-        end = getattr(point, "end", None)
         if end is None:
-            return self._shift(point.time, self.slot_minutes)
-        if instant_key(end) > instant_key(point.time):
+            return self._shift(start, self.slot_minutes)
+        end = self._match_awareness(end, start)
+        if instant_key(end) > instant_key(start):
             return end
         self._warn_malformed_record(
-            f"Price record for {point.time} declares an end of {end}, which "
+            f"Price record for {start} declares an end of {end}, which "
             f"is not after its start; dropping it. The interval it claimed is "
             f"a gap until a source publishes it properly."
         )
@@ -240,12 +278,21 @@ class NordPoolPriceService:
         covered_until: Optional[datetime.datetime] = None
 
         for point in sorted(prices, key=lambda p: instant_key(p.time)):
-            interval_end = self._interval_end(point)
+            # ONE awareness for the whole record, before anything is compared.
+            # `_align_to_slot` reads a naive value as local wall time, so a
+            # naive `start` at a site that HAS a timezone produced an aware
+            # cursor against naive keys and raised `TypeError` in the walk
+            # below - the same defect `_match_awareness` fixes one field
+            # earlier, and the fetch has no catch for either.
+            start_dt = ensure_local_tz(point.time, self.get_timezone())
+            interval_end = self._interval_end(
+                start_dt, getattr(point, "end", None)
+            )
             if interval_end is None:
                 # Corrupt: an end at or before its own start. `_interval_end`
                 # has already said so, once an hour.
                 continue
-            start_key = instant_key(point.time)
+            start_key = instant_key(start_dt)
             end_key = instant_key(interval_end)
             if covered_until is not None and start_key < covered_until:
                 start_key = covered_until
@@ -253,7 +300,7 @@ class NordPoolPriceService:
                     continue
             covered_until = end_key
 
-            cursor = self._align_to_slot(point.time)
+            cursor = self._align_to_slot(start_dt)
             while True:
                 cursor_key = instant_key(cursor)
                 if cursor_key >= end_key:

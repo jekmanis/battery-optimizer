@@ -1466,6 +1466,12 @@ The rules, in full:
 
 - `PricePoint.end` carries the source's own end. Both parsers now set it.
 - A point with **no** `end` covers exactly one `slot_minutes` slot.
+- A record whose `start` and `end` disagree about being timezone-aware is
+  normalized to ONE awareness - its start's, through the local zone - before
+  anything is compared. With no timezone configured in AppDaemon both parsers
+  leave each field with whatever its own ISO string carried, and comparing the
+  two raised `TypeError` out of `get_prices`, losing the whole reply and the
+  fetch that would have noticed the gap.
 - A point whose `end` is at or **before** its `start` is **dropped**, with a
   WARNING rate-limited to once an hour. An absent end is a normal case with a
   documented answer; a reversed one is evidence the record is corrupt, and

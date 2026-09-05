@@ -57,6 +57,12 @@ TEMP_OBSERVATION_WINDOW = 192
 MIN_THERMAL_SAMPLES = 20
 MAX_THERMAL_SAMPLES = 300
 
+# Persisted-state version. v7 fixed the |P_bat| units of CHARGING thermal
+# samples (terminal power, not stored-energy growth); a file below it has its
+# thermal samples and fitted coefficients dropped once on load. Charge-rate
+# observations are untouched by that and have never changed representation.
+THERMAL_UNITS_VERSION = 7
+
 # ---------------------------------------------------------------------------
 # Learned-rate plausibility bounds — THE one sanity bound
 # ---------------------------------------------------------------------------
@@ -538,12 +544,22 @@ class BatteryLearningEngine:
 
         # Raw thermal sample for k1/k2 calibration. Charging samples are kept
         # alongside discharging ones: |P_bat| is the regressor, not the mode.
+        #
+        # UNITS: |P_bat| is the TERMINAL power, because k2 is Celsius per kWh
+        # moved THROUGH the battery and because that is what every consumer of
+        # the projector feeds it (`simulate_slot.battery_power_kw`,
+        # `battery_power_for_entry`). `charge_rate` above is stored-side growth,
+        # so it is converted here. Feeding the stored-side number made the
+        # regressor low by `efficiency` on every charging sample, the fitted k2
+        # high by `1/efficiency`, and then applied it to the larger power --
+        # over-warming every projected charge. The discharge recorder needs no
+        # conversion: its energy counter is already DC out of the pack.
         if battery_temp_start is not None and battery_temp_end is not None:
             self.record_thermal_observation(
                 temp_start=battery_temp_start,
                 temp_end=battery_temp_end,
                 duration_minutes=duration_minutes,
-                avg_power_kw=charge_rate,
+                avg_power_kw=self.stored_to_input_dc_kw(charge_rate),
                 ambient_temp=ambient_temp,
             )
 
@@ -1497,10 +1513,44 @@ class BatteryLearningEngine:
             ),
         }
 
+    def _drop_pre_v7_thermal_data(self) -> None:
+        """One-off: discard thermal samples recorded in the wrong |P_bat| units.
+
+        Charging samples before v7 stored stored-energy growth instead of
+        terminal power. They cannot be converted: the sample list carries no
+        mode flag, so a charge sample cannot be told from a discharge one and a
+        blanket ``/efficiency`` would corrupt the discharge half.
+
+        They are DERIVED, re-learnable data -- unlike the charge-rate history,
+        which is preserved untouched. Roughly ten charge/discharge events
+        re-accumulate them, and ``MIN_THERMAL_SAMPLES`` keeps the shared
+        thermal model on its defaults until then. Idempotent by construction:
+        the next save writes v7, so this runs at most once per file.
+        """
+        n_samples = len(self.stats.thermal_samples or [])
+        had_fit = bool(self.stats.thermal_coeffs)
+        if not n_samples and not had_fit:
+            return
+        self.stats.thermal_samples = []
+        self.stats.thermal_coeffs = {}
+        self._thermal_samples_since_calibration = 0
+        self.log(
+            "Learning: dropped pre-v7 thermal calibration data "
+            f"({n_samples} sample(s)"
+            + (", 1 fit" if had_fit else "")
+            + "). Charging samples recorded stored-energy growth where the "
+            "shared thermal model wants terminal power, so k2 was high by "
+            "1/efficiency. Charge-rate history is unaffected; k1/k2 fall back "
+            "to their defaults until ~10 events have re-accumulated."
+        )
+
     def save_to_json(self) -> str:
         """Serialize learning state for persistence."""
         data = {
-            "version": 6,  # v6 adds thermal_samples / thermal_coeffs
+            # v6 added thermal_samples / thermal_coeffs. v7 fixes their |P_bat|
+            # units on the charging side: terminal power, not stored-energy
+            # growth. See load_from_json for what happens to a v6 file.
+            "version": THERMAL_UNITS_VERSION,
             "learned_efficiency": self.learned_efficiency,
             "stats": self.stats.to_dict(),
         }
@@ -1515,6 +1565,8 @@ class BatteryLearningEngine:
                 self.learned_efficiency = data.get("learned_efficiency", self.nominal_efficiency)
                 if "stats" in data:
                     self.stats = LearningStats.from_dict(data["stats"])
+                    if data.get("version", 0) < THERMAL_UNITS_VERSION:
+                        self._drop_pre_v7_thermal_data()
                     removed = self.sanitize_stats()
                     if any(removed.values()):
                         self.log(

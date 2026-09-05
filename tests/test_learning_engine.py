@@ -249,7 +249,7 @@ class TestBatteryLearningEngine:
 
         # Verify it's valid JSON
         data = json.loads(json_str)
-        assert data["version"] == 6  # v6 adds thermal_samples / thermal_coeffs
+        assert data["version"] == 7  # v7 fixes charging thermal-sample |P_bat| units
 
         # Create new engine and load
         new_engine = BatteryLearningEngine()
@@ -822,8 +822,18 @@ class TestThermalAmbientSourceIsShared:
 
         charge_sample, discharge_sample = learning_engine.stats.thermal_samples
         assert charge_sample[4] == discharge_sample[4] == pytest.approx(20.0)
-        # Identical physics -> identical sample, mode included.
-        assert charge_sample == discharge_sample
+        # Everything the regression keys on except |P_bat| is identical, which
+        # is what this test is about: one ambient source, so k1 cannot absorb
+        # the mode.
+        assert charge_sample[:3] == discharge_sample[:3]
+
+        # |P_bat| legitimately differs. The same 15 SOC points cost the
+        # terminal 15/efficiency going in and yield exactly 15 coming out, and
+        # k2 is Celsius per kWh moved THROUGH the pack. It used to record the
+        # stored-side number for charging, which made the regressor low by
+        # `efficiency` on every charging sample.
+        eff = learning_engine.storage_efficiency
+        assert charge_sample[3] == pytest.approx(discharge_sample[3] / eff)
 
     def test_omitted_ambient_still_falls_back_for_both(self, learning_engine):
         for _ in range(20):

@@ -343,6 +343,95 @@ class TestPersistedLearningData:
         assert transition.soc_end == pytest.approx(50.0, abs=1e-6)
 
 
+class TestThermalSamplesUseTerminalPower:
+    """k2 is Celsius per kWh THROUGH the battery, so |P_bat| must be terminal.
+
+    ``record_charging`` fed the thermal regression its stored-side rate, while
+    every consumer of the projector feeds input-DC power
+    (``simulate_slot.battery_power_kw``, ``battery_power_for_entry``). The
+    regressor was therefore low by a factor of ``efficiency`` on every charging
+    sample, so the fitted k2 came out high by ``1/efficiency`` and was then
+    applied to a larger power -- over-warming every projected charge.
+    """
+
+    @staticmethod
+    def _record(engine):
+        engine.record_charging(
+            soc_start=40.0,
+            soc_end=50.0,
+            duration_minutes=15.0,
+            battery_temp=10.0,
+            battery_temp_start=10.0,
+            battery_temp_end=12.0,
+            ambient_temp=5.0,
+        )
+
+    def test_the_recorded_power_is_the_terminal_power(self):
+        engine = _engine(efficiency=0.85)
+        self._record(engine)
+        assert engine.stats.thermal_samples
+        power = engine.stats.thermal_samples[-1][3]
+        # 1 kWh stored in 0.25 h is 4 kW of GROWTH; the terminal delivered
+        # 4 / 0.85 to produce it, and that is what heats the pack.
+        assert power == pytest.approx(4.0 / 0.85, rel=1e-9)
+
+    def test_it_matches_what_the_projector_is_fed(self):
+        """Same number the planner uses as |P_bat| for the same observation."""
+        engine = _engine(efficiency=0.85)
+        for _ in range(3):  # enough observations to leave the nominal fallback
+            self._record(engine)
+        recorded = engine.stats.thermal_samples[-1][3]
+        assert recorded == pytest.approx(
+            engine.get_charge_rate_for_soc(45.0), rel=1e-9
+        )
+
+    def test_unit_efficiency_is_unchanged(self):
+        engine = _engine(efficiency=1.0)
+        self._record(engine)
+        assert engine.stats.thermal_samples[-1][3] == pytest.approx(4.0)
+
+    def test_pre_v7_thermal_data_is_dropped_once(self):
+        """Old samples hold stored-side power; there is no way to convert them.
+
+        The list carries no mode flag, so a charge sample cannot be told from a
+        discharge one and a blanket 1/efficiency would corrupt the discharge
+        half. They are derived, re-learnable data -- unlike the charge-rate
+        history, which is preserved -- so they are dropped once, on the first
+        load of a pre-v7 file, and the defaults apply until ~10 events have
+        re-accumulated.
+        """
+        engine = _engine(efficiency=0.85)
+        blob = json.dumps(
+            {
+                "version": 6,
+                "learned_efficiency": 0.85,
+                "stats": {
+                    "charge_rates_by_soc": {"25-50": [4.0, 4.0, 4.0]},
+                    "thermal_samples": [[10.0, 12.0, 15.0, 4.0, 5.0]],
+                    "thermal_coeffs": {"k1": 0.01, "k2": 3.0, "n": 40},
+                },
+            }
+        )
+        assert engine.load_from_json(blob)
+        assert engine.stats.thermal_samples == []
+        assert engine.stats.thermal_coeffs == {}
+        # The charge-rate history is NOT touched.
+        assert engine.get_charge_rate_for_soc(45.0) == pytest.approx(4.0 / 0.85)
+
+    def test_a_v7_file_keeps_its_thermal_data(self):
+        engine = _engine(efficiency=0.85)
+        engine.stats.thermal_samples = [[10.0, 12.0, 15.0, 4.7, 5.0]]
+        blob = engine.save_to_json()
+        assert json.loads(blob)["version"] >= 7
+        reloaded = _engine(efficiency=0.85)
+        assert reloaded.load_from_json(blob)
+        assert reloaded.stats.thermal_samples == [[10.0, 12.0, 15.0, 4.7, 5.0]]
+        # And a second round trip does not drop or rescale them.
+        again = _engine(efficiency=0.85)
+        assert again.load_from_json(reloaded.save_to_json())
+        assert again.stats.thermal_samples == [[10.0, 12.0, 15.0, 4.7, 5.0]]
+
+
 class TestEfficiencyLearningHonesty:
     """A synthetic grid figure is not an efficiency measurement."""
 

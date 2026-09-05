@@ -81,6 +81,10 @@ class FakeOptimizer(bo.BatteryOptimizer):
         # was invisible in the overrun accounting.
         ("_record_ambient_observation", "(self, kwargs=None)"),
         ("_sample_pv", "(self, kwargs=None)"),
+        # The bounded price-recovery retry is a run_in callback: AppDaemon
+        # hands it the kwargs dict positionally, and its generation token is
+        # read out of that dict.
+        ("_price_recovery_retry", "(self, kwargs=None) -> None"),
     ],
 )
 def test_timed_callbacks_keep_their_signatures(name, expected):
@@ -320,6 +324,10 @@ def test_control_health_sensor_survives_a_broken_direct_control():
         "_on_energy_sensor_change",
         "_record_ambient_observation",
         "_sample_pv",
+        "_price_recovery_retry",
+        # AppDaemon calls terminate() on its own thread and it clears the
+        # retry generation, so it belongs under the app lock like the rest.
+        "terminate",
     ],
 )
 def test_scheduled_callbacks_are_timed(name):

@@ -697,10 +697,168 @@ class TestTheDocumentedClaimMatchesTheMeasurement:
             flat = " ".join(text.split()).lower()
             assert "no bucket boundary falls strictly inside" in flat, name
 
-    def test_both_texts_condition_the_cooling_bound_on_monotonicity(self):
-        for name, text in self._texts().items():
-            flat = " ".join(text.split()).lower()
-            assert "non-increasing in temperature" in flat, name
+
+# ---------------------------------------------------------------------------
+# The cooling bound, measured rather than quoted
+# ---------------------------------------------------------------------------
+
+def _cooling_endpoint_bound(rate_fn, temp_start, cooling, minutes=15.0,
+                            efficiency=1.0, capacity=CAPACITY,
+                            soc_start=START_SOC):
+    """``(rate(T_start) - rate(T_end)) * slot_hours * efficiency``, in SOC %."""
+    temp_end = temp_start + minutes * cooling
+    return (
+        (rate_fn(soc_start, temp_start) - rate_fn(soc_start, temp_end))
+        * (minutes / 60.0)
+        * efficiency
+        / capacity
+        * 100
+    )
+
+
+def _rate_step(threshold, cold, warm):
+    """A monotone step in temperature: colder is never faster."""
+
+    def _fn(soc, temp):
+        if temp is None:
+            return warm
+        return cold if temp < threshold else warm
+
+    return _fn
+
+
+def _rate_ramp(slope, intercept, floor=0.0):
+    """A linear, non-decreasing rate in temperature."""
+
+    def _fn(soc, temp):
+        if temp is None:
+            return intercept
+        return max(floor, intercept + slope * temp)
+
+    return _fn
+
+
+def _rate_ladder(*, points):
+    """A monotone ladder: ``points`` is [(threshold, rate)], ascending."""
+
+    def _fn(soc, temp):
+        if temp is None:
+            return points[-1][1]
+        rate = points[0][1]
+        for threshold, value in points:
+            if temp >= threshold:
+                rate = value
+        return rate
+
+    return _fn
+
+
+NON_DECREASING_IN_TEMPERATURE = {
+    # The engine double's own step, driven downwards through its threshold.
+    "step_1kW_to_4kW_at_16C": (_rate_step(16.0, COLD_RATE, WARM_RATE), 20.0, -0.8),
+    # A gentle ramp that never plateaus: every sub-step sees a different rate.
+    "linear_ramp": (_rate_ramp(0.15, 0.5), 25.0, -1.0),
+    # Three steps inside the traversed range, so the endpoint pair is a long
+    # way from the rates the slot actually spends its time at.
+    "three_step_ladder": (
+        _rate_ladder(points=[(-273.0, 0.5), (8.0, 1.5), (14.0, 3.0), (18.0, 5.0)]),
+        22.0,
+        -1.0,
+    ),
+    # Flat: the bound is zero and so must the over-credit be.
+    "constant": (_rate_ramp(0.0, 2.0), 20.0, -1.0),
+    # Cooling far enough to leave the curve's whole interesting range behind.
+    "step_deep_cooling": (_rate_step(16.0, COLD_RATE, WARM_RATE), 17.0, -1.5),
+}
+
+
+class TestTheCoolingBoundHoldsWhereItsMonotonicityHolds:
+    """The claim, measured against the sub-stepped reference.
+
+    Both texts used to condition this bound on the rate being *non-increasing*
+    in temperature. That is the reverse of what it needs, and nothing held the
+    sentence to a number: a string assertion checked that the words were
+    present, not that they were true.
+
+    The bound assumes every rate the slot visits lies between the two endpoint
+    rates. On a cooling pack the visited temperatures lie in
+    ``[T_end, T_start]``, so that is exactly the NON-DECREASING case -- and it
+    is also the only direction that over-credits at all.
+    """
+
+    @pytest.mark.parametrize("name", sorted(NON_DECREASING_IN_TEMPERATURE))
+    def test_a_cooling_pack_is_over_credited_within_the_endpoint_bound(self, name):
+        rate_fn, temp_start, cooling = NON_DECREASING_IN_TEMPERATURE[name]
+
+        truth = _fine_grained_end_soc(
+            rate_fn, temp_start=temp_start, warm_per_min=cooling
+        )
+        model = _span_end_soc(rate_fn, temp_start=temp_start)
+        bound = _cooling_endpoint_bound(rate_fn, temp_start, cooling)
+
+        over_credit = model - truth
+        assert bound >= -1e-12, "a non-decreasing rate cannot give a negative bound"
+        assert over_credit >= -1e-9, "the model never under-credits a cooling pack"
+        assert over_credit <= bound + 1e-9, (
+            f"{name}: over-credit {over_credit:.4f} exceeds the stated bound "
+            f"{bound:.4f}"
+        )
+
+    def test_the_reverse_condition_cannot_over_credit_at_all(self):
+        """Why "non-increasing" was not merely a typo.
+
+        Under the condition the texts stated, a cooling pack only gets FASTER
+        than the rate the slot was looked up at, so the model under-credits and
+        the bound describes a case that cannot arise. It is negative here,
+        which is not a bound on anything.
+        """
+        falling = _rate_ramp(-0.15, 6.0)          # slower as it warms
+        temp_start, cooling = 25.0, -1.0
+
+        truth = _fine_grained_end_soc(
+            falling, temp_start=temp_start, warm_per_min=cooling
+        )
+        model = _span_end_soc(falling, temp_start=temp_start)
+        bound = _cooling_endpoint_bound(falling, temp_start, cooling)
+
+        assert model < truth, "the model under-credits under the stated condition"
+        assert bound < 0
+
+    def test_the_non_monotone_counterexample_only_satisfies_the_identity(self):
+        """Both endpoints fast, the middle slow: the endpoint bound is false.
+
+        Pack cooling 1 C/min from 20 C; 2.0 kW at or above 19 C, 0.1 kW between
+        11 and 19 C, 1.9 kW below 11 C. The same curve
+        ``TestTheDirectionClaimNeedsMonotonicity`` pins -- restated here as the
+        boundary of the condition above rather than as a separate story.
+        """
+
+        def rate_fn(soc, temp):
+            if temp is None:
+                return 2.0
+            if temp >= 19.0:
+                return 2.0
+            if temp >= 11.0:
+                return 0.1
+            return 1.9
+
+        temp_start, cooling = 20.0, -1.0
+        truth = _fine_grained_end_soc(
+            rate_fn, soc_start=20.0, temp_start=temp_start, warm_per_min=cooling
+        )
+        model = _span_end_soc(rate_fn, soc_start=20.0, temp_start=temp_start)
+        bound = _cooling_endpoint_bound(
+            rate_fn, temp_start, cooling, soc_start=20.0
+        )
+
+        assert bound == pytest.approx(0.25, abs=1e-9)
+        assert model - truth > 10 * bound
+
+        visited = _rates_visited(
+            rate_fn, soc_start=20.0, temp_start=temp_start, warm_per_min=cooling
+        )
+        identity = (max(visited) - min(visited)) * 0.25 / CAPACITY * 100
+        assert abs(truth - model) <= identity + 1e-9
 
 
 class TestTheRateSpanErrsConservative:

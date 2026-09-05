@@ -501,11 +501,17 @@ direction claim does not apply.
   non-decreasing in temperature — the physical case while charging, since the
   rate is looked up at the start-of-slot temperature.
 - **Over-crediting**, and bounded rather than eliminated, on a pack that *cools*
-  while charging **and the rate is non-increasing in temperature over the range
+  while charging **and the rate is non-decreasing in temperature over the range
   the slot traverses**. Temperature is not spanned (the DP's 1-D energy state
   cannot carry it), so the over-credit is then at most
-  `(rate(T_start) - rate(T_end)) * slot_hours * efficiency`. Without the
-  monotonicity that bound compares two endpoints of a curve the slot leaves:
+  `(rate(T_start) - rate(T_end)) * slot_hours * efficiency`: every temperature
+  the slot visits is between `T_end` and `T_start`, so every rate it visits is
+  between the two endpoint rates. It is the same monotonicity direction the
+  warming bullet above needs, and only this direction produces an over-credit
+  at all — a rate that *falls* as temperature rises makes a cooling pack faster
+  than the rate it was looked up at, so the model under-credits and there is
+  nothing to bound. Without the monotonicity that bound compares two endpoints
+  of a curve the slot leaves:
   a pack cooling 20 → 5 °C on a curve of 2.0 kW at or above 19 °C, 0.1 kW from
   11 to 19 °C and 1.9 kW below 11 °C has both endpoints fast and the middle
   slow — the model says 25.0 %, the sub-stepped truth is 22.4 %, and the
@@ -1275,11 +1281,30 @@ What happens instead:
   guard - the enable switch, the manual override, the min-SOC and max-SOC
   overrides. Retention keeps a decision made on real data; it does not exempt
   it from anything.
-- **Otherwise the slot applies `HOLD` with reason `no_price`**, the retry stays
-  armed, and no other command is sent for that slot. (`no_schedule` remains the
-  reason for the different failure where prices are fine and the plan ran out;
-  a restart that has not fetched yet also reports `no_schedule`, because an
-  empty snapshot says nothing about whether the interval was published.)
+- **Otherwise the slot gets a `HOLD` entry with reason `no_price`**, no price
+  provenance, the retry stays armed, and no other command is sent for that
+  slot. (`no_schedule` remains the reason for the different failure where
+  prices are fine and the plan ran out; a restart that has not fetched yet also
+  reports `no_schedule`, because an empty snapshot says nothing about whether
+  the interval was published.)
+
+  It is an **entry, not an absence**. The pre-solve step advanced the pack
+  across this interval, so a schedule that omits it makes both callers rebuild
+  `expected_soc_schedule` from the measured SOC and skip the interval
+  altogether: at 10:07 with 40 % SOC and 3 kW of PV the DP starts 10:15 at
+  42.3776 % while the published trajectory says 40 %, for the same quarter
+  hour. `schedule` is the one source of truth for what runs, and every
+  consumer walks it; the alternative — threading an advanced SOC, temperature
+  and time anchor through `calculate_expected_soc_schedule`,
+  `project_schedule_trajectory`, the cost projection and the deviation
+  detector's anchor — is four more places that can disagree.
+
+  A stand-in `HOLD` must not make the missing price look answered, so the
+  paths that used to key off the absence test for it instead
+  (`_is_no_price_fallback`): `execute_scheduled_mode` still applies
+  `HOLD/no_price` and still arms the retry, the diagnostics still report
+  `current_slot_entry: fallback`, and the adaptive horizon extension still
+  rebuilds over it once the interval is published.
 - **`execute_scheduled_mode` will not send a non-HOLD current-slot entry that
   carries no provenance.** After the above there should be none, so this is a
   guard that makes the claim falsifiable rather than a rule the code merely
@@ -1354,3 +1379,37 @@ are performed by the optimizer.
 
 Use dry-run mode (`device_id: ""`) first and compare the schedule, SOC trajectory,
 and actual inverter behavior before enabling hardware control.
+
+### Restart continuity is a constraint on the solve
+
+AppDaemon can restart in the middle of a CHARGE or DISCHARGE interval, and the
+plan it was executing is gone. `sensor.battery_optimizer` still carries it, so
+the app reads back the mode for the interval it woke up in and **keeps
+executing that action for the rest of the slot**. Stopping mid-charge, or
+holding through a peak the previous plan was discharging into, is a real cost.
+
+That continuity is applied **before** the DP runs, exactly like a current
+interval nobody published a price for:
+
+- the action is fixed for the remainder of the slot;
+- the SOC and temperature are advanced across the remaining fraction through
+  `soc_projection.project_slot_soc`;
+- the DP plans the rest of the horizon from there, starting at the next
+  interval.
+
+It used to be applied *after* `find_optimal_schedule` had validated, replayed,
+counted, costed and logged its answer — so the plan that executed was not the
+plan that was checked. A validated `HOLD, DISCHARGE` pair that reserved the
+pack for a 1.00 EUR/kWh slot and imported during the 0.10 one became
+`DISCHARGE, DISCHARGE`: the import moved to the expensive slot, the second slot
+was credited with battery service the pack no longer had, and the published SOC
+trajectory, mode census, projected-cost column, decision log and final-plan
+replay all still described the plan that had been replaced. **No action change
+may follow the final validation** — the one post-optimization rewrite is the
+cloud-safe hedge, which runs before it.
+
+The continued entry carries the interval's published-price provenance only when
+that interval was actually published. When it was not, `execute_scheduled_mode`'s
+provenance guard degrades it to `HOLD/unpriced_slot`, which is the right answer
+for an action nobody can price. The restored schedule is consumed once: a later
+re-optimization of the same slot is an ordinary optimization.

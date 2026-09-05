@@ -376,8 +376,14 @@ def charge_rate_for_span(
     physical case while charging -- and over-credits a pack that cools while
     charging, bounded by
     ``(rate(T_start) - rate(T_end)) * duration_h * efficiency`` **only when the
-    rate is non-increasing in temperature over the range the slot traverses**.
-    That bound compares two endpoints, so a rate that is non-monotone in
+    rate is NON-DECREASING in temperature over the range the slot traverses**.
+    That is the direction that makes the bound mean anything: a rate that only
+    ever falls as the pack cools stays between ``rate(T_end)`` and
+    ``rate(T_start)``, so the difference of the endpoints caps the over-credit.
+    Under the opposite condition the model cannot over-credit a cooling pack at
+    all -- every temperature it visits is at least as fast as the one the rate
+    was looked up at -- so the bound would be describing a case that does not
+    arise. That bound compares two endpoints, so a rate that is non-monotone in
     temperature breaks it outright: a pack cooling 20 -> 5 C on a curve of
     2.0 kW at or above 19 C, 0.1 kW from 11 to 19 C and 1.9 kW below 11 C has
     both endpoints fast and the middle slow -- the model says 25.0 %, the

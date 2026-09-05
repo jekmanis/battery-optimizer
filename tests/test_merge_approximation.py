@@ -405,6 +405,28 @@ def _repo_root():
     return pathlib.Path(__file__).resolve().parent.parent
 
 
+def _tracked_paths(root):
+    """Paths git tracks, or None when git is unavailable.
+
+    The guard is about what the repository CLAIMS, so an untracked scratch
+    file, a review brief, or a local note that happens to quote a forbidden
+    phrase must not fail the suite. Falling back to the glob keeps the guard
+    alive in a source export without git metadata.
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=root,
+            capture_output=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return {root / p for p in out.decode("utf-8").split("\0") if p}
+
+
 def _scanned_files():
     root = _repo_root()
     paths = []
@@ -414,6 +436,9 @@ def _scanned_files():
         )
     paths.append(root / "README.md")
     paths.append(root / "CLAUDE.md")
+    tracked = _tracked_paths(root)
+    if tracked is not None:
+        paths = [p for p in paths if p.resolve() in {t.resolve() for t in tracked}]
     return sorted(set(paths))
 
 

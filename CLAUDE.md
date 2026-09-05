@@ -13,7 +13,9 @@ Battery Optimizer for Growatt WIT Inverter - a Home Assistant AppDaemon applicat
 appdaemon/apps/
 ├── battery_optimizer.py           # Main AppDaemon app (orchestrator)
 ├── battery_optimizer_lib/         # Python package for helper modules
-│   ├── __init__.py                # Re-exports all public classes
+│   ├── __init__.py                # Re-exports the public classes
+│   │                              #   (except direct_control and price_horizon,
+│   │                              #    imported by module path)
 │   ├── config.py                  # BatteryOptimizerConfig dataclass
 │   ├── models.py                  # Data classes and enums
 │   ├── dp_optimizer.py            # Dynamic programming optimizer
@@ -36,8 +38,7 @@ appdaemon/apps/
 │   ├── load_prediction_tracker.py # Predicted vs actual load accuracy
 │   ├── slot_outcome_tracker.py    # Per-slot outcome/compliance tracking
 │   ├── timezone_utils.py          # Timezone-aware datetime helpers
-│   ├── ha_helpers.py              # HA state reading helpers
-│   └── charge_rate_utils.py       # Temperature-aware rate computation
+│   └── ha_helpers.py              # HA state reading helpers
 ├── apps.yaml                      # AppDaemon configuration (contains secrets!)
 homeassistant/packages/
 └── battery_optimizer.yaml         # HA entities, automations, sensors
@@ -67,13 +68,12 @@ tests/
 | `ambient_service.py` | AmbientTemperatureService, AmbientServiceConfig | `T_ambient(t)` across the horizon: weather forecast → outdoor sensor → diurnal profile |
 | `slot_energy.py` | simulate_slot, SlotEnergyParams, SlotEnergyResult | The ONE pure slot transition: every energy flow with its measurement boundary in the name |
 | `plan_validation.py` | replay_plan, PlanReplay | Continuous replay of the FINAL plan; prefix energy conservation before clamping |
-| `soc_projection.py` | project_slot_soc, SocProjectionParams | Single slot-SOC transition model shared by the expected-SOC trajectory and the deviation detector (the DP keeps its own inlined transition; `tests/test_soc_projection.py` guards that they agree) |
+| `soc_projection.py` | project_slot_soc, SocProjectionParams | Single slot-SOC transition model shared by the expected-SOC trajectory, the projected-cost column and the deviation detector; delegates the physics to `slot_energy.simulate_slot`. The DP keeps its own inlined transition, fused with the value recursion — `test_dp_energy_conservation.py::TestPrefixConservationAcrossConditions::test_no_prefix_creates_energy` replays 210 selected plans and requires the DP's own trajectory to match |
 | `soc_deviation.py` | SocDeviationDetector, SocDeviationConfig | Detects unexpected SOC changes for revalidation |
 | `load_prediction_tracker.py` | LoadPredictionTracker | Predicted vs actual load accuracy tracking |
 | `slot_outcome_tracker.py` | SlotOutcomeTracker | Per-slot outcome and mode compliance tracking |
 | `timezone_utils.py` | normalize_tz_pair, align_to_slot, lookup_by_time, dt_ge | Timezone-aware datetime comparison and alignment |
 | `ha_helpers.py` | SensorReader | HA state reading with validation |
-| `charge_rate_utils.py` | compute_charge_rates_per_slot | Temperature-aware charge rate computation |
 
 ### Data Models
 - `BatteryMode` enum: HOLD (0), CHARGE (1), DISCHARGE (2)
@@ -114,7 +114,7 @@ Uses **dynamic programming** with SOC state tracking:
 
 **One slot-energy model.** `slot_energy.simulate_slot` is the pure transition that names every flow (stored in/out, PV vs grid share of a charge, AC served, import, export, `unmet_battery_ac_kwh`). `soc_projection.project_slot_soc` delegates to it. Its `dc_energy_in_kwh`/`dc_energy_out_kwh` are what the pack ACTUALLY moved; the uncapped request lives in `requested_dc_energy_*`. Never report a request as delivered energy.
 
-**Conservative quantization.** A DP state carries a floored bucket *label* and the *exact* energy of the best path reaching it; every transition is computed from the exact energy. Nearest rounding on the grid was not zero-mean for a constant load on a constant slot length — it credited 2.8 kWh of service from a 2.0 kWh battery and published 15 % SOC for a pack its own model had emptied. Pure floor-to-grid is safe but throws away 30 % of the usable energy at 1 % steps, so it is not the answer either. Physics is now exact; what `soc_step_percent` controls is only how aggressively distinct paths are MERGED (ties broken toward more energy — a dominance rule). Energy-limited discharges deliver what the pack has and the grid pays for the rest; no threshold decides whether a slot "counts". `plan_validation.replay_plan`, called last in `find_optimal_schedule`, re-walks the FINAL action sequence and checks prefix conservation before any clamping.
+**Conservative quantization.** A DP state carries a floored bucket *label* and the *exact* energy of the best path reaching it; every transition is computed from the exact energy. Nearest rounding on the grid was not zero-mean for a constant load on a constant slot length — it credited 2.8 kWh of service from a 2.0 kWh battery and published 15 % SOC for a pack its own model had emptied. Pure floor-to-grid is safe but throws away 30 % of the usable energy at 1 % steps, so it is not the answer either. Physics is now exact; what `soc_step_percent` controls is only how aggressively distinct paths are MERGED (ties broken toward more energy — a dominance rule). Energy-limited discharges deliver what the pack has and the grid pays for the rest; no threshold decides whether a slot "counts". `plan_validation.replay_plan`, called last in `find_optimal_schedule`, re-walks the FINAL action sequence and checks, before any clamping, that every slot the continuous model cannot serve in full is one the plan DECLARED energy-limited (`ScheduleEntry.energy_limited`). Accumulating the replay's own clamped flows and comparing them with the bound those flows are built to satisfy is an identity and catches nothing.
 
 **One slot-SOC model.** The expected-SOC trajectory, the SOC deviation detector
 and the schedule log's fallback trajectory
@@ -132,13 +132,16 @@ in `docs/scheduling-algorithm.md` § SOC transitions and discretization.
 Divergence here caused a production recalculation loop, not a threshold problem.
 
 **One thermal model.** Battery temperature is projected only by
-`thermal_model.TemperatureProjector`, shared by the DP trajectory, the
-expected-SOC trajectory (`soc_projection`), the schedule formatter and
-`charge_rate_utils`. Two invariants must not be broken:
+`thermal_model.TemperatureProjector`, shared by the DP's rate refinement
+(`_idle_temp_profile`, `_replay_plan_temps`), the expected-SOC trajectory
+(`soc_projection`) and the schedule formatter. Two invariants must not be
+broken:
 
 1. Warming is a function of `|P_bat|`, not of the mode — discharging heats the
-   pack. Never reintroduce a `mode == CHARGE` branch in a temperature path;
-   derive power with `thermal_model.battery_power_for_entry`.
+   pack. Never reintroduce a `mode == CHARGE` branch in a temperature path. And
+   `|P_bat|` is the power that ACTUALLY flowed: `simulate_slot`'s
+   `battery_power_kw`, not `thermal_model.battery_power_for_entry`, which models
+   the REQUESTED flow and happily warms a full pack ordered to charge.
 2. Ambient is `T_ambient(t)` from `ambient_service`, never one scalar for the
    whole horizon. In the no-external-source fallback, the learning engine's
    rolling battery minimum anchors the diurnal profile's daily **maximum**, not

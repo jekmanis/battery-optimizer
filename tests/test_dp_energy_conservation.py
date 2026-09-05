@@ -192,8 +192,16 @@ class TestPrefixConservationAcrossConditions:
             charge_rate_for=lambda dt, s, t: 4.0,
             current_slot=BASE,
             minutes_into_slot=minutes_in,
+            # This is the DP-vs-simulate_slot parity proof: the DP keeps an
+            # inlined transition fused with the value recursion, and the only
+            # thing standing between the two implementations is this sweep.
+            planned_soc_by_slot={
+                slot: pair[1] for slot, pair in result.soc_trajectory.items()
+            },
+            soc_tolerance=1e-6,
         )
         assert replay.conservation_violations == []
+        assert replay.trajectory_disagreements == []
         # AC energy served after inverter loss, not just raw DC totals.
         assert (
             replay.total_battery_ac_served_kwh
@@ -315,6 +323,107 @@ class TestExhaustiveEnumeration:
         assert replay.total_value_eur >= best - 0.02
 
 
+class TestTheConservationCheckIsFalsifiable:
+    """The prefix check must be able to FAIL, not restate the replay.
+
+    It used to accumulate `simulate_slot`'s own clamped outputs and compare
+    them with the bound those same outputs are constructed to satisfy -- an
+    identity. Injecting the brief's exact pre-fix defect (a planner deducting
+    1 % per slot for a 1.4 %-per-slot load) produced zero violations.
+
+    What makes it falsifiable is the plan's own declaration: a slot the replay
+    cannot serve in full is either one the plan DECLARED energy-limited
+    ("until depleted", priced with the grid covering the rest), or the plan
+    credited the battery with service it does not have.
+    """
+
+    @staticmethod
+    def _defective_plan():
+        """20 DISCHARGE slots, none declared limited -- the pre-fix DP."""
+        from battery_optimizer_lib import ScheduleEntry
+
+        cfg = _config()
+        schedule = {}
+        planned = {}
+        soc = 30.0
+        for i in range(20):
+            slot = BASE + datetime.timedelta(minutes=15 * i)
+            entry = ScheduleEntry(time=slot, mode=BatteryMode.DISCHARGE, reason="")
+            entry.export_rate = 0
+            schedule[slot] = entry
+            # 1 % per slot: what nearest-rounding on a 0.10 kWh grid deducted
+            # for a 0.14 kWh load.
+            soc = max(cfg.min_soc, soc - 1.0)
+            planned[slot] = soc
+        return cfg, schedule, planned
+
+    @staticmethod
+    def _replay(cfg, schedule, planned):
+        return replay_plan(
+            schedule=schedule,
+            config=cfg,
+            starting_soc=30.0,
+            predict_load_kw=lambda dt: 0.56,
+            predict_pv_kw=lambda dt: 0.0,
+            charge_rate_for=lambda dt, soc, temp: 0.0,
+            planned_soc_by_slot=planned,
+            soc_tolerance=1e-6,
+        )
+
+    def test_the_injected_defect_violates_conservation(self):
+        cfg, schedule, planned = self._defective_plan()
+        replay = self._replay(cfg, schedule, planned)
+        assert replay.conservation_violations, (
+            "a plan that credits 2.8 kWh of battery service from a 2.0 kWh "
+            "battery must violate the conservation check"
+        )
+        assert not replay.ok
+
+    def test_a_declared_partial_slot_is_not_a_violation(self):
+        """Running the pack dry mid-slot is legitimate WHEN the plan says so."""
+        from battery_optimizer_lib import ScheduleEntry
+
+        cfg = _config()
+        schedule = {}
+        planned = {}
+        energy = 3.0
+        for i in range(20):
+            slot = BASE + datetime.timedelta(minutes=15 * i)
+            available = max(0.0, energy - 1.0)
+            draw = min(0.14, available)
+            mode = BatteryMode.DISCHARGE if draw > 1e-9 else BatteryMode.HOLD
+            entry = ScheduleEntry(time=slot, mode=mode, reason="")
+            entry.export_rate = 0 if mode == BatteryMode.DISCHARGE else None
+            entry.energy_limited = draw < 0.14 - 1e-9 and mode == BatteryMode.DISCHARGE
+            schedule[slot] = entry
+            energy -= draw
+            planned[slot] = energy / cfg.battery_capacity * 100
+        replay = self._replay(cfg, schedule, planned)
+        assert replay.conservation_violations == []
+        assert replay.trajectory_disagreements == []
+
+    def test_the_real_dp_plan_declares_every_limited_slot(self):
+        cfg = _config()
+        opt = _optimizer(cfg, load_kw=0.56)
+        result = opt.optimize(
+            prices=_prices(20), current_slot=BASE, current_soc=30.0
+        )
+        replay = replay_plan(
+            schedule=result.schedule,
+            config=cfg,
+            starting_soc=30.0,
+            predict_load_kw=lambda dt: 0.56,
+            predict_pv_kw=lambda dt: 0.0,
+            charge_rate_for=lambda dt, soc, temp: 0.0,
+            planned_soc_by_slot={
+                slot: pair[1] for slot, pair in result.soc_trajectory.items()
+            },
+            soc_tolerance=1e-6,
+        )
+        assert replay.conservation_violations == []
+        assert replay.trajectory_disagreements == []
+
+
 class _StubApp:
     """Minimal surface `_validate_final_plan` needs, nothing more."""
 
@@ -346,6 +455,11 @@ class _StubApp:
 
     def log(self, message, level="INFO"):
         self.messages.append((level, message))
+
+    def _replay_schedule(self, **kwargs):
+        import battery_optimizer as bo
+
+        return bo.BatteryOptimizer._replay_schedule(self, **kwargs)
 
 
 class TestFinalPlanValidationHook:
@@ -395,7 +509,45 @@ class TestFinalPlanValidationHook:
         replay = self._validate(app, result.schedule, inflated, 30.0)
         assert replay.trajectory_disagreements
         warnings = [m for m in app.messages if m[0] == "WARNING"]
-        assert warnings and "disagrees with the shared" in warnings[0][1]
+        assert warnings and "disagreed with the shared" in warnings[0][1]
+        assert "publishing the replayed trajectory instead" in warnings[0][1]
+
+    def test_a_disagreement_is_RESOLVED_not_just_logged(self):
+        """The published trajectory must describe the physical model.
+
+        Logging a disagreement and publishing the disagreeing numbers anyway
+        leaves the schedule log, the deviation detector and the projected-cost
+        column all describing a plan that cannot happen.
+        """
+        cfg, result = self._plan()
+        app = _StubApp(cfg)
+        inflated = {
+            slot: (pair[0], pair[1] + 5.0)
+            for slot, pair in result.soc_trajectory.items()
+        }
+        replay = self._validate(app, result.schedule, inflated, 30.0)
+        assert replay.trajectory_disagreements
+        assert replay.corrected is True
+        # What it hands back is the shared model's own answer, per slot.
+        corrected = replay.soc_trajectory()
+        for slot in sorted(result.schedule.keys()):
+            assert corrected[slot][1] == pytest.approx(
+                replay.by_slot[slot].soc_end, abs=1e-12
+            )
+            assert corrected[slot][1] != pytest.approx(inflated[slot][1])
+
+    def test_the_correction_is_verified_by_a_second_replay(self):
+        cfg, result = self._plan()
+        app = _StubApp(cfg)
+        inflated = {
+            slot: (pair[0], pair[1] + 5.0)
+            for slot, pair in result.soc_trajectory.items()
+        }
+        replay = self._validate(app, result.schedule, inflated, 30.0)
+        # The corrected trajectory is replayed again and must agree, so no
+        # ERROR is raised for an ordinary correction.
+        assert not [m for m in app.messages if m[0] == "ERROR"]
+        assert [m for m in app.messages if m[0] == "WARNING"]
 
     def test_the_hook_never_breaks_planning(self):
         cfg, result = self._plan()

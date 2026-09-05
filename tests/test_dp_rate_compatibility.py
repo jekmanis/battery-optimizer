@@ -401,6 +401,11 @@ class TestPlanReplayAgreesWithTheTemperatureAwarePlan:
         def log(self, message, level="INFO"):
             self.messages.append((level, message))
 
+        def _replay_schedule(self, **kwargs):
+            import battery_optimizer as bo
+
+            return bo.BatteryOptimizer._replay_schedule(self, **kwargs)
+
     def test_no_disagreement_is_reported(self):
         import battery_optimizer as bo
 
@@ -440,51 +445,332 @@ class TestPlanReplayAgreesWithTheTemperatureAwarePlan:
         assert replay is not None
         assert replay.conservation_violations == []
         assert replay.trajectory_disagreements == []
+        assert replay.corrected is False
         assert not [m for m in app.messages if m[0] in ("WARNING", "ERROR")]
 
+    def test_a_post_hedge_schedule_is_validated_and_corrected(self):
+        """The hedge rewrites actions after the DP; validation sees the result.
 
-class TestHoistedConstantRate:
-    """The SOC-independent fast path must not change any answer.
+        A HOLD slot turned into ``discharge_to_load`` changes the modelled flow
+        whenever PV does NOT cover the load, so the DP's trajectory no longer
+        describes the plan. The validator must correct what gets published,
+        not merely mention it.
+        """
+        import battery_optimizer as bo
+        from battery_optimizer_lib import BatteryMode as _Mode
 
-    When the rate is the same at every state, `_run_dp` hoists the derived
-    per-slot energies out of the state loop. That is a performance hint, not a
-    modelling choice, so the two paths must produce identical plans.
+        projector = TestSharedThermalModel._projector(ambient=5.0, k1=0.0, k2=6.0)
+        cfg = _config(terminal_energy_value_eur_kwh=1.0)
+        load = lambda dt: 0.0 if _slot_index(dt) < 2 else 2.0
+        opt = DPOptimizer(
+            config=cfg,
+            load_predictor=load,
+            charge_rate_predictor=self._Engine.get_charge_rate_for_soc,
+            temp_after_charge_predictor=lambda t, m: t,
+            temp_after_idle_predictor=lambda t, m: t,
+            pv_predictor=lambda dt: 0.0,
+            temp_projector=projector,
+        )
+        result = opt.optimize(
+            prices=_prices([0.05, 0.05, 0.50, 0.50]),
+            current_slot=BASE,
+            current_soc=60.0,
+            current_temp=20.0,
+        )
+        # Rewrite a HOLD slot the way the orchestrator's hedge would.
+        hedged = None
+        for slot in sorted(result.schedule):
+            entry = result.schedule[slot]
+            if entry.mode is _Mode.HOLD:
+                entry.mode = _Mode.DISCHARGE
+                entry.export_rate = 0
+                hedged = slot
+                break
+
+        app = self._App(cfg, projector, load=0.0, pv=0.0)
+        app._predict_load_kw = load
+        replay = bo.BatteryOptimizer._validate_final_plan(
+            app,
+            schedule=result.schedule,
+            soc_trajectory=result.soc_trajectory,
+            starting_soc=60.0,
+            starting_temp=20.0,
+            current_slot=None,
+            minutes_into_slot=0.0,
+            prices_sorted=None,
+            planning_temp_by_slot=result.planning_temp_by_slot,
+        )
+        assert replay is not None
+        if hedged is not None and replay.trajectory_disagreements:
+            assert replay.corrected is True
+            corrected = replay.soc_trajectory()
+            assert corrected[hedged][1] == pytest.approx(
+                replay.by_slot[hedged].soc_end, abs=1e-12
+            )
+
+
+class TestOneTrajectoryPerPlan:
+    """The schedule log and the deviation detector must read the same plan.
+
+    Two trajectories were published for one schedule: the DP's own energies,
+    built at the PLANNING temperatures, and ``calculate_expected_soc_schedule``,
+    built by re-projecting at the projector's own evolving temperature. On the
+    brief's Task 4 case they diverged by several SOC points -- the schedule log
+    printed one and the deviation detector ran on the other, while the plan
+    validator's tolerance is a tenth of a grid step.
+    """
+
+    class _Engine:
+        @staticmethod
+        def get_charge_rate_for_soc(soc, temp=None):
+            if temp is None:
+                return 4.0
+            return 1.0 if temp < 10.0 else 4.0
+
+        @staticmethod
+        def predict_temp_after_idle(temp, duration_minutes):
+            return temp
+
+        @classmethod
+        def predict_charge_input_dc_energy(
+            cls, soc, start_temp, duration_minutes, temp_threshold=16.0
+        ):
+            # Flat within the slot, and charging warms the pack 1 C per minute
+            # -- the same synthetic thermal model the DP is given below.
+            rate = cls.get_charge_rate_for_soc(soc, start_temp)
+            return rate * duration_minutes / 60.0, start_temp + duration_minutes
+
+    class _App:
+        def __init__(self, cfg, projector, load_fn, pv_fn):
+            import types
+
+            # project_schedule_trajectory reads a main-config surface, which
+            # adds `charge_rate` to what DPOptimizerConfig carries.
+            self.config = types.SimpleNamespace(
+                battery_capacity=cfg.battery_capacity,
+                efficiency=cfg.efficiency,
+                charge_rate=4.0,
+                discharge_rate=cfg.discharge_rate,
+                export_discharge_rate=cfg.export_discharge_rate,
+                inverter_efficiency=cfg.inverter_efficiency,
+                slot_minutes=cfg.slot_minutes,
+                soc_step_percent=cfg.soc_step_percent,
+            )
+            self.min_soc = cfg.min_soc
+            self.max_soc = cfg.max_soc
+            self._temp_projector = projector
+            self.learning_engine = TestOneTrajectoryPerPlan._Engine()
+            self._load_fn = load_fn
+            self._pv_fn = pv_fn
+
+        def project_schedule_trajectory(self, *args, **kwargs):
+            import battery_optimizer as bo
+
+            return bo.BatteryOptimizer.project_schedule_trajectory(
+                self, *args, **kwargs
+            )
+
+        def _predict_load_kw(self, dt):
+            return self._load_fn(dt)
+
+        def _predict_pv_kw(self, dt):
+            return self._pv_fn(dt)
+
+        def _get_local_timezone(self):
+            return None
+
+        def log(self, message, level="INFO"):
+            pass
+
+    @staticmethod
+    def _load(dt):
+        return 4.0 if _slot_index(dt) == 2 else 0.0
+
+    def _plan(self):
+        """The brief's Task 4 case, where the refinement OSCILLATES.
+
+        That is the interesting one: the plan is then built on the conservative
+        idle profile (0 C throughout) while the shared projection evolves the
+        pack to 15 C and 30 C, so the two trajectories diverge by the whole of
+        the plan's warming.
+        """
+        cfg = _config()
+        opt = DPOptimizer(
+            config=cfg,
+            load_predictor=self._load,
+            charge_rate_predictor=self._Engine.get_charge_rate_for_soc,
+            temp_after_charge_predictor=lambda t, m: t + m,
+            temp_after_idle_predictor=lambda t, m: t,
+            pv_predictor=lambda dt: 0.0,
+        )
+        result = opt.optimize(
+            prices=_prices([0.60, 0.01, 1.00]),
+            current_slot=BASE,
+            current_soc=10.0,
+            current_temp=0.0,
+        )
+        assert result.rate_refinement_fallback
+        app = self._App(cfg, None, self._load, lambda dt: 0.0)
+        return cfg, app, result
+
+    def test_expected_soc_matches_the_dp_trajectory(self):
+        import battery_optimizer as bo
+
+        cfg, app, result = self._plan()
+        expected_soc, _t = bo.BatteryOptimizer.calculate_expected_soc_schedule(
+            app,
+            result.schedule,
+            10.0,
+            starting_temp=0.0,
+            planning_temp_by_slot=result.planning_temp_by_slot,
+        )
+        # calculate_expected_soc_schedule reports the START of each slot; the
+        # DP trajectory reports (start, end). Compare starts.
+        tolerance = 0.1 * cfg.soc_step_percent
+        for slot in sorted(result.schedule.keys()):
+            planned_start = result.soc_trajectory[slot][0]
+            assert expected_soc[slot] == pytest.approx(planned_start, abs=tolerance), (
+                f"{slot}: schedule log says {planned_start:.2f}%, the deviation "
+                f"detector says {expected_soc[slot]:.2f}%"
+            )
+
+    def test_the_rebuilt_trajectory_matches_too(self):
+        import battery_optimizer as bo
+
+        cfg, app, result = self._plan()
+        soc_traj, _temp = bo.BatteryOptimizer.project_schedule_trajectory(
+            app,
+            result.schedule,
+            10.0,
+            starting_temp=0.0,
+            planning_temp_by_slot=result.planning_temp_by_slot,
+        )
+        tolerance = 0.1 * cfg.soc_step_percent
+        for slot in sorted(result.schedule.keys()):
+            assert soc_traj[slot][1] == pytest.approx(
+                result.soc_trajectory[slot][1], abs=tolerance
+            ), slot
+
+
+def assert_plan_respects_its_own_rate_contract(cfg, result, rate_fn, tol=1e-9):
+    """Every slot stores at most what ITS OWN planning rate allows.
+
+    The invariant the DP owes: for each slot, the stored energy the plan
+    credits is at most ``rate(soc at the start of that slot, the temperature
+    the plan was built with for that slot) * efficiency * duration``. Written
+    against ``rate_fn`` -- the caller's curve -- not against anything the
+    implementation computed, so a hoisted or cached rate cannot make it pass.
+    """
+    for slot in sorted(result.schedule.keys()):
+        start_soc, end_soc = result.soc_trajectory[slot]
+        stored = max(0.0, (end_soc - start_soc) / 100.0 * cfg.battery_capacity)
+        temp = result.planning_temp_by_slot.get(slot)
+        allowed = rate_fn(start_soc, temp) * cfg.efficiency * cfg.slot_hours
+        assert stored <= allowed + tol, (
+            f"{slot}: plan stores {stored:.4f} kWh from {start_soc:.2f}% at "
+            f"{temp} C, but its own rate curve allows {allowed:.4f} kWh"
+        )
+
+
+class TestRateIsEvaluatedAtTheTemperatureTheProfileReaches:
+    """A rate that is SOC-dependent only at a temperature no probe visited.
+
+    `_run_dp` used to decide once, from a fixed probe set around the CURRENT
+    temperature, whether the rate varies with SOC -- and if it decided "no", it
+    hoisted ``rate(min_soc, slot_temp)``, the fastest point of a tapering
+    curve, onto every state. A curve that is flat at every probe but tapers at
+    a temperature the refined profile actually reaches therefore had its taper
+    erased, and the plan invented the difference.
     """
 
     @staticmethod
-    def _run(force_per_state):
-        cfg = _config(terminal_energy_value_eur_kwh=0.2)
+    def _rate(soc, temp):
+        # Flat at every probe around 0 C (-5, 0, 5, 10, 15, 25) ...
+        if temp is None:
+            return 8.0
+        if temp < 5.0:
+            return 1.0
+        # ... but tapered above 50 % in a window the probes step over, and
+        # which the plan's own warming lands squarely inside.
+        if 6.0 <= temp < 9.0 and soc > 50.0:
+            return 0.5
+        return 8.0
+
+    def _run(self):
+        cfg = _config(terminal_energy_value_eur_kwh=1.0)
         opt = DPOptimizer(
             config=cfg,
-            load_predictor=lambda dt: 1.1,
-            charge_rate_predictor=lambda soc, temp: 4.0,
-            temp_after_charge_predictor=lambda t, m: t,
-            temp_after_idle_predictor=lambda t, m: t,
-            pv_predictor=lambda dt: 2.0 if _slot_index(dt) in (3, 4) else 0.0,
+            load_predictor=lambda dt: 0.0,
+            charge_rate_predictor=self._rate,
+            # The pack settles at 7 C, inside the tapered window, whatever it
+            # does -- so the refinement reaches a genuine fixed point and the
+            # conservative fallback never fires to mask the defect.
+            temp_after_charge_predictor=lambda t, m: 7.0,
+            temp_after_idle_predictor=lambda t, m: 7.0,
+            pv_predictor=lambda dt: 0.0,
         )
-        original = DPOptimizer._rate_is_soc_dependent
-        if force_per_state:
-            opt._rate_is_soc_dependent = lambda socs, temp: True
-        try:
-            return opt.optimize(
-                prices=_prices([0.30, 0.05, 0.02, 0.40, 0.90, 0.10, 0.60, 0.03]),
-                current_slot=BASE,
-                current_soc=40.0,
-                minutes_into_slot=7.0,
-            )
-        finally:
-            opt._rate_is_soc_dependent = original.__get__(opt, DPOptimizer)
+        result = opt.optimize(
+            prices=_prices([0.01] * 5),
+            current_slot=BASE,
+            current_soc=50.5,
+            current_temp=0.0,
+        )
+        return cfg, result
 
-    def test_the_two_paths_agree(self):
-        hoisted = self._run(force_per_state=False)
-        per_state = self._run(force_per_state=True)
-        assert [e.mode for _, e in sorted(hoisted.schedule.items())] == [
-            e.mode for _, e in sorted(per_state.schedule.items())
-        ]
-        for slot in sorted(hoisted.schedule):
-            assert hoisted.soc_trajectory[slot] == pytest.approx(
-                per_state.soc_trajectory[slot], abs=1e-9
-            )
+    def test_the_taper_is_not_erased(self):
+        cfg, result = self._run()
+        # The refinement must reach a fixed point here: the conservative
+        # fallback would mask the defect rather than fix it.
+        assert result.rate_refinement_converged
+        assert not result.rate_refinement_fallback
+        assert_plan_respects_its_own_rate_contract(cfg, result, self._rate)
+
+    def test_no_slot_charges_at_the_low_soc_rate_from_a_tapered_state(self):
+        cfg, result = self._run()
+        for slot in sorted(result.schedule.keys()):
+            start_soc, end_soc = result.soc_trajectory[slot]
+            temp = result.planning_temp_by_slot.get(slot)
+            if temp is not None and 6.0 <= temp < 9.0 and start_soc > 50.0:
+                stored = (end_soc - start_soc) / 100.0 * cfg.battery_capacity
+                # 0.5 kW for 15 minutes = 0.125 kWh = 1.25 SOC points.
+                assert stored <= 0.125 + 1e-9
+
+
+class TestRandomCurvesRespectTheirOwnRates:
+    """Metamorphic sweep over arbitrary SOC/temperature rate curves."""
+
+    @pytest.mark.parametrize("seed", range(12))
+    def test_random_curve_plans_stay_inside_their_rate(self, seed):
+        import random
+
+        rng = random.Random(seed)
+        soc_knots = sorted(rng.sample(range(11, 100), 3))
+        temp_knots = sorted(rng.sample(range(-5, 30), 3))
+        levels = [round(rng.uniform(0.3, 6.0), 3) for _ in range(16)]
+
+        def rate(soc, temp):
+            if temp is None:
+                return levels[0]
+            si = sum(1 for k in soc_knots if soc > k)
+            ti = sum(1 for k in temp_knots if temp > k)
+            return levels[si * 4 + ti]
+
+        cfg = _config(terminal_energy_value_eur_kwh=rng.choice([0.0, 0.5, 1.0]))
+        opt = DPOptimizer(
+            config=cfg,
+            load_predictor=lambda dt: rng.choice([0.0, 0.8, 3.0]),
+            charge_rate_predictor=rate,
+            temp_after_charge_predictor=lambda t, m: t + 0.3 * m,
+            temp_after_idle_predictor=lambda t, m: t - 0.02 * m,
+            pv_predictor=lambda dt: 0.0,
+        )
+        result = opt.optimize(
+            prices=_prices([0.30, 0.02, 0.60, 0.01, 0.90, 0.05]),
+            current_slot=BASE,
+            current_soc=rng.choice([15.0, 45.5, 72.0]),
+            current_temp=rng.choice([-2.0, 4.0, 12.0, 22.0]),
+        )
+        assert_plan_respects_its_own_rate_contract(cfg, result, rate)
 
 
 class TestWithinSlotApproximation:

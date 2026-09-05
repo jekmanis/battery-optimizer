@@ -143,7 +143,6 @@ class PartialSlotOptimizer:
 PartialSlotOptimizer.find_optimal_schedule = BatteryOptimizer.find_optimal_schedule
 PartialSlotOptimizer._ensure_current_slot_price = BatteryOptimizer._ensure_current_slot_price
 PartialSlotOptimizer._compute_slot_fractions = BatteryOptimizer._compute_slot_fractions
-PartialSlotOptimizer._compute_charge_rates_per_slot = BatteryOptimizer._compute_charge_rates_per_slot
 
 
 class MissingPriceOptimizer:

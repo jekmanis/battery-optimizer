@@ -12,11 +12,16 @@ Historically three places modelled this independently:
 * ``SocDeviationDetector._interpolate_expected_soc`` (the deviation detector)
 
 They disagreed, which produced false "SOC behind plan" / "SOC ahead" events and
-a recalculation loop. The semantics below are copied 1:1 from the DP so that the
-two consumers cannot drift from it again. The DP keeps its own inlined
-transition (it is fused with the value recursion and the discrete SOC grid);
-``tests/test_soc_projection.py`` guards that the two agree within one DP grid
-step per slot.
+a recalculation loop. The physics is now delegated to
+``slot_energy.simulate_slot``, so this function and the energy view of a slot
+cannot drift apart at all. The DP keeps its own inlined transition (it is fused
+with the value recursion and the discrete SOC grid), and THAT parity is proven
+by replay: ``tests/test_dp_energy_conservation.py::
+TestPrefixConservationAcrossConditions::test_no_prefix_creates_energy`` sweeps
+210 (starting SOC, load, PV, partial-slot) combinations, replays each selected
+plan through ``simulate_slot`` and requires the DP's own SOC trajectory to match
+to 1e-6 %. ``tests/test_slot_energy_parity.py`` sweeps this function against
+``simulate_slot`` directly.
 
 Invariants (see also docs/scheduling-algorithm.md):
 
@@ -40,7 +45,6 @@ from typing import Optional
 
 from .models import BatteryMode
 from .slot_energy import params_from_soc_projection, simulate_slot
-from .thermal_model import battery_power_for_entry
 
 
 @dataclass(frozen=True)
@@ -119,6 +123,7 @@ def project_slot_soc(
     learning_engine=None,
     temp_threshold: float = 16.0,
     rate_lookup_soc: Optional[float] = None,
+    rate_lookup_temp: Optional[float] = None,
     temp_projector=None,
     slot_time: Optional[datetime.datetime] = None,
 ) -> SocTransition:
@@ -142,6 +147,17 @@ def project_slot_soc(
         rate_lookup_soc: SOC to use for charge-rate lookups instead of
             ``soc_start``. The deviation detector passes the *actual* SOC here
             because that is what the inverter's rate really depends on.
+        rate_lookup_temp: Temperature to use for charge-rate lookups instead of
+            ``temp_start``. Consumers that are re-projecting a plan pass the
+            temperature the PLAN was built with for that slot
+            (``DPOptimizerResult.planning_temp_by_slot``). Without it the
+            re-projection charges at whatever rate its own evolving temperature
+            implies, which is a different plan: on the brief's Task 4 case,
+            where the refinement falls back to a conservative idle profile, the
+            two trajectories diverged by 7.5 SOC points after three slots -- the
+            schedule log printing one and the deviation detector running on the
+            other. The thermal projection itself still uses ``temp_start``; only
+            the rate lookup is pinned.
         temp_projector: Optional ``thermal_model.TemperatureProjector``. When
             given, the end temperature comes from the SHARED thermal model for
             every mode (relaxation toward a time-varying ambient plus
@@ -164,7 +180,11 @@ def project_slot_soc(
     pv_surplus_kw = max(0.0, pv_kw - load_kw)
 
     rate_soc = rate_lookup_soc if rate_lookup_soc is not None else soc_start
-    charge_rate = _effective_charge_rate(params, rate_soc, temp_start, learning_engine)
+    # The temperature the RATE is looked up at may be pinned to the one the plan
+    # was built with, independently of the temperature the pack is projected
+    # through. See `rate_lookup_temp` in the docstring.
+    rate_temp = rate_lookup_temp if rate_lookup_temp is not None else temp_start
+    charge_rate = _effective_charge_rate(params, rate_soc, rate_temp, learning_engine)
 
     inv_eff = params.inverter_efficiency if params.inverter_efficiency > 0 else 1.0
     temp_end = temp_start
@@ -182,13 +202,20 @@ def project_slot_soc(
         # charge_input_dc_kwh: DC energy at the battery terminal, before
         # retention. Multiplying by `efficiency` gives stored energy. (The
         # variable used to be called `energy_ac`, which it never was.)
-        charge_input_dc_kwh, temp_end = (
+        charge_input_dc_kwh, warmed_temp = (
             learning_engine.predict_charge_input_dc_energy(
                 rate_soc,
-                temp_start,
+                rate_temp,
                 duration_minutes,
                 temp_threshold=temp_threshold,
             )
+        )
+        # When the rate lookup is pinned to the plan's temperature the pack's
+        # own temperature still evolves from where it really is.
+        temp_end = (
+            warmed_temp
+            if rate_lookup_temp is None
+            else _idle_temp(learning_engine, temp_start, duration_minutes)
         )
         if duration_hours > 0:
             slot_charge_input_dc_kw = charge_input_dc_kwh / duration_hours
@@ -214,20 +241,16 @@ def project_slot_soc(
     soc_end = energy_params.soc_of(outcome.energy_end_kwh)
 
     if temp_projector is not None and temp_start is not None:
-        # One thermal model for every mode. |P_bat| is derived by the same
-        # helper the DP trajectory uses, so the two can never disagree.
-        power_kw = battery_power_for_entry(
-            mode,
-            charge_rate_kw=charge_rate,
-            load_kw=load_kw,
-            pv_kw=pv_kw,
-            discharge_rate_kw=params.discharge_rate,
-            export_discharge_rate_kw=params.effective_export_discharge_rate,
-            export_rate=export_rate,
-            inverter_efficiency=inv_eff,
-        )
+        # One thermal model for every mode, driven by the energy that ACTUALLY
+        # moved. This used to call `thermal_model.battery_power_for_entry`,
+        # which models the REQUESTED flow and knows nothing about SOC limits --
+        # three lines after `simulate_slot` had already computed the real one.
+        # A full pack ordered to charge therefore warmed as if it had taken a
+        # full slot of energy, in every consumer of this projection, and which
+        # convention the published temperature used depended on which code path
+        # built it. Imaginary power must not manufacture future capability.
         temp_end = temp_projector.project(
-            temp_start, slot_time, duration_minutes, power_kw
+            temp_start, slot_time, duration_minutes, outcome.battery_power_kw
         )
 
     return SocTransition(

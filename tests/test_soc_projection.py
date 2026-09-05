@@ -701,12 +701,11 @@ class TestDetectorAgreesWithTheSharedModel:
         """A poisoned learning file must not fan out into three different rates.
 
         This is the exact live 0-25 %/>20 C bucket. Before the bound, the DP
-        (via ``charge_rate_utils``), the trajectory (via ``project_slot_soc``)
+        (through its own rate lookup), the trajectory (via ``project_slot_soc``)
         and the detector each reached a different median and produced
         10.95 / 3.01 / 14308.71 kW for the same slot.
         """
         from battery_optimizer_lib import BatteryLearningEngine
-        from battery_optimizer_lib.charge_rate_utils import compute_charge_rates_per_slot
 
         poison = [2.806, 34535.687, 44653.932, 14308.71, 5.959]
         engine = BatteryLearningEngine(
@@ -725,14 +724,11 @@ class TestDetectorAgreesWithTheSharedModel:
             PricePoint(time=slot + datetime.timedelta(minutes=15 * i), price=0.05)
             for i in range(4)
         ]
-        dp_rates = compute_charge_rates_per_slot(
-            slots, [1.0] * 4, 15, 10.0, 21.9,
-            engine.get_charge_rate_for_soc,
-            battery_capacity=CAPACITY, efficiency=0.95, max_soc=100.0,
-            project_temp=lambda t, _s, _d, _p: t,
-        )
+        # The DP evaluates the rate per candidate state through this one
+        # gate; there is no time-indexed array any more.
+        dp_rates = [engine.get_charge_rate_for_soc(soc, 21.9) for soc in
+                    (10.0, 20.0, 50.0, 90.0)]
         assert all(r <= bound for r in dp_rates)
-        # The first slot is the one the DP scores at the current SOC/temperature.
         assert dp_rates[0] == engine.get_charge_rate_for_soc(10.0, 21.9)
 
         # 2. Expected-SOC trajectory path

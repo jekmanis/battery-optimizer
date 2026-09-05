@@ -175,9 +175,16 @@ The consequences are worth being precise about:
 - **The merging is the approximation.** Two paths in one bucket differ by up to
   one step and only the better-valued one survives. Ties are broken toward the
   path holding more energy, which is a genuine dominance rule (more energy can
-  only widen later options). The optimality gap is bounded by one step times the
-  marginal value of a kWh; the solver is exact for its discretized model, and an
-  approximation of the continuous problem.
+  only widen later options).
+
+  **Size of that gap.** One step times the marginal value of a kWh is the
+  *per-merge* error, not the horizon bound: a discarded path can be discarded
+  again at every later slot, so the only bound proven here is the sum,
+  `n_slots * step * marginal_value`. That is loose — the errors are not
+  independent and a merged path usually rejoins — but nothing in this
+  implementation establishes anything tighter, and the honest statement is the
+  loose one. What IS exact: the solver is exact for its discretized model given
+  a temperature profile, and the physics of every transition is exact.
 - **Energy-limited candidates pay the grid.** A discharge delivers what the pack
   has; whatever it cannot cover is charged to the grid at the import price in the
   same slot. No threshold decides whether a slot "counts" — the energy does. The
@@ -291,15 +298,33 @@ Two designs were rejected:
   are in play, and it would refuse to plan the warm-pack charging the
   installation actually does.
 
-**Runtime**, 132-slot horizon (33 h at 15-minute slots), 14.3 kWh pack, median
-of five runs, with and without a partial first slot:
+**Runtime.** 132-slot horizon (33 h at 15-minute slots), 14.3 kWh pack, median
+of five runs, without / with a partial first slot. Absolute numbers are
+machine-dependent — a reviewer measured roughly twice these on their hardware —
+so read the shape, not the digits:
 
 | Rate curve | 1 % step (91 states) | 0.5 % (181) | 0.25 % (361) |
 | --- | --- | --- | --- |
-| flat | 36 / 140 ms | 74 / 267 ms | 143 / 602 ms |
-| SOC taper | 56 / 200 ms | 110 / 425 ms | 208 / 842 ms |
-| SOC + temperature, converges in 1 pass | 61 / 202 ms | 117 / 416 ms | 236 / 829 ms |
-| worst case: 3 refinement passes + fallback | 185 / 728 ms | 198 / 734 ms | 389 / 1456 ms |
+| flat | 54 / 187 ms | 97 / 369 ms | 194 / 786 ms |
+| SOC taper | 53 / 203 ms | 100 / 403 ms | 201 / 1004 ms |
+| SOC + temperature, converges in 1 pass | 62 / 211 ms | 120 / 408 ms | 240 / 888 ms |
+| a curve that forces refinement | 207 / 772 ms (4 passes) | 211 / 773 ms (2) | 403 / 1510 ms (2) |
+
+Three things the table is there to say:
+
+- **The worst case is bounded but real.** At most
+  `MAX_RATE_REFINEMENT_PASSES + 1 = 4` solves, and the partial-first-slot
+  lookahead runs the whole DP once per candidate on top of that. Around 0.8 s at
+  the reference installation's 1 % step, and past 1.5 s (2.9 s on slower
+  hardware) at 0.25 %.
+- **It runs under the app callback lock**, on AppDaemon's single thread, so it
+  delays every other callback of this app for that long. That is the argument
+  against putting temperature into the DP state, and the reason
+  `MAX_RATE_REFINEMENT_PASSES` is 3 rather than "until it settles".
+- **Whether the refinement converges depends on `soc_step_percent`.** In the
+  bottom row a 1 % grid oscillates and falls back while 0.5 % and 0.25 % reach a
+  fixed point in two passes: a finer grid changes which plan each pass selects.
+  The step is an accuracy/performance control with a third effect.
 
 These are planning estimates; an actual SOC deviation still triggers a
 re-optimization.
@@ -307,8 +332,8 @@ re-optimization.
 ### One bound on the learned charge rate
 
 `BatteryLearningEngine.get_charge_rate_for_soc` is the ONE gate every consumer of
-a learned battery power passes through: the DP (via
-`charge_rate_utils.compute_charge_rates_per_slot`), the expected-SOC trajectory
+a learned battery power passes through: the DP (via `DPOptimizer._rate_for`,
+once per candidate state), the expected-SOC trajectory
 (via `soc_projection._effective_charge_rate`), the deviation detector (via
 `_project_charge_completion` and `_calculate_extra_charge_slots`) and the
 orchestrator's status sensors. The plausibility bound therefore lives there and
@@ -326,7 +351,8 @@ Two lines of defence, both derived from the same constants in
    (`Learning: rejected implausible …`) and counted in
    `get_learning_summary()["rejected_observations"]`.
 2. **At read.** `_plausible_rates` filters every median window *before* the
-   `[-10:]` slice, and `_bounded_median` clamps the result. `load_from_json`
+   `[-10:]` slice, and `_bounded_input_dc_rate` converts the median to terminal
+   power and clamps the result. `load_from_json`
    runs the same filter (`sanitize_stats`) so a file written before the ingest
    guards existed is neutralised in memory on load and written back clean on the
    next save.
@@ -369,15 +395,17 @@ numbers for the same 05:00 CHARGE slot, all from that one file:
 
 | consumer | path | rate | slot effect |
 |---|---|---|---|
-| DP | `charge_rate_utils` at projected SOC/temp | 10.95 kW | +18.2 %/slot planned |
+| DP | the time-indexed rate array, at a projected SOC/temp | 10.95 kW | +18.2 %/slot planned |
 | expected-SOC trajectory | `project_slot_soc` at 10 %, 16 C | 3.01 kW | +5.0 %/slot |
 | deviation detector | `_project_charge_completion` at 10 %, 21.9 C | 14308.71 kW | "projected to reach 21894.1 %" |
 
-The DP's 10.95 kW is the tell: `compute_charge_rates_per_slot` walks the SOC
-forward assuming continuous charging, so the first slot's 14308.71 kW saturated
-the projection at 100 % and *every remaining slot* was priced from the
-`90-100`/`>20` bucket (median 10.95 kW) instead of the bucket it would really be
-in. Reality delivered 6.86 kW (SOC 9 %→21 % in 15 min).
+The DP's 10.95 kW is the tell. That table is history: the rate array it names
+walked the SOC forward assuming continuous charging, so the first slot's
+14308.71 kW saturated the projection at 100 % and *every remaining slot* was
+priced from the `90-100`/`>20` bucket (median 10.95 kW) instead of the bucket it
+would really be in. Reality delivered 6.86 kW (SOC 9 %→21 % in 15 min). The
+array is gone — the DP evaluates the rate per candidate state — but the bound is
+what stopped the 14308.71 kW, and the bound is what this section is about.
 
 `scripts/clean_learning_data.py` inspects a learning file and writes a cleaned
 copy using the same `sanitize_stats` rule; it never modifies its input.
@@ -480,15 +508,19 @@ T(t+dt) = Ta(t) + (T(t) - Ta(t)) * exp(-k1*dt) + k2 * |P_bat| * dt/60
    at 0 kW) and `record_cooling` discarded every summer sample via
    `temp_end < ambient_temp`, so `k1` never got calibrated. The fallback profile
    therefore spans `[min - 2A, min]`.
-3. **One projector, four consumers.** `DPOptimizer._build_temp_trajectory`,
-   `soc_projection.project_slot_soc` (used by the expected-SOC trajectory),
-   `ScheduleFormatter` and `charge_rate_utils.compute_charge_rates_per_slot` all go
-   through the same `TemperatureProjector`. Two different models on two code paths
-   is the bug this replaced.
-4. **The trajectory is reporting-only in the DP output.**
-   `_build_temp_trajectory` runs *after* `_build_schedule`. Temperature influences
-   decisions solely through `compute_charge_rates_per_slot`, because that feeds
-   `get_charge_rate_for_soc(soc, temp)`.
+3. **One projector, every consumer.** `DPOptimizer._idle_temp_profile` and
+   `DPOptimizer._replay_plan_temps`, `soc_projection.project_slot_soc` (used by
+   the expected-SOC trajectory, the projected-cost column and the deviation
+   detector) and `ScheduleFormatter` all go through the same
+   `TemperatureProjector`. Two different models on two code paths is the bug
+   this replaced.
+4. **Temperature reaches the DP's decisions through the refinement loop.**
+   `_idle_temp_profile` supplies pass 0 and `_replay_plan_temps` each later
+   pass; the per-slot temperature then feeds `get_charge_rate_for_soc(soc, temp)`
+   inside the candidate transition. The temperature trajectory in
+   `DPOptimizerResult` is the last pass's replay, so the reported trajectory and
+   the one the plan was priced at are the same object — they used to be built by
+   two different functions, one before and one after `_build_schedule`.
 5. **Projections are bounded.** `TemperatureProjector.project` clamps to
    `MAX_BATTERY_TEMP_C` and cannot undershoot `min(start, ambient) - 2 C`.
    The unbounded linear projection it replaced reached ~230 C after 132 slots.
@@ -630,11 +662,22 @@ the two actions apart. `BatteryOptimizer._cloud_safe_hedge` requires all four:
    for a later slot — and no import price makes them equivalent.
 2. **Nothing the plan was going to sell gets curtailed.** `discharge_to_load`
    pins the export limiter to 0 % (see `direct_control.expected_registers`),
-   while `hold` leaves it open. So either the sell price is zero, or the HOLD
-   plan stored the whole surplus in the pack. The check reads the shared
-   model's continuous trajectory of the HOLD plan, not the DP's quantized one:
-   a single SOC step of rounding is enough to hide a slot's worth of
-   exportable PV. A full pack with a **sellable** surplus therefore never
+   while `hold` leaves it open. So either the sell price is zero, or the plan
+   was not selling anything in that slot. The check reads the **pre-hedge
+   replay's own `grid_export_ac_kwh`** (`plan_validation.replay_plan`, built by
+   `BatteryOptimizer._replay_schedule` — the same construction
+   `_validate_final_plan` uses), whose charge-rate lookup is pinned to
+   `DPOptimizerResult.planning_temp_by_slot`, i.e. the temperatures the DP
+   actually priced the slot at.
+
+   It used to infer absorption from `project_schedule_trajectory`'s SOC span
+   instead. That looks the charge rate up at the *projector's* own evolving
+   temperature, which is a different plan whenever the rate refinement falls
+   back to its conservative idle profile: on a cold pack the re-projection
+   "absorbs" a surplus the DP had booked as export revenue, the slot converts,
+   and `discharge_to_load` curtails the sale the schedule was chosen for.
+
+   A full pack with a **sellable** surplus therefore never
    converts — which is the planning side of the execution-time
    `DISCHARGE -> HOLD at max SOC with PV > load` override. (With export
    remuneration at zero there is nothing to curtail, so this condition does not

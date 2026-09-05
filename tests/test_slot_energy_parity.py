@@ -5,8 +5,11 @@ Two consumers must agree with it over the whole reachable parameter space:
 * ``soc_projection.project_slot_soc`` -- the SOC view used by the expected
   trajectory, the deviation detector, the schedule formatter and the projected
   cost column;
-* ``DPOptimizer`` -- which keeps an inlined, fused hot path for performance
-  (``tests/test_dp_slot_energy_parity.py``).
+* ``DPOptimizer`` -- which keeps an inlined transition fused with the value
+  recursion. That parity is proven in
+  ``test_dp_energy_conservation.py::TestPrefixConservationAcrossConditions::
+  test_no_prefix_creates_energy``, which replays 210 selected plans through
+  ``simulate_slot`` and requires the DP's own SOC trajectory to match.
 
 Agreement is checked by sweeping the parameters, not by re-deriving the formula
 in the test: a test that copies the implementation reproduces its mistakes.
@@ -96,6 +99,86 @@ def test_soc_projection_and_simulate_slot_agree(efficiency, inv_eff):
         checked += 1
 
     assert checked == len(SOCS) * len(LOADS) * len(PVS) * len(FRACTIONS) * len(MODES)
+
+
+class TestWarmingFollowsActualFlow:
+    """A pack that cannot move energy cannot be warmed by the order to try.
+
+    ``project_slot_soc`` re-derived the thermal power with
+    ``thermal_model.battery_power_for_entry``, which models the REQUESTED flow
+    and knows nothing about SOC limits -- three lines after ``simulate_slot``
+    had already computed the actual one. Every consumer of the shared
+    projection (the expected-SOC trajectory, the projected-cost column, the
+    deviation detector) therefore warmed a full pack ordered to charge and an
+    empty one ordered to discharge.
+    """
+
+    @staticmethod
+    def _projector(ambient=5.0, k2=6.0):
+        from battery_optimizer_lib.thermal_model import TemperatureProjector
+
+        class _Ambient:
+            def predict_c(self, when):
+                return ambient
+
+        return TemperatureProjector(
+            ambient_provider=_Ambient(),
+            default_cooling_rate=0.0,
+            default_heating_c_per_kwh=k2,
+        )
+
+    def test_a_full_pack_ordered_to_charge_does_not_warm(self):
+        params = _soc_params(1.0, 1.0, 4.0)
+        transition = project_slot_soc(
+            soc_start=100.0,
+            mode=BatteryMode.CHARGE,
+            params=params,
+            temp_start=10.0,
+            temp_projector=self._projector(),
+        )
+        assert transition.dc_energy_in_kwh == pytest.approx(0.0)
+        assert transition.temp_end == pytest.approx(10.0, abs=1e-9)
+
+    def test_an_empty_pack_ordered_to_discharge_does_not_warm(self):
+        params = _soc_params(1.0, 1.0, 4.0)
+        transition = project_slot_soc(
+            soc_start=10.0,
+            mode=BatteryMode.DISCHARGE,
+            params=params,
+            load_kw=4.0,
+            export_rate=0,
+            temp_start=10.0,
+            temp_projector=self._projector(),
+        )
+        assert transition.dc_energy_out_kwh == pytest.approx(0.0)
+        assert transition.temp_end == pytest.approx(10.0, abs=1e-9)
+
+    def test_a_partly_full_pack_warms_only_for_what_it_took(self):
+        """98 % SOC with a 4 kW order: it stores 0.2 kWh, so it warms for 0.2."""
+        params = _soc_params(1.0, 1.0, 4.0)
+        transition = project_slot_soc(
+            soc_start=98.0,
+            mode=BatteryMode.CHARGE,
+            params=params,
+            temp_start=10.0,
+            temp_projector=self._projector(k2=6.0),
+        )
+        assert transition.dc_energy_in_kwh == pytest.approx(0.2)
+        # 0.2 kWh at 6 C/kWh, no cooling: exactly 1.2 C, not the 6.0 C the
+        # uncapped 4 kW request would have produced.
+        assert transition.temp_end == pytest.approx(11.2, abs=1e-6)
+
+    def test_a_normal_charge_is_unchanged(self):
+        params = _soc_params(1.0, 1.0, 4.0)
+        transition = project_slot_soc(
+            soc_start=50.0,
+            mode=BatteryMode.CHARGE,
+            params=params,
+            temp_start=10.0,
+            temp_projector=self._projector(k2=6.0),
+        )
+        assert transition.dc_energy_in_kwh == pytest.approx(1.0)
+        assert transition.temp_end == pytest.approx(16.0, abs=1e-6)
 
 
 class TestConservation:

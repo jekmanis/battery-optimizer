@@ -126,7 +126,6 @@ class MockCostOptimizer:
         starting_soc,
         starting_cost,
         prices_by_slot,
-        charge_rates_by_slot=None,
         slot_fractions_by_slot=None,
     ):
         """Wrapper that calls cost tracker's project_costs with predict_load_func."""
@@ -136,7 +135,6 @@ class MockCostOptimizer:
             starting_cost=starting_cost,
             prices_by_slot=prices_by_slot,
             predict_load_func=self._predict_load_kw,
-            charge_rates_by_slot=charge_rates_by_slot,
             slot_fractions_by_slot=slot_fractions_by_slot,
         )
 
@@ -477,29 +475,12 @@ class TestProjectBatteryCosts:
         expected_cost = (old_energy * 0.10 + max_added * landed_cost) / (old_energy + max_added)
         assert abs(final_cost - expected_cost) < 0.001
 
-    def test_charge_rates_by_slot_used(self, optimizer, base_time):
-        """Custom charge rates should affect energy calculation."""
-        hour = base_time
-        schedule = {hour: make_schedule_entry(hour, BatteryMode.CHARGE)}
-        prices_by_slot = {hour: 0.05}
-        charge_rates_by_slot = {hour: 2.0}  # Half the default rate
-
-        projected, final_cost = optimizer._project_battery_costs(
-            schedule=schedule,
-            starting_soc=50.0,
-            starting_cost=0.10,
-            prices_by_slot=prices_by_slot,
-            charge_rates_by_slot=charge_rates_by_slot,
-        )
-
-        # Calculate expected with custom rate
-        old_energy = (50 - 10) / 100 * 14.3
-        added_energy = 2.0 * 0.85 * 1.0  # Half rate
-        landed_cost = (0.05 + optimizer.grid_fee) / optimizer.efficiency
-        expected_cost = (old_energy * 0.10 + added_energy * landed_cost) / (
-            old_energy + added_energy
-        )
-        assert abs(final_cost - expected_cost) < 0.001
+    # NOTE: test_charge_rates_by_slot_used lived here. `project_costs` took a
+    # per-slot rate array that never reached the column:
+    # `soc_projection._effective_charge_rate` always prefers the learning
+    # engine, which is passed in production. The parameter is gone; what the
+    # rate does to the projected cost is covered by
+    # TestProjectedCostsUseTheSharedChargeModel below, through the engine.
 
     def test_slot_fractions_affect_energy(self, optimizer, base_time):
         """Partial slot fractions should reduce energy added/removed."""

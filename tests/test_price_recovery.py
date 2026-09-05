@@ -1138,4 +1138,7 @@ class TestPriceRecoveryConfig:
         app.execute_scheduled_mode({})
 
         assert app.pending_retries() == []
-        assert app.applied[-1].reason == "no_schedule", "still a safe HOLD"
+        # `full_optimize` already judged the (empty) snapshot, so the missing
+        # entry is attributed to the missing PRICE rather than to an exhausted
+        # plan. Either way it is a safe HOLD and nothing is armed.
+        assert app.applied[-1].reason == "no_price", "still a safe HOLD"

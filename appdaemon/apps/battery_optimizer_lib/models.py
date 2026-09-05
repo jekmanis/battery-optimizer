@@ -25,6 +25,14 @@ class PricePoint:
     price: float
 
 
+# Provenance marker for `ScheduleEntry.price_source`. "market" means the slot
+# was planned on an interval that a price source actually published and that
+# `PriceHorizonMonitor` accepted as coverage. There is deliberately no marker
+# for anything else: the optimizer no longer manufactures a price, so an entry
+# with no marker is an entry whose price cannot be vouched for.
+PRICE_SOURCE_MARKET = "market"
+
+
 @dataclass
 class ScheduleEntry:
     """Represents a scheduled battery mode for a specific time slot."""
@@ -38,6 +46,19 @@ class ScheduleEntry:
 
     ac_charge_mode: Optional[str] = None
     # None = auto-detect, "disabled" / "pv_priority" / "ac_priority"
+
+    price_source: Optional[str] = None
+    # Provenance of the price this slot was planned on. `PRICE_SOURCE_MARKET`
+    # when the interval came from a published, coverage-validated price;
+    # None when nothing can vouch for it (a fallback HOLD, a restored entry,
+    # a hand-built safety entry).
+    #
+    # This is the difference between "the planner chose CHARGE" and "the
+    # planner chose CHARGE at a number we made up", which the schedule used to
+    # be unable to state. `execute_scheduled_mode` refuses to send a non-HOLD
+    # CURRENT-slot entry that carries no marker, and a rebuild that finds the
+    # current interval unpriced retains the previous entry only if it has one.
+    # Never infer it from the reason string -- that is prose.
 
     # --- Reporting fields (never read by the DP objective) ---
     marginal_value_eur_kwh: Optional[float] = None

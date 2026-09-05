@@ -175,6 +175,16 @@ so the enable switch and the manual override still decide whether anything is
 sent to the inverter. While waiting, the safe `HOLD` stands — recovery never
 invents a price.
 
+**A price is never manufactured for the interval you are in.** When the fetched
+data does not contain the current interval, planning starts at the next one it
+does contain, and the current slot is resolved in one of two ways: the entry
+already in the plan is kept if it was itself built from a published price, or
+the slot applies `HOLD/no_price` until the retry brings the real price in.
+Nothing is derived from yesterday's prices or from the neighbouring interval.
+`sensor.battery_optimizer`'s `price_horizon` attribute reports this as
+`current_slot_priced` and `current_slot_entry`
+(`planned` / `retained` / `fallback`).
+
 An incomplete horizon is *noted*, never acted on: missing tomorrow between
 `tomorrow_prices_hour` and publication is normal, so the periodic pass records
 it and still runs the reactive PV‑shortfall check.

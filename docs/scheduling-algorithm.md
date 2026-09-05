@@ -979,8 +979,62 @@ An unusable verdict arms **one** pending retry with a bounded backoff
   through `_recalculate_remaining_schedule`, which finishes with the normal
   `execute_scheduled_mode` path. Enabled and manual-override checks therefore
   still apply: during an override the plan is refreshed and no command is sent.
-- While waiting, a slot with no entry stays `HOLD/no_schedule`. Recovery never
-  invents a price and never forces charging to paper over missing data.
+- While waiting, a slot with no entry stays `HOLD`. Recovery never invents a
+  price and never forces charging to paper over missing data.
+
+### The current interval when nobody published a price for it
+
+Coverage question 1 above can fail on its own: the horizon is otherwise fine,
+but the interval the app is *living in* is not in the data. The planner used to
+manufacture one - yesterday's same-clock price, else the most recent past
+price, else the next price - and then plan, log and **execute** the live slot on
+it. With yesterday at 0.01 EUR/kWh and the real next interval at 1.00, that is a
+grid-charge command issued at a price that does not exist, and an armed retry
+does not prevent the command.
+
+The premise was that "Nord Pool may exclude the current hour as past". It does
+not hold for either fetch path: `_get_prices_via_service` asks
+`nordpool.get_price_indices_for_date` for whole **dates**, and
+`_get_prices_via_sensor` reads the whole-day `raw_today` / `raw_tomorrow`
+attributes. Both deliver the elapsed part of the day, so a missing current
+interval means the data is genuinely missing.
+
+What happens instead:
+
+- **Planning starts at the next validated interval.** The DP is given the
+  prices as fetched; it finds no index for the current slot, so it solves the
+  remaining slots at full width with no partial first slot. The horizon is not
+  lost because one interval is.
+- **A previously planned entry is retained** if it was itself built from a
+  published price. `ScheduleEntry.price_source` records that provenance
+  (`"market"`), stamped when the schedule is built against the price keys the
+  DP was actually handed. A retained entry is still subject to every execution
+  guard - the enable switch, the manual override, the min-SOC and max-SOC
+  overrides. Retention keeps a decision made on real data; it does not exempt
+  it from anything.
+- **Otherwise the slot applies `HOLD` with reason `no_price`**, the retry stays
+  armed, and no other command is sent for that slot. (`no_schedule` remains the
+  reason for the different failure where prices are fine and the plan ran out;
+  a restart that has not fetched yet also reports `no_schedule`, because an
+  empty snapshot says nothing about whether the interval was published.)
+- **`execute_scheduled_mode` will not send a non-HOLD current-slot entry that
+  carries no provenance.** After the above there should be none, so this is a
+  guard that makes the claim falsifiable rather than a rule the code merely
+  intends to follow: such an entry executes as `HOLD/unpriced_slot` and says so
+  at WARNING.
+
+This applies to every planning path - the daily optimization, every
+`_recalculate_remaining_schedule` trigger (SOC deviation, PV shortfall,
+depletion, price recovery) and the adaptive horizon extension - because a rule
+applied in one of them is a rule the other four break. Each of those rebuilds
+also asks the monitor to judge the snapshot it just fetched, so a rebuild
+triggered by something other than a price problem is still able to notice one
+and arm the retry.
+
+Asking a source for the missing interval is a **fetch**, not a substitution,
+and belongs in the price service and the bounded retry - which already
+re-request whole days. `NordPoolPriceService.get_prices_for_date` remains
+available for that.
 
 The periodic adaptive pass evaluates the **last known** snapshot rather than
 fetching: a price fetch is a blocking REST call on the shared AppDaemon worker
@@ -1010,7 +1064,10 @@ instants the reply actually contains.
 
 `sensor.battery_optimizer` publishes the verdict under `price_horizon`:
 coverage end, required end, the failure reason, the last successful horizon
-end, and pending-retry/attempt information.
+end, pending-retry/attempt information, and - for the slot running right now -
+`current_slot_priced` plus `current_slot_entry`
+(`planned` / `retained` / `fallback`). The last two are scoped to the interval
+they describe, so they report `null` rather than the previous slot's answer.
 
 ## Re-optimization and execution
 

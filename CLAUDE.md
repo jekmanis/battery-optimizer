@@ -364,9 +364,10 @@ as a count of slots, because a Riga DST day is 92 or 100 quarter-hours). The
 orchestrator owns only the timer: **at most one pending retry per app
 instance**, carrying a generation token so a timer queued before a disable,
 a `terminate()` or a successful recovery is inert. Every path that can notice the
-same gap in the same minute — `full_optimize`, the `no_schedule` HOLD in
-`execute_scheduled_mode`, `adaptive_optimize` — shares that one retry and none of
-them advances the backoff while it is armed.
+same gap in the same minute — `full_optimize`, `_recalculate_remaining_schedule`,
+the `no_price`/`no_schedule` HOLD in `execute_scheduled_mode`,
+`adaptive_optimize` — shares that one retry and none of them advances the
+backoff while it is armed.
 
 The periodic adaptive pass evaluates the **last known** snapshot and never
 fetches; the retry is the only new path that performs a blocking price fetch,
@@ -374,6 +375,23 @@ and it does so exactly where `full_optimize` already did. Recovery rebuilds
 through `_recalculate_remaining_schedule` -> `execute_scheduled_mode`, so
 enabled/override gating and command tracking are unchanged: during a manual
 override the plan is refreshed and nothing is sent.
+
+**No price is ever synthesized for the current interval.** The old
+`_ensure_current_slot_price` substituted yesterday's same-clock price, else the
+last past price, else the next price, on the premise that "Nord Pool may exclude
+the current hour as past". Both fetch paths request whole days
+(`get_price_indices_for_date` per date; `raw_today` / `raw_tomorrow`), so that
+premise is false and an absent current interval means the data is missing — and
+the substitution planned, logged and EXECUTED the live slot on a number nobody
+published (yesterday at 0.01 against a real 1.00 next slot produced a grid-charge
+command). Planning now starts at the next validated interval; the current slot
+either keeps an existing entry that carries `ScheduleEntry.price_source ==
+"market"` provenance or applies `HOLD/no_price`. `execute_scheduled_mode`
+refuses to send any non-HOLD current-slot entry without that provenance. Asking a
+source for the missing interval is a **fetch** and belongs in the price service
+and the retry, never a substitution at planning time. See
+`docs/scheduling-algorithm.md`, "The current interval when nobody published a
+price for it".
 
 ## Deployment to the HA machine
 

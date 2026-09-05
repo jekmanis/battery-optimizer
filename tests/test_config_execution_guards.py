@@ -27,6 +27,7 @@ import pytest
 
 import battery_optimizer as bo
 from battery_optimizer_lib import BatteryMode, CallbackLock, ScheduleEntry
+from battery_optimizer_lib.models import PRICE_SOURCE_MARKET
 
 
 TZ = datetime.timezone(datetime.timedelta(hours=3))
@@ -156,7 +157,14 @@ def _note(app, slot, mode, outcome=None):
 
 
 def _entry(slot, mode=BatteryMode.HOLD, reason="dp_optimal"):
-    return ScheduleEntry(time=slot, mode=mode, reason=reason)
+    # `price_source` is what every planner-produced entry carries: the DP is
+    # only ever given intervals a source published. Without it
+    # `execute_scheduled_mode` correctly refuses to send the entry, and these
+    # tests would be exercising the unpriced-slot guard instead of the SOC
+    # guards they are about.
+    return ScheduleEntry(
+        time=slot, mode=mode, reason=reason, price_source=PRICE_SOURCE_MARKET
+    )
 
 
 # ---------------------------------------------------------------------------

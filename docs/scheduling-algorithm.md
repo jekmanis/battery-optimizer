@@ -1357,6 +1357,43 @@ thread, and the retry is what pays that cost. Only when the snapshot is unusable
 - or when it is fine but the current slot has no entry, i.e. the plan ran out -
 does the adaptive pass act.
 
+### What counts as coverage
+
+A price covers the interval its source published and nothing else.
+`NordPoolPriceService._normalize_prices` maps each record onto the slot grid
+inside its own `[start, end)`: a coarser interval expands, finer ones
+aggregate, and a slot that no interval covers *completely* is simply not
+emitted. It is a gap, and everything downstream is built to see one.
+
+The width is **never inferred from the spacing between timestamps.** That was
+the whole mechanism: the minimum gap between the records that survived was
+taken as the source resolution and every point was expanded by that factor.
+Spacing cannot distinguish "these are 30-minute intervals" from "these are
+15-minute intervals and the record between them is missing", and both parsers
+were throwing away the explicit `end` that would have settled it
+(`{start, end, price}` from `nordpool.get_price_indices_for_date`,
+`{start, end, value}` from the HACS `raw_today` / `raw_tomorrow` attributes).
+
+A reply containing only 10:00-10:15 at 0.01 EUR/kWh and 10:30-10:45 at 1.00
+was therefore expanded into four quarter hours. At 10:17 the monitor reported
+`has_current=True` for an interval nobody published, and the planner sent
+CHARGE for it carrying `price_source="market"` — the provenance marker exists
+precisely to make that impossible, and it was stamped on a manufactured price.
+
+The rules, in full:
+
+- `PricePoint.end` carries the source's own end. Both parsers now set it.
+- A point with **no** `end` covers exactly one `slot_minutes` slot.
+- The simple sensor list (`today` / `tomorrow`, bare numbers) is the one
+  exception: it has no ends, but the format's own resolution is explicit —
+  24 values for a local day are hourly, 96 are quarter-hours, and the list is
+  the whole day by construction. Each value is given that step as its end.
+- Overlapping records are resolved by publication order, not by summing
+  minutes: a later interval contributes only what an earlier one did not
+  already cover. Summing raw overlaps would let two intervals that both start
+  *inside* a slot add up to its width and mark it covered when its first
+  minutes never were.
+
 ### Retained intervals
 
 `get_prices()` merges each reply with the still-valid intervals already known.

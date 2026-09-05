@@ -48,7 +48,11 @@ class ScheduleEntry:
 
     value_basis: Optional[str] = None
     # Which economics the number above describes: "avoided-import", "export",
-    # "landed-charge" or "kept".
+    # "landed-charge" or "kept" — plus "kept (cloud-safe)" for a slot the
+    # orchestrator's cloud-safe hedge turned into discharge_to_load. That one
+    # keeps the DP's HOLD number on purpose: the hedge only fires where the
+    # modeled energy flow is unchanged, so "kept" is still the right basis, and
+    # the suffix says why a DISCHARGE row carries it.
 
 
 @dataclass

@@ -391,13 +391,50 @@ Forecast PV participates directly in the DP. PV first serves predicted load;
 surplus can charge the battery within its charge/headroom limits, and remaining
 surplus can earn net export revenue.
 
-After optimization, HOLD slots with forecast PV are converted to
-DISCHARGE(to load) when the import price exceeds battery wear ("cloud-safe"
-conversion, tagged `[cloud-safe]` in the schedule log). On the Growatt WIT,
-`discharge_to_load` charges from PV surplus exactly like hold while the sun
-covers the load, but the battery — not the grid — picks up the load the moment
-clouds cut PV. The expected SOC trajectory still assumes PV covers the slot, so
-any cloud-induced drain shows up as an SOC deviation and triggers replanning.
+### The cloud-safe hedge
+
+After optimization, some HOLD slots are converted to DISCHARGE(to load), tagged
+`[cloud-safe]` in the schedule log. On the Growatt WIT, `discharge_to_load`
+charges from PV surplus exactly like `hold` while the sun covers the load, but
+the battery — not the grid — picks up the load the moment clouds cut PV,
+without waiting for the next re-optimization.
+
+This is a **hedge, not an economic improvement on the DP.** The DP has already
+chosen the whole horizon on the assumption that a HOLD slot preserves its
+energy, so a slot may only be rewritten where the DP's own model cannot tell
+the two actions apart. `BatteryOptimizer._cloud_safe_hedge` requires all four:
+
+1. **Forecast PV covers forecast load** (`pv >= load`). Then the net load is
+   zero and `soc_projection.project_slot_soc` gives DISCHARGE and HOLD the same
+   transition: no DC out, and `min(pv - load, charge_rate)` stored. With
+   `0 < pv < load` the actions differ — DISCHARGE drains a pack the DP reserved
+   for a later slot — and no import price makes them equivalent.
+2. **Nothing the plan was going to sell gets curtailed.** `discharge_to_load`
+   pins the export limiter to 0 % (see `direct_control.expected_registers`),
+   while `hold` leaves it open. So either the sell price is zero, or the HOLD
+   plan stored the whole surplus in the pack. The check reads the shared
+   model's continuous trajectory of the HOLD plan, not the DP's quantized one:
+   a single SOC step of rounding is enough to hide a slot's worth of
+   exportable PV. A full pack therefore never converts — which is the planning
+   side of the execution-time `DISCHARGE -> HOLD at max SOC with PV > load`
+   override.
+3. **The avoided import beats battery wear**, per discharged DC kWh.
+4. **The avoided import beats the value of keeping that kWh** — the DP's own
+   terminal rate (`terminal_energy_value_eur_kwh`, or the derived `auto` value).
+
+Converted entries keep the DP's marginal value, because their modeled flow is
+unchanged; their `value_basis` becomes `kept (cloud-safe)` so a DISCHARGE row
+never reports a bare HOLD label. The published SOC and temperature trajectories
+are rebuilt from the final schedule through the shared model, and the mode
+census is taken after the conversion.
+
+**Forecast equivalence is not equivalence under every cloud event.** If PV does
+collapse, the hedge spends energy that a later, more expensive slot may have
+been counting on; conditions 3 and 4 bound that per kWh against the plan's own
+valuation, but not against the best remaining slot. The expected SOC trajectory
+assumes PV covers the slot, so a cloud-induced drain surfaces as an SOC
+deviation, and the reactive PV-shortfall path forces a forecast refresh and a
+replan — that, not the hedge itself, is what limits the exposure.
 
 During execution, live PV above `pv_threshold_w` can pause a scheduled grid
 charge so solar can charge instead. This real-time safety/operational override

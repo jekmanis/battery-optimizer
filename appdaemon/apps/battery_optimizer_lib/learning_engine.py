@@ -100,6 +100,12 @@ DEFAULT_COUNTER_RESOLUTION_KWH = 0.1
 # caught by ``is_plausible_rate`` regardless of any wall-time rule.
 MIN_OBSERVATION_MINUTES = 0.25
 
+# How many distinct temperatures the ``_get_temp_range`` memo keeps before it
+# is dropped whole. A planning horizon introduces a new projected temperature
+# per slot per pass forever, so the memo has to be bounded; the bound only has
+# to be far above the few hundred a single solve asks about.
+_TEMP_BUCKET_MEMO_MAX = 20000
+
 # Absolute ceiling for the self-heating coefficient k2 (C per kWh through the
 # pack). Measured on the reference pack: 21.9C -> 25.8C while storing 1.716 kWh
 # over one 15-minute slot = 2.27 C/kWh, so the previous 2.0 ceiling was itself
@@ -191,6 +197,14 @@ class BatteryLearningEngine:
 
         # Temperature range boundaries for bucketing (default: <5, 5-10, 10-15, 15-20, >20)
         self.temp_ranges = temp_ranges if temp_ranges is not None else [5, 10, 15, 20]
+        # Bucket LABELS, derived from those boundaries by `_get_temp_range` and
+        # rebuilt whenever `temp_ranges` is REPLACED (identity check). Mutating
+        # the boundary list in place would not be noticed; nothing does, and
+        # the labels are an internal derivation of it.
+        self._temp_range_labels: Optional[List[str]] = None
+        self._temp_range_labels_for: Optional[List[float]] = None
+        # temperature -> bucket label, bounded (see `_get_temp_range`).
+        self._temp_range_by_temp: Dict[float, str] = {}
 
         # Learning data
         self.stats = LearningStats()
@@ -212,6 +226,38 @@ class BatteryLearningEngine:
             "75-90": 1.0,   # Will be learned
             "90-100": 1.0,  # Will be learned
         }
+
+        # Memoized `get_charge_rate_for_soc` answers, keyed by exactly what
+        # decides them (see `invalidate_rate_cache`).
+        self._rate_lookup_cache: Dict[Tuple[str, Optional[str]], float] = {}
+
+    # ------------------------------------------------------------------
+    # Memoized rate lookups
+    # ------------------------------------------------------------------
+
+    def invalidate_rate_cache(self) -> None:
+        """Drop the memoized :meth:`get_charge_rate_for_soc` answers.
+
+        That method is a pure function of ``(soc bucket, temperature bucket)``
+        and the observations, nominal rates and multipliers behind them, so its
+        answer is memoized on the bucket pair. Anything that CHANGES those
+        inputs must call this. Every mutation inside this class does
+        (:meth:`record_charging`, :meth:`sanitize_stats`,
+        :meth:`load_from_json`); code that reaches into ``stats`` directly --
+        the offline cleanup script, tests that poison a bucket -- has to say so
+        too.
+
+        Why it exists: the DP evaluates the charge rate per candidate
+        transition (CLAUDE.md, "Charge rates match the SOC and temperature the
+        plan actually reaches"), and the refinement's profile comparison
+        evaluates it at every state SOC the solve visited. One live 130-slot
+        solve at ``soc_step_percent: 0.25`` asked this question 8.4 million
+        times; at 19 us a call -- a plausibility filter over 50 observations
+        plus a median, recomputed every time -- that alone was 165 of the
+        solve's 180 seconds. The answer only ever takes one of ~30 values, so
+        it is computed once per bucket pair.
+        """
+        self._rate_lookup_cache.clear()
 
     # ------------------------------------------------------------------
     # Unit conversion boundary (see the module docstring)
@@ -382,18 +428,45 @@ class BatteryLearningEngine:
         - "15-20" for temps 15-20C
         - ">20" for temps above 20C
         """
-        if not self.temp_ranges:
+        # Pure function of the temperature and the boundaries, asked once per
+        # (state SOC, profile temperature) pair by the refinement -- millions of
+        # times for a few hundred distinct temperatures.
+        bucket = self._temp_range_by_temp.get(temp)
+        if bucket is not None:
+            return bucket
+
+        ranges = self.temp_ranges
+        if not ranges:
             return "all"
 
-        for i, boundary in enumerate(self.temp_ranges):
-            if temp < boundary:
-                if i == 0:
-                    return f"<{boundary}"
-                else:
-                    return f"{self.temp_ranges[i-1]}-{boundary}"
+        # The labels depend only on the boundaries, so they are built once and
+        # rebuilt if `temp_ranges` is ever reassigned. Formatting them per call
+        # was 5.0 of the 22.8 profiled seconds of one live solve: the planner
+        # asks this question millions of times per horizon and every answer is
+        # one of six strings.
+        labels = self._temp_range_labels
+        if labels is None or self._temp_range_labels_for is not ranges:
+            labels = [
+                f"<{ranges[0]}" if i == 0 else f"{ranges[i - 1]}-{boundary}"
+                for i, boundary in enumerate(ranges)
+            ]
+            labels.append(f">{ranges[-1]}")
+            self._temp_range_labels = labels
+            self._temp_range_labels_for = ranges
 
-        # Above the highest boundary
-        return f">{self.temp_ranges[-1]}"
+        bucket = labels[-1]  # above the highest boundary
+        for i, boundary in enumerate(ranges):
+            if temp < boundary:
+                bucket = labels[i]
+                break
+
+        cache = self._temp_range_by_temp
+        # A projected horizon introduces new temperatures forever, so the memo
+        # is bounded rather than unbounded. Dropping it costs one recomputation.
+        if len(cache) >= _TEMP_BUCKET_MEMO_MAX:
+            cache.clear()
+        cache[temp] = bucket
+        return bucket
 
     def record_charging(
         self,
@@ -522,6 +595,9 @@ class BatteryLearningEngine:
             if len(self.stats.charge_rates_by_soc_temp[soc_range][temp_range]) > 50:
                 self.stats.charge_rates_by_soc_temp[soc_range][temp_range] = \
                     self.stats.charge_rates_by_soc_temp[soc_range][temp_range][-50:]
+
+        # A new observation changes what `get_charge_rate_for_soc` answers.
+        self.invalidate_rate_cache()
 
         # Track temperature warming rate during charging
         # This helps predict when the inverter will switch to higher charge power
@@ -967,6 +1043,9 @@ class BatteryLearningEngine:
             removed["thermal_coeffs"] = 1
             self.stats.thermal_coeffs = {}
 
+        # Observations were rewritten in place; the memoized answers are stale.
+        self.invalidate_rate_cache()
+
         return removed
 
     def get_heating_coefficient(
@@ -1136,6 +1215,11 @@ class BatteryLearningEngine:
         ingest guards existed cannot leak a five-digit kW rate into any of them.
         Consumers must NOT add their own clamp.
 
+        The answer depends on its arguments ONLY through the SOC bucket and the
+        temperature bucket, so it is memoized on that pair -- see
+        :meth:`invalidate_rate_cache` for the lifetime rule and for the
+        production solve this was measured on.
+
         Args:
             soc: Current state of charge (%)
             battery_temp: Current battery temperature in Celsius (optional)
@@ -1144,11 +1228,26 @@ class BatteryLearningEngine:
             Predicted charge rate in kW
         """
         soc_range = self._get_soc_range(soc)
+        temp_range = (
+            None if battery_temp is None else self._get_temp_range(battery_temp)
+        )
+        # Memoized on the bucket pair, which is the whole of what the fallback
+        # chain below reads about its arguments. See `invalidate_rate_cache`
+        # for the lifetime rule and for why it matters.
+        key = (soc_range, temp_range)
+        cached = self._rate_lookup_cache.get(key)
+        if cached is not None:
+            return cached
+        rate = self._compute_charge_rate_for_bucket(soc_range, temp_range)
+        self._rate_lookup_cache[key] = rate
+        return rate
 
+    def _compute_charge_rate_for_bucket(
+        self, soc_range: str, temp_range: Optional[str]
+    ) -> float:
+        """The fallback chain of :meth:`get_charge_rate_for_soc`, uncached."""
         # Fallback 1: Try temperature-aware lookup if temp is available
-        if battery_temp is not None:
-            temp_range = self._get_temp_range(battery_temp)
-
+        if temp_range is not None:
             # Check for exact SOC+temp match
             if soc_range in self.stats.charge_rates_by_soc_temp:
                 temp_data = self.stats.charge_rates_by_soc_temp[soc_range]
@@ -1580,6 +1679,8 @@ class BatteryLearningEngine:
             if data.get("version", 0) >= 1:
                 # Note: learned_charge_rate removed in v4, global confidence removed in v5
                 self.learned_efficiency = data.get("learned_efficiency", self.nominal_efficiency)
+                # A whole new observation set replaces the old one.
+                self.invalidate_rate_cache()
                 if "stats" in data:
                     self.stats = LearningStats.from_dict(data["stats"])
                     if data.get("version", 0) < THERMAL_UNITS_VERSION:

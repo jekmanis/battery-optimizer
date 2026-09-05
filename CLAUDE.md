@@ -420,7 +420,12 @@ wording does not match master.
 **Price coverage has one owner.** `battery_optimizer_lib/price_horizon.py`
 answers "is the horizon usable" (current interval present, contiguous, reaching
 the end of the current publication window — measured between UTC instants, never
-as a count of slots, because a Riga DST day is 92 or 100 quarter-hours). The
+as a count of slots, because a Riga DST day is 92 or 100 quarter-hours). That
+midnight is attached with the zone's `localize` because AppDaemon's
+`get_timezone()` is a **pytz** zone: `combine(..., tzinfo=<pytz zone>)` answers
+with Riga's +01:37 local-mean-time offset, which put the required end at 22:23
+UTC against a day that ends at 21:00 UTC and re-fetched every 15 min forever
+(production, 2026-09-05). The
 orchestrator owns only the timer: **at most one pending retry per app
 instance**, carrying a generation token so a timer queued before a disable,
 a `terminate()` or a successful recovery is inert. Every path that can notice the

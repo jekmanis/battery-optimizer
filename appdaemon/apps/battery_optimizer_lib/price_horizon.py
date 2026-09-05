@@ -239,6 +239,17 @@ class PriceHorizonMonitor:
         computed in the ZONE (see `get_zone_func`), not in whatever fixed
         offset happens to be in force right now: `combine(2024-04-01, 00:00,
         +02:00)` is an hour later than Europe/Riga's actual midnight that day.
+
+        And it is attached with the zone's own `localize` when the zone has
+        one.  AppDaemon's `get_timezone()` returns a **pytz** zone, and a pytz
+        zone handed to `datetime.combine(..., tzinfo=zone)` (or `replace`)
+        answers with the zone's local-mean-time offset from before standard
+        time existed - Europe/Riga's is +01:37 - never with the rules in force
+        on that date.  In production that put the required end at 22:23 UTC
+        while the published day ends at 21:00 UTC, so a complete horizon read
+        as `tomorrow_missing` every evening and the app retried the fetch
+        every 15 minutes for nothing.  `zoneinfo` zones have no `localize`
+        and `replace` is exact for them.
         """
         local_now = self._local(now)
         zone = self._boundary_zone()
@@ -255,9 +266,12 @@ class PriceHorizonMonitor:
         target_date = local_now.date() + datetime.timedelta(
             days=2 if expects_tomorrow else 1
         )
-        boundary = datetime.datetime.combine(
-            target_date, datetime.time(0, 0), tzinfo=zone
-        )
+        naive_midnight = datetime.datetime.combine(target_date, datetime.time(0, 0))
+        localize = getattr(zone, "localize", None)
+        if callable(localize):
+            boundary = localize(naive_midnight)
+        else:
+            boundary = naive_midnight.replace(tzinfo=zone)
         return instant_key(boundary), expects_tomorrow
 
     # ------------------------------------------------------------------

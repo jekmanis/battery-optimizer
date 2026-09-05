@@ -496,7 +496,7 @@ Implementation requirements common to all approaches:
   justify the tolerance independently of the observed error.
 - Any iterative approach has bounded runtime, oscillation coverage, and a
   tested fallback that does not credit unavailable charge energy.
-- Document whether the final solver is exact for its discretized model or an
+- Document whether the final solver is exact under its discretization or an
   approximation. Report runtime at the actual supported planning horizons.
 
 ## Task 5: recover price data and maintain a usable schedule horizon

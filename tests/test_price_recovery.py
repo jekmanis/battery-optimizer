@@ -1088,6 +1088,129 @@ class TestDstBoundaryWithAProductionTimezone:
         assert len(degraded) == 1
 
 
+def _real_riga():
+    """The real Europe/Riga rules: the conftest fixture only knows 2024."""
+    zoneinfo = pytest.importorskip("zoneinfo")
+    try:
+        return zoneinfo.ZoneInfo("Europe/Riga")
+    except Exception:
+        pytest.skip("no tz database available")
+
+
+class _PytzLikeZone(datetime.tzinfo):
+    """What AppDaemon's `get_timezone()` hands the app: a pytz zone.
+
+    Faithful to the one pytz behaviour that matters here: attached with
+    `combine(..., tzinfo=zone)` or `replace(tzinfo=zone)` (`dt.tzinfo is self`)
+    the zone answers with its pre-standard-time local-mean-time offset - +01:37
+    for Europe/Riga - and only `localize()` applies the rules for the date.
+    Verified against pytz 2025 on 2026-09-07 00:00: combine -> +01:37
+    (22:23 UTC the day before), localize -> +03:00 (21:00 UTC).
+    """
+
+    LMT = datetime.timedelta(hours=1, minutes=37)
+
+    def __init__(self, zone):
+        self._zone = zone
+        self.zone = str(zone)
+
+    def utcoffset(self, dt):
+        if dt is None or dt.tzinfo is self:
+            return self.LMT
+        return self._zone.utcoffset(dt.replace(tzinfo=self._zone))
+
+    def dst(self, dt):
+        if dt is None:
+            return datetime.timedelta(0)
+        return self._zone.dst(dt.replace(tzinfo=self._zone))
+
+    def tzname(self, dt):
+        return "LMT" if dt is None or dt.tzinfo is self else self._zone.tzname(
+            dt.replace(tzinfo=self._zone)
+        )
+
+    def localize(self, naive, is_dst=False):
+        assert naive.tzinfo is None
+        return naive.replace(tzinfo=self._zone)
+
+    def __repr__(self):
+        return f"<PytzLike {self.zone}>"
+
+
+class TestPytzZoneBoundaryIsLocalized:
+    """Production 2026-09-05 16:31 EEST: 192 published intervals reaching
+    2026-09-06 22:00 UTC (the CET day end, 01:00 Riga) were judged
+    `tomorrow_missing` against a required end of 2026-09-06 **22:23** UTC -
+    local midnight computed with pytz's +01:37 local-mean-time offset instead
+    of the +03:00 in force. The horizon can never satisfy that, so the app
+    re-fetched on the 15-minute backoff forever.
+    """
+
+    NOW = datetime.datetime(2026, 9, 5, 16, 31, tzinfo=TZ)
+
+    def _prices(self, riga):
+        start = datetime.datetime(2026, 9, 5, tzinfo=riga)
+        end = datetime.datetime(2026, 9, 7, tzinfo=riga)
+        return make_prices(start, slots_between(start, end), tz=riga), end
+
+    def test_the_fake_reproduces_pytz(self):
+        riga_timezone = _real_riga()
+        zone = _PytzLikeZone(riga_timezone)
+        combined = datetime.datetime.combine(
+            datetime.date(2026, 9, 7), datetime.time(0, 0), tzinfo=zone
+        )
+        assert combined.utcoffset() == datetime.timedelta(hours=1, minutes=37)
+        assert zone.localize(datetime.datetime(2026, 9, 7)).utcoffset() == (
+            datetime.timedelta(hours=3)
+        )
+        assert zone.dst(datetime.datetime(2026, 9, 7)) == datetime.timedelta(hours=1)
+
+    def test_required_end_is_the_zone_midnight_not_the_lmt_one(self):
+        riga_timezone = _real_riga()
+        zone = _PytzLikeZone(riga_timezone)
+        app = RecoveryOptimizer(self.NOW, prices=[], zone=zone)
+
+        required_end, expects_tomorrow = app._price_horizon.required_horizon_end(self.NOW)
+
+        assert expects_tomorrow
+        assert required_end == bo.instant_key(datetime.datetime(2026, 9, 7, tzinfo=riga_timezone))
+        assert required_end == datetime.datetime(2026, 9, 6, 21, 0, tzinfo=UTC)
+
+    def test_a_complete_horizon_is_usable_with_a_pytz_zone(self):
+        riga_timezone = _real_riga()
+        zone = _PytzLikeZone(riga_timezone)
+        prices, end = self._prices(riga_timezone)
+        app = RecoveryOptimizer(self.NOW, prices=prices, zone=zone)
+
+        health = app._price_horizon.evaluate(prices, self.NOW)
+
+        assert health.required_end == bo.instant_key(end)
+        assert health.ok, health.reason
+
+    def test_a_short_horizon_is_still_detected_with_a_pytz_zone(self):
+        riga_timezone = _real_riga()
+        zone = _PytzLikeZone(riga_timezone)
+        prices, _end = self._prices(riga_timezone)
+        app = RecoveryOptimizer(self.NOW, prices=prices[:-4], zone=zone)
+
+        health = app._price_horizon.evaluate(prices[:-4], self.NOW)
+
+        assert not health.ok
+        assert health.reason == "tomorrow_missing"
+
+    def test_full_optimize_does_not_arm_the_retry_with_a_pytz_zone(self):
+        riga_timezone = _real_riga()
+        zone = _PytzLikeZone(riga_timezone)
+        prices, _end = self._prices(riga_timezone)
+        app = RecoveryOptimizer(self.NOW, prices=prices, zone=zone)
+
+        app.full_optimize(None)
+
+        assert app.schedule
+        assert not app._price_retry_pending()
+        assert not any("DST rules" in m for m, _lvl in app.logs)
+
+
 class TestReEnableKeepsTheRetryItArmed:
     """Finding 4: the healthy-coverage review cancelled the `no_schedule` retry.
 

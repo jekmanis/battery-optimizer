@@ -904,6 +904,30 @@ class DPOptimizer:
     # Charge rate: evaluated per candidate transition (see the module header)
     # ------------------------------------------------------------------
 
+    def _rate_uncached(self, soc: float, temp: Optional[float]) -> float:
+        """The predictor, normalized: a non-negative float, never ``None``.
+
+        The one place the injected ``charge_rate_predictor`` is called.
+        """
+        return max(0.0, float(self._get_charge_rate_for_soc(soc, temp) or 0.0))
+
+    def _rates_over(self, socs, temp: Optional[float]) -> List[float]:
+        """:meth:`_rate_uncached` at every SOC in ``socs``, in order.
+
+        One list comprehension rather than a call per SOC from the caller's own
+        loop, because ``_profiles_agree`` asks this question millions of times
+        per solve. It holds two of these lists at a time and nothing longer.
+
+        The normalization is spelled out here rather than delegated to
+        ``_rate_uncached`` only to save that call frame on a loop that runs
+        ~8.5 M times per live solve; it MUST stay the same expression, and
+        ``tests/test_dp_rate_normalization.py`` pins the two together.
+        """
+        predictor = self._get_charge_rate_for_soc
+        return [
+            max(0.0, float(predictor(soc, temp) or 0.0)) for soc in socs
+        ]
+
     def _rate_for(self, soc: float, temp: Optional[float]) -> float:
         """``charge_input_dc_kw`` at this SOC and temperature, memoized.
 
@@ -911,11 +935,17 @@ class DPOptimizer:
         rounded to 1e-6 % only so that float noise does not defeat the cache;
         the temperature is used exactly, because a synthetic or learned rate
         curve may have a threshold anywhere.
+
+        This memo is for the TRANSITION paths -- the DP's inner loop, the
+        partial-slot lookahead and the replays -- where the same state energy
+        recurs across the four lookahead candidates and the two probes of
+        ``charge_rate_for_span``. It is deliberately NOT used by
+        ``_profiles_agree``; see the note there.
         """
         key = (round(soc, 6), temp)
         cached = self._rate_cache.get(key)
         if cached is None:
-            cached = max(0.0, float(self._get_charge_rate_for_soc(soc, temp) or 0.0))
+            cached = self._rate_uncached(soc, temp)
             self._rate_cache[key] = cached
         return cached
 
@@ -1266,6 +1296,21 @@ class DPOptimizer:
         """
         if len(a) != len(b):
             return False
+        # The rate comparison depends on the temperature PAIR and on
+        # ``state_socs``, never on which slot the pair came from, so a pair that
+        # has already been shown to agree is not re-scanned. Same answers, and
+        # the scan is what costs: it is the only O(states x slots) loop in the
+        # whole refinement.
+        #
+        # It also calls the predictor directly rather than through
+        # ``_rate_for``. Each (state SOC, profile temperature) here is visited
+        # exactly ONCE -- the SOCs are already deduplicated and each profile
+        # temperature is scanned once -- so that memo could never hit, while it
+        # would grow by millions of entries in a single solve (measured: 8.2 M
+        # on the live 130-slot, 0.25 %-step horizon). The predictor's own
+        # memoization, where it has one, is the right place for this.
+        rates_over = self._rates_over
+        agreed_pairs = set()
         for i, (x, y) in enumerate(zip(a, b)):
             if x is None or y is None:
                 if x is not y:
@@ -1275,9 +1320,21 @@ class DPOptimizer:
                 continue
             if state_socs is None:
                 return False
-            for soc in state_socs:
-                if abs(self._rate_for(soc, x) - self._rate_for(soc, y)) > 1e-9:
-                    return False
+            pair = (x, y)
+            if pair in agreed_pairs:
+                continue
+            rx = rates_over(state_socs, x)
+            ry = rates_over(state_socs, y)
+            # Equal lists mean every difference is exactly 0, which is inside
+            # the tolerance -- so the elementwise test only has to run when the
+            # two profiles produce different rates SOMEWHERE. The common case
+            # (they agree) is then one C-level list comparison instead of
+            # 40 000 Python subtractions.
+            if rx != ry and any(
+                abs(u - v) > 1e-9 for u, v in zip(rx, ry)
+            ):
+                return False
+            agreed_pairs.add(pair)
         return True
 
     def _build_soc_trajectory(

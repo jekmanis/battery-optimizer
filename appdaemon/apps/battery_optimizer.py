@@ -101,7 +101,7 @@ from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
 # published on sensor.battery_optimizer, so a deploy can be PROVEN to be
 # running: on 2026-09-02 the add-on silently imported the previous commit out
 # of a backup directory inside apps/ while SHA256 verification of apps/ passed.
-APP_VERSION = "2026-09-05"
+APP_VERSION = "2026-09-05b"
 
 
 def _code_paths() -> Tuple[str, str]:
@@ -4540,9 +4540,14 @@ class BatteryOptimizer(hass.Hass):
         Europe/Riga's actual midnight that day, so a complete price horizon
         reads as `tomorrow_missing` all afternoon.
 
-        AppDaemon's own `get_timezone()` reports the configured zone, normally
-        as a name. Anything unusable falls back to `_get_local_timezone()`; the
-        monitor then says once that the boundary has no DST rules.
+        AppDaemon's own `get_timezone()` reports the configured zone - as a
+        **pytz** zone object on AppDaemon 4.5, a name on some builds. A pytz
+        zone is returned as-is; the monitor attaches it with `localize`,
+        because `combine(..., tzinfo=<pytz zone>)` yields the zone's
+        local-mean-time offset (+01:37 for Europe/Riga), which put the required
+        horizon end 83 minutes past the published day in production. Anything
+        unusable falls back to `_get_local_timezone()`; the monitor then says
+        once that the boundary has no DST rules.
         """
         zone = None
         getter = getattr(self, "get_timezone", None)

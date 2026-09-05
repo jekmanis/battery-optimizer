@@ -582,6 +582,35 @@ Earlier measurements on a 14.3 kWh pack, for the shape across step sizes:
 | flat | 54 / 187 ms | 97 / 369 ms | 194 / 786 ms |
 | SOC taper | 53 / 203 ms | 100 / 403 ms | 201 / 1004 ms |
 
+**Those numbers are the solver on a synthetic rate curve. On live learned
+data they were off by two orders of magnitude.** The first production run of
+this refinement (2026-09-05, 130 slots, 0.25 % step, 33 C pack, a learning file
+with ~50 observations per bucket) took **206 s** on the Home Assistant machine
+and 179 s on a desktop, with `branch=converged, passes=2` — not a runaway loop
+but two causes that the synthetic curve never exercised:
+
+- `BatteryLearningEngine.get_charge_rate_for_soc` cost ~20 us a call: it re-ran
+  the plausibility filter over every observation and a median on every call,
+  although its answer is a pure function of the (SOC bucket, temperature bucket)
+  pair — at most ~30 distinct values. It is now memoized on that pair, and every
+  mutation inside the engine (`record_charging`, `sanitize_stats`,
+  `load_from_json`) drops the memo (`invalidate_rate_cache`).
+- `_profiles_agree`, the feasibility check between passes, scanned every exact
+  state SOC the solve visited (~40 000 at a 0.25 % step) for every slot whose two
+  temperature profiles differed, twice — 8.4 million predictor calls per solve.
+  It now deduplicates temperature pairs, evaluates each profile as one list and
+  compares the lists before any elementwise test. Same verdicts; it is still
+  O(states x slots) per pass and is the term that dominates as the horizon or the
+  step count grows.
+
+After both, the same live solve takes **4.6 s** on the desktop with a
+byte-identical plan (`scripts/profile_dp.py --compare` asserts schedule, SOC and
+temperature trajectories, counts and refinement diagnostics), which extrapolates
+to roughly 5-6 s on the Home Assistant machine. That is the number to budget for
+under the app lock, not the sub-second table above. Measure with
+`scripts/profile_dp.py` against the live JSON files before trusting any faster
+claim.
+
 Three things the table is there to say:
 
 - **The worst case is bounded, real, and it got worse.** At most
@@ -1230,6 +1259,19 @@ that day. Left uncorrected, a complete horizon read as `tomorrow_missing` for
 the whole spring-transition afternoon, and an incomplete one read as complete
 every autumn. When no region zone can be resolved the app falls back to the
 offset and says so once at WARNING.
+
+The zone AppDaemon 4.5 hands over is a **pytz** zone, and pytz has its own trap:
+a pytz zone attached with `combine(..., tzinfo=zone)` or `replace(tzinfo=zone)`
+answers with the zone's pre-standard-time local-mean-time offset — +01:37 for
+Europe/Riga — and applies the rules for the date only through `localize()`.
+The first deploy of the monitor combined, and on 2026-09-05 at 16:31 EEST a
+complete 192-interval reply reaching 2026-09-06 22:00 UTC (the CET day end)
+was judged `tomorrow_missing` against a required end of 2026-09-06 **22:23**
+UTC, an instant no publication can ever reach; the recovery backoff re-fetched
+every 15 minutes for nothing. `required_horizon_end` now localizes the naive
+midnight when the zone offers `localize` and uses `replace` otherwise, which is
+exact for `zoneinfo`. `tests/test_price_recovery.py::TestPytzZoneBoundaryIsLocalized`
+pins it with a pytz-faithful fake, since pytz is not a dependency.
 
 An unusable verdict is *noted*, not acted on: `tomorrow_missing` is the normal
 state from `tomorrow_prices_hour` until tomorrow publishes, and that window sits

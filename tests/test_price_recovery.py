@@ -122,17 +122,23 @@ class RecoveryOptimizer(bo.BatteryOptimizer):
     rebuilt and applied after prices come back, not about its economics.
     """
 
-    def __init__(self, now, prices=None, tz=TZ, soc=50.0, **config_overrides):
+    def __init__(self, now, prices=None, tz=TZ, soc=50.0, zone=None, **config_overrides):
         config_overrides.setdefault("slot_minutes", SLOT)
         config_overrides.setdefault("tomorrow_prices_hour", 14)
         config_overrides.setdefault("decision_log_level", 0)
         self.config = bo.BatteryOptimizerConfig(**config_overrides)
         self._lock = CallbackLock()
         self._tz = tz
+        # What AppDaemon's own `get_timezone()` offers: a zone name, a tzinfo,
+        # an exception, or nothing. `_tz` stays the FIXED-OFFSET value
+        # production gets from `_get_local_timezone()` when `self.datetime()`
+        # is naive.
+        self._zone_source = zone
         self._now = now
         self._soc = soc
         self.enabled = True
         self.override = False
+        self.shortfall_checks = 0
 
         self.logs = []
         self.schedule = {}
@@ -197,6 +203,12 @@ class RecoveryOptimizer(bo.BatteryOptimizer):
     def cancel_timer(self, handle):
         self.cancelled_timers.append(handle)
 
+    def get_timezone(self):
+        """AppDaemon's own accessor - a configured zone NAME in production."""
+        if isinstance(self._zone_source, BaseException):
+            raise self._zone_source
+        return self._zone_source
+
     # --- app surface -------------------------------------------------------
     def _get_local_timezone(self):
         return self._tz
@@ -249,6 +261,7 @@ class RecoveryOptimizer(bo.BatteryOptimizer):
         pass
 
     def _check_pv_shortfall(self, current_soc):
+        self.shortfall_checks += 1
         return False
 
     # --- planner stub ------------------------------------------------------
@@ -810,6 +823,263 @@ class TestBoundedCost:
 
 
 # ===========================================================================
+# Review findings
+# ===========================================================================
+
+class TestUnreadableSocDoesNotResetTheBackoff:
+    """Finding 1: an unreadable SOC used to restart the backoff every retry.
+
+    `_review_price_horizon` ran FIRST; healthy coverage called `record_success`
+    (attempts -> 0) and only then did the SOC check fail and record attempt 1
+    again.  The result was a permanent 30 s loop, each iteration paying for a
+    blocking price fetch under the app lock.
+    """
+
+    def test_delays_grow_while_the_soc_is_unreadable(self, base_now):
+        app = RecoveryOptimizer(base_now, prices=[])
+        app.full_optimize(None)
+        app.set_prices(full_day_prices(app.datetime()))
+        app._soc = None
+
+        delays = []
+        for _ in range(5):
+            call = app.pending_retries()[-1]
+            delays.append(call["delay"])
+            app.advance(call["delay"])
+            app.fire_latest_retry()
+
+        assert delays == [30, 120, 300, 900, 900]
+
+    def test_an_unreadable_soc_does_not_pay_for_a_fetch(self, base_now):
+        app = RecoveryOptimizer(base_now, prices=full_day_prices(base_now))
+        app.full_optimize(None)
+        app.schedule = {}
+        # None, not {}: a timer call moments after full_optimize applied the
+        # same slot is deduped and would never reach the no_schedule branch.
+        app.execute_scheduled_mode(None)
+        app._soc = None
+        fetches = app._price_service.calls
+
+        for _ in range(3):
+            call = app.pending_retries()[-1]
+            app.advance(call["delay"])
+            app.fire_latest_retry()
+
+        assert app._price_service.calls == fetches, (
+            "nothing can be planned without an SOC; do not re-fetch prices "
+            "under the app lock to find that out"
+        )
+
+    def test_recovery_resumes_once_the_soc_returns(self, base_now):
+        app = RecoveryOptimizer(base_now, prices=full_day_prices(base_now))
+        app.execute_scheduled_mode({})
+        app._soc = None
+        call = app.pending_retries()[-1]
+        app.advance(call["delay"])
+        app.fire_latest_retry()
+
+        app._soc = 42.0
+        call = app.pending_retries()[-1]
+        app.advance(call["delay"])
+        app.fire_latest_retry()
+
+        assert app.schedule
+        assert app._price_horizon.attempts == 0
+
+
+class TestCoverageFailureDoesNotSuppressTheShortfallCheck:
+    """Finding 2: `tomorrow_missing` is routine, and it blocked the PV replan.
+
+    From `tomorrow_prices_hour` until tomorrow's intervals publish, the horizon
+    is legitimately incomplete - and that window sits inside the PV day.  The
+    adaptive pass returned early, so the reactive PV-shortfall replan never ran
+    for hours.
+    """
+
+    def test_today_only_after_the_window_still_checks_pv_shortfall(self):
+        now = datetime.datetime(2024, 1, 15, 14, 30, tzinfo=TZ)
+        app = RecoveryOptimizer(now, prices=full_day_prices(now, days=1))
+        app.full_optimize(None)
+        assert app.schedule, "a plan exists; only tomorrow is missing"
+        app.shortfall_checks = 0
+
+        app.adaptive_optimize(None)
+
+        assert app.shortfall_checks == 1
+        assert app._price_horizon.last_health.reason == "tomorrow_missing"
+
+    def test_a_rebuild_still_suppresses_the_duplicate_shortfall_pass(self, base_now):
+        app = RecoveryOptimizer(base_now, prices=full_day_prices(base_now))
+        app.full_optimize(None)
+        app.schedule = {}
+        app.shortfall_checks = 0
+
+        app.adaptive_optimize(None)
+
+        assert app.schedule, "the exhausted plan was rebuilt"
+        assert app.shortfall_checks == 0, (
+            "the rebuild already re-planned; a second pass in the same "
+            "callback would be wasted work"
+        )
+
+    def test_missing_prices_still_check_pv_shortfall(self, base_now):
+        app = RecoveryOptimizer(base_now, prices=[])
+
+        app.adaptive_optimize(None)
+
+        assert app.shortfall_checks == 1
+        assert app._price_retry_pending()
+
+
+class TestDstBoundaryWithAProductionTimezone:
+    """Finding 3: local midnight computed with a FIXED offset is 1 h wrong.
+
+    `_get_local_timezone()` returns `datetime.now().astimezone().tzinfo` - a
+    fixed `datetime.timezone` - whenever AppDaemon hands the app a naive
+    `self.datetime()`.  Combining a date with that offset gives the wrong
+    instant for the midnight on the far side of a DST transition, so a complete
+    horizon was judged `tomorrow_missing` all afternoon (and, with finding 2,
+    silenced the PV shortfall check too).
+    """
+
+    def _spring_prices(self, riga):
+        start = datetime.datetime(2024, 3, 30, tzinfo=riga)
+        end = datetime.datetime(2024, 4, 1, tzinfo=riga)
+        return make_prices(start, slots_between(start, end), tz=riga), end
+
+    def _autumn_prices(self, riga):
+        start = datetime.datetime(2024, 10, 26, tzinfo=riga)
+        end = datetime.datetime(2024, 10, 28, tzinfo=riga)
+        return make_prices(start, slots_between(start, end), tz=riga), end
+
+    def test_spring_forward_required_end_uses_real_dst_rules(self, riga_timezone):
+        fixed = datetime.timezone(datetime.timedelta(hours=2))  # Riga on 03-30
+        now = datetime.datetime(2024, 3, 30, 15, 0, tzinfo=fixed)
+        prices, end = self._spring_prices(riga_timezone)
+        app = RecoveryOptimizer(now, prices=prices, tz=fixed, zone=riga_timezone)
+
+        health = app._price_horizon.evaluate(prices, now)
+
+        assert health.required_end == bo.instant_key(end)
+        assert health.ok, "a complete 47-hour horizon must not read as incomplete"
+
+    def test_autumn_back_required_end_uses_real_dst_rules(self, riga_timezone):
+        fixed = datetime.timezone(datetime.timedelta(hours=3))  # Riga on 10-26
+        now = datetime.datetime(2024, 10, 26, 15, 0, tzinfo=fixed)
+        prices, end = self._autumn_prices(riga_timezone)
+        app = RecoveryOptimizer(now, prices=prices, tz=fixed, zone=riga_timezone)
+
+        health = app._price_horizon.evaluate(prices, now)
+
+        assert health.required_end == bo.instant_key(end)
+        assert health.ok
+
+    def test_a_short_horizon_is_still_detected_on_a_transition_day(self, riga_timezone):
+        fixed = datetime.timezone(datetime.timedelta(hours=2))
+        now = datetime.datetime(2024, 3, 30, 15, 0, tzinfo=fixed)
+        prices, _end = self._spring_prices(riga_timezone)
+        app = RecoveryOptimizer(now, prices=prices[:-8], tz=fixed, zone=riga_timezone)
+
+        health = app._price_horizon.evaluate(prices[:-8], now)
+
+        assert not health.ok
+        assert health.reason == "tomorrow_missing"
+
+    def test_full_optimize_does_not_retry_a_complete_dst_horizon(self, riga_timezone):
+        fixed = datetime.timezone(datetime.timedelta(hours=2))
+        now = datetime.datetime(2024, 3, 30, 15, 0, tzinfo=fixed)
+        prices, _end = self._spring_prices(riga_timezone)
+        app = RecoveryOptimizer(now, prices=prices, tz=fixed, zone=riga_timezone)
+
+        app.full_optimize(None)
+
+        assert app.schedule
+        assert not app._price_retry_pending()
+
+    def test_a_zone_name_is_resolved(self, base_now):
+        zoneinfo = pytest.importorskip("zoneinfo")
+        try:
+            expected = zoneinfo.ZoneInfo("Europe/Riga")
+        except Exception:
+            pytest.skip("no tz database available")
+        app = RecoveryOptimizer(base_now, prices=[], zone="Europe/Riga")
+        assert app._get_region_timezone() == expected
+
+    def test_an_unusable_zone_falls_back_and_says_so(self, base_now):
+        app = RecoveryOptimizer(base_now, prices=[], zone="Not/AZone")
+        assert app._get_region_timezone() is app._tz
+        assert any("Not/AZone" in m for m, _lvl in app.logs)
+
+    def test_a_missing_or_broken_accessor_falls_back(self, base_now):
+        app = RecoveryOptimizer(base_now, prices=[], zone=RuntimeError("nope"))
+        assert app._get_region_timezone() is app._tz
+
+        app2 = RecoveryOptimizer(base_now, prices=[], zone=None)
+        assert app2._get_region_timezone() is app2._tz
+
+    def test_a_fixed_offset_boundary_is_reported_once(self, base_now):
+        """No region zone available: the app must say the boundary is degraded."""
+        app = RecoveryOptimizer(base_now, prices=[], zone=None)
+
+        for _ in range(3):
+            app._price_horizon.evaluate(full_day_prices(base_now), base_now)
+
+        degraded = [m for m, lvl in app.logs if "DST rules" in m]
+        assert len(degraded) == 1
+
+
+class TestReEnableKeepsTheRetryItArmed:
+    """Finding 4: the healthy-coverage review cancelled the `no_schedule` retry.
+
+    Re-enable executed the current slot first (no plan -> HOLD/no_schedule ->
+    retry armed) and then reviewed the horizon; healthy prices cancelled that
+    retry, leaving the app holding until the next adaptive pass.
+    """
+
+    def test_re_enable_with_healthy_prices_and_no_schedule(self, base_now):
+        app = RecoveryOptimizer(base_now, prices=full_day_prices(base_now))
+        app.get_prices()  # populate the retained snapshot
+        app.schedule = {}
+
+        app.enabled = False
+        app._on_enabled_change(None, None, "on", "off", {})
+        app.enabled = True
+        app._on_enabled_change(None, None, "off", "on", {})
+
+        assert app._price_retry_pending(), (
+            "the empty schedule armed a retry; a healthy price verdict must "
+            "not disarm it"
+        )
+
+        app.advance(30)
+        app.fire_latest_retry()
+        assert app.schedule
+        assert app.applied[-1].reason != "no_schedule"
+
+    def test_a_non_coverage_retry_survives_a_healthy_review(self, base_now):
+        app = RecoveryOptimizer(base_now, prices=full_day_prices(base_now))
+        app.get_prices()
+        app.execute_scheduled_mode({})  # no schedule -> arms a retry
+        assert app._price_horizon.last_failure_reason == "no_schedule"
+
+        app._review_price_horizon(app._price_horizon.retained_prices)
+
+        assert app._price_retry_pending()
+        assert app._price_horizon.attempts == 1
+
+    def test_a_coverage_retry_is_still_cancelled_on_recovery(self, base_now):
+        app = RecoveryOptimizer(base_now, prices=[])
+        app.full_optimize(None)
+        assert app._price_retry_pending()
+
+        app.set_prices(full_day_prices(app.datetime()))
+        app._review_price_horizon(app.get_prices())
+
+        assert not app._price_retry_pending()
+        assert app._price_horizon.attempts == 0
+
+
+# ===========================================================================
 # Configuration
 # ===========================================================================
 
@@ -832,6 +1102,20 @@ class TestPriceRecoveryConfig:
             {"price_retry_delays_seconds": "45, 90, 180"}
         )
         assert config.price_retry_delays_seconds == (45, 90, 180)
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("false", False), ("False", False), ("no", False), ("off", False),
+            ("0", False), ("", False),
+            ("true", True), ("yes", True), ("on", True), ("1", True),
+            (False, False), (True, True), (0, False), (1, True),
+        ],
+    )
+    def test_yaml_strings_are_parsed_as_booleans(self, raw, expected):
+        """`price_retry_enabled: "false"` used to be True: bool("false")."""
+        config = bo.BatteryOptimizerConfig.from_args({"price_retry_enabled": raw})
+        assert config.price_retry_enabled is expected
 
     def test_a_blank_key_uses_the_default(self):
         config = bo.BatteryOptimizerConfig.from_args(

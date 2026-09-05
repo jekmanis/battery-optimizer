@@ -29,6 +29,7 @@ from battery_optimizer_lib import (
     HorizonHealth,
     PriceHorizonConfig,
     PriceHorizonMonitor,
+    is_coverage_reason,
     DirectControl,
     # App-wide callback lock (AppDaemon multi-thread dispatch)
     CallbackLock,
@@ -746,6 +747,10 @@ class BatteryOptimizer(hass.Hass):
         self._price_horizon = PriceHorizonMonitor(
             config=PriceHorizonConfig.from_main_config(self.config),
             get_timezone_func=self._get_local_timezone,
+            # Local midnight needs REAL DST rules, not the fixed offset
+            # `_get_local_timezone()` degrades to when `self.datetime()` is
+            # naive - see `_get_region_timezone`.
+            get_zone_func=self._get_region_timezone,
             log_func=self.log,
         )
         # At most ONE pending retry per app instance. `_price_retry_token` is
@@ -820,6 +825,14 @@ class BatteryOptimizer(hass.Hass):
         monitor = self._price_horizon
         health = monitor.evaluate(prices, now)
         if health.ok:
+            pending_reason = monitor.last_failure_reason
+            if self._price_retry_pending() and not is_coverage_reason(pending_reason):
+                # Usable prices say nothing about an empty schedule or an
+                # unreadable SOC. Disarming that retry here left the app on
+                # HOLD/no_schedule until the next adaptive pass - which is
+                # exactly what happened on re-enable.
+                monitor.note_coverage_ok(health, now)
+                return health
             was_failing = monitor.attempts > 0
             monitor.record_success(health, now)
             self._cancel_price_retry()
@@ -898,16 +911,25 @@ class BatteryOptimizer(hass.Hass):
             return
 
         now = self.datetime()
+
+        # SOC FIRST, before the horizon review. Nothing can be planned without
+        # it, and reviewing first meant a healthy price snapshot called
+        # `record_success` (attempts -> 0) a moment before the SOC check failed
+        # and recorded attempt 1 again: an unreadable battery pinned the backoff
+        # at its first step and re-fetched prices under the app lock every 30 s
+        # for as long as the sensor stayed away.
+        current_soc = self._get_current_soc()
+        if current_soc is None:
+            self.log(
+                "Price recovery: SOC unavailable, cannot rebuild yet",
+                level="DEBUG",
+            )
+            self._note_price_horizon_failure("soc_unavailable", now)
+            return
+
         prices = self.get_prices()
         health = self._review_price_horizon(prices, now, context="price_recovery")
         if not health.ok:
-            return
-
-        current_soc = self._get_current_soc()
-        if current_soc is None:
-            # Prices are back but the battery is unreadable: treat it as an
-            # unfinished recovery rather than planning from a guessed SOC.
-            self._note_price_horizon_failure("soc_unavailable", now, health)
             return
 
         # Rebuild from the CURRENT SOC and time. `_recalculate_remaining_schedule`
@@ -929,16 +951,23 @@ class BatteryOptimizer(hass.Hass):
         thread, and this runs every `adaptive_recalc_minutes`. When the snapshot
         is unusable the bounded retry does the fetching.
 
-        Returns True when it took an action the caller should not duplicate.
+        Returns True ONLY when it rebuilt the schedule, i.e. when a second pass
+        over the same callback would be duplicated work. A coverage failure is
+        not such an action: `tomorrow_missing` is the routine state between
+        `tomorrow_prices_hour` and tomorrow's publication, which sits squarely
+        inside the PV day, so returning True there suppressed the reactive
+        PV-shortfall replan for hours.
         """
         now = self.datetime()
         monitor = self._price_horizon
         health = monitor.evaluate(monitor.retained_prices, now)
         if not health.ok:
+            # Note it, arm the bounded retry - and fall through, because the
+            # rest of the adaptive pass works on the plan we already have.
             self._note_price_horizon_failure(
                 health.reason, now, health, context="adaptive"
             )
-            return True
+            return False
 
         # Coverage is fine, so an absent entry for the current slot means the
         # PLAN ran out (or was never built), not that prices are missing.
@@ -2649,10 +2678,14 @@ class BatteryOptimizer(hass.Hass):
             # stale while disabled, and the previous attempt count says nothing
             # about the price service now.
             self._price_horizon.reset_backoff()
-            self.execute_scheduled_mode(None)
+            # Review BEFORE executing. The other order armed a `no_schedule`
+            # retry in `execute_scheduled_mode` and then cancelled it with a
+            # healthy price verdict, so a re-enabled app with an empty schedule
+            # sat on HOLD until the next adaptive pass.
             self._review_price_horizon(
                 self._price_horizon.retained_prices, context="enable"
             )
+            self.execute_scheduled_mode(None)
 
     @_timed_callback
     def on_override_change(self, entity, attribute, old, new, kwargs):
@@ -3328,6 +3361,44 @@ class BatteryOptimizer(hass.Hass):
     def _is_override_active(self) -> bool:
         """Check if manual override is active."""
         return self._sensors.is_on(self.config.override_entity, default=False)
+
+    def _get_region_timezone(self):
+        """A timezone with real DST rules, for local-midnight arithmetic.
+
+        `_get_local_timezone()` returns `self.datetime().tzinfo` when AppDaemon
+        hands over an aware datetime and otherwise falls back to
+        `datetime.now().astimezone().tzinfo` - a FIXED `datetime.timezone`
+        carrying today's offset. That is perfectly good for ordering instants
+        and aligning slots, and wrong for "the local midnight after next" on the
+        two DST days: `combine(2024-04-01, 00:00, +02:00)` is an hour later than
+        Europe/Riga's actual midnight that day, so a complete price horizon
+        reads as `tomorrow_missing` all afternoon.
+
+        AppDaemon's own `get_timezone()` reports the configured zone, normally
+        as a name. Anything unusable falls back to `_get_local_timezone()`; the
+        monitor then says once that the boundary has no DST rules.
+        """
+        zone = None
+        getter = getattr(self, "get_timezone", None)
+        if callable(getter):
+            try:
+                zone = getter()
+            except Exception as e:
+                self.log(f"get_timezone() failed: {e}", level="DEBUG")
+                zone = None
+        if isinstance(zone, datetime.tzinfo):
+            return zone
+        if isinstance(zone, str) and zone.strip():
+            try:
+                from zoneinfo import ZoneInfo
+                return ZoneInfo(zone.strip())
+            except Exception as e:
+                self.log(
+                    f"Cannot resolve timezone '{zone}': {e} - falling back to the "
+                    f"local offset for horizon boundaries",
+                    level="WARNING",
+                )
+        return self._get_local_timezone()
 
     def _get_local_timezone(self):
         """

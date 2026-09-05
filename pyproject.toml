@@ -13,6 +13,10 @@ dev = [
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
     "pyyaml>=6.0.3",
+    # Windows has no system tz database, so `zoneinfo.ZoneInfo("Europe/Riga")`
+    # raises there and the price-horizon zone test would only ever skip on a
+    # developer machine. The HA add-on runs on Linux and needs no such package.
+    "tzdata>=2024.1; sys_platform == 'win32'",
 ]
 
 [tool.pytest.ini_options]

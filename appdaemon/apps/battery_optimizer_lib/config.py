@@ -48,6 +48,22 @@ def _arg(args: dict, key: str, default):
     return default if value is None else value
 
 
+_FALSE_STRINGS = frozenset({"", "0", "false", "no", "off", "none", "null"})
+
+
+def _bool_arg(args: dict, key: str, default: bool) -> bool:
+    """``_arg`` for a boolean, honouring the strings YAML can produce.
+
+    ``bool("false")`` is ``True``. AppDaemon's apps.yaml is hand-edited, quoting
+    happens, and a key written as ``price_retry_enabled: "false"`` must not turn
+    the feature ON. Real booleans and numbers pass through unchanged.
+    """
+    value = _arg(args, key, default)
+    if isinstance(value, str):
+        return value.strip().lower() not in _FALSE_STRINGS
+    return bool(value)
+
+
 @dataclass
 class BatteryOptimizerConfig:
     """
@@ -609,7 +625,7 @@ class BatteryOptimizerConfig:
             nordpool_area=args.get("nordpool_area", "LV"),
             nordpool_sensor=args.get("nordpool_sensor", "sensor.nord_pool_lv_current_price"),
             tomorrow_prices_hour=int(args.get("tomorrow_prices_hour", 14)),
-            price_retry_enabled=bool(_arg(args, "price_retry_enabled", True)),
+            price_retry_enabled=_bool_arg(args, "price_retry_enabled", True),
             price_retry_delays_seconds=price_retry_delays,
             price_retry_max_seconds=int(_arg(args, "price_retry_max_seconds", 900)),
             price_retain_max_age_hours=float(

@@ -632,6 +632,21 @@ day needs 100. The verdict distinguishes a `gap` (data exists past the break -
 a hole in otherwise available data) from `tomorrow_missing` (nothing past the
 break, and publication was expected).
 
+That midnight is computed in a zone **with DST rules**, taken from AppDaemon's
+`get_timezone()`. `_get_local_timezone()` cannot be used for it: it falls back
+to `datetime.now().astimezone().tzinfo`, a fixed `datetime.timezone` carrying
+today's offset, whenever `self.datetime()` is naive — and
+`combine(2024-04-01, 00:00, +02:00)` is an hour later than Riga's real midnight
+that day. Left uncorrected, a complete horizon read as `tomorrow_missing` for
+the whole spring-transition afternoon, and an incomplete one read as complete
+every autumn. When no region zone can be resolved the app falls back to the
+offset and says so once at WARNING.
+
+An unusable verdict is *noted*, not acted on: `tomorrow_missing` is the normal
+state from `tomorrow_prices_hour` until tomorrow publishes, and that window sits
+inside the PV day. The adaptive pass records the failure, arms the retry, and
+continues to the reactive PV-shortfall check.
+
 ### Recovery
 
 An unusable verdict arms **one** pending retry with a bounded backoff
@@ -663,10 +678,21 @@ does the adaptive pass act.
 
 `get_prices()` merges each reply with the still-valid intervals already known.
 A fresh value always wins for the same instant; retained values only fill
-instants the reply does not contain, only in the future, and only while the last
-successful fetch is younger than `price_retain_max_age_hours`. This exists
-because the price service replaces its cache wholesale on any non-empty reply,
-so a today-only response could shorten a horizon that already held tomorrow.
+instants the reply does not contain, and only in the future. This exists because
+the price service replaces its cache wholesale on any non-empty reply, so a
+today-only response could shorten a horizon that already held tomorrow.
+
+`price_retain_max_age_hours` measures the time since the last **non-empty**
+reply, not the age of an individual interval: it is the backstop for a source
+that goes permanently silent. It is not the thing that bounds how long an
+interval survives — pruning to the future on every merge is, so an interval can
+outlive at most its own instant.
+
+An interval that a later reply **omits while spanning it** is retained. A
+partial response and a genuine withdrawal are indistinguishable here, and
+discarding a known price because one response came back short is the failure
+this merge exists to prevent. A correction therefore only takes effect for
+instants the reply actually contains.
 
 `sensor.battery_optimizer` publishes the verdict under `price_horizon`:
 coverage end, required end, the failure reason, the last successful horizon

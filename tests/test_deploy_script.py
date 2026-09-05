@@ -191,12 +191,17 @@ def test_restore_accepts_an_in_apps_backup_path(deploy_text):
 def test_post_deploy_check_reads_the_addon_log(deploy_text):
     assert "function Invoke-PostDeployCheck" in deploy_text
     # The Supervisor log endpoint takes the line count as a journald-style
-    # `Range: entries=:-N:` header, not a `?lines=` query. Windows PowerShell
-    # 5.1 refuses to set `Range` on a WebRequest, so the script goes through
-    # HttpClient and TryAddWithoutValidation; pin both halves of that.
+    # `Range: entries=:-N:` header. Windows PowerShell 5.1 refuses to set
+    # `Range` on a WebRequest, so the script goes through HttpClient and
+    # TryAddWithoutValidation, and only falls back to the `?lines=` query
+    # when that path is unavailable. Pin the endpoint, the header, and the
+    # fallback so neither half can be dropped silently.
     assert "/api/hassio/addons/{1}/logs" in deploy_text
-    assert "?lines=" not in deploy_text, "the log endpoint ignores ?lines="
     assert "TryAddWithoutValidation('Range', ('entries=:-' + $Lines + ':'))" in deploy_text
+    assert "($uri + '?lines=' + $Lines)" in deploy_text, "keep the ?lines= fallback"
+    assert deploy_text.index("TryAddWithoutValidation('Range'") < deploy_text.index("'?lines='"), (
+        "the ranged request is the primary path; ?lines= is the fallback"
+    )
     check = deploy_text[deploy_text.index("function Invoke-PostDeployCheck"):]
     assert "Initializing Battery Optimizer" in check
     assert "ModuleNotFoundError" in check

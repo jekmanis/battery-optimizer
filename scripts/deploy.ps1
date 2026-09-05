@@ -164,7 +164,7 @@
     Evacuate legacy backup-* directories out of apps\ first, then deploy.
 
 .EXAMPLE
-    pwsh> .\scripts\deploy.ps1 -Restore '\\192.168.33.167\addon_configs\a0d7b954_appdaemon\backups\battery_optimizer\backup-20260902-181500'
+    pwsh> .\scripts\deploy.ps1 -Restore '\\192.168.77.167\addon_configs\a0d7b954_appdaemon\backups\battery_optimizer\backup-20260902-181500'
     Roll back to a previous deploy.
 
 .NOTES
@@ -173,7 +173,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$Share = '\\192.168.33.167\addon_configs\a0d7b954_appdaemon\apps',
+    [string]$Share = '\\192.168.77.167\addon_configs\a0d7b954_appdaemon\apps',
     [string]$BackupRoot = '',
     [switch]$DryRun,
     [switch]$SkipTests,
@@ -181,7 +181,7 @@ param(
     [string[]]$AllowedApps = @('hello.py'),
     [switch]$MoveStrayBackups,
     [string]$HaToken = '',
-    [string]$HaUrl = 'http://192.168.33.167:8123',
+    [string]$HaUrl = 'http://192.168.77.167:8123',
     [string]$AddonSlug = 'a0d7b954_appdaemon',
     [ValidateSet('proxy', 'service')]
     [string]$AddonApi = 'service',

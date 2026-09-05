@@ -25,7 +25,7 @@ Windows PowerShell 5.1 compatible (no `&&`/`||`, no ternary, no `??`).
 .\scripts\deploy.ps1 -MoveStrayBackups -HaToken $env:HA_TOKEN -NoPause
 
 # roll back
-.\scripts\deploy.ps1 -Restore '\\192.168.33.167\addon_configs\a0d7b954_appdaemon\backups\battery_optimizer\backup-20260902-015714'
+.\scripts\deploy.ps1 -Restore '\\192.168.77.167\addon_configs\a0d7b954_appdaemon\backups\battery_optimizer\backup-20260902-015714'
 ```
 
 ### `-AddonApi`: add-on stop/start on current HA
@@ -202,7 +202,7 @@ a `finally` block (the script warns loudly if the delete fails).
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `-Share` | `\\192.168.33.167\addon_configs\a0d7b954_appdaemon\apps` | AppDaemon apps directory |
+| `-Share` | `\\192.168.77.167\addon_configs\a0d7b954_appdaemon\apps` | AppDaemon apps directory |
 | `-BackupRoot` | `<parent of -Share>\backups\battery_optimizer` | where `backup-<ts>` directories go; refused if inside `-Share` |
 | `-DryRun` | off | run every check, print the plan, write nothing |
 | `-SkipTests` | off | skip pytest (compile + smoke test still run) |
@@ -210,7 +210,7 @@ a `finally` block (the script warns loudly if the delete fails).
 | `-AllowedApps` | `hello.py` | other AppDaemon apps allowed to sit directly in `apps\` |
 | `-MoveStrayBackups` | off | move `backup-*` directories out of `apps\` instead of aborting |
 | `-HaToken` | *empty* | HA long-lived token (any user, no admin rights needed; `$env:HA_TOKEN` on this machine, also in `~\.ha_token`); enables API stop/start and the post-deploy checks. Required by `-NoPause` and by an explicit `-AddonApi service` |
-| `-HaUrl` | `http://192.168.33.167:8123` | HA base URL (the Supervisor proxy is under `/api/hassio`) |
+| `-HaUrl` | `http://192.168.77.167:8123` | HA base URL (the Supervisor proxy is under `/api/hassio`) |
 | `-AddonSlug` | `a0d7b954_appdaemon` | add-on slug |
 | `-AddonApi` | `service` | `service` = `hassio.addon_stop`/`addon_start` + AppDaemon-port probe; `proxy` = Supervisor proxy, **legacy** — current HA answers 401 there for every token |
 | `-AppDaemonPort` | `5050` | AppDaemon's HTTP port, used as the add-on up/down signal in `-AddonApi service` |

@@ -503,7 +503,7 @@ retry are unchanged.
 The running app lives on the Home Assistant share, not in this repo:
 
 ```
-//192.168.33.167/addon_configs/a0d7b954_appdaemon/apps/
+//192.168.77.167/addon_configs/a0d7b954_appdaemon/apps/
 ├── apps.yaml              # LIVE config, contains the HA token — never overwrite from here
 ├── battery_optimizer.py
 └── battery_optimizer_lib/

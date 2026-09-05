@@ -839,10 +839,25 @@ NON_DECREASING_IN_TEMPERATURE = {
 # class below: `charge_rate_for_span` probes TWO SOCs at ONE temperature, so a
 # SOC-dependent curve moves the endpoint pair the bound is stated over. See
 # TestTheCoolingBoundAlsoNeedsSocMonotonicity.
-assert all(
-    fn(10.0, 20.0) == fn(90.0, 20.0)
-    for fn, _temp, _cooling in NON_DECREASING_IN_TEMPERATURE.values()
-), "these fixtures must stay SOC-independent"
+#
+# A two-point probe (10 % vs 90 %) is not a check of SOC independence: a curve
+# that dips between the probes and recovers passes it. Sweep the whole range.
+def _is_soc_independent(fn) -> bool:
+    for temp in (5.0, 20.0):
+        reference = fn(0.0, temp)
+        for tenths in range(0, 2001):
+            if fn(tenths / 20.0, temp) != reference:
+                return False
+    return True
+
+
+def test_the_cooling_bound_fixtures_are_soc_independent():
+    """Guard for the class below, as a test so it survives `python -O`."""
+    for name, (fn, _temp, _cooling) in NON_DECREASING_IN_TEMPERATURE.items():
+        assert _is_soc_independent(fn), f"{name} depends on SOC"
+    # The guard itself has content: the SOC-dip fixture the SOC-monotonicity
+    # class uses is fast at both classic probes and slow in between.
+    assert not _is_soc_independent(_soc_dip_with_temperature_slope())
 
 
 class TestTheCoolingBoundHoldsWhereItsMonotonicityHolds:

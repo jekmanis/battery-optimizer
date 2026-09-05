@@ -362,8 +362,10 @@ def charge_rate_for_span(
       29.0 %. "At most one boundary" was the condition for the rule being
       well-behaved, never for it being exact;
     * **conservative** (never over-credits) when the rate is monotone over the
-      span the slot covers -- the minimum of the endpoints is then a lower
-      bound on every rate the slot visits;
+      span the slot covers AND the rate at the start-of-slot temperature is a
+      lower bound over the slot (the pack warms, or the rate ignores
+      temperature) -- the minimum of the endpoints is then a lower bound on
+      every rate the slot visits;
     * an **approximation** otherwise. A curve that dips between the two
       endpoints and recovers is still over-credited; the only statement that
       always holds is the identity bound
@@ -373,7 +375,10 @@ def charge_rate_for_span(
     slot starts at, because temperature evolves between slots through
     ``thermal_model.TemperatureProjector`` and the DP's 1-D energy state cannot
     carry it. That is conservative when the pack WARMS during the slot -- the
-    physical case while charging -- and it MAY OVER-CREDIT a pack that cools
+    physical case while charging -- provided the rate is non-decreasing in
+    temperature AND monotone over the SOC span the slot covers (a SOC dip
+    between the two probes over-credits regardless of the temperature
+    direction), and it MAY OVER-CREDIT a pack that cools
     while charging, bounded by
     ``(rate(T_start) - rate(T_end)) * duration_h * efficiency`` **only when the
     rate is NON-DECREASING in temperature over the range the slot traverses and

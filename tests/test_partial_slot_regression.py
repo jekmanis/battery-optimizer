@@ -223,3 +223,4 @@ def test_missing_current_slot_is_not_planned_on_an_invented_price():
     assert entry.price_source is None
     assert len(schedule) > 1, "the rest of the horizon is still planned"
     assert min(p.time for p in future) in schedule
+    assert min(schedule) == current, "nothing may be planned before the current slot"

@@ -495,11 +495,16 @@ direction claim does not apply.
   24.5 % against 29.0 %. "At most one boundary" was the condition for the rule
   being well-behaved, never for it being exact.
 - **Conservative** (never over-credits) when the rate is monotone over the SOC
-  span the slot covers: the minimum of the two endpoints is then a lower bound
-  on every rate the slot visits.
-- **Conservative** when the pack *warms* during the slot and the rate is
-  non-decreasing in temperature — the physical case while charging, since the
-  rate is looked up at the start-of-slot temperature.
+  span the slot covers *and* the rate at the start-of-slot temperature is a
+  lower bound over the slot (the pack warms, or the rate ignores
+  temperature): the minimum of the two endpoints is then a lower bound on
+  every rate the slot visits.
+- **Conservative** when the pack *warms* during the slot, the rate is
+  non-decreasing in temperature *and* the rate is monotone over the SOC span
+  the slot covers — the physical case while charging, since the rate is looked
+  up at the start-of-slot temperature. Both conditions are needed: a SOC dip
+  between the two probes over-credits regardless of the temperature direction
+  (measured +0.83 kWh on a warming pack with the same dip curve used below).
 - **May over-credit**, and bounded rather than eliminated, on a pack that
   *cools* while charging **and the rate is non-decreasing in temperature over
   the range the slot traverses and monotone over the SOC span the slot

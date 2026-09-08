@@ -13,6 +13,7 @@ Author: AppDaemon Battery Optimizer
 import appdaemon.plugins.hass.hassapi as hass
 import datetime
 import functools
+import json
 import math
 import time
 from typing import Dict, List, Optional, Tuple
@@ -101,7 +102,33 @@ from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
 # published on sensor.battery_optimizer, so a deploy can be PROVEN to be
 # running: on 2026-09-02 the add-on silently imported the previous commit out
 # of a backup directory inside apps/ while SHA256 verification of apps/ passed.
-APP_VERSION = "2026-09-08"
+APP_VERSION = "2026-09-08.2"
+
+# Home Assistant's recorder refuses to store an entity's attributes once the
+# serialized blob passes this size ("State attributes for <entity> exceed
+# maximum size of 16384 bytes ... Attributes will not be stored"). The state
+# itself is still recorded; every attribute silently stops having history.
+HA_MAX_STATE_ATTRS_BYTES = 16384
+
+# Self-imposed ceiling for sensor.battery_optimizer, which IS recorded. Half the
+# recorder limit, so the sensor keeps its history no matter how long the horizon
+# grows. The bulky payloads (the per-slot schedule, the load profile table) live
+# on their own recorder-excluded entities instead.
+MAIN_SENSOR_ATTRS_BUDGET_BYTES = 8192
+
+
+def _attributes_size_bytes(attrs: Dict) -> int:
+    """Serialized size of an HA attribute dict, the way the recorder measures it.
+
+    `default=str` mirrors HA's tolerance for non-JSON values (datetimes, enums)
+    so this never raises on a payload HA would happily store.
+    """
+    try:
+        return len(
+            json.dumps(attrs, default=str, separators=(",", ":")).encode("utf-8")
+        )
+    except Exception:
+        return 0
 
 
 def _code_paths() -> Tuple[str, str]:
@@ -586,6 +613,11 @@ class BatteryOptimizer(hass.Hass):
             self._slowest_callback: Optional[Tuple[str, float]] = None
             self._threads_hint_logged: bool = False
             self._last_terminal_warning_time: Optional[datetime.datetime] = None
+            # Attribute-budget guard for sensor.battery_optimizer: the KiB class
+            # last warned about, and when. Both keep the WARNING off the 15-min
+            # cadence without ever hiding a size that has grown.
+            self._attrs_budget_warned_kib: Optional[int] = None
+            self._attrs_budget_warned_at: Optional[float] = None
 
             # Wall-clock instant a grid_charge command stops being in force at the
             # inverter. A set_wit_mode override runs for slot_minutes +
@@ -4119,6 +4151,9 @@ class BatteryOptimizer(hass.Hass):
                 self.log(f"Could not load load profile data: {e}", level="WARNING")
 
         self.log("Starting with fresh load profile")
+        # Nothing was loaded, so no save has published the profile sensors yet.
+        # Publish once so the entities exist after an AppDaemon restart.
+        self._update_load_profile_sensors()
 
     def _init_prediction_tracker(self):
         """Initialize prediction tracker from persistent storage."""
@@ -4221,6 +4256,10 @@ class BatteryOptimizer(hass.Hass):
                 )
         except Exception as e:
             self.log(f"Could not update load profile sensors: {e}", level="DEBUG")
+
+        # The hourly aggregate table used to ride on sensor.battery_optimizer at
+        # ~2.4 KB; it has its own recorder-excluded entity now.
+        self._update_load_profile_stats_sensor()
 
     def _save_prediction_tracker(self):
         """Persist prediction tracker to file."""
@@ -4702,10 +4741,23 @@ class BatteryOptimizer(hass.Hass):
         return stats
 
     def _update_schedule_sensor(self):
-        """Update the schedule sensor in Home Assistant"""
+        """Update the schedule sensor in Home Assistant.
+
+        Three entities, because HA's recorder drops the whole attribute blob
+        above HA_MAX_STATE_ATTRS_BYTES and the per-slot `schedule` list alone
+        passes that on a two-day horizon:
+
+        - sensor.battery_optimizer          lean, recorded, holds a summary
+        - sensor.battery_optimizer_schedule the full per-slot list, recorder-excluded
+        - sensor.battery_optimizer_schedule_markdown  dashboard table, recorder-excluded
+
+        Nothing in this app ever reads a schedule back out of HA; these are
+        publication only.
+        """
         try:
             # Format schedule for sensor using formatter
             schedule_data = self._schedule_formatter.format_schedule_list(self.schedule)
+            schedule_summary = self._schedule_formatter.summarize_schedule(self.schedule)
 
             # Find next charge/discharge times using formatter
             now = self.datetime()
@@ -4723,10 +4775,6 @@ class BatteryOptimizer(hass.Hass):
                 current_soc, current_temp
             )
 
-            # Get temperature-aware rates summary from learning engine
-            learning_summary = self.learning_engine.get_learning_summary()
-            temp_aware_rates = learning_summary.get("temp_aware_rates", {})
-
             # Generate markdown schedule for dashboard display
             schedule_md = self._schedule_formatter.format_schedule_markdown(
                 schedule=self.schedule,
@@ -4738,57 +4786,87 @@ class BatteryOptimizer(hass.Hass):
                 predict_pv_kw=self._predict_pv_kw,
             )
 
+            last_optimization = (
+                self.last_optimization.isoformat() if self.last_optimization else None
+            )
+
+            # Main sensor: everything EXCEPT the bulky payloads. `schedule` moved
+            # to sensor.battery_optimizer_schedule, `load_profile_stats` to
+            # sensor.battery_optimizer_load_profile, and `temp_aware_rates` was
+            # already published as `temp_aware_stored_rates` on
+            # sensor.battery_learning_stats.
+            main_attributes = {
+                "current_mode": self.current_mode.name,
+                "next_charge": next_charge,
+                "next_discharge": next_discharge,
+                "last_optimization": last_optimization,
+                "prices_cached": len(self._price_service.cached_prices),
+                # Coverage health: last usable horizon end, why it is not
+                # usable, and whether a bounded retry is pending. A nonempty
+                # `prices_cached` alone never proved a usable horizon.
+                "price_horizon": self._price_horizon_diagnostics(),
+                # Which of the four rate/temperature refinement paths built
+                # the current plan, and the kWh the degrade branch could not
+                # supply. "degraded" means the actions were chosen for
+                # energy the pack will not have.
+                "rate_refinement": self._rate_refinement_diagnostics(),
+                "battery_avg_cost": round(self.battery_avg_cost, 4),
+                "discharge_threshold": round(self._get_discharge_threshold(), 4),
+                # Decision transparency attributes
+                "last_recalc_trigger": self._last_recalc_trigger,
+                "last_recalc_time": self._last_recalc_time.isoformat() if self._last_recalc_time else None,
+                "last_soc_deviation": round(self._last_soc_deviation, 1) if self._last_soc_deviation is not None else None,
+                "min_charge_slots_required": self._last_min_charge_slots,
+                "charge_slots": self._last_charge_slots,
+                # Temperature-aware charge rate attributes
+                "current_battery_temp": round(current_temp, 1) if current_temp is not None else None,
+                "current_predicted_rate": round(current_predicted_rate, 2),
+                # Energy measurement source
+                "energy_measurement_source": "inverter" if self._energy_sensor_available else "soc",
+                "load_profile_observations": self.load_profile.stats.observation_count,
+                "pv_profile_observations": self.pv_profile.stats.observation_count,
+                # Sliding PV forecast bias
+                "pv_bias_factor": self._pv_bias_factor,
+                "pv_bias_samples": self._pv_bias.ratio_count(self.datetime()),
+                "pv_bias_enabled": self.config.pv_bias_enabled,
+                "slot_minutes": self.config.slot_minutes,
+                # Compact schedule census; the per-slot list is on the entity below
+                **schedule_summary,
+                "schedule_entity": "sensor.battery_optimizer_schedule",
+                # Slot outcome monitoring
+                "slot_outcomes_recent": self._outcome_tracker.get_recent_outcomes(10),
+                "prediction_accuracy": self._outcome_tracker.get_accuracy_stats(),
+                # Inverter control health (verify-after-set counters)
+                "inverter_control_health": self._direct_control.get_diagnostics(),
+                # Deploy proof: which code is actually running (see APP_VERSION)
+                "app_version": APP_VERSION,
+                "code_paths": dict(zip(("orchestrator", "lib"), _code_paths())),
+                "friendly_name": "Battery Optimizer"
+            }
+
+            # Never truncate — say what grew instead.
+            self._check_main_sensor_attr_budget(main_attributes)
+
             # Set sensor state
             self.set_state("sensor.battery_optimizer",
                 state=self.current_mode.name,
+                attributes=main_attributes,
+            )
+
+            # Full per-slot plan on its own entity. This one WILL pass
+            # HA_MAX_STATE_ATTRS_BYTES on a long horizon, which is why the HA
+            # package excludes it from the recorder.
+            self.set_state("sensor.battery_optimizer_schedule",
+                # MUST be a string (see _update_control_health_sensor): an int 0
+                # is falsy and gets dropped from the POST body, which HA answers
+                # with "[400] Bad Request".
+                state=str(len(self.schedule)),
                 attributes={
                     "schedule": schedule_data,
-                    "current_mode": self.current_mode.name,
-                    "next_charge": next_charge,
-                    "next_discharge": next_discharge,
-                    "last_optimization": self.last_optimization.isoformat() if self.last_optimization else None,
-                    "prices_cached": len(self._price_service.cached_prices),
-                    # Coverage health: last usable horizon end, why it is not
-                    # usable, and whether a bounded retry is pending. A nonempty
-                    # `prices_cached` alone never proved a usable horizon.
-                    "price_horizon": self._price_horizon_diagnostics(),
-                    # Which of the four rate/temperature refinement paths built
-                    # the current plan, and the kWh the degrade branch could not
-                    # supply. "degraded" means the actions were chosen for
-                    # energy the pack will not have.
-                    "rate_refinement": self._rate_refinement_diagnostics(),
-                    "battery_avg_cost": round(self.battery_avg_cost, 4),
-                    "discharge_threshold": round(self._get_discharge_threshold(), 4),
-                    # Decision transparency attributes
-                    "last_recalc_trigger": self._last_recalc_trigger,
-                    "last_recalc_time": self._last_recalc_time.isoformat() if self._last_recalc_time else None,
-                    "last_soc_deviation": round(self._last_soc_deviation, 1) if self._last_soc_deviation is not None else None,
-                    "min_charge_slots_required": self._last_min_charge_slots,
-                    "charge_slots": self._last_charge_slots,
-                    # Temperature-aware charge rate attributes
-                    "current_battery_temp": round(current_temp, 1) if current_temp is not None else None,
-                    "current_predicted_rate": round(current_predicted_rate, 2),
-                    "temp_aware_rates": temp_aware_rates,
-                    # Energy measurement source
-                    "energy_measurement_source": "inverter" if self._energy_sensor_available else "soc",
-                    # Load profile statistics for visualization
-                    "load_profile_stats": self._get_load_profile_stats(),
-                    "load_profile_observations": self.load_profile.stats.observation_count,
-                    "pv_profile_observations": self.pv_profile.stats.observation_count,
-                    # Sliding PV forecast bias
-                    "pv_bias_factor": self._pv_bias_factor,
-                    "pv_bias_samples": self._pv_bias.ratio_count(self.datetime()),
-                    "pv_bias_enabled": self.config.pv_bias_enabled,
                     "slot_minutes": self.config.slot_minutes,
-                    # Slot outcome monitoring
-                    "slot_outcomes_recent": self._outcome_tracker.get_recent_outcomes(10),
-                    "prediction_accuracy": self._outcome_tracker.get_accuracy_stats(),
-                    # Inverter control health (verify-after-set counters)
-                    "inverter_control_health": self._direct_control.get_diagnostics(),
-                    # Deploy proof: which code is actually running (see APP_VERSION)
-                    "app_version": APP_VERSION,
-                    "code_paths": dict(zip(("orchestrator", "lib"), _code_paths())),
-                    "friendly_name": "Battery Optimizer"
+                    "last_optimization": last_optimization,
+                    **schedule_summary,
+                    "friendly_name": "Battery Optimizer Schedule",
                 }
             )
 
@@ -4802,3 +4880,75 @@ class BatteryOptimizer(hass.Hass):
             )
         except Exception as e:
             self.log(f"Error updating schedule sensor: {e}", level="WARNING")
+
+    def _check_main_sensor_attr_budget(self, attrs: Dict) -> None:
+        """Warn when sensor.battery_optimizer outgrows its attribute budget.
+
+        HA's recorder stores nothing above HA_MAX_STATE_ATTRS_BYTES, so a sensor
+        that quietly grows past it loses ALL attribute history without an error
+        from this app. Nothing is truncated or dropped here — the three largest
+        keys are named so the payload can be moved to its own entity, the way
+        `schedule`, `load_profile_stats` and `temp_aware_rates` were.
+
+        Rate limited to one WARNING per KiB size class and at most one per hour,
+        so it cannot ride the 15-minute recalculation cadence.
+        """
+        try:
+            size = _attributes_size_bytes(attrs)
+            if size <= MAIN_SENSOR_ATTRS_BUDGET_BYTES:
+                # Back under budget: the next crossing is news again.
+                self._attrs_budget_warned_kib = None
+                self._attrs_budget_warned_at = None
+                return
+
+            kib = size // 1024
+            now = time.monotonic()
+            last_at = self._attrs_budget_warned_at
+            if (
+                kib == self._attrs_budget_warned_kib
+                and last_at is not None
+                and (now - last_at) < 3600
+            ):
+                return
+            self._attrs_budget_warned_kib = kib
+            self._attrs_budget_warned_at = now
+
+            largest = sorted(
+                ((k, _attributes_size_bytes({k: v})) for k, v in attrs.items()),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )[:3]
+            biggest = ", ".join(f"{k}={n}B" for k, n in largest)
+            self.log(
+                f"sensor.battery_optimizer attributes are {size} bytes, over the "
+                f"{MAIN_SENSOR_ATTRS_BUDGET_BYTES}-byte budget (recorder limit "
+                f"{HA_MAX_STATE_ATTRS_BYTES}). Largest: {biggest}. Move a payload "
+                f"to its own recorder-excluded entity.",
+                level="WARNING",
+            )
+        except Exception as e:
+            self.log(f"Could not check sensor attribute budget: {e}", level="DEBUG")
+
+    def _update_load_profile_stats_sensor(self) -> None:
+        """Publish the hourly load-profile table on its own entity.
+
+        It is ~2.4 KB and changes on every observation, so it does not belong on
+        the recorded main sensor. Created with set_state, so it exists only once
+        the app has published it after an HA or AppDaemon restart; the HA package
+        excludes it from the recorder.
+        """
+        try:
+            self.set_state(
+                "sensor.battery_optimizer_load_profile",
+                # String state, same reason as _update_control_health_sensor.
+                state=str(self.load_profile.stats.observation_count),
+                attributes={
+                    "load_profile_stats": self._get_load_profile_stats(),
+                    "slot_minutes": self.config.slot_minutes,
+                    "default_load_w": self.load_profile.default_load_w,
+                    "observations": self.load_profile.stats.observation_count,
+                    "friendly_name": "Battery Optimizer Load Profile",
+                },
+            )
+        except Exception as e:
+            self.log(f"Could not update load profile stats sensor: {e}", level="DEBUG")

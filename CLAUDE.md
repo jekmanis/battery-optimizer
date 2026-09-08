@@ -582,6 +582,51 @@ the same stop/copy/start dance. Add-on stop/start goes through HA's Supervisor
 proxy when `-HaToken` is given, otherwise the script pauses for you to do it in
 the UI. See `scripts/README.md`.
 
+### HA sensors and the recorder attribute limit
+
+Home Assistant's recorder stores **no** attributes for a state whose serialized
+attribute blob exceeds **16 384 bytes** — it logs "State attributes for
+`<entity>` exceed maximum size of 16384 bytes ... Attributes will not be
+stored" and drops all of them, silently as far as this app is concerned. The
+per-slot `schedule` list is ~217 bytes per entry, so the ~140-slot horizon the
+13:15 run produces is ~30 KB on its own; on 2026-09-07 the main sensor was
+18 821 bytes and had lost its attribute history.
+
+The plan is therefore published across separate entities in
+`_update_schedule_sensor`:
+
+- `sensor.battery_optimizer` — recorded. Carries only bounded attributes, plus
+  the compact census `ScheduleFormatter.summarize_schedule` returns
+  (`schedule_slots`, `schedule_start`/`schedule_end`,
+  `charge_hours`/`discharge_hours`/`hold_hours`,
+  `charge_slots_count`/`discharge_slots_count`) and `schedule_entity`.
+- `sensor.battery_optimizer_schedule` — the full per-slot list. Deliberately
+  allowed past 16 KB.
+- `sensor.battery_optimizer_load_profile` — the hourly `load_profile_stats`
+  table, published by `_update_load_profile_stats_sensor` after every
+  observation and once at startup.
+- `sensor.battery_optimizer_schedule_markdown` — the dashboard table.
+- The temperature-aware rate tables were already on
+  `sensor.battery_learning_stats` as `temp_aware_stored_rates`; the duplicate on
+  the main sensor is gone.
+
+The last three plus the schedule entity are excluded from the recorder in
+`homeassistant/packages/battery_optimizer.yaml`. A recorder change needs a full
+HA restart, not `template.reload`, and HA merges package `recorder:` config with
+`configuration.yaml` (lists append; a scalar defined in both files is a startup
+error).
+
+`_check_main_sensor_attr_budget` measures the main sensor's dict with
+`_attributes_size_bytes` against `MAIN_SENSOR_ATTRS_BUDGET_BYTES` (8192, half
+the recorder's `HA_MAX_STATE_ATTRS_BYTES`) and WARNs with the three largest keys
+and their byte sizes, rate-limited to one message per KiB size class and per
+hour so it cannot ride the 15-minute cadence. It never truncates or drops an
+attribute — the fix is to move a payload onto its own recorder-excluded entity,
+not to hide it.
+
+Nothing in the app reads any of these entities back; publication is one-way (see
+"There is also no restart override at all").
+
 ## Development
 
 This is a Python AppDaemon project. Use `uv` for running Python scripts and syntax checks. No formatter or linter is enforced.

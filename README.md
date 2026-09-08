@@ -131,7 +131,23 @@ Restart Home Assistant, then restart the AppDaemon add‑on. Watch **Settings �
 **Scripts:** `script.battery_force_charge`, `script.battery_force_discharge`, `script.battery_force_hold`, `script.battery_resume_auto`.
 
 ### Status & schedule sensors
-`sensor.battery_optimizer` carries the live plan as attributes: `current_mode`, `schedule` (per‑slot list), `slot_minutes`, `next_charge`, `next_discharge`, `battery_avg_cost`, plus decision‑transparency fields. Helper template sensors (confidence, learned rate, profit, energy totals, schedule hours, next charge/discharge times) are created by the HA package for dashboards.
+
+The plan is published across three entities, because Home Assistant's recorder
+stores no attributes at all once the serialized blob passes 16 384 bytes and the
+per‑slot list alone exceeds that on a two‑day horizon:
+
+| Entity | Contents | Recorded |
+|--------|----------|----------|
+| `sensor.battery_optimizer` | `current_mode`, `next_charge`, `next_discharge`, `battery_avg_cost`, `slot_minutes`, the schedule summary (`schedule_slots`, `schedule_start`/`schedule_end`, `charge_hours`/`discharge_hours`/`hold_hours`, `charge_slots_count`/`discharge_slots_count`), `schedule_entity`, plus decision‑transparency fields | Yes — kept under 8 KB on purpose |
+| `sensor.battery_optimizer_schedule` | the per‑slot `schedule` list (`time`, `mode`, `wit_mode`, `wit_mode_name`, `export`, `reason`, `value`, `value_basis`), `slot_minutes`, `last_optimization`, the same summary | No — recorder‑excluded |
+| `sensor.battery_optimizer_load_profile` | `load_profile_stats` (hourly aggregates for the dashboard chart), `slot_minutes`, `default_load_w`, `observations` | No — recorder‑excluded |
+
+`sensor.battery_optimizer_schedule_markdown` (dashboard table) and
+`sensor.battery_learning_stats` (which carries the temperature‑aware rate
+tables) complete the set; the markdown sensor is recorder‑excluded too. Helper
+template sensors (confidence, learned rate, profit, energy totals, schedule
+hours, next charge/discharge times) are created by the HA package for
+dashboards.
 
 ---
 

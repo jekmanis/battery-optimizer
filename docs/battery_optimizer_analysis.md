@@ -63,8 +63,11 @@ The `BatteryOptimizer` class is an AppDaemon application that orchestrates batte
 │  ├── _is_enabled(), _is_override_active() - State checks            │
 │  └── Properties: min_soc, max_soc, pv_threshold, battery_avg_cost   │
 ├─────────────────────────────────────────────────────────────────────┤
-│  Sensor Updates (~70 lines)                                         │
-│  └── _update_schedule_sensor() - Main sensor.battery_optimizer      │
+│  Sensor Updates (~200 lines)                                        │
+│  ├── _update_schedule_sensor() - lean sensor.battery_optimizer,     │
+│  │     plus _schedule and _schedule_markdown (recorder-excluded)    │
+│  ├── _check_main_sensor_attr_budget() - 16384-byte recorder limit   │
+│  └── _update_load_profile_stats_sensor() - _load_profile entity     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 

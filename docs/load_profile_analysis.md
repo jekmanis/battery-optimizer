@@ -295,7 +295,7 @@ During charging, the household load still must be served by grid import (same as
 | `sensor.load_profile_observation_count` | Total observations recorded (lifetime) |
 | `sensor.load_profile_last_observation` | Timestamp of most recent observation |
 | `sensor.battery_optimizer` (attribute: `load_profile_observations`) | Same count, in optimizer sensor |
-| `sensor.battery_optimizer` (attribute: `load_profile_stats`) | Hourly aggregates for dashboard charts |
+| `sensor.battery_optimizer_load_profile` (attribute: `load_profile_stats`) | Hourly aggregates for dashboard charts. Its own entity, excluded from the recorder — the table is ~2.4 KB and would eat the main sensor's 16 384-byte attribute allowance |
 
 ### 7.2 Hourly Statistics Exposure (`battery_optimizer.py:2009-2057`)
 

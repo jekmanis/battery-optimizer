@@ -546,6 +546,60 @@ class ScheduleFormatter:
             })
         return schedule_data
 
+    def summarize_schedule(
+        self, schedule: Dict[datetime.datetime, ScheduleEntry]
+    ) -> Dict:
+        """Compact census of a schedule, small enough for any sensor.
+
+        The per-slot list (``format_schedule_list``) is ~217 bytes per entry and
+        passes 16 KB well before a two-day horizon, which is more than HA's
+        recorder stores as attributes. This summary is what the main sensor
+        publishes instead; the list itself lives on
+        ``sensor.battery_optimizer_schedule``.
+
+        Returns:
+            Dict with slot count, horizon bounds (ISO, ``None`` when empty) and
+            hours/slots per mode. ``schedule_end`` is the LAST slot's start plus
+            ``slot_minutes``, i.e. the exclusive end of the plan.
+        """
+        slot_minutes = self.config.slot_minutes
+        slot_hours = slot_minutes / 60.0
+
+        if not schedule:
+            return {
+                "schedule_slots": 0,
+                "schedule_start": None,
+                "schedule_end": None,
+                "charge_hours": 0.0,
+                "discharge_hours": 0.0,
+                "hold_hours": 0.0,
+                "charge_slots_count": 0,
+                "discharge_slots_count": 0,
+            }
+
+        times = sorted(schedule.keys())
+        counts = {BatteryMode.CHARGE: 0, BatteryMode.DISCHARGE: 0, BatteryMode.HOLD: 0}
+        for entry in schedule.values():
+            if entry.mode in counts:
+                counts[entry.mode] += 1
+
+        charge = counts[BatteryMode.CHARGE]
+        discharge = counts[BatteryMode.DISCHARGE]
+        hold = counts[BatteryMode.HOLD]
+
+        return {
+            "schedule_slots": len(schedule),
+            "schedule_start": times[0].isoformat(),
+            "schedule_end": (
+                times[-1] + datetime.timedelta(minutes=slot_minutes)
+            ).isoformat(),
+            "charge_hours": round(charge * slot_hours, 2),
+            "discharge_hours": round(discharge * slot_hours, 2),
+            "hold_hours": round(hold * slot_hours, 2),
+            "charge_slots_count": charge,
+            "discharge_slots_count": discharge,
+        }
+
     def format_schedule_markdown(
         self,
         schedule: Dict[datetime.datetime, ScheduleEntry],

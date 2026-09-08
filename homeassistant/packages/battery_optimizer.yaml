@@ -11,6 +11,35 @@
 # =============================================================================
 
 # =============================================================================
+# Recorder - keep the bulky AppDaemon entities out of the database
+# =============================================================================
+# Home Assistant's recorder refuses to store an entity's attributes once the
+# serialized blob exceeds 16384 bytes; it logs "State attributes for <entity>
+# exceed maximum size of 16384 bytes ... Attributes will not be stored" and
+# drops ALL of them. The three entities below are published by AppDaemon with
+# set_state and carry payloads that legitimately pass that limit - the per-slot
+# schedule alone is ~217 bytes per slot, so a two-day horizon (~140 slots) is
+# ~30 KB. None of them has any value as history: the app never reads a schedule
+# back out of Home Assistant, and every recorded number lives on
+# sensor.battery_optimizer, which is kept well under 8 KB on purpose.
+#
+# Home Assistant MERGES a package's `recorder:` config with the one in
+# configuration.yaml: lists are appended, so an existing `recorder: exclude:
+# entities:` there is fine, but a scalar key defined in both places (e.g.
+# `purge_keep_days`) is a duplicate-key error at startup. Define such scalars in
+# exactly one file.
+#
+# A recorder change needs a FULL Home Assistant restart - `template.reload` and
+# the YAML-reload services do not touch the recorder configuration.
+# =============================================================================
+recorder:
+  exclude:
+    entities:
+      - sensor.battery_optimizer_schedule
+      - sensor.battery_optimizer_schedule_markdown
+      - sensor.battery_optimizer_load_profile
+
+# =============================================================================
 # Group - Battery Optimizer Entities
 # =============================================================================
 # Creates a group containing all Battery Optimizer entities for easy access
@@ -31,6 +60,8 @@ group:
       - input_number.battery_avg_cost
       # Status Sensors
       - sensor.battery_optimizer
+      - sensor.battery_optimizer_schedule
+      - sensor.battery_optimizer_load_profile
       - sensor.battery_learning_stats
       - sensor.battery_next_charge_time
       - sensor.battery_next_discharge_time
@@ -178,46 +209,29 @@ template:
             unknown
           {% endif %}
 
+      # Reads the compact summary attributes the optimizer publishes on
+      # sensor.battery_optimizer. The per-slot `schedule` list moved to
+      # sensor.battery_optimizer_schedule (recorder-excluded, see above), so
+      # nothing here iterates it any more.
       - name: "Battery Schedule Hours"
         unique_id: battery_schedule_hours
         icon: mdi:timetable
         state: >-
-          {% set schedule = state_attr('sensor.battery_optimizer', 'schedule') %}
-          {% if schedule %}
-            {% set slot_min = state_attr('sensor.battery_optimizer', 'slot_minutes') | default(15) | float %}
-            {% set charge = schedule | selectattr('mode', 'eq', 'CHARGE') | list | count %}
-            {% set discharge = schedule | selectattr('mode', 'eq', 'DISCHARGE') | list | count %}
-            {% set ch = (charge * slot_min / 60) | round(1) %}
-            {% set dh = (discharge * slot_min / 60) | round(1) %}
+          {% set slots = state_attr('sensor.battery_optimizer', 'schedule_slots') %}
+          {% if slots %}
+            {% set ch = state_attr('sensor.battery_optimizer', 'charge_hours') | default(0, true) | round(1) %}
+            {% set dh = state_attr('sensor.battery_optimizer', 'discharge_hours') | default(0, true) | round(1) %}
             {{ ch }}h charge / {{ dh }}h discharge
           {% else %}
             No schedule
           {% endif %}
         attributes:
           charge_hours: >-
-            {% set schedule = state_attr('sensor.battery_optimizer', 'schedule') %}
-            {% if schedule %}
-              {% set slot_min = state_attr('sensor.battery_optimizer', 'slot_minutes') | default(15) | float %}
-              {{ (schedule | selectattr('mode', 'eq', 'CHARGE') | list | count * slot_min / 60) | round(2) }}
-            {% else %}
-              0
-            {% endif %}
+            {{ state_attr('sensor.battery_optimizer', 'charge_hours') | default(0, true) | round(2) }}
           discharge_hours: >-
-            {% set schedule = state_attr('sensor.battery_optimizer', 'schedule') %}
-            {% if schedule %}
-              {% set slot_min = state_attr('sensor.battery_optimizer', 'slot_minutes') | default(15) | float %}
-              {{ (schedule | selectattr('mode', 'eq', 'DISCHARGE') | list | count * slot_min / 60) | round(2) }}
-            {% else %}
-              0
-            {% endif %}
+            {{ state_attr('sensor.battery_optimizer', 'discharge_hours') | default(0, true) | round(2) }}
           hold_hours: >-
-            {% set schedule = state_attr('sensor.battery_optimizer', 'schedule') %}
-            {% if schedule %}
-              {% set slot_min = state_attr('sensor.battery_optimizer', 'slot_minutes') | default(15) | float %}
-              {{ (schedule | selectattr('mode', 'eq', 'HOLD') | list | count * slot_min / 60) | round(2) }}
-            {% else %}
-              0
-            {% endif %}
+            {{ state_attr('sensor.battery_optimizer', 'hold_hours') | default(0, true) | round(2) }}
 
       # Learning Stats Sensors
       - name: "Battery Learning Confidence"
@@ -307,12 +321,9 @@ automation:
         data:
           title: "Battery Schedule Updated"
           message: >-
-            {% set schedule = state_attr('sensor.battery_optimizer', 'schedule') %}
-            {% if schedule %}
-              {% set slot_min = state_attr('sensor.battery_optimizer', 'slot_minutes') | default(15) | float %}
-              {% set charge = schedule | selectattr('mode', 'eq', 'CHARGE') | list | count %}
-              {% set discharge = schedule | selectattr('mode', 'eq', 'DISCHARGE') | list | count %}
-              New schedule: {{ (charge * slot_min / 60) | round(1) }}h charge, {{ (discharge * slot_min / 60) | round(1) }}h discharge.
+            {% set slots = state_attr('sensor.battery_optimizer', 'schedule_slots') %}
+            {% if slots %}
+              New schedule: {{ state_attr('sensor.battery_optimizer', 'charge_hours') | default(0, true) | round(1) }}h charge, {{ state_attr('sensor.battery_optimizer', 'discharge_hours') | default(0, true) | round(1) }}h discharge.
               Next charge: {{ state_attr('sensor.battery_optimizer', 'next_charge') | default('None') }}
               Next discharge: {{ state_attr('sensor.battery_optimizer', 'next_discharge') | default('None') }}
             {% else %}

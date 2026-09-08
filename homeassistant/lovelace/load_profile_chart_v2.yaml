@@ -121,7 +121,7 @@ apex_config:
         fontSize: 11px
 series:
   # Min-Max range (outer glow)
-  - entity: sensor.battery_optimizer
+  - entity: sensor.battery_optimizer_load_profile
     name: Min-Max Range
     type: area
     yaxis_id: power
@@ -137,7 +137,7 @@ series:
       });
 
   # P25-P75 range (typical consumption band)
-  - entity: sensor.battery_optimizer
+  - entity: sensor.battery_optimizer_load_profile
     name: Typical (P25-P75)
     type: area
     yaxis_id: power
@@ -153,7 +153,7 @@ series:
       });
 
   # Average line with gradient fill
-  - entity: sensor.battery_optimizer
+  - entity: sensor.battery_optimizer_load_profile
     name: Average
     type: area
     yaxis_id: power

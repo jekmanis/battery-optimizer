@@ -12,6 +12,7 @@ This package contains helper modules for the main BatteryOptimizer AppDaemon app
 - timezone_utils: Timezone-aware datetime comparison and slot alignment
 - ha_helpers: Home Assistant state reading helpers
 - cost_tracker: Battery cost tracking with weighted average calculations
+- energy_counter: Physical-plausibility guard for the daily inverter energy counters
 - schedule_formatter: Schedule logging and formatting for display
 - pv_forecast_service: PV forecast fetching (Solcast / Forecast.Solar)
 - pv_bias_tracker: Sliding PV forecast bias estimation and slot-energy sampling
@@ -63,6 +64,11 @@ from .timezone_utils import (
 )
 from .ha_helpers import SensorReader
 from .cost_tracker import BatteryCostTracker, BatteryCostConfig
+from .energy_counter import (
+    CounterVerdict,
+    EnergyCounterGuard,
+    is_daily_counter_reset,
+)
 from .soc_projection import SocProjectionParams, SocTransition, project_slot_soc
 from .slot_energy import (
     SlotEnergyParams,
@@ -138,6 +144,10 @@ __all__ = [
     # Cost tracker
     "BatteryCostTracker",
     "BatteryCostConfig",
+    # Inverter energy-counter plausibility guard
+    "CounterVerdict",
+    "EnergyCounterGuard",
+    "is_daily_counter_reset",
     # SOC projection (shared slot transition model)
     "SocProjectionParams",
     "SocTransition",

@@ -31,6 +31,45 @@ except ImportError:
 MALFORMED_WARNING_INTERVAL_S = 3600
 
 
+# ``ad_status`` values that mean AppDaemon stopped waiting, not that Home
+# Assistant answered. `websocket_send_json` synthesises `{"success": False}`
+# for both and stamps the status onto it, so without this check a client-side
+# timeout is indistinguishable from a reply that carried no prices.
+#
+# The same classification `direct_control._ad_status_of` applies to
+# `set_wit_mode` and the register reads. Deliberately duplicated rather than
+# imported: the price service must not depend on the inverter module.
+UNCONFIRMED_AD_STATUSES = ("TIMEOUT", "TERMINATING")
+
+# How long AppDaemon may wait for Home Assistant to answer the price fetch.
+#
+# AppDaemon's own default (`ws_timeout`) is 10 s, and a day-ahead fetch goes on
+# to Nord Pool's API. The REST path already allows 30 s; the fallback gets the
+# same budget so the two paths do not disagree about what "too slow" means.
+SERVICE_CALL_TIMEOUT_S = 30
+
+
+def _ad_status_of(response) -> Optional[str]:
+    """Upper-cased ``ad_status`` from a service response, top level or nested.
+
+    AppDaemon 4.5.13 stamps it in `HassPlugin.websocket_send_json`::
+
+        result.update({"ad_status": ad_status.name, "ad_duration": travel_time})
+
+    onto the envelope it returns, but WHERE it lands depends on the AD version
+    and on whether the service declared a response: it can sit at the top level
+    or one level down under ``result``. Both places are checked, exactly as
+    `direct_control._ad_status_of` does.
+    """
+    if not isinstance(response, dict):
+        return None
+    status = response.get("ad_status")
+    if not isinstance(status, str):
+        inner = response.get("result")
+        status = inner.get("ad_status") if isinstance(inner, dict) else None
+    return status.upper() if isinstance(status, str) else None
+
+
 class _MalformedEnd:
     """Sentinel: the source PUBLISHED an ``end`` and it cannot be used.
 
@@ -644,7 +683,28 @@ class NordPoolPriceService:
         if result:
             return result
 
-        # Fallback to AppDaemon call_service (may not return response data)
+        # Fallback to AppDaemon call_service.
+        #
+        # The keyword is `return_response`, and it is NOT optional trivia. In
+        # AppDaemon 4.5.13 `HassPlugin.call_plugin_service` names exactly three
+        # of its own parameters -- `hass_timeout`, `return_response`,
+        # `suppress_log_messages` -- and sweeps *everything else* into the
+        # websocket request's `service_data`:
+        #
+        #     if return_response is not None:
+        #         req["return_response"] = return_response
+        #     service_data = data.pop("service_data", {})
+        #     service_data.update(data)
+        #
+        # So the old `return_result=True` was forwarded to Home Assistant as a
+        # SERVICE PARAMETER, which HA rejected outright:
+        # `invalid_format: not a valid option at 'return_result'`. The
+        # `return_response: True` visible at the top level of that same logged
+        # request was AppDaemon's own doing -- the block below the one quoted
+        # forces it whenever HA's service definition declares a response -- so
+        # the flag we needed was already there and the call still failed on the
+        # junk parameter beside it. Every production occurrence of this fallback
+        # (three between 2026-09-05 and 2026-09-08) failed this way.
         try:
             result = self.call_service(
                 "nordpool/get_price_indices_for_date",
@@ -652,13 +712,99 @@ class NordPoolPriceService:
                 date=date_str,
                 areas=self.nordpool_area,
                 resolution=self.slot_minutes,
-                return_result=True
+                return_response=True,
+                hass_timeout=SERVICE_CALL_TIMEOUT_S,
             )
-            self.log(f"Nord Pool service response for {date_str}: {type(result)}")
-            return result
         except Exception as e:
             self.log(f"Service call failed for {date_str}: {e}", level="WARNING")
             return None
+        return self._unwrap_service_envelope(result, date_str)
+
+    def _unwrap_service_envelope(self, result, date_str):
+        """The price payload inside AppDaemon's ``call_service`` envelope.
+
+        ``None`` means NO DATA, and it is said out loud. The fallback used to
+        return whatever `call_service` handed back, so the error envelope
+        AppDaemon returns for a rejected call --
+        ``{'id', 'type', 'success', 'error', 'ad_status', 'ad_duration'}`` --
+        was passed to `_parse_service_response`, which found no list under any
+        area key and logged "Parsing 0 price entries" at INFO. A refused call
+        and a day with no published prices produced the same line. The caller
+        then fell through to the cached-price path with no reason recorded.
+
+        The success shape is the websocket envelope, documented by AppDaemon's
+        own `ADAPI.call_service` example::
+
+            events = self.call_service("calendar/get_events", ...)
+                        ["result"]["response"]["calendar.home"]["events"]
+
+        i.e. ``{"id":.., "type":"result", "success":True,
+        "result":{"context":{..}, "response":{"LV":[{start,end,price},..]}},
+        "ad_status":"OK"}``. The REST path reaches the same
+        ``{"LV": [...]}`` through the ``service_response`` wrapper, so once
+        unwrapped both paths hand `_parse_service_response` the identical dict.
+
+        A payload that is not an envelope at all is returned untouched -- a
+        plugin or a test double may hand back the bare ``{area: [...]}``.
+        """
+        if result is None:
+            self.log(
+                f"Nord Pool service call for {date_str} returned no response "
+                f"(AppDaemon is not connected, or the service produced "
+                f"nothing); no prices from this path.",
+                level="WARNING",
+            )
+            return None
+
+        ad_status = _ad_status_of(result)
+        if ad_status in UNCONFIRMED_AD_STATUSES:
+            self.log(
+                f"Nord Pool service call for {date_str} did not complete: "
+                f"AppDaemon ad_status={ad_status} after "
+                f"{SERVICE_CALL_TIMEOUT_S}s. Home Assistant may still have run "
+                f"it; no prices were received either way.",
+                level="WARNING",
+            )
+            return None
+
+        if not isinstance(result, dict):
+            return result
+
+        is_envelope = (
+            "ad_status" in result
+            or "success" in result
+            or ("type" in result and "result" in result)
+        )
+        if not is_envelope:
+            # A bare payload: {"LV": [...]}. Nothing to unwrap.
+            return result
+
+        if result.get("success") is False or result.get("error"):
+            self.log(
+                f"Nord Pool service call for {date_str} was refused by Home "
+                f"Assistant: {result.get('error') or 'success=False'}. "
+                f"No prices from this path.",
+                level="WARNING",
+            )
+            return None
+
+        inner = result.get("result")
+        if isinstance(inner, dict):
+            response = inner.get("response")
+            if isinstance(response, (dict, list)):
+                return response
+            # Some AD/HA combinations put the payload straight into `result`.
+            return inner
+        if isinstance(inner, list):
+            return inner
+
+        self.log(
+            f"Nord Pool service call for {date_str} succeeded but carried no "
+            f"response payload (keys: {sorted(result)}). The service must be "
+            f"called with return_response for prices to come back.",
+            level="WARNING",
+        )
+        return None
 
     def _call_nordpool_rest_api(self, date_str: str) -> Optional[Dict]:
         """

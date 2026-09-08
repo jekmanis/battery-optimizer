@@ -13,6 +13,8 @@ import datetime
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
+from .energy_counter import CounterVerdict, EnergyCounterGuard, is_daily_counter_reset
+
 if TYPE_CHECKING:
     from .config import BatteryOptimizerConfig
     from .models import BatteryMode, PricePoint, ScheduleEntry
@@ -179,6 +181,25 @@ class BatteryCostTracker:
         self._last_charge_today_kwh: Optional[float] = None
         self._last_discharge_today_kwh: Optional[float] = None
         self._energy_sensor_available: bool = False
+        # Every booked charge/discharge is the DIFFERENCE between two readings
+        # of a daily counter, so a single bad poll is real energy unless
+        # something checks it against physics. These guards own that check and
+        # the delta baseline; see energy_counter.py for the 2026-09-07 incident
+        # they exist for. The floor mirrors the accumulator's drift tolerance.
+        counter_floor = max(2.0, 0.25 * config.battery_capacity)
+        self._charge_counter = EnergyCounterGuard(
+            max_rate_kw=config.charge_rate,
+            min_bound_kwh=counter_floor,
+            name=config.battery_charge_sensor,
+        )
+        self._discharge_counter = EnergyCounterGuard(
+            # Export discharge can be the faster of the two limits.
+            max_rate_kw=max(
+                config.discharge_rate, config.effective_export_discharge_rate
+            ),
+            min_bound_kwh=counter_floor,
+            name=config.battery_discharge_sensor,
+        )
         self._stored_energy_kwh: Optional[float] = None
         self._current_mode: Optional["BatteryMode"] = None
         self._basis_migrated_this_runtime = False
@@ -483,8 +504,7 @@ class BatteryCostTracker:
         # Initialize inverter energy sensor readings
         charge_today, discharge_today = self._get_inverter_energy_readings()
         if charge_today is not None:
-            self._last_charge_today_kwh = charge_today
-            self._last_discharge_today_kwh = discharge_today
+            self._anchor_energy_counters(charge_today, discharge_today, self._last_soc_time)
             self._energy_sensor_available = True
             # Recalculate stored energy with current SOC
             if current_soc is not None:
@@ -579,18 +599,48 @@ class BatteryCostTracker:
         except (ValueError, TypeError):
             return None, None
 
+    def _anchor_energy_counters(
+        self,
+        charge_kwh: Optional[float],
+        discharge_kwh: Optional[float],
+        now: Optional[datetime.datetime] = None,
+    ) -> None:
+        """Adopt fresh counter readings as the delta baseline without booking.
+
+        Used at startup and on sensor recovery: the counters may have advanced
+        arbitrarily far while nobody was reading them, and that gap is not a
+        charge.
+        """
+        if now is None:
+            now = self._get_datetime()
+        self._last_charge_today_kwh = charge_kwh
+        self._last_discharge_today_kwh = discharge_kwh
+        self._charge_counter.reset(charge_kwh, now)
+        self._discharge_counter.reset(discharge_kwh, now)
+
+    def _counter_for(self, entity: str) -> EnergyCounterGuard:
+        """The plausibility guard owning `entity`'s baseline."""
+        if entity == self._config.battery_charge_sensor:
+            return self._charge_counter
+        return self._discharge_counter
+
+    def _record_counter_value(self, entity: str, value: float) -> None:
+        """Keep the reported `*_today` mirrors in step with the guard baseline."""
+        if entity == self._config.battery_charge_sensor:
+            self._last_charge_today_kwh = value
+        else:
+            self._last_discharge_today_kwh = value
+
     def _is_midnight_reset(self, current: float, previous: float, now: datetime.datetime) -> bool:
         """
         Detect if value drop is due to midnight reset.
 
         Note: `now` comes from get_datetime() which returns HA's configured timezone
-        (local time), matching the inverter's midnight reset behavior.
+        (local time), matching the inverter's midnight reset behavior. The rule
+        itself lives in `energy_counter.is_daily_counter_reset` so the guard and
+        this tracker cannot disagree about what a reset is.
         """
-        if current >= previous:
-            return False
-        minutes_since_midnight = now.hour * 60 + now.minute
-        # Within 5 min of local midnight and current value is small (post-reset)
-        return (minutes_since_midnight < 5 or minutes_since_midnight > 1435) and current < 1.0
+        return is_daily_counter_reset(current, previous, now)
 
     def on_energy_sensor_change(
         self,
@@ -615,8 +665,7 @@ class BatteryCostTracker:
             # Sensor just became available - check if both sensors are now available
             charge_today, discharge_today = self._get_inverter_energy_readings()
             if charge_today is not None:
-                self._last_charge_today_kwh = charge_today
-                self._last_discharge_today_kwh = discharge_today
+                self._anchor_energy_counters(charge_today, discharge_today)
                 if not self._energy_sensor_available:
                     self._energy_sensor_available = True
                     current_soc = self._get_current_soc()
@@ -627,7 +676,6 @@ class BatteryCostTracker:
 
         try:
             current_value = float(new)
-            old_value = float(old)
         except (ValueError, TypeError):
             return
 
@@ -637,18 +685,34 @@ class BatteryCostTracker:
 
         now = self._get_datetime()
 
-        # Detect midnight reset
-        if self._is_midnight_reset(current_value, old_value, now):
-            self._log(f"Midnight reset on {entity}: {old_value:.2f} -> {current_value:.2f} kWh")
-            # Reset tracking for new day
-            if entity == self._config.battery_charge_sensor:
-                self._last_charge_today_kwh = current_value
-            else:
-                self._last_discharge_today_kwh = current_value
+        # The delta comes from the guard's own baseline (the last ACCEPTED
+        # reading), never from HA's `old`: `old` is whatever the previous poll
+        # reported, including a glitch value the guard just refused, and it
+        # carries no timestamp to bound the delta against.
+        verdict = self._counter_for(entity).observe(current_value, now)
+        self._record_counter_value(entity, current_value)
+
+        if verdict.kind == CounterVerdict.MIDNIGHT_RESET:
+            self._log(
+                f"Midnight reset on {entity}: {verdict.previous_kwh:.2f} -> "
+                f"{current_value:.2f} kWh"
+            )
             return
 
-        # Calculate energy delta
-        energy_delta = current_value - old_value
+        if verdict.is_glitch:
+            # Nothing is booked and nothing reaches _process_energy_change, so
+            # _resync_stored_energy never sees the phantom energy either.
+            self._log(
+                f"Rejected implausible energy counter reading: {verdict.message}",
+                level="WARNING",
+            )
+            return
+
+        if not verdict.accepted:
+            # FIRST reading or sub-resolution rounding backwards.
+            return
+
+        energy_delta = verdict.delta_kwh
         if energy_delta < 0.05:  # Ignore tiny changes (noise)
             return
 

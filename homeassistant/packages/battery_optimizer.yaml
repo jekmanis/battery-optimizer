@@ -139,6 +139,19 @@ input_number:
 # =============================================================================
 # Template Sensors - Schedule Display
 # =============================================================================
+# DELETING a template sensor from this file does NOT delete its entity. A YAML
+# template sensor with a `unique_id` gets a row in `.storage/core.entity_registry`
+# (platform: template, config_entry_id: null), and that row outlives the YAML.
+# On every restart HA then restores the entity with no platform to back it, so
+# it reads `unavailable` with the attribute `restored: true` forever — the
+# template platform logs nothing, because there is no template left to fail.
+# `sensor.battery_optimizer_status` and `sensor.battery_overall_efficiency`,
+# removed here on 2026-07-21 (commit 48829c9), are exactly that: two ghosts
+# still in the reference installation's registry.
+# So: after removing a sensor below, also delete its entity in
+# Settings -> Devices & Services -> Entities (filter Status = Unavailable,
+# the row is marked "restored"). Nothing in this package can do it for you.
+# =============================================================================
 template:
   - sensor:
       - name: "Battery Next Charge Time"

@@ -624,6 +624,11 @@ hour so it cannot ride the 15-minute cadence. It never truncates or drops an
 attribute — the fix is to move a payload onto its own recorder-excluded entity,
 not to hide it.
 
+All four publications pass `replace=True`: AppDaemon's `set_state` MERGES the
+attribute dict into what HA already holds, so a key the app stops publishing
+survives until the next HA restart — the first lean deploy still measured
+18 550 bytes with `schedule` present.
+
 Nothing in the app reads any of these entities back; publication is one-way (see
 "There is also no restart override at all").
 

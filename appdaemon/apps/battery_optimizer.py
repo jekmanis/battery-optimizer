@@ -102,7 +102,7 @@ from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
 # published on sensor.battery_optimizer, so a deploy can be PROVEN to be
 # running: on 2026-09-02 the add-on silently imported the previous commit out
 # of a backup directory inside apps/ while SHA256 verification of apps/ passed.
-APP_VERSION = "2026-09-08.2"
+APP_VERSION = "2026-09-08.3"
 
 # Home Assistant's recorder refuses to store an entity's attributes once the
 # serialized blob passes this size ("State attributes for <entity> exceed
@@ -4847,10 +4847,16 @@ class BatteryOptimizer(hass.Hass):
             # Never truncate — say what grew instead.
             self._check_main_sensor_attr_budget(main_attributes)
 
-            # Set sensor state
+            # Set sensor state. `replace=True` matters: AppDaemon's set_state
+            # MERGES the attribute dict into the entity's existing attributes
+            # by default, so a key this app stops publishing (schedule,
+            # load_profile_stats, temp_aware_rates on 2026-09-08) would live on
+            # in HA until the next HA restart — the deployed lean sensor still
+            # measured 18 550 bytes until the call replaced instead of merged.
             self.set_state("sensor.battery_optimizer",
                 state=self.current_mode.name,
                 attributes=main_attributes,
+                replace=True,
             )
 
             # Full per-slot plan on its own entity. This one WILL pass
@@ -4867,7 +4873,8 @@ class BatteryOptimizer(hass.Hass):
                     "last_optimization": last_optimization,
                     **schedule_summary,
                     "friendly_name": "Battery Optimizer Schedule",
-                }
+                },
+                replace=True,
             )
 
             # Separate markdown sensor — lightweight, used by dashboard template
@@ -4876,7 +4883,8 @@ class BatteryOptimizer(hass.Hass):
                 attributes={
                     "md": schedule_md,
                     "friendly_name": "Battery Schedule",
-                }
+                },
+                replace=True,
             )
         except Exception as e:
             self.log(f"Error updating schedule sensor: {e}", level="WARNING")
@@ -4949,6 +4957,7 @@ class BatteryOptimizer(hass.Hass):
                     "observations": self.load_profile.stats.observation_count,
                     "friendly_name": "Battery Optimizer Load Profile",
                 },
+                replace=True,
             )
         except Exception as e:
             self.log(f"Could not update load profile stats sensor: {e}", level="DEBUG")

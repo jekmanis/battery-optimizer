@@ -268,6 +268,15 @@ class TestMainSensorStaysLean:
     def test_the_schedule_entity_is_published_by_the_same_method(self):
         source = inspect.getsource(bo.BatteryOptimizer._update_schedule_sensor)
         assert 'set_state("sensor.battery_optimizer_schedule"' in source
+
+    def test_main_sensor_replaces_attributes_instead_of_merging(self):
+        """AppDaemon's set_state merges attributes by default; a removed key
+        would survive in HA until the next HA restart. Measured on the first
+        deploy: 18 550 bytes with `schedule` still present."""
+        source = inspect.getsource(bo.BatteryOptimizer._update_schedule_sensor)
+        main_call = source.split('set_state("sensor.battery_optimizer",', 1)[1]
+        main_call = main_call.split(")", 1)[0]
+        assert "replace=True" in main_call
         assert '"schedule": schedule_data' in source
         # HA states are strings; an int 0 is falsy and gets dropped from the POST.
         assert "state=str(len(self.schedule))" in source

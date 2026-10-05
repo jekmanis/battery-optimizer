@@ -1,8 +1,7 @@
 # Home Assistant add-on ("app") manifest for the battery optimizer.
 #
 # Every optimizer key is OPTIONAL (`?`): an absent key means "the code's
-# default", exactly like a key missing from the old apps.yaml. The keys and
-# their meaning are the apps.yaml keys documented in options.example.yaml;
+# default". Every key is documented in options.example.yaml;
 # tests/test_addon_options.py checks that every key BatteryOptimizerConfig
 # reads is here and that the example yields the identical config.
 #
@@ -22,7 +21,7 @@ homeassistant_api: true
 # /config inside the container = /addon_configs/local_battery_optimizer on the
 # host (SMB: \\<ha>\addon_configs\local_battery_optimizer). The learning,
 # load-profile, PV-profile and prediction JSON files live here, under the same
-# /config/... paths apps.yaml used, and are part of every HA backup.
+# /config/... paths the options name, and are part of every HA backup.
 map:
   - addon_config:rw
 

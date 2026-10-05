@@ -2,7 +2,7 @@
 # Battery Optimizer - Home Assistant Package
 # =============================================================================
 # This package provides the control entities and UI helpers for the
-# AppDaemon battery optimizer. Include this in your configuration.yaml:
+# battery optimizer add-on. Include this in your configuration.yaml:
 #
 #   homeassistant:
 #     packages:
@@ -11,12 +11,12 @@
 # =============================================================================
 
 # =============================================================================
-# Recorder - keep the bulky AppDaemon entities out of the database
+# Recorder - keep the bulky optimizer entities out of the database
 # =============================================================================
 # Home Assistant's recorder refuses to store an entity's attributes once the
 # serialized blob exceeds 16384 bytes; it logs "State attributes for <entity>
 # exceed maximum size of 16384 bytes ... Attributes will not be stored" and
-# drops ALL of them. The three entities below are published by AppDaemon with
+# drops ALL of them. The three entities below are published by the add-on with
 # set_state and carry payloads that legitimately pass that limit - the per-slot
 # schedule alone is ~217 bytes per slot, so a two-day horizon (~140 slots) is
 # ~30 KB. None of them has any value as history: the app never reads a schedule
@@ -162,7 +162,7 @@ input_number:
     # A freshly created helper must assume the CURRENT basis (2). Without
     # initial:, HA creates restore-less helpers at min (1), which would
     # falsely re-migrate an already-landed battery_avg_cost when the package
-    # is deployed after the AppDaemon code. Set to 1 manually (once) to
+    # is deployed after the optimizer code. Set to 1 manually (once) to
     # convert a legacy raw-spot average from a pre-landed-cost install.
     initial: 2
     mode: box
@@ -334,7 +334,7 @@ automation:
   - id: battery_optimizer_safety_alert
     alias: "Battery Optimizer - Safety Alert"
     description: "Alert when safety limits are reached"
-    # NOTE: Update entity_id below if using a different SOC sensor (must match soc_sensor in apps.yaml)
+    # NOTE: Update entity_id below if using a different SOC sensor (must match the soc_sensor option)
     mode: single
     trigger:
       - platform: numeric_state

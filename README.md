@@ -286,7 +286,7 @@ example values against your bill.
 ```
 addon/battery_optimizer/           # The HA add-on: config.yaml (options schema), Dockerfile,
                                   # run.sh, DOCS.md, options.example.yaml
-appdaemon/apps/                   # (historical name) the optimizer itself
+app/                              # The optimizer (orchestrator + library)
 ├── battery_optimizer.py          # Orchestrator (scheduling, execution)
 └── battery_optimizer_lib/
     ├── ha_host.py                # Host: HA websocket + REST, scheduler, worker pool
@@ -330,9 +330,9 @@ See [docs/scheduling-algorithm.md](docs/scheduling-algorithm.md) for the optimiz
 Python project managed with [`uv`](https://docs.astral.sh/uv/); no enforced linter/formatter.
 
 ```bash
-uv run python -m py_compile appdaemon/apps/battery_optimizer.py   # syntax check
+uv run python -m py_compile app/battery_optimizer.py   # syntax check
 uv run pytest tests/ -v                                           # run tests
-uv run pytest tests/ --cov=appdaemon/apps --cov-report=term-missing
+uv run pytest tests/ --cov=app --cov-report=term-missing
 ```
 
 Library modules are tested standalone. `tests/fake_ha.py` is a fake Home Assistant (websocket + REST on a local socket); `conftest.py` exposes it and a connected host as fixtures, and `tests/test_addon_shadow_run.py` runs the real orchestrator against it in shadow mode.

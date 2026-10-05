@@ -213,7 +213,7 @@ class MockOptimizer:
 # Import the actual algorithm method
 import sys
 from pathlib import Path
-apps_dir = Path(__file__).parent.parent / "appdaemon" / "apps"
+apps_dir = Path(__file__).parent.parent / "app"
 sys.path.insert(0, str(apps_dir))
 
 # We need to import the method from the module

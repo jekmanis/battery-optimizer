@@ -1,8 +1,8 @@
 # Battery Optimizer Scheduling Algorithm
 
 This document describes the dynamic-programming (DP) scheduler in
-`appdaemon/apps/battery_optimizer_lib/dp_optimizer.py` and its orchestration in
-`appdaemon/apps/battery_optimizer.py`.
+`app/battery_optimizer_lib/dp_optimizer.py` and its orchestration in
+`app/battery_optimizer.py`.
 
 ## Objective and inputs
 

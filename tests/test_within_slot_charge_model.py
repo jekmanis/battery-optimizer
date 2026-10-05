@@ -678,8 +678,8 @@ class TestTheDocumentedClaimMatchesTheMeasurement:
 
         root = pathlib.Path(__file__).resolve().parent.parent
         return {
-            "appdaemon/apps/battery_optimizer_lib/slot_energy.py": (
-                root / "appdaemon/apps/battery_optimizer_lib/slot_energy.py"
+            "app/battery_optimizer_lib/slot_energy.py": (
+                root / "app/battery_optimizer_lib/slot_energy.py"
             ).read_text(encoding="utf-8"),
             "docs/scheduling-algorithm.md": (
                 root / "docs/scheduling-algorithm.md"

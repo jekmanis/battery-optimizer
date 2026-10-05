@@ -30,7 +30,7 @@ filterwarnings = [
 ]
 
 [tool.coverage.run]
-source = ["appdaemon/apps"]
+source = ["app"]
 omit = ["tests/*"]
 
 [tool.coverage.report]

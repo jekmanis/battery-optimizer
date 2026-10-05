@@ -251,7 +251,7 @@ class MockOptimizer:
 # Import the actual methods from BatteryOptimizer
 import sys
 from pathlib import Path
-apps_dir = Path(__file__).parent.parent / "appdaemon" / "apps"
+apps_dir = Path(__file__).parent.parent / "app"
 sys.path.insert(0, str(apps_dir))
 
 from battery_optimizer import BatteryOptimizer

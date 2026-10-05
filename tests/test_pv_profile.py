@@ -3,7 +3,7 @@
 import datetime
 import json
 import sys
-sys.path.insert(0, "appdaemon/apps")
+sys.path.insert(0, "app")
 
 from battery_optimizer_lib.pv_profile import PvProfile
 

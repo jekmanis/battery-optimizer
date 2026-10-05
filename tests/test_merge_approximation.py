@@ -393,7 +393,7 @@ FORBIDDEN_CLAIMS = (
 # file, and `test_every_allowance_is_still_needed` fails when one goes stale.
 ALLOWED = (
     (
-        "appdaemon/apps/battery_optimizer_lib/dp_optimizer.py",
+        "app/battery_optimizer_lib/dp_optimizer.py",
         'This solver is therefore NOT "exact for its discretized model"',
     ),
     (
@@ -456,7 +456,7 @@ def _scanned_files(root=None):
         # cover beats none, and `test_the_guard_scans_every_tracked_source`
         # skips rather than lying about it.
         paths = []
-        for pattern in ("appdaemon/**/*.py", "docs/**/*.md"):
+        for pattern in ("app/**/*.py", "docs/**/*.md"):
             paths.extend(
                 p for p in root.glob(pattern) if "__pycache__" not in p.parts
             )
@@ -550,9 +550,9 @@ class TestNoSourceClaimsAnOptimalityItDoesNotHave:
         root = _repo_root()
         scanned = {p.relative_to(root).as_posix() for p in _scanned_files()}
         for required in (
-            "appdaemon/apps/battery_optimizer.py",
-            "appdaemon/apps/battery_optimizer_lib/dp_optimizer.py",
-            "appdaemon/apps/battery_optimizer_lib/schedule_formatter.py",
+            "app/battery_optimizer.py",
+            "app/battery_optimizer_lib/dp_optimizer.py",
+            "app/battery_optimizer_lib/schedule_formatter.py",
             "docs/scheduling-algorithm.md",
             "docs/dp_optimization_parameters.md",
             "README.md",

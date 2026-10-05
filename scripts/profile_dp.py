@@ -38,7 +38,7 @@ import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-APPS_DIR = REPO_ROOT / "appdaemon" / "apps"
+APPS_DIR = REPO_ROOT / "app"
 
 DEFAULT_DATA_DIR = Path(
     os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))

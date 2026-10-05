@@ -40,7 +40,7 @@ def test_stage_is_a_complete_build_context(staged):
     files = deploy.file_hashes(staged)
     for required in deploy.REQUIRED_STAGE_FILES:
         assert required in files
-    lib = sorted(p.name for p in (REPO / "appdaemon/apps/battery_optimizer_lib").glob("*.py"))
+    lib = sorted(p.name for p in (REPO / "app/battery_optimizer_lib").glob("*.py"))
     shipped = sorted(Path(f).name for f in files if f.startswith("app/battery_optimizer_lib/"))
     assert shipped == lib
     assert not any("__pycache__" in f for f in files)

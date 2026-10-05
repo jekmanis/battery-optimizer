@@ -60,7 +60,7 @@ from typing import Dict, List, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ADDON_SRC = REPO_ROOT / "addon" / "battery_optimizer"
-APPS_DIR = REPO_ROOT / "appdaemon" / "apps"
+APPS_DIR = REPO_ROOT / "app"
 ORCHESTRATOR = APPS_DIR / "battery_optimizer.py"
 LIB_DIR = APPS_DIR / "battery_optimizer_lib"
 

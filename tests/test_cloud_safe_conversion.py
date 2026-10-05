@@ -226,7 +226,7 @@ class HedgeOptimizer:
 import sys  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-apps_dir = Path(__file__).parent.parent / "appdaemon" / "apps"
+apps_dir = Path(__file__).parent.parent / "app"
 sys.path.insert(0, str(apps_dir))
 
 from battery_optimizer import BatteryOptimizer  # noqa: E402

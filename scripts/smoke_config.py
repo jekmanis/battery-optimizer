@@ -35,7 +35,7 @@ import traceback
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-APPS_DIR = REPO_ROOT / "appdaemon" / "apps"
+APPS_DIR = REPO_ROOT / "app"
 CONFIG_PY = APPS_DIR / "battery_optimizer_lib" / "config.py"
 
 # Any key whose NAME contains one of these is never printed.

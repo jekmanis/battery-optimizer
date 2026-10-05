@@ -471,7 +471,7 @@ class TestMidnightRule:
 # Wiring: the orchestrator is not unit-tested, so scan the source
 # =========================================================================
 
-_APPS = pathlib.Path(__file__).resolve().parents[1] / "appdaemon" / "apps"
+_APPS = pathlib.Path(__file__).resolve().parents[1] / "app"
 
 
 class TestWiring:

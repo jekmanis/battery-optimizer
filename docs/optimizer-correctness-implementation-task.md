@@ -55,8 +55,8 @@ reliable than line numbers after implementation begins.
 
 | Component | Main files/symbols | Responsibility |
 | --- | --- | --- |
-| Orchestrator | `appdaemon/apps/battery_optimizer.py`: `find_optimal_schedule`, `full_optimize`, `adaptive_optimize`, `execute_scheduled_mode` | Gather inputs, generate and modify plans, execute modes, trigger recovery |
-| Planner | `appdaemon/apps/battery_optimizer_lib/dp_optimizer.py`: `DPOptimizer`, `_run_dp`, `_build_schedule`, `_discharge_index` | Economic objective, energy state transitions, partial-slot lookahead |
+| Orchestrator | `app/battery_optimizer.py`: `find_optimal_schedule`, `full_optimize`, `adaptive_optimize`, `execute_scheduled_mode` | Gather inputs, generate and modify plans, execute modes, trigger recovery |
+| Planner | `app/battery_optimizer_lib/dp_optimizer.py`: `DPOptimizer`, `_run_dp`, `_build_schedule`, `_discharge_index` | Economic objective, energy state transitions, partial-slot lookahead |
 | Charge-rate learning | `battery_optimizer_lib/learning_engine.py`: `record_charging`, `get_charge_rate_for_soc`, `predict_charge_energy_with_warming` | Learn and predict charging capability |
 | Rate precomputation | `battery_optimizer_lib/charge_rate_utils.py`: `compute_charge_rates_per_slot` | Currently predicts rates on a continuous-charging path |
 | Continuous projection | `battery_optimizer_lib/soc_projection.py`: `project_slot_soc` | Expected SOC, deviation detection, and other projection consumers |
@@ -66,7 +66,7 @@ reliable than line numbers after implementation begins.
 | Cost accounting | `battery_optimizer_lib/cost_tracker.py` | Learn from observations and project stored-energy costs |
 
 Abbreviated `battery_optimizer_lib/` paths in the table live under
-`appdaemon/apps/`.
+`app/`.
 
 The main architectural problem is duplicated or inconsistent assumptions:
 the DP implements its own transitions, partial-slot lookahead repeats them,
@@ -664,7 +664,7 @@ Run focused tests while implementing, then the full required suite after
 integration:
 
 ```powershell
-uv run python -m py_compile appdaemon/apps/battery_optimizer.py
+uv run python -m py_compile app/battery_optimizer.py
 uv run pytest tests/ -v
 ```
 

@@ -1,8 +1,8 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `appdaemon/apps/battery_optimizer.py` holds the main optimizer logic (the orchestrator). The directory name is historical; it runs as a Home Assistant add-on.
-- `appdaemon/apps/battery_optimizer_lib/` houses helper modules (learning, load profile, price service, direct inverter control, models) and the add-on host (`ha_host.py`, `addon_main.py`).
+- `app/battery_optimizer.py` holds the main optimizer logic (the orchestrator). The directory name is historical; it runs as a Home Assistant add-on.
+- `app/battery_optimizer_lib/` houses helper modules (learning, load profile, price service, direct inverter control, models) and the add-on host (`ha_host.py`, `addon_main.py`).
 - `addon/battery_optimizer/` is the add-on (manifest + options schema, Dockerfile, run script, `DOCS.md`); `options.example.yaml` is the annotated options template.
 - `scripts/` holds the deploy tooling (`deploy_addon.py`, `addon_options.py`, `compare_shadow.py`, `smoke_config.py`, `profile_dp.py`); see `scripts/README.md`.
 - `homeassistant/packages/battery_optimizer.yaml` defines Home Assistant entities, automations, and scripts.
@@ -11,7 +11,7 @@
 - `README.md` documents setup and usage; `CLAUDE.md` captures architecture notes for agents.
 
 ## Build, Test, and Development Commands
-- `uv run python -m py_compile appdaemon/apps/battery_optimizer.py` - quick syntax check for the main app.
+- `uv run python -m py_compile app/battery_optimizer.py` - quick syntax check for the main app.
 - `uv run python script.py` - run ad-hoc scripts in the repo's Python environment.
 - `uv run pytest tests/ -v` - run the test suite.
 - `uv run python scripts/deploy_addon.py deploy --dry-run`, then `... deploy` - stage, copy to the `addons` share, rebuild and restart the add-on. See CLAUDE.md, "Deployment to the HA machine".

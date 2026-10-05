@@ -8,7 +8,7 @@ import pytest
 from typing import Optional
 
 import sys
-sys.path.insert(0, "appdaemon/apps")
+sys.path.insert(0, "app")
 
 from battery_optimizer_lib import (
     BatteryMode,

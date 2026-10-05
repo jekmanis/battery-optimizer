@@ -1,6 +1,6 @@
 # Battery Optimizer Main Module Analysis
 
-**File:** `appdaemon/apps/battery_optimizer.py`
+**File:** `app/battery_optimizer.py`
 **Lines:** ~2057 (after cleanup)
 **Last analyzed:** 2026-02-02
 

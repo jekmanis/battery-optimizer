@@ -2,8 +2,7 @@
 
 Plans a Growatt WIT battery's charge / hold / discharge schedule from Nord Pool
 prices, load and PV forecasts, and executes it through
-`growatt_modbus/set_wit_mode`. Same optimizer that ran under AppDaemon; this
-add-on is only its host.
+`growatt_modbus/set_wit_mode`.
 
 ## How it talks to Home Assistant
 
@@ -20,13 +19,17 @@ add-on is only its host.
 
 ## Options
 
-Every optimizer option is the apps.yaml key of the same name, and every one is
-optional: an option you leave out takes the code default. See
-`options.example.yaml` in the repository. Convert an existing apps.yaml with
+Every optimizer option is optional: an option you leave out takes the code
+default. `options.example.yaml` in the repository documents every key. Set
+them in the Configuration tab, or from a file:
 
 ```
-uv run python scripts/addon_options.py apps.yaml [--live] --out options.json
+uv run python scripts/deploy_addon.py export-options options.json   # current options
+uv run python scripts/deploy_addon.py options options.json          # set + restart
 ```
+
+A legacy `apps.yaml` app block converts with
+`uv run python scripts/addon_options.py apps.yaml [--live] --out options.json`.
 
 Add-on-level options:
 
@@ -42,7 +45,7 @@ Add-on-level options:
 `/config` in the container is `/addon_configs/local_battery_optimizer` on the
 host (SMB `\\<ha>\addon_configs\local_battery_optimizer`). The learning data,
 load profile, PV profile and prediction tracker JSON files live there under the
-same `/config/...` paths apps.yaml used, and are part of every HA backup.
+same `/config/...` paths, and are part of every HA backup.
 
 ## Threads and blocking
 
@@ -52,26 +55,13 @@ own state with one lock and releases it only around the blocking
 `call_service` that HA does not answer in time is reported as UNCONFIRMED, not
 as a failure; register verification decides.
 
-## Cutover from AppDaemon
+## History and rollback
 
-1. Stop the AppDaemon add-on and set its boot to manual (keep it installed:
-   it is the rollback; with boot auto an HA reboot would start two instances).
-2. Copy the four JSON files from `\\<ha>\addon_configs\a0d7b954_appdaemon\`
-   into `\\<ha>\addon_configs\local_battery_optimizer\` (fresh copies - the
-   shadow run kept its own).
-3. Set the options with `shadow_mode: false` and the real `device_id`
-   (`scripts/addon_options.py <live apps.yaml> --live --out live.json`, then
-   `scripts/deploy_addon.py options live.json --watchdog on`; the
-   Supervisor watchdog restarts the container if it crashes).
-4. Check: `sensor.battery_optimizer` shows this add-on's `app_version`;
-   `sensor.battery_inverter_control_health` shows register matches and no
-   `persistent_mismatch_count`; the log has no Traceback.
-5. Delete the leftover `*_shadow` entities (they are not refreshed any more
-   and disappear at the next HA restart).
+Until 2026-10-05 the optimizer ran on AppDaemon. That add-on
+(`a0d7b954_appdaemon`) is kept installed, stopped and `boot: manual` - with
+`auto` an HA reboot would start a second instance commanding the inverter.
 
-## Rollback
-
-Two commands each way, nothing to copy back:
+Rollback, two commands each way:
 
 1. `uv run python scripts/deploy_addon.py stop` and
    `uv run python scripts/deploy_addon.py boot manual` (this add-on), or set
@@ -79,8 +69,6 @@ Two commands each way, nothing to copy back:
 2. `uv run python scripts/deploy_addon.py boot auto --slug a0d7b954_appdaemon`
    and `uv run python scripts/deploy_addon.py start --slug a0d7b954_appdaemon`.
 
-AppDaemon resumes from its own JSON files, which are older than this add-on's
-by the length of the live run; the learning engine catches up within a day.
-If the add-on's learned data should survive the rollback, copy the four JSON
-files back into `\\<ha>\addon_configs\a0d7b954_appdaemon\` while AppDaemon is
-still stopped.
+The old instance resumes from its own JSON files, which are as old as the
+cutover; to carry the learned data back, copy the four JSON files into
+`\\<ha>\addon_configs\a0d7b954_appdaemon\` before starting it.

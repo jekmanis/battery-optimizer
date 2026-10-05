@@ -2,7 +2,7 @@
 
 import datetime
 import sys
-sys.path.insert(0, "appdaemon/apps")
+sys.path.insert(0, "app")
 
 from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
 

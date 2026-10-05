@@ -12,11 +12,11 @@ The Battery Optimizer uses a statistical load profile to predict household elect
 
 | File | Purpose |
 |------|---------|
-| `appdaemon/apps/battery_optimizer.py` | Orchestrator: reads sensor, records observations, invokes optimizer |
-| `appdaemon/apps/battery_optimizer_lib/load_profile.py` | Statistical engine: stores samples, computes quantile forecasts |
-| `appdaemon/apps/battery_optimizer_lib/models.py` | `LoadProfileStats` dataclass |
-| `appdaemon/apps/battery_optimizer_lib/dp_optimizer.py` | DP algorithm: consumes load predictions |
-| `appdaemon/apps/battery_optimizer_lib/config.py` | Configuration defaults and loader |
+| `app/battery_optimizer.py` | Orchestrator: reads sensor, records observations, invokes optimizer |
+| `app/battery_optimizer_lib/load_profile.py` | Statistical engine: stores samples, computes quantile forecasts |
+| `app/battery_optimizer_lib/models.py` | `LoadProfileStats` dataclass |
+| `app/battery_optimizer_lib/dp_optimizer.py` | DP algorithm: consumes load predictions |
+| `app/battery_optimizer_lib/config.py` | Configuration defaults and loader |
 
 ---
 

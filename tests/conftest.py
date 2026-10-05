@@ -10,7 +10,7 @@ from typing import List
 import pytest
 
 # Add the apps directory to path for imports
-APPS_DIR = Path(__file__).parent.parent / "appdaemon" / "apps"
+APPS_DIR = Path(__file__).parent.parent / "app"
 sys.path.insert(0, str(APPS_DIR))
 
 

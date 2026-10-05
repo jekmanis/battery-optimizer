@@ -35,6 +35,7 @@ Usage:
     uv run python scripts/deploy_addon.py options opts.json [--no-restart]
     uv run python scripts/deploy_addon.py start|stop|restart [--slug SLUG]
     uv run python scripts/deploy_addon.py stage --out DIR
+    uv run python scripts/deploy_addon.py seed [--force]
     uv run python scripts/deploy_addon.py restore <backup-dir>
 """
 
@@ -487,6 +488,81 @@ def cmd_lifecycle(args) -> int:
     return 0
 
 
+# Persisted state, by apps.yaml key, with the config loader's defaults.
+STATE_FILE_KEYS = {
+    "load_profile_file": "/config/load_profile.json",
+    "learning_data_file": "",
+    "prediction_tracker_file": "/config/prediction_tracker.json",
+    "pv_profile_file": "/config/pv_profile.json",
+}
+
+
+def appdaemon_config_dir(share_root: Path = None) -> Path:
+    return Path(share_root or SHARE_ROOT) / "addon_configs" / APPDAEMON_SLUG
+
+
+def addon_config_dir(share_root: Path = None) -> Path:
+    return Path(share_root or SHARE_ROOT) / "addon_configs" / SLUG
+
+
+def seed_plan(app_args: dict, share_root: Path = None):
+    """(key, source, destination) for every state file the live config uses.
+
+    Both containers see their own config dir as ``/config``, so a path is
+    mapped by its part below ``/config`` - the add-on keeps the exact paths
+    apps.yaml used. A path outside ``/config`` cannot be mapped and is an
+    error rather than a guess.
+    """
+    plan = []
+    for key, default in STATE_FILE_KEYS.items():
+        path = app_args.get(key, default)
+        if not path:
+            continue
+        if not str(path).startswith("/config/"):
+            raise DeployError(f"{key}={path!r} is not under /config")
+        rel = str(path)[len("/config/"):]
+        plan.append((key, appdaemon_config_dir(share_root) / rel,
+                     addon_config_dir(share_root) / rel))
+    return plan
+
+
+def read_live_app_args(share_root: Path = None) -> dict:
+    import yaml
+
+    path = appdaemon_config_dir(share_root) / "apps" / "apps.yaml"
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    for value in raw.values():
+        if isinstance(value, dict) and value.get("module") == "battery_optimizer":
+            return value
+    raise DeployError(f"no battery_optimizer app in {path}")
+
+
+def cmd_seed(args) -> int:
+    """Copy the AppDaemon instance's JSON state into the add-on's /config."""
+    plan = seed_plan(read_live_app_args())
+    if not args.force:
+        sup = Supervisor()
+        try:
+            info = sup.info(SLUG) or {}
+        finally:
+            sup.close()
+        if info.get("state") == "started":
+            raise DeployError(f"{SLUG} is running and writes these files; stop it "
+                              "first (or --force)")
+    addon_config_dir().mkdir(parents=True, exist_ok=True)
+    for key, src, dst in plan:
+        if not src.is_file():
+            log(f"  {key}: {src} missing - skipped")
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+        same = hashlib.sha256(src.read_bytes()).hexdigest() == \
+            hashlib.sha256(dst.read_bytes()).hexdigest()
+        log(f"  {key}: {src.name} {dst.stat().st_size} bytes "
+            f"{'verified' if same else 'CHANGED DURING COPY'}")
+    return 0
+
+
 def cmd_restore(args) -> int:
     source = Path(args.backup)
     if not (source / "config.yaml").is_file():
@@ -538,6 +614,10 @@ def main(argv=None) -> int:
         p = sub.add_parser(name)
         p.add_argument("--slug", default=SLUG)
         p.set_defaults(func=cmd_lifecycle)
+
+    p = sub.add_parser("seed", help="copy AppDaemon's JSON state into the add-on")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_seed)
 
     p = sub.add_parser("restore")
     p.add_argument("backup")

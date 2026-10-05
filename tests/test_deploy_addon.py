@@ -108,3 +108,23 @@ def test_log_check():
     assert deploy.check_log(ok, v) == []
     assert deploy.check_log(ok + "\nTraceback (most recent call last):", v)
     assert deploy.check_log("starting", v) == [f"no 'Battery Optimizer version {v}' line yet"]
+
+
+def test_seed_plan_maps_config_paths_between_containers(tmp_path):
+    plan = deploy.seed_plan({
+        "load_profile_file": "/config/load_profile.json",
+        "learning_data_file": "/config/battery_learning_data.json",
+    }, tmp_path)
+    by_key = {k: (s, d) for k, s, d in plan}
+    assert set(by_key) == {"load_profile_file", "learning_data_file",
+                           "prediction_tracker_file", "pv_profile_file"}
+    src, dst = by_key["learning_data_file"]
+    assert src == tmp_path / "addon_configs" / deploy.APPDAEMON_SLUG / "battery_learning_data.json"
+    assert dst == tmp_path / "addon_configs" / deploy.SLUG / "battery_learning_data.json"
+
+
+def test_seed_plan_skips_unset_and_rejects_foreign_paths(tmp_path):
+    plan = deploy.seed_plan({"learning_data_file": ""}, tmp_path)
+    assert "learning_data_file" not in {k for k, _, _ in plan}
+    with pytest.raises(deploy.DeployError):
+        deploy.seed_plan({"pv_profile_file": "/homeassistant/pv.json"}, tmp_path)

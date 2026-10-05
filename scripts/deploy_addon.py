@@ -323,7 +323,9 @@ def fetch_logs(slug: str, lines: int = 300, token: Optional[str] = None) -> str:
     if response.status_code == 401:
         raise DeployError("logs: 401 - not retrying")
     response.raise_for_status()
-    return response.text
+    # text/plain without a charset: requests would guess ISO-8859-1 and turn
+    # every em dash into mojibake. The add-on writes UTF-8.
+    return response.content.decode("utf-8", "replace")
 
 
 def check_log(text: str, version: Optional[str]) -> List[str]:
@@ -457,7 +459,10 @@ def cmd_status(args) -> int:
 
 
 def cmd_logs(args) -> int:
-    sys.stdout.write(fetch_logs(args.slug, args.lines))
+    # Bytes, not text: a Windows console codec cannot encode the log's
+    # em dashes and degree signs.
+    sys.stdout.buffer.write(fetch_logs(args.slug, args.lines).encode("utf-8", "replace"))
+    sys.stdout.flush()
     return 0
 
 

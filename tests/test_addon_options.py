@@ -28,12 +28,9 @@ from battery_optimizer_lib.config import BatteryOptimizerConfig
 
 REPO = Path(__file__).resolve().parent.parent
 ADDON_CONFIG = REPO / "addon" / "battery_optimizer" / "config.yaml"
-EXAMPLES = [
-    REPO / "appdaemon" / "apps" / "apps.yaml.example",
-    REPO / "addon" / "battery_optimizer" / "options.example.yaml",
-]
-# Keys only AppDaemon ever consumed; meaningless to the add-on.
-APPDAEMON_ONLY_KEYS = {"module", "class", "pin_app", "pin_thread"}
+EXAMPLES = [REPO / "addon" / "battery_optimizer" / "options.example.yaml"]
+# Keys of the pre-add-on apps.yaml format that only its host consumed.
+LEGACY_APP_KEYS = {"module", "class", "pin_app", "pin_thread"}
 
 
 def _schema():
@@ -82,12 +79,11 @@ def test_no_dead_options():
     assert not dead, f"options nothing reads: {dead}"
 
 
-@pytest.mark.parametrize("example", [p for p in EXAMPLES if p.exists()],
-                         ids=lambda p: p.name)
+@pytest.mark.parametrize("example", EXAMPLES, ids=lambda p: p.name)
 def test_example_yields_identical_config(example):
     schema = _schema()
     raw = _example_args(example)
-    keys = set(raw) - APPDAEMON_ONLY_KEYS - CONNECTION_KEYS - HOST_OPTIONS
+    keys = set(raw) - LEGACY_APP_KEYS - CONNECTION_KEYS - HOST_OPTIONS
     missing = sorted(k for k in keys if k not in schema)
     assert not missing, f"{example.name} keys missing from the schema: {missing}"
 
@@ -96,7 +92,7 @@ def test_example_yields_identical_config(example):
     token = "supervisor-token"
     via_addon = options_to_args(options, supervisor_token=token)
 
-    via_appsyaml = {k: v for k, v in raw.items() if k not in APPDAEMON_ONLY_KEYS}
+    via_appsyaml = {k: v for k, v in raw.items() if k not in LEGACY_APP_KEYS}
     via_appsyaml["ha_url"] = SUPERVISOR_CORE_URL
     via_appsyaml["ha_token"] = token
     assert _config_dict(via_addon) == _config_dict(via_appsyaml)
@@ -159,7 +155,7 @@ def test_unknown_apps_yaml_key_is_rejected():
         ADDON_OPTIONS.apps_yaml_to_options({"slot_minuts": 15}, _schema(), shadow=True)
 
 
-def test_conversion_drops_appdaemon_and_connection_keys():
+def test_conversion_drops_legacy_host_and_connection_keys():
     options = ADDON_OPTIONS.apps_yaml_to_options(
         {"module": "battery_optimizer", "class": "BatteryOptimizer",
          "pin_app": False, "ha_url": "http://x", "ha_token": "secret",

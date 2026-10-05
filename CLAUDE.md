@@ -4,18 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Battery Optimizer for Growatt WIT Inverter - a Home Assistant AppDaemon application that uses Nord Pool electricity price forecasts to optimize battery charging/discharging schedules.
+Battery Optimizer for Growatt WIT Inverter - a Home Assistant add-on that uses Nord Pool electricity price forecasts to optimize battery charging/discharging schedules.
 
 ## Architecture
 
 ### File Structure
 ```
-appdaemon/apps/
-├── battery_optimizer.py           # Main AppDaemon app (orchestrator)
+addon/battery_optimizer/             # The HA add-on: config.yaml (options schema),
+│                                    #   Dockerfile, run.sh, DOCS.md, options.example.yaml
+appdaemon/apps/                      # (historical name) the optimizer
+├── battery_optimizer.py           # Main app (orchestrator)
 ├── battery_optimizer_lib/         # Python package for helper modules
 │   ├── __init__.py                # Re-exports the public classes
 │   │                              #   (except direct_control and price_horizon,
 │   │                              #    imported by module path)
+│   ├── ha_host.py                 # Host: HA websocket + REST, scheduler, worker pool
+│   ├── addon_main.py              # Add-on entry point: /data/options.json -> config -> app
 │   ├── config.py                  # BatteryOptimizerConfig dataclass
 │   ├── callback_lock.py           # App-wide re-entrant lock behind every callback
 │   ├── models.py                  # Data classes and enums
@@ -40,11 +44,11 @@ appdaemon/apps/
 │   ├── slot_outcome_tracker.py    # Per-slot outcome/compliance tracking
 │   ├── timezone_utils.py          # Timezone-aware datetime helpers
 │   └── ha_helpers.py              # HA state reading helpers
-├── apps.yaml                      # AppDaemon configuration (contains secrets!)
 homeassistant/packages/
 └── battery_optimizer.yaml         # HA entities, automations, sensors
 tests/
-├── conftest.py                    # Pytest fixtures + mock AppDaemon setup
+├── conftest.py                    # Pytest fixtures (fake HA + connected host)
+├── fake_ha.py                     # Fake Home Assistant: websocket + REST
 └── test_*.py                      # Test modules
 ```
 
@@ -52,6 +56,8 @@ tests/
 
 | Module | Key Classes | Purpose |
 |--------|-------------|---------|
+| `ha_host.py` | HAHost, Hass, ShadowPolicy | The host: AppDaemon-compatible API over HA's websocket + REST (see Runtime constraints) |
+| `addon_main.py` | options_to_args, main | Add-on entry point: options -> args (Supervisor URL/token) -> app |
 | `config.py` | BatteryOptimizerConfig | Typed config dataclass with `from_args()` loader |
 | `models.py` | BatteryMode, PricePoint, ScheduleEntry | Pure data structures and enums |
 | `dp_optimizer.py` | DPOptimizer, DPOptimizerConfig, DPOptimizerResult | Dynamic programming SOC-aware scheduling |
@@ -85,7 +91,7 @@ tests/
 
 ### Slot Resolution
 - Default `slot_minutes=15` (96 slots/day) — matches Nord Pool 15-minute pricing periods
-- Configurable via `apps.yaml` (`slot_minutes: 15`)
+- Configurable via the add-on options (`slot_minutes: 15`)
 - Price service requests 15-min resolution from Nord Pool (`resolution` parameter)
 - `_normalize_prices()` maps each published interval onto the slot grid **within its own `[start, end)`** — a coarser interval expands (hourly → 4x15min), finer ones aggregate, and a slot no interval covers completely stays ABSENT. **Interval width is never inferred from timestamp spacing.** It used to be, and spacing cannot tell "these are 30-minute intervals" from "these are 15-minute intervals and the record between them is missing": a reply holding only 10:00-10:15 at 0.01 and 10:30-10:45 at 1.00 was expanded into four quarter hours, so 10:15 — the interval the app was living in — was published at 0.01 and the planner sent CHARGE with `price_source="market"`. Both parsers keep the `end` their source publishes (`{start, end, price}`, `{start, end, value}`); a point with no `end` covers exactly one `slot_minutes` slot. The one exception is the simple sensor list, where the format's own resolution (24 values for a local day, 96 values) IS explicit coverage.
 - Load profile supports migration from coarser buckets (30-min → 15-min) on first load
@@ -109,7 +115,7 @@ Uses **dynamic programming** with SOC state tracking:
 
 `efficiency` is the charge-retention factor, not a complete round-trip figure. `inverter_efficiency` applies on grid AC-to-DC charging and battery DC-to-AC discharge, so the modeled grid-charge round trip is approximately `efficiency * inverter_efficiency^2`.
 
-**One charge-rate unit.** A "charge rate" is always `charge_input_dc_kw` — DC power at the battery terminal, BEFORE retention — everywhere a planner touches it: `charge_rate_kw` in apps.yaml, `SocProjectionParams.charge_rate`, the DP's per-slot rate, `|P_bat|` for the thermal model, and everything `BatteryLearningEngine.get_charge_rate_for_soc` returns. Stored energy is `rate * efficiency * duration`; grid AC is `grid_dc / inverter_efficiency`. Learning *observations* are the other quantity — `stored_charge_kw`, a SOC delta or the inverter's energy counter over an interval — and are recorded and persisted in those units unchanged. The single conversion happens at the API boundary in `get_charge_rate_for_soc`. Applying storage retention to a rate that already described stored-energy growth made a learned 40 %→50 % observation replay as 48.5 %; `tests/test_charge_rate_units.py` is that replay. Do not "simplify" by removing the `* efficiency` at a consumer — that fixes learned rates and breaks the nominal fallback, grid costs and PV limits, which is why the contract is named rather than inferred.
+**One charge-rate unit.** A "charge rate" is always `charge_input_dc_kw` — DC power at the battery terminal, BEFORE retention — everywhere a planner touches it: `charge_rate_kw` in the options, `SocProjectionParams.charge_rate`, the DP's per-slot rate, `|P_bat|` for the thermal model, and everything `BatteryLearningEngine.get_charge_rate_for_soc` returns. Stored energy is `rate * efficiency * duration`; grid AC is `grid_dc / inverter_efficiency`. Learning *observations* are the other quantity — `stored_charge_kw`, a SOC delta or the inverter's energy counter over an interval — and are recorded and persisted in those units unchanged. The single conversion happens at the API boundary in `get_charge_rate_for_soc`. Applying storage retention to a rate that already described stored-energy growth made a learned 40 %→50 % observation replay as 48.5 %; `tests/test_charge_rate_units.py` is that replay. Do not "simplify" by removing the `* efficiency` at a consumer — that fixes learned rates and breaks the nominal fallback, grid costs and PV limits, which is why the contract is named rather than inferred.
 
 `learned_efficiency` is NOT a measurement. It can only be learned from an independent AC meter reading for the charge interval, and there is none; the synthetic `stored / configured_efficiency` input that used to feed it is a tautology and is rejected.
 
@@ -254,9 +260,9 @@ via the `growatt_modbus/set_wit_mode` HA service (no raw register writes):
 - Health accounting reads `apply_mode_with_outcome`'s `ApplyOutcome`, never the boolean: `apply_mode` returns True for three outcomes the inverter never acknowledged (`DRY_RUN`, `SKIPPED_DUPLICATE`, `UNCONFIRMED_TIMEOUT`), so only `SENT` resets `_consecutive_apply_failures`, an unconfirmed timeout escalates to the same ERROR after 3 in a row (the hung-modbus case), and a duplicate skip or dry run is neutral.
 - **Verification is opt-in and pluggable — a `Verifier` strategy, not one hard-wired sensor.** `verify_enabled` (default true) is the master switch; `verify_source` picks the strategy: `registers` / `mode_sensor` / `none` / `auto` (the default: registers whenever `device_id` is set, otherwise none — it deliberately never falls back to the mode sensor).
   - `RegisterVerifier` (recommended) reads holding 30407-30410 and 30200-30201 back through `growatt_modbus/get_register_data` (the schema field is **`start_address`**, not `address`). Expectations are derived from the params that were actually sent, so the check is against the command, not against a label: 30410 accepts `{2, 1}` (the handler writes either for an enabled AC charge), 30408 (duration, which does not count down) is informational only, and **any unclean read — exception, `None`, `ad_status` TIMEOUT/TERMINATING at either envelope depth, `success: False`, a short `values` list — is UNVERIFIABLE, never a MISMATCH.**
-  - `ModeSensorVerifier` compares `inverter_mode_sensor` and is only correct while the integration's never-cleared `_failed_optional_holding_addrs` blacklist has not frozen that entity. On 2026-09-01T03:46:34Z one transient read failure froze it at "Passthrough" indefinitely; the 2026-09-02 log then carried 73/73 false mismatches, each paying for a blocking resend on the single AppDaemon thread. Empty `inverter_mode_sensor` disables it — no entity is ever guessed.
+  - `ModeSensorVerifier` compares `inverter_mode_sensor` and is only correct while the integration's never-cleared `_failed_optional_holding_addrs` blacklist has not frozen that entity. On 2026-09-01T03:46:34Z one transient read failure froze it at "Passthrough" indefinitely; the 2026-09-02 log then carried 73/73 false mismatches, each paying for a blocking resend on the then-single AppDaemon thread. Empty `inverter_mode_sensor` disables it — no entity is ever guessed.
   - A `passthrough` match is recorded **non-probative** (`VerificationOutcome.probative=False`): a sensor that ignores overrides entirely reads "Passthrough" too, so counting it as verified would manufacture evidence.
-  - `hass_timeout` expiry does not raise and does not return None: AppDaemon 4.5.13 stamps `ad_status: TIMEOUT` on the response, which is classified `UNCONFIRMED_TIMEOUT`, not `FAILED`. `_ad_status_of()` is the one helper both the `set_wit_mode` call and the register read use, because the stamp lands at the top level on some AD versions and under `result` on others.
+  - `hass_timeout` expiry does not raise and does not return None: the host stamps `ad_status: TIMEOUT` on the response (as AppDaemon 4.5.13 did), which is classified `UNCONFIRMED_TIMEOUT`, not `FAILED`. `_ad_status_of()` is the one helper both the `set_wit_mode` call and the register read use, because the stamp lands at the top level on some AD versions and under `result` on others.
   - **Physical plausibility is NOT a verification strategy.** Do not add one: on 2026-09-02 a discharge command at -100 % measured -39.7 W because SOC was 12 % against a 10 % cutoff. Correct behaviour, and indistinguishable from a dropped override.
 - The ladder itself is a **bounded two-step ladder**, max 2 checks and 2 sends per `apply_mode` — never a resend loop:
   1. after `verify_delay_seconds` (default 90) the configured source is consulted; a genuine mismatch → WARNING (naming the source and the raw value) + resend once (bypassing duplicate suppression) + schedule check 2;
@@ -270,7 +276,7 @@ via the `growatt_modbus/set_wit_mode` HA service (no raw register writes):
   `apply_mode_with_outcome`/`release_control`, and why `_verify_mode` reports
   its duration to `record_external_callback_duration` (which takes the app
   lock) only after both DirectControl locks are released.
-- Dry-run mode: `device_id: ""` in apps.yaml logs commands without sending them
+- Dry-run mode: `device_id: ""` in the options logs commands without sending them (`shadow_mode: true` forces it)
 
 ### Battery Cost Tracking
 - **Units**: `battery_avg_cost` is landed EUR per stored DC kWh, not raw spot price
@@ -314,7 +320,7 @@ triggers.  `_register_closed` only ever clears the streak on a *good* slot, so
 without the reset persistent cloud cover made it grow 2, 3, 4, 5 … and the
 `streak < pv_reactive_consecutive_slots` guard could never hold again — every
 following slot paid for a full `_recalculate_remaining_schedule` on the same
-AppDaemon thread the `_timed_callback` instrumentation warns about. The reset
+app lock the `_timed_callback` instrumentation warns about. The reset
 bounds the cadence at one recalculation per `pv_reactive_consecutive_slots`
 slots.
 
@@ -339,38 +345,48 @@ observed production, which would otherwise make the ratio read ~1.0.
 
 ### Runtime constraints
 
-**This app needs more than one AppDaemon thread, and `total_threads` alone
-is not enough.** `set_wit_mode` is a synchronous, blocking service call made
-from a callback, so on the default single thread one slow inverter write stalls
-schedule execution, the SOC listener and PV sampling alike (production: 70 ×
-"Excessive time spent in callback (limit=10.0s)" at 10–34 s, all on
-`thread-0`). Two settings are required (AppDaemon 4.5.13):
+**The app runs as a Home Assistant add-on on `battery_optimizer_lib/ha_host.py`,
+which provides the slice of AppDaemon's API the orchestrator was written
+against** (AppDaemon 4.5.13 was its host until 2026-10-05). The host keeps
+those semantics on purpose, because every caller was built and debugged
+against them:
 
-```yaml
-# appdaemon.yaml
-appdaemon:
-  total_threads: 4
-  thread_duration_warning_threshold: 25   # optional; a set_wit_mode write is legitimately ~15 s
-```
-```yaml
-# apps.yaml (LIVE file — hand-edit; it holds the HA token)
-battery_optimizer:
-  pin_app: false
-```
+- `call_service` goes over HA's websocket and returns HA's result envelope
+  with `ad_status` / `ad_duration` stamped on it. A request written to the
+  socket but not answered within `hass_timeout` (default 10 s) returns
+  `{"success": False, "ad_status": "TIMEOUT"}` - UNCONFIRMED in
+  `direct_control` and `price_service`, never FAILED. A refused call is HA's
+  own `success: False` envelope (FAILED). Disconnected -> `None` (nothing was
+  sent); a write that breaks mid-send raises. `return_response` is set
+  automatically for services whose definition declares a response; the
+  catalogue is reloaded on `service_registered`, so an integration that loads
+  after the host connected is still covered.
+- `listen_state` fires only when the watched value changed, with
+  `(entity, attribute, old, new, kwargs)`. Timer callbacks get `(kwargs)` -
+  or `**kwargs` when the unwrapped function declares `**` - and event
+  callbacks `(event, data, kwargs)`. `run_every` keeps its grid (next fire =
+  previous DUE + interval, missed beats collapse into one); `run_daily`
+  recomputes the local wall time every day (DST-safe).
+- `set_state` merges into the cached attributes unless `replace=True`, then
+  `POST /api/states/<entity>` (which HA stores as given).
+- `datetime()` is NAIVE local time in HA's zone, `datetime(aware=True)` aware,
+  `get_timezone()` a `zoneinfo` zone. The process zone is set to HA's zone at
+  startup (`TZ` + `tzset`) because `_get_local_timezone` falls back to
+  `datetime.now().astimezone().tzinfo`.
+- Reconnect: backoff (1/2/5/10/30 s; 60 s after a refused token), re-auth,
+  re-subscribe, reload the catalogue, replace the state cache with a fresh
+  `get_states`. Listeners and timers stay registered and nothing is re-fired
+  for what changed during the outage.
 
-`total_threads` clears the GLOBAL `pin_apps` flag only
-(`models/config/appdaemon.py` `model_post_init`), while `app_should_be_pinned`
-reads `cfg.pin_app or self.pin_apps` and `models/config/app.py` defaults
-`pin_app: True`. A pinned app with `pin_thread = None` hits `select_q`'s
-`"Invalid thread ID for pinned thread in app: ... - assigning to thread 0"`
-WARNING **on every dispatch** and still runs everything on thread-0 — so
-`total_threads` without `pin_app: false` is strictly worse than the default.
-With both set, dispatch is round-robin and this app's callbacks genuinely run
-**concurrently**. Do not set `pin_threads` (forced to 0). Rollback lever
-without touching `appdaemon.yaml`: `pin_app: true` + `pin_thread: 2` (must be
-`< total_threads`). Startup check: expect `Starting apps with 4 worker threads,
-with None reserved for pinned apps`, and NO "Invalid thread ID for pinned
-thread" line for `battery_optimizer`.
+**Callbacks run concurrently.** `ha_host` dispatches every timer, state and
+event callback to a pool of `worker_threads` threads (add-on option, default
+4) and does NOT serialize them itself - a host-level lock would invert the
+lock order below, and `DirectControl._verify_mode` deliberately runs outside
+the app lock. `set_wit_mode` is a synchronous, blocking service call made from
+a callback; on AppDaemon's default single thread one slow inverter write
+stalled schedule execution, the SOC listener and PV sampling alike
+(production: 70 × "Excessive time spent in callback (limit=10.0s)" at 10–34 s,
+all on `thread-0`).
 
 **Concurrency is handled by one app-wide lock, not by an async rewrite.**
 `initialize`'s first statement is `self._lock = CallbackLock(log_func=self.log)`
@@ -393,21 +409,16 @@ lock for their `open(..., "w")` truncation window.
 The app instruments its own callbacks via `_timed_callback` and
 `_record_callback_duration()` — `time.monotonic()` is sampled outside the
 acquire so lock wait counts as thread occupancy — warning above
-`callback_warn_seconds` and repeating the `total_threads` + `pin_app` advice
-once after three overruns. The decorator must keep `functools.wraps` +
-`*args/**kwargs`: AppDaemon calls these positionally
-(`execute_scheduled_mode(kwargs, force=True)`) and the orchestrator is not
-unit-tested (`tests/test_callback_instrumentation.py` guards the wiring with
-source-scanning tests instead).
+`callback_warn_seconds` and, once after three overruns, pointing at
+`set_wit_mode_timeout_seconds` and the inverter integration. The decorator
+must keep `functools.wraps` + `*args/**kwargs`: the host inspects the
+unwrapped signature and calls these positionally
+(`execute_scheduled_mode(kwargs, force=True)`);
+`tests/test_callback_instrumentation.py` guards the wiring with
+source-scanning tests.
 
 Asynchronous I/O is explicitly out of scope — the mitigation is a shorter
-timeout, more threads plus the app lock, not a rewrite.
-
-The 2026-09-02 production log predates this: it was produced by commit 86a2ffb
-imported from a backup directory the deploy script had placed *inside* `apps/`
-(AppDaemon rglobs `app_dir` and `sys.path.insert(0)`s every subdirectory
-containing `.py` files), not by the files in `apps/` — which is why its log
-wording does not match master.
+timeout, worker threads plus the app lock, not a rewrite.
 
 ### Scheduled Tasks
 Everything below is registered in `initialize` (`run_daily` / `run_every`); there is no
@@ -426,8 +437,8 @@ separate safety-check job and nothing runs hourly.
 answers "is the horizon usable" (current interval present, contiguous, reaching
 the end of the current publication window — measured between UTC instants, never
 as a count of slots, because a Riga DST day is 92 or 100 quarter-hours). That
-midnight is attached with the zone's `localize` because AppDaemon's
-`get_timezone()` is a **pytz** zone: `combine(..., tzinfo=<pytz zone>)` answers
+midnight is attached with the zone's `localize` when it has one, because
+AppDaemon's `get_timezone()` (the previous host) was a **pytz** zone: `combine(..., tzinfo=<pytz zone>)` answers
 with Riga's +01:37 local-mean-time offset, which put the required end at 22:23
 UTC against a day that ends at 21:00 UTC and re-fetched every 15 min forever
 (production, 2026-09-05). The
@@ -510,77 +521,64 @@ retry are unchanged.
 
 ## Deployment to the HA machine
 
-The running app lives on the Home Assistant share, not in this repo:
+The app is the local add-on `local_battery_optimizer`, built by the Supervisor
+from the `addons` share; there is no token anywhere (the Supervisor injects
+`SUPERVISOR_TOKEN` and proxies Core at `http://supervisor/core`):
 
 ```
-//192.168.77.167/addon_configs/a0d7b954_appdaemon/apps/
-├── apps.yaml              # LIVE config, contains the HA token — never overwrite from here
-├── battery_optimizer.py
-└── battery_optimizer_lib/
+//192.168.77.167/addons/battery_optimizer/            # build context (staged, not edited by hand)
+├── config.yaml  Dockerfile  run.sh  DOCS.md  requirements.txt
+└── app/  battery_optimizer.py  battery_optimizer_lib/
+//192.168.77.167/addon_configs/local_battery_optimizer/   # the container's /config
+└── battery_learning_data.json  load_profile.json  pv_profile.json  prediction_tracker.json
 ```
 
-**STOP the AppDaemon add-on before copying more than one file.** AppDaemon
-hot-reloads on every `.py` modification, so a multi-file copy is imported
-*while it is still in progress*: it will load a new module against its old
-peers. That is not hypothetical — on 2026-07-28 it produced
+The options (the pre-add-on apps.yaml keys, all optional; schema in
+`addon/battery_optimizer/config.yaml`, annotated in `options.example.yaml`)
+live in the Supervisor: `deploy_addon.py export-options <file>` /
+`deploy_addon.py options <file>`.
 
-```
-ModuleNotFoundError: No module named 'battery_optimizer_lib.soc_projection'
-TypeError: record_discharging() got an unexpected keyword argument 'battery_temp_start'
-```
+`scripts/deploy_addon.py deploy` (details in `scripts/README.md`): git check,
+pytest, syntax check, stage (version = `APP_VERSION`), backup, mirror +
+SHA256 into the share, then install / update / rebuild / start through HA's
+websocket `supervisor/api` with the ADMIN token (`~/.ha_token`; the REST
+`/api/hassio/addons/<slug>/info` path answers 401 for every token), then a
+log check. A rebuild replaces the whole image, so there is no hot reload and
+no half-copied tree to import - the failure mode that produced
+`ModuleNotFoundError: battery_optimizer_lib.soc_projection` under AppDaemon on
+2026-07-28.
 
-from a tree whose files were all individually correct. Copying a *single*
-file while running is safe (one reload, no window).
+**Backups must never live under `addons/`.** The Supervisor scans that tree
+for `config.yaml`; a backup there is a second add-on with the same slug. They
+go to `//192.168.77.167/share/battery_optimizer_backups/addon-<ts>/`. Same
+class of bug as 2026-09-02, when `deploy.ps1` wrote `apps/backup-20260902-015911/`
+and AppDaemon (which rglobbed `apps/` and put every `.py` directory at the
+front of `sys.path`) imported the previous commit while SHA256 verification
+passed.
 
-**Backups must never live under `apps/`.** AppDaemon discovers apps with
-`app_dir.rglob("*.py")` and does `sys.path.insert(0, <dir>)` for every
-directory below `apps/` that holds `.py` files and has no `__init__.py`, so
-such a directory sits at the *front* of `sys.path` and wins every
-`import battery_optimizer` / `import battery_optimizer_lib`. On 2026-09-02
-`deploy.ps1` wrote `apps/backup-20260902-015911/` and the add-on then ran the
-*previous* commit while SHA256 verification of `apps/` passed — the files in
-`apps/` were correct, the wrong ones were imported from the sibling directory.
-The only symptoms were an old log wording and a health sensor missing the
-attributes the new commit added. Backups therefore go to
-`<share-root>/backups/battery_optimizer/`, and nothing but
-`battery_optimizer.py`, `battery_optimizer_lib/` and `hello.py` may hold `.py`
-under `apps/`.
+**SHA256 proves the bytes on the share; it does not prove what runs.**
+`initialize` logs `Battery Optimizer version <APP_VERSION>:
+orchestrator=/app/battery_optimizer.py lib=/app/battery_optimizer_lib/__init__.py`,
+`sensor.battery_optimizer` carries `app_version` / `code_paths`, and the
+add-on version the Supervisor shows is `APP_VERSION`. Bump `APP_VERSION` in
+`battery_optimizer.py` with behaviour changes. After any install: no
+`Traceback` / `ModuleNotFoundError` / `TypeError` in the log
+(`deploy_addon.py logs`, or `curl` with `Range: entries=:-800:` from Git Bash
+- PowerShell 5.1 refuses that header), `full_optimize` in seconds,
+`sensor.battery_optimizer` with `price_horizon.ok` true after 14:00 local,
+`schedule_slots > 0` and a moving `last_updated`.
 
-**SHA256 proves the bytes on the share; it does not prove AppDaemon imported
-them.** Every deploy must end with a positive check that the *running* code is
-the new one: `initialize` logs `Battery Optimizer version <APP_VERSION>:
-orchestrator=<path> lib=<path>`, and `sensor.battery_optimizer` carries the
-same as `app_version` / `code_paths`. Both paths must point into `apps/`
-itself. Bump `APP_VERSION` in `battery_optimizer.py` with behaviour changes.
+**Shadow mode** (`shadow_mode: true`, `entity_suffix`) is a parallel run: the
+host suppresses every service except the read-only ones (no inverter command,
+no `input_*` write), `device_id` is forced empty, and every published entity
+gets the suffix. `scripts/compare_shadow.py` compares the two plans.
 
-Procedure:
-
-1. Back up `battery_optimizer.py` + `battery_optimizer_lib/` on the share.
-2. Stop the add-on.
-3. Copy both, then delete `__pycache__` in each directory.
-4. Verify every deployed file matches the repo, then start the add-on.
-
-Before deploying, smoke-test the new code against the LIVE `apps.yaml`
-(`BatteryOptimizerConfig.from_args`) and import every module — the unit suite
-does not cover the orchestrator, so a config or wiring break only shows up here.
-
-`scripts/deploy.ps1` automates exactly that procedure (Windows PowerShell 5.1):
-git-clean check plus the commit/branch it will deploy, `pytest`, `py_compile`,
-`scripts/smoke_config.py` against a temp copy of the LIVE `apps.yaml` (deleted
-immediately — the share's `apps.yaml` is only ever read), a pre-flight scan
-that aborts on anything under `apps/` AppDaemon would import besides our own
-files (`-MoveStrayBackups` relocates legacy `backup-*` directories instead of
-aborting), a timestamped `<share-root>/backups/battery_optimizer/backup-<ts>/`
-keeping the 5 newest, stop → copy (pruning `.py` files the repo no longer has)
-→ `__pycache__` cleanup → SHA256 verification → mtime stamping (`Copy-Item`
-preserves the source time, which would make the share's timestamps describe
-the git checkout) → start → a best-effort post-deploy read of the add-on log
-for "Initializing Battery Optimizer", import errors and the worker-thread
-count. Start with `-DryRun`, which runs every check and prints the planned copy
-list while writing nothing; `-Restore <backup-dir>` rolls a deploy back through
-the same stop/copy/start dance. Add-on stop/start goes through HA's Supervisor
-proxy when `-HaToken` is given, otherwise the script pauses for you to do it in
-the UI. See `scripts/README.md`.
+**Rollback:** the AppDaemon add-on `a0d7b954_appdaemon` stays installed and
+stopped, with its `apps/` (APP_VERSION 2026-09-08.3) and its JSON files as of
+the cutover. `deploy_addon.py stop`, then
+`deploy_addon.py start --slug a0d7b954_appdaemon`; copy the four JSON files
+back into `//192.168.77.167/addon_configs/a0d7b954_appdaemon/` first if the
+learned data should survive. Never uninstall it or delete its config dir.
 
 ### HA sensors and the recorder attribute limit
 
@@ -624,7 +622,7 @@ hour so it cannot ride the 15-minute cadence. It never truncates or drops an
 attribute — the fix is to move a payload onto its own recorder-excluded entity,
 not to hide it.
 
-All four publications pass `replace=True`: AppDaemon's `set_state` MERGES the
+All four publications pass `replace=True`: the host's `set_state` (like AppDaemon's) MERGES the
 attribute dict into what HA already holds, so a key the app stops publishing
 survives until the next HA restart — the first lean deploy still measured
 18 550 bytes with `schedule` present.
@@ -634,7 +632,7 @@ Nothing in the app reads any of these entities back; publication is one-way (see
 
 ## Development
 
-This is a Python AppDaemon project. Use `uv` for running Python scripts and syntax checks. No formatter or linter is enforced.
+This is a Python project that ships as a Home Assistant add-on. Use `uv` for running Python scripts and syntax checks. No formatter or linter is enforced.
 
 **Shell note**: Even though the platform is Windows, the shell is bash. Don't use Windows-specific syntax like `cd /d`. The working directory is already set, so run commands directly without `cd`.
 
@@ -656,9 +654,11 @@ uv run pytest tests/ --cov=appdaemon/apps --cov-report=term-missing
 ```
 
 ### Testing Architecture
-- `conftest.py` mocks the entire `appdaemon.plugins.hass.hassapi` module before any imports, so library modules can be tested without AppDaemon installed.
-- Library modules in `battery_optimizer_lib/` are tested directly. The main `battery_optimizer.py` (AppDaemon orchestrator) is not unit-tested — it's validated via dry-run mode (`device_id: ""` in apps.yaml).
-- `apps.yaml` contains a long-lived HA access token — do not commit changes to it carelessly.
+- Library modules in `battery_optimizer_lib/` are tested directly. `ha_host.Hass` is constructible without a host, so app test doubles subclass `BatteryOptimizer` with no module mock.
+- `tests/fake_ha.py` is a fake Home Assistant (RFC 6455 websocket + `POST /api/states` + `POST /api/services` on a local socket), so host tests run the real `websocket-client` / `requests` paths; `conftest.py` exposes it as `fake_ha` and a connected `HAHost` as `ha_host`.
+- `tests/test_addon_shadow_run.py` runs the real orchestrator (`initialize`, startup `full_optimize`, slot execution, every helper-writing path) against the fake HA in shadow mode.
+- `tests/test_addon_options.py` keeps the options schema, `options.example.yaml` and `from_args` in step.
 
 ## Key Dependencies
-- AppDaemon 4, Home Assistant, Nord Pool integration, Growatt Modbus integration
+- Home Assistant (Supervisor add-on), Nord Pool integration, Growatt Modbus integration
+- `websocket-client` (synchronous, fits the threaded host) and `requests` in the image; base image pinned in `addon/battery_optimizer/Dockerfile`

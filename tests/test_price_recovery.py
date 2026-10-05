@@ -14,7 +14,7 @@ after the configured publication window, therefore leaves the optimizer on an
 old or absent plan until an unrelated trigger or the next daily optimization.
 
 Everything here is deterministic: a settable clock, a scripted price service,
-and a stubbed planner.  No AppDaemon, no HA, no network.
+and a stubbed planner.  No host, no HA, no network.
 """
 
 from __future__ import annotations
@@ -116,7 +116,7 @@ class FakeOutcomeTracker:
 
 
 class RecoveryOptimizer(bo.BatteryOptimizer):
-    """Orchestrator with AppDaemon and the planner replaced by test doubles.
+    """Orchestrator with the host and the planner replaced by test doubles.
 
     The planner is stubbed on purpose: Task 5 is about *whether* a plan is
     rebuilt and applied after prices come back, not about its economics.
@@ -129,7 +129,7 @@ class RecoveryOptimizer(bo.BatteryOptimizer):
         self.config = bo.BatteryOptimizerConfig(**config_overrides)
         self._lock = CallbackLock()
         self._tz = tz
-        # What AppDaemon's own `get_timezone()` offers: a zone name, a tzinfo,
+        # What a host's `get_timezone()` may offer: a zone name, a tzinfo,
         # an exception, or nothing. `_tz` stays the FIXED-OFFSET value
         # production gets from `_get_local_timezone()` when `self.datetime()`
         # is naive.
@@ -182,7 +182,7 @@ class RecoveryOptimizer(bo.BatteryOptimizer):
         # State that initialize() builds for the price-recovery owner.
         self._init_price_recovery_state()
 
-    # --- AppDaemon surface -------------------------------------------------
+    # --- host surface -------------------------------------------------------
     def log(self, message, level="INFO"):
         self.logs.append((message, level))
 
@@ -204,7 +204,7 @@ class RecoveryOptimizer(bo.BatteryOptimizer):
         self.cancelled_timers.append(handle)
 
     def get_timezone(self):
-        """AppDaemon's own accessor - a configured zone NAME in production."""
+        """The host's accessor - a configured zone NAME on some hosts."""
         if isinstance(self._zone_source, BaseException):
             raise self._zone_source
         return self._zone_source
@@ -356,7 +356,7 @@ class TestEmptyThenSuccessRecovery:
 
         ``_price_recovery_retry`` fetched, judged the horizon, and then
         ``_recalculate_remaining_schedule`` fetched AGAIN -- a second blocking
-        REST call on the shared AppDaemon worker thread, and a second snapshot,
+        REST call under the app lock, and a second snapshot,
         so the plan could be built from data the verdict never saw.
         """
         app = RecoveryOptimizer(base_now, prices=[])
@@ -995,7 +995,7 @@ class TestDstBoundaryWithAProductionTimezone:
     """Finding 3: local midnight computed with a FIXED offset is 1 h wrong.
 
     `_get_local_timezone()` returns `datetime.now().astimezone().tzinfo` - a
-    fixed `datetime.timezone` - whenever AppDaemon hands the app a naive
+    fixed `datetime.timezone` - whenever the host hands the app a naive
     `self.datetime()`.  Combining a date with that offset gives the wrong
     instant for the midnight on the far side of a DST transition, so a complete
     horizon was judged `tomorrow_missing` all afternoon (and, with finding 2,
@@ -1098,7 +1098,7 @@ def _real_riga():
 
 
 class _PytzLikeZone(datetime.tzinfo):
-    """What AppDaemon's `get_timezone()` hands the app: a pytz zone.
+    """What AppDaemon's `get_timezone()` (the previous host) handed the app: a pytz zone.
 
     Faithful to the one pytz behaviour that matters here: attached with
     `combine(..., tzinfo=zone)` or `replace(tzinfo=zone)` (`dt.tzinfo is self`)

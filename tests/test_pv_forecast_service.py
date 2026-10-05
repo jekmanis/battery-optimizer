@@ -515,7 +515,7 @@ class TestCaching:
         ``_cache_timestamp`` is written only when a provider returns data, so
         while Solcast / Forecast.Solar were down the guard never engaged and
         every optimize / adaptive / PV-shortfall pass re-issued the fetch —
-        for Forecast.Solar a 30 s blocking ``requests.get`` on an AppDaemon
+        for Forecast.Solar a 30 s blocking ``requests.get`` on a
         callback thread.
         """
         config = PvForecastServiceConfig(
@@ -591,7 +591,7 @@ class TestCaching:
         assert svc.refresh() is False
 
     def test_forecast_solar_http_timeout_is_bounded(self):
-        """The blocking REST call runs on an AppDaemon callback thread."""
+        """The blocking REST call runs on a callback worker thread."""
         config = PvForecastServiceConfig(
             forecast_solar_lat=56.9,
             forecast_solar_lon=24.1,

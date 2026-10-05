@@ -1,243 +1,100 @@
 # scripts/
 
-Deployment tooling for the AppDaemon share. Both scripts are read-only until
-you drop `-DryRun`.
+Tooling for the Home Assistant add-on (`addon/battery_optimizer/`). Everything
+that talks to HA reads the **admin** token from `~/.ha_token` (first line),
+never prints it, and authenticates **once** per run — repeated 401s can get the
+client IP banned.
 
-## `deploy.ps1`
+## `deploy_addon.py`
 
-Automates the manual procedure in CLAUDE.md § "Deployment to the HA machine".
-Windows PowerShell 5.1 compatible (no `&&`/`||`, no ternary, no `??`).
+Builds, copies and (re)installs the add-on. A local add-on is a directory in
+the HA `addons` share (`\\192.168.77.167\addons\battery_optimizer`); the
+Supervisor builds the image from it.
 
-```powershell
-# rehearsal: every check runs, nothing is written to the share
-.\scripts\deploy.ps1 -DryRun
-
-# real deploy, pausing twice so you stop/start the add-on in the HA UI
-.\scripts\deploy.ps1
-
-# real deploy, unattended (stop/start via hassio.addon_stop / hassio.addon_start)
-.\scripts\deploy.ps1 -HaToken $env:HA_TOKEN -NoPause
-
-# same, but stop/start through the legacy Supervisor proxy (older HA only)
-.\scripts\deploy.ps1 -HaToken $env:HA_TOKEN -NoPause -AddonApi proxy
-
-# one-off: evacuate legacy backup-* directories out of apps\ first
-.\scripts\deploy.ps1 -MoveStrayBackups -HaToken $env:HA_TOKEN -NoPause
-
-# roll back
-.\scripts\deploy.ps1 -Restore '\\192.168.77.167\addon_configs\a0d7b954_appdaemon\backups\battery_optimizer\backup-20260902-015714'
+```bash
+uv run python scripts/deploy_addon.py deploy --dry-run        # every check, prints the file list, writes nothing
+uv run python scripts/deploy_addon.py deploy                  # the real thing
+uv run python scripts/deploy_addon.py deploy --options o.json # ... and set the options
+uv run python scripts/deploy_addon.py status                  # both add-ons: state, version, shadow_mode
+uv run python scripts/deploy_addon.py logs [--lines 300] [--slug SLUG]
+uv run python scripts/deploy_addon.py options o.json          # set options + restart
+uv run python scripts/deploy_addon.py export-options o.json   # current options -> file
+uv run python scripts/deploy_addon.py start|stop|restart [--slug SLUG]
+uv run python scripts/deploy_addon.py seed [--force]          # copy the rollback instance's JSON state in
+uv run python scripts/deploy_addon.py restore <backup-dir>
+uv run python scripts/deploy_addon.py stage --out DIR         # build context only (e.g. for `docker build`)
 ```
 
-### `-AddonApi`: add-on stop/start on current HA
+`deploy`, in order:
 
-**Default: `service`.** On HA 2026.8 the REST Supervisor proxy
-(`/api/hassio/...`) no longer forwards add-on **info / start / stop** for *any*
-token — an admin long-lived token gets HTTP 401 from
-`GET /api/hassio/addons/<slug>/info` just like a non-admin one. The proxy still
-forwards a small allowlist (logs, ingress, backup upload/download); add-on
-control moved to the websocket command `supervisor/api`
-(`{"type":"supervisor/api","endpoint":"/addons/<slug>/info","method":"get"}`,
-admin only), which this script deliberately does not implement in
-Windows PowerShell 5.1. So **`-AddonApi proxy` is a legacy mode for older HA
-versions** and cannot work here.
+1. **git** — refuses a dirty tree without `--allow-dirty`; prints branch@commit.
+2. **tests** — `pytest tests/ -q` (`--skip-tests` to skip), then a syntax check
+   of every shipped module.
+3. **stage** — `addon/battery_optimizer/` plus the optimizer in `app/`
+   (`battery_optimizer.py`, `battery_optimizer_lib/*.py`, never `__pycache__`);
+   `run.sh`/`Dockerfile` forced to LF; `config.yaml`'s `version` set to
+   `APP_VERSION`, so the version the Supervisor shows is the one the app logs.
+4. **backup** — the current share copy to
+   `\\<ha>\share\battery_optimizer_backups\addon-<ts>\`, newest 5 kept.
+   **Never under `addons/`**: the Supervisor scans that tree for `config.yaml`,
+   and a backup there would be a second add-on with the same slug — the same
+   shadowing trap that once made AppDaemon import a backup out of `apps/`.
+5. **copy** — mirror into the share, pruning files the stage no longer has,
+   then SHA256-verify every file.
+6. **Supervisor** — through HA's websocket `supervisor/api` (the REST
+   `/api/hassio/addons/<slug>/info` path answers 401 for every token here):
+   store reload, then install (first time), update (version changed) or
+   rebuild (same version), options if given, then start/restart and wait for
+   `started`.
+7. **log check** — `GET /api/hassio/addons/<slug>/logs` with
+   `Range: entries=:-400:` (works from Python and Git Bash `curl`; Windows
+   PowerShell 5.1 refuses the header) until the
+   `Battery Optimizer version <APP_VERSION>` line appears; any `Traceback`,
+   `ModuleNotFoundError`, `ImportError` or `TypeError` fails the check.
 
-`-AddonApi service` (the default) stops/starts the add-on with the HA services
-`hassio.addon_stop` / `hassio.addon_start`
-(`POST <HaUrl>/api/services/hassio/addon_<action>` with body
-`{"addon": "<slug>"}`), which **any** authenticated user may call — no admin
-rights needed. Only one thing then has to be inferred rather than queried:
+SHA256 proves the bytes on the share; the version line and
+`sensor.battery_optimizer.attributes.app_version` prove what runs.
 
-* **add-on state** — a TCP connect to AppDaemon's own HTTP server on the HA
-  machine (`-AppDaemonPort`, default `5050`), which listens exactly while the
-  add-on runs: port refuses = `stopped`, port accepts = `started`. Same polling
-  shape as the old proxy path (3 s interval, 60 s timeout, hard fail on
-  expiry), and the script logs which signal it is using. Verified working on a
-  real deploy: the probe tracked both the stop and the start.
+## `addon_options.py`
 
-The **add-on log is on the proxy's allowlist** and
-`GET /api/hassio/addons/<slug>/logs` returns 200 for an admin *and* a non-admin
-token, so the post-deploy log check runs in **both** modes, alongside the
-`sensor.battery_optimizer` version poll.
+Converts a legacy `apps.yaml` app block (the pre-add-on format) into add-on
+options: host-only keys (`module`, `class`, `pin_app`, `pin_thread`) and the
+connection keys (`ha_url`, `ha_token`) are dropped, every other key must be in
+the add-on schema, and values are coerced the way the Supervisor coerces them
+(a fractional value under an `int` type is an error, not a silent truncation).
 
-```powershell
-.\scripts\deploy.ps1 -HaToken $env:HA_TOKEN -NoPause
+```bash
+uv run python scripts/addon_options.py apps.yaml                 # shadow options, printed redacted
+uv run python scripts/addon_options.py apps.yaml --live --out o.json
 ```
 
-`$env:HA_TOKEN` is already set on this machine (user environment variable, also
-kept in `~\.ha_token`); the same token sits in the live `apps.yaml` on the share
-as `ha_token`. A **typed** `-AddonApi service` without `-HaToken` is an error
-(no token, no service call) and `-DryRun` warns instead of aborting so a
-rehearsal still runs — but plain `.\scripts\deploy.ps1` with no token is still
-the manual flow: the script pauses for you to stop/start the add-on in the HA
-UI, exactly as before.
+A shadow conversion sets `shadow_mode: true`, `entity_suffix: _shadow` and
+`device_id: ""`.
 
-### Nothing but the app may hold `*.py` under `apps\`
+## `compare_shadow.py`
 
-AppDaemon 4.5 discovers apps with `app_dir.rglob("*.py")` and calls
-`sys.path.insert(0, <dir>)` for **every** directory below the apps directory
-that contains `.py` files and has no `__init__.py`. Such a directory therefore
-sits at the **front** of `sys.path` and wins every `import battery_optimizer` /
-`import battery_optimizer_lib`.
-
-That is not theoretical. Until 2026-09-02 this script wrote its backup to
-`apps\backup-<ts>\`. After the 01:59 deploy the add-on imported
-`apps\backup-20260902-015911\` — the *previous* commit — while the SHA256
-verification of `apps\` passed, because the files in `apps\` really were
-correct; the wrong ones were simply imported from the sibling directory. The
-only symptoms were an old log wording (`Failed to apply mode — will retry next
-slot`) and `sensor.battery_inverter_control_health` missing the attributes the
-new commit had added.
-
-Consequences for this script:
-
-* backups go **outside** the apps directory, to
-  `<share-root>\backups\battery_optimizer\backup-<ts>\` (`-BackupRoot`), and
-  `-BackupRoot` pointing back inside `apps\` is refused;
-* a pre-flight scan (step 3, runs in `-DryRun` too) aborts the deploy on any
-  `.py` under `apps\` that is not `battery_optimizer.py`, not inside
-  `battery_optimizer_lib\` and not in `-AllowedApps` (default `hello.py`), and
-  on any other directory below `apps\` that contains `.py` files;
-* `-MoveStrayBackups` **moves** `backup-*` directories found inside `apps\` to
-  the backup root instead of aborting. They are never deleted;
-* `-Restore` accepts a backup in either location and, after copying it back,
-  evacuates any `backup-*` directory still sitting inside `apps\`.
-
-Harmless neighbours that the scan deliberately tolerates: `apps.yaml`,
-`apps.yaml.bak-*` (not `.py`), `__pycache__\` (removed anyway),
-`battery_optimizer_lib\` (a real package — it has `__init__.py`, so AppDaemon
-does not prepend it to `sys.path`), and `hello.py` (the stock sample app).
-`<share-root>\backup-2026-07-28-pre-fixes\` is outside `apps\` and is fine.
-
-Steps, in order:
-
-1. **git** — refuses a dirty working tree without `-AllowDirty`, prints the
-   branch and commit that is about to be deployed.
-2. **share** — `Test-Path` on the UNC path and on the LIVE `apps.yaml`.
-3. **strays** — the shadowing scan described above. Runs in `-DryRun` too: a
-   backup directory under `apps\` makes the whole deploy a lie, so the
-   rehearsal has to surface it as loudly as the real run.
-4. **tests** — `uv run pytest tests/ -q` (skip with `-SkipTests`).
-5. **compile** — `uv run python -m py_compile` on the orchestrator and every
-   library module.
-6. **smoke test** — copies the LIVE `apps.yaml` to `$env:TEMP`, runs
-   `smoke_config.py` on the copy, deletes the copy. The unit suite does not
-   cover `battery_optimizer.py`, so this is the only check that the deployed
-   config still loads.
-7. **backup** — `<share-root>\backups\battery_optimizer\backup-<yyyyMMdd-HHmmss>\`
-   with the current `battery_optimizer.py`, `battery_optimizer_lib\` and a
-   `deployed-commit.txt` naming the commit/branch/user. Keeps the
-   `-KeepBackups` newest (default 5) and only ever prunes directories matching
-   `backup-<8 digits>-<6 digits>` **in the backup root** — the live `apps\` is
-   never enumerated for pruning.
-8. **stop** — `POST <HaUrl>/api/services/hassio/addon_stop` with the HA
-   long-lived token as Bearer, then polls the AppDaemon port until it refuses
-   connections (60 s timeout). With the legacy `-AddonApi proxy` it posts
-   `/api/hassio/addons/<slug>/stop` instead and polls `GET .../info` until
-   `state = stopped`. Without `-HaToken` the script prints what to do in the
-   HA UI and waits for Enter.
-9. **copy** — `battery_optimizer.py` plus every `*.py` under
-   `battery_optimizer_lib\` (never `__pycache__`, `.pyc` or tests), then
-   deletes `.py` files on the share that no longer exist in the repo, so a
-   removed module cannot be imported by stale code.
-10. **pycache** — removes every `__pycache__` directory under the share's apps
-    directory.
-11. **verify** — SHA256 of each deployed file against its repo original; any
-    mismatch is listed and the script fails.
-12. **stamp** — sets `LastWriteTime = now` on every copied file. `Copy-Item`
-    preserves the *source* mtime, so without this the share shows the git
-    checkout's timestamps and "when was this deployed?" is unanswerable from
-    `ls -l`; AppDaemon's own mtime-based change detection is likewise fed a
-    time in the past. Stamping happens **after** the hash check, so it can
-    never mask a bad copy. A `<backup-root>\last-deploy.txt` records the
-    commit, branch, time, user and the backup directory of the latest deploy.
-13. **start** — starts the add-on (API or pause).
-14. **post-deploy check** (best effort, `-SkipPostCheck` to disable) — with
-    `-HaToken`, and in **both** `-AddonApi` modes, reads
-    `GET /api/hassio/addons/<slug>/logs` back for up to
-    `-PostCheckTimeoutSeconds` (default 90) and reports:
-    * `Initializing Battery Optimizer` appearing **after** the restart (the log
-      is diffed against an anchor line captured just before the start, so no
-      timestamp parsing is involved);
-    * `ModuleNotFoundError` / `ImportError` / `Traceback` / `SyntaxError` in the
-      new lines;
-    * AppDaemon's `Starting apps with N worker threads` line, warning if
-      `N < 2` — this app makes blocking `set_wit_mode` calls from callbacks and
-      needs `appdaemon: total_threads: 4` in `appdaemon.yaml`.
-
-    The default log window is only ~100 lines and the first full optimization
-    dumps well over that immediately after startup, which scrolls the
-    `Initializing Battery Optimizer` anchor out of view. The endpoint honours a
-    journald-style `Range: entries=:-400:` header — but Windows PowerShell 5.1
-    refuses to put `Range` (a .NET *restricted* header) on an
-    `Invoke-WebRequest` ("must be modified using the appropriate property or
-    method") and `HttpWebRequest.AddRange` only emits **byte** ranges. The
-    script therefore issues that one request through
-    `System.Net.Http.HttpClient` with
-    `Headers.TryAddWithoutValidation('Range', ...)`, falling back to the plain
-    `Invoke-WebRequest` (default window) if anything about it fails. ANSI
-    colour codes are stripped before any matching.
-
-    It then polls `GET /api/states/sensor.battery_optimizer` until
-    `attributes.app_version` matches `APP_VERSION` in the repo's
-    `battery_optimizer.py` and prints `attributes.code_paths` — the half of the
-    check that catches a shadowing directory.
-
-    It never fails the deploy: the HA API may be unreachable from the deploying
-    machine, and a warning is the right outcome there.
-
-If anything fails between the stop and a successful verify, the script prints
-the backup directory and the exact `-Restore` command to undo the deploy.
-
-**SHA256 proves the bytes on the share; it does not prove AppDaemon imported
-them.** Always confirm the running code is the new one — the post-deploy check
-does the log half, and a version marker visible in HA (e.g. an attribute that
-only the new commit adds to `sensor.battery_inverter_control_health`) does the
-rest.
-
-`apps.yaml` on the share is **never written** — it holds the HA long-lived
-token. It is only read, and the temp copy made for the smoke test is deleted in
-a `finally` block (the script warns loudly if the delete fails).
-
-### Parameters
-
-| Parameter | Default | Meaning |
-|---|---|---|
-| `-Share` | `\\192.168.77.167\addon_configs\a0d7b954_appdaemon\apps` | AppDaemon apps directory |
-| `-BackupRoot` | `<parent of -Share>\backups\battery_optimizer` | where `backup-<ts>` directories go; refused if inside `-Share` |
-| `-DryRun` | off | run every check, print the plan, write nothing |
-| `-SkipTests` | off | skip pytest (compile + smoke test still run) |
-| `-AllowDirty` | off | allow deploying an uncommitted tree |
-| `-AllowedApps` | `hello.py` | other AppDaemon apps allowed to sit directly in `apps\` |
-| `-MoveStrayBackups` | off | move `backup-*` directories out of `apps\` instead of aborting |
-| `-HaToken` | *empty* | HA long-lived token (any user, no admin rights needed; `$env:HA_TOKEN` on this machine, also in `~\.ha_token`); enables API stop/start and the post-deploy checks. Required by `-NoPause` and by an explicit `-AddonApi service` |
-| `-HaUrl` | `http://192.168.77.167:8123` | HA base URL (the Supervisor proxy is under `/api/hassio`) |
-| `-AddonSlug` | `a0d7b954_appdaemon` | add-on slug |
-| `-AddonApi` | `service` | `service` = `hassio.addon_stop`/`addon_start` + AppDaemon-port probe; `proxy` = Supervisor proxy, **legacy** — current HA answers 401 there for every token |
-| `-AppDaemonPort` | `5050` | AppDaemon's HTTP port, used as the add-on up/down signal in `-AddonApi service` |
-| `-NoPause` | off | never prompt; requires `-HaToken` |
-| `-Restore` | *empty* | path (or bare name) of a `backup-<ts>` directory to roll back to; old in-`apps\` paths accepted |
-| `-KeepBackups` | `5` | how many `backup-*` directories to keep in the backup root |
-| `-SkipPostCheck` | off | do not read the add-on log back after the start |
-| `-PostCheckTimeoutSeconds` | `90` | how long to poll the add-on log |
+Prints the live plan (`sensor.battery_optimizer_schedule`) and the shadow plan
+(`sensor.battery_optimizer_schedule_shadow`) side by side, matched by UTC
+instant, and checks that the current and next 4 slot modes agree and every
+mode's total over the common range is within one slot. Exit code 0 = pass.
 
 ## `smoke_config.py`
 
-Standalone; `deploy.ps1` calls it, but it is useful on its own:
-
-```powershell
-uv run python scripts/smoke_config.py appdaemon/apps/apps.yaml.example
+```bash
+uv run python scripts/smoke_config.py addon/battery_optimizer/options.example.yaml
+uv run python scripts/smoke_config.py <options.yaml | legacy apps.yaml>
 ```
 
-It imports `tests/conftest.py` to install the same
-`appdaemon.plugins.hass.hassapi` mock the unit suite uses, imports
-`battery_optimizer` and every module in `battery_optimizer_lib`, then loads the
-given YAML, finds the app whose `module` is `battery_optimizer`, and builds
-`BatteryOptimizerConfig.from_args()` plus `AmbientServiceConfig` and
-`PvForecastServiceConfig`. It prints a redacted summary (any key containing
-`token`/`key`/`password`/`secret` is shown as `<set>`/`<empty>`), lists config
-keys present in the YAML that this version of the loader does not read (typos,
-stale settings) and supported keys absent from it (defaults apply), and exits
-non-zero on any failure.
+Imports `battery_optimizer` and every module in `battery_optimizer_lib`, loads
+the file (flat add-on options, or the `battery_optimizer` app of a legacy
+apps.yaml) and builds `BatteryOptimizerConfig.from_args()` plus
+`AmbientServiceConfig` and `PvForecastServiceConfig`. For a legacy apps.yaml it
+also converts it to add-on options and requires the IDENTICAL config. Prints a
+redacted summary, lists keys the loader does not read (typos, stale settings)
+and supported keys left at their defaults, and exits non-zero on any failure.
 
-Requires PyYAML, declared in the project's `dev` extra
-(`uv pip install pyyaml` if your environment predates it).
+## `profile_dp.py`, `clean_learning_data.py`
+
+Offline tools on copies of the persisted JSON files; see their docstrings. The
+state files live in `\\<ha>\addon_configs\local_battery_optimizer\`, the
+options come from `deploy_addon.py export-options`.

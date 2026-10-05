@@ -12,7 +12,7 @@ sensor read ``Passthrough`` for 73 consecutive verifications of commands the
 battery demonstrably executed (grid charge lifted SOC 9 -> 21 %, max_export
 dumped 0.7 kWh in 4 min, hold held SOC flat for 27 min under load). Every one of
 those was a false mismatch, and every false mismatch cost a blocking ~10 s
-resend on the AppDaemon callback thread — 36 useless inverter writes in 9 h.
+resend on the then-AppDaemon callback thread — 36 useless inverter writes in 9 h.
 
 The cause was found by probing the inverter: growatt_modbus computes that sensor
 from holding registers 30100, 30200-30201 and 30407-30410, but reads them behind
@@ -37,8 +37,8 @@ cutoff, so a power check would have failed a perfectly good command.
 
 Thread safety
 -------------
-AppDaemon dispatches this app's callbacks across several worker threads
-(``total_threads`` + ``pin_app: false``), so ``apply_mode``, ``release_control``
+The host (``ha_host``) dispatches this app's callbacks across several worker
+threads (``worker_threads``), so ``apply_mode``, ``release_control``
 and the verification timer can all run at once. DirectControl owns two locks:
 
 * ``_io_lock`` (plain Lock) — one ``set_wit_mode`` in flight at a time. Held
@@ -156,18 +156,19 @@ VERIFY_DELAY_SECONDS = 90
 # needed to see it.
 VERIFY_RECHECK_SECONDS = 60
 
-# Per-call websocket timeout for set_wit_mode (AppDaemon >= 4.4 HASS kwarg).
+# Per-call websocket timeout for set_wit_mode (the host's ``hass_timeout``).
 # The handler performs 6-9 sequential Modbus writes behind a shared lock and can
-# exceed AppDaemon's 10s default. This call is SYNCHRONOUS on the callback
+# exceed the host's 10s default. This call is SYNCHRONOUS on the callback
 # thread, so every second here blocks every other callback of this app; the
 # unconfirmed path is safe because the request is already on the wire when the
 # timeout fires (see _call_set_wit_mode). Overridable via
 # config.set_wit_mode_timeout_seconds.
 SET_WIT_MODE_TIMEOUT_SECONDS = 15
 
-# ``ad_status`` values the AppDaemon HASS plugin stamps onto a service-call
-# response. Both mean "we stopped waiting", not "it did not happen": the request
-# JSON is written to the websocket BEFORE the plugin starts awaiting the
+# ``ad_status`` values the host stamps onto a service-call response (the
+# names AppDaemon's HASS plugin used). Both mean "we stopped waiting", not "it
+# did not happen": the request JSON is written to the websocket BEFORE the host
+# starts awaiting the
 # matching response future, so a timeout says nothing about whether Home
 # Assistant ran the service.
 UNCONFIRMED_AD_STATUSES = ("TIMEOUT", "TERMINATING")
@@ -176,9 +177,10 @@ UNCONFIRMED_AD_STATUSES = ("TIMEOUT", "TERMINATING")
 def _ad_status_of(response) -> Optional[str]:
     """Upper-cased ``ad_status`` from a service response, top level or nested.
 
-    AppDaemon stamps ``ad_status`` onto the envelope it returns, but WHERE it
-    lands depends on the AD version and on whether the service declared a
-    response: it can sit at the top level or one level down under ``result``.
+    The host stamps ``ad_status`` onto the envelope it returns. ``ha_host``
+    puts it at the top level; AppDaemon, the previous host, put it there or one
+    level down under ``result`` depending on its version, so both places are
+    still read.
     Both service calls in this module must look in both places, and they used
     to disagree — ``_call_set_wit_mode`` checked the nested copy,
     ``RegisterVerifier._read_block`` only the top-level one. A nested TIMEOUT
@@ -461,7 +463,7 @@ class RegisterVerifier:
       30407 count 4 -> remote_enable, duration_min, power_percent(u16), ac_charge
       30200 count 2 -> export_limit_enable, export_limit_rate
 
-    Each read is a SYNCHRONOUS blocking service call on the AppDaemon callback
+    Each read is a SYNCHRONOUS blocking service call on a callback worker
     thread, exactly like set_wit_mode, so it carries the same ``hass_timeout``
     and the enclosing ``_verify_mode`` reports its wall time through
     ``record_external_callback_duration``. 30100 (control authority) and 30476
@@ -504,11 +506,11 @@ class RegisterVerifier:
         NOTE the field is ``start_address``, not ``address``.
 
         ``return_response=True`` is safe to pass and is NOT service data: it is a
-        formal parameter of AppDaemon's ``HassPlugin.call_plugin_service``
-        (hassplugin.py:727), bound before ``service_data`` is assembled — the
-        same mechanism as ``hass_timeout``. It is passed explicitly rather than
-        relying on AppDaemon's auto-enable for SupportsResponse.OPTIONAL, which
-        only fires once the plugin has learned the service's response metadata.
+        formal parameter of ``HAHost.call_service``, bound before
+        ``service_data`` is assembled — the same mechanism as ``hass_timeout``.
+        It is passed explicitly rather than relying on the host's auto-enable
+        for SupportsResponse.OPTIONAL, which only fires once the host has
+        learned the service's response metadata.
         """
         try:
             result = self.app.call_service(
@@ -530,7 +532,7 @@ class RegisterVerifier:
             return None
 
         if result is None:
-            self._last_read_error = "no response from the AppDaemon HASS plugin"
+            self._last_read_error = "no response (not connected to Home Assistant)"
             return None
 
         # Same envelope handling as _call_set_wit_mode: ad_status can sit at the
@@ -539,7 +541,7 @@ class RegisterVerifier:
         ad_status = _ad_status_of(result)
         if ad_status in UNCONFIRMED_AD_STATUSES:
             self._last_read_error = (
-                f"AppDaemon ad_status={ad_status} after {self.timeout}s "
+                f"ad_status={ad_status} after {self.timeout}s "
                 f"(read timeout, not a mismatch)"
             )
             return None
@@ -566,8 +568,8 @@ class RegisterVerifier:
     def _service_payload(result, depth: int = 0):
         """Dig the integration's {"success":..., "values":[...]} out.
 
-        AppDaemon hands back Home Assistant's websocket envelope, whose depth
-        varies by version: the response dict can sit at the top level, under
+        The host hands back Home Assistant's websocket envelope, whose depth
+        varied across AppDaemon versions and is tolerated in full: the response dict can sit at the top level, under
         ``result``, or under ``result`` -> ``response``.
         """
         if not isinstance(result, dict) or depth > 4:
@@ -697,7 +699,7 @@ class DirectControl:
                  verifier: Optional[Verifier] = None):
         """
         Args:
-            app: AppDaemon app instance (for call_service, get_state, log,
+            app: The app (an ``ha_host.Hass``: call_service, get_state, log,
                  run_in, cancel_timer). If it exposes
                  ``record_external_callback_duration(name, seconds)``, the
                  verification callback's wall time is reported through it.
@@ -716,7 +718,7 @@ class DirectControl:
                 ``DEFAULT_MODE_STATUS_ENTITY``: that fallback made every
                 deployment verify against an entity that may not track the
                 override, and each false mismatch costs a blocking ~10 s resend
-                on the AppDaemon callback thread.
+                on a callback worker thread.
         """
         self.app = app
         self.config = config
@@ -1149,10 +1151,13 @@ class DirectControl:
             None  - unconfirmed: we stopped waiting, but the request was already
                     written to the websocket, so the service very likely ran.
 
-        Why a timeout is *unconfirmed*, not a failure (AppDaemon 4.5.x, verified
-        against the installed package):
+        Why a timeout is *unconfirmed*, not a failure: ``ha_host`` writes the
+        request to the websocket and only then waits ``hass_timeout`` for the
+        result; on expiry it returns ``{"success": False, "ad_status":
+        "TIMEOUT"}``. That is the envelope AppDaemon 4.5.x produced, and the
+        history below is why it is read this way.
 
-        ``HassPlugin.websocket_send_json`` awaits the response future with
+        AppDaemon's ``HassPlugin.websocket_send_json`` awaited the response future with
         ``asyncio.wait_for(..., timeout=hass_timeout)`` AFTER it has already
         done ``await self.ws.send_json(request)``. On ``asyncio.TimeoutError`` it
         does NOT raise and does NOT return None — it logs
@@ -1168,14 +1173,12 @@ class DirectControl:
         "Request already timed out" pairs prove Home Assistant *did* answer.
         ``ad_status`` is what separates the two, so it is checked first.
 
-        ``ad_status: TERMINATING`` (the wait was cancelled during AppDaemon
+        ``ad_status: TERMINATING`` (AppDaemon: the wait was cancelled during
         shutdown) is unconfirmed for the same reason: the request was on the
         wire.
 
-        A ``None`` return is still possible and still unconfirmed — the plugin
-        returns None when the websocket is not connected, and
-        ``run_coroutine_threadsafe`` returns None when AppDaemon's own
-        ``internal_function_timeout`` (60 s) expires first.
+        A ``None`` return is still possible and still unconfirmed — the host
+        returns None when the websocket is not connected (nothing was sent).
 
         Threading: every caller holds ``_io_lock``, which is also what
         serializes ``_last_service_error`` with the log line that reads it. No
@@ -1183,11 +1186,10 @@ class DirectControl:
         """
         self._last_service_error = None
         try:
-            # hass_timeout: a formal parameter of the AppDaemon HASS plugin
-            #   (>= 4.4). It is consumed by the plugin, NOT forwarded as
-            #   service data.
+            # hass_timeout: a formal parameter of HAHost.call_service. It is
+            #   consumed by the host, NOT forwarded as service data.
             # No return_response/return_result kwarg is passed: set_wit_mode is
-            #   registered SupportsResponse.OPTIONAL, and AppDaemon auto-enables
+            #   registered SupportsResponse.OPTIONAL, and the host auto-enables
             #   return_response for such services, so call_service already
             #   surfaces the handler's response dict and propagates handler
             #   exceptions. Passing an unknown kwarg like return_result would be
@@ -1207,7 +1209,7 @@ class DirectControl:
             return False
 
         if result is None:
-            self._last_service_error = "no response from the AppDaemon HASS plugin"
+            self._last_service_error = "no response (not connected to Home Assistant)"
             return None
 
         # Response shape from the handler on success:
@@ -1222,7 +1224,7 @@ class DirectControl:
             ad_status = _ad_status_of(result)
             if ad_status in UNCONFIRMED_AD_STATUSES:
                 self._last_service_error = (
-                    f"AppDaemon ad_status={ad_status} after "
+                    f"ad_status={ad_status} after "
                     f"{self._set_mode_timeout}s"
                 )
                 return None
@@ -1243,7 +1245,7 @@ class DirectControl:
         """Cancel any pending verification timer and invalidate its generation.
 
         ``cancel_timer`` alone is not enough under multi-thread dispatch: it
-        cannot stop a callback AppDaemon has already handed to another worker.
+        cannot stop a callback the host has already handed to another worker.
         Bumping the generation makes such an in-flight callback inert, so it
         neither clears a newer handle nor resends the mode we just superseded.
         """
@@ -1298,7 +1300,7 @@ class DirectControl:
     def _report_duration(self, name: str, seconds: float) -> None:
         """Feed this callback's wall time into the app's slow-callback advice.
 
-        ``_verify_mode`` runs on the AppDaemon callback thread and its resend is
+        ``_verify_mode`` runs on a callback worker thread and its resend is
         a blocking ``set_wit_mode``: the 2026-09-02 log has eight verifications
         at 10-16 s that never showed up in the app's "Callback ... took Ns"
         accounting, because only methods decorated with the app's own
@@ -1317,7 +1319,7 @@ class DirectControl:
             pass
 
     def _verify_mode(self, kwargs=None) -> None:
-        """AppDaemon scheduler entry point for verification (timed).
+        """Scheduler (``run_in``) entry point for verification (timed).
 
         ``_report_duration`` MUST stay here rather than inside
         ``_run_verification``: it calls back into the app, which runs it under
@@ -1371,8 +1373,8 @@ class DirectControl:
             if generation is not None:
                 # CLAIM this verification by bumping the generation and taking
                 # the new value as our stamp. Two things need this:
-                #   * a duplicate dispatch of the same callback (AppDaemon can
-                #     hand a dequeued timer to more than one worker) would
+                #   * a duplicate dispatch of the same callback (AppDaemon
+                #     handed a dequeued timer to more than one worker) would
                 #     otherwise pass the guard too and double-count — six
                 #     workers on one attempt-2 callback logged six persistent
                 #     mismatches and six ERRORs for one event;

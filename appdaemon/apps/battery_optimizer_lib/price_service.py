@@ -31,9 +31,9 @@ except ImportError:
 MALFORMED_WARNING_INTERVAL_S = 3600
 
 
-# ``ad_status`` values that mean AppDaemon stopped waiting, not that Home
-# Assistant answered. `websocket_send_json` synthesises `{"success": False}`
-# for both and stamps the status onto it, so without this check a client-side
+# ``ad_status`` values that mean the host stopped waiting, not that Home
+# Assistant answered. `ha_host` synthesises `{"success": False}` for a
+# timeout and stamps the status onto it (the envelope AppDaemon 4.5 used), so without this check a client-side
 # timeout is indistinguishable from a reply that carried no prices.
 #
 # The same classification `direct_control._ad_status_of` applies to
@@ -41,9 +41,9 @@ MALFORMED_WARNING_INTERVAL_S = 3600
 # imported: the price service must not depend on the inverter module.
 UNCONFIRMED_AD_STATUSES = ("TIMEOUT", "TERMINATING")
 
-# How long AppDaemon may wait for Home Assistant to answer the price fetch.
+# How long the host may wait for Home Assistant to answer the price fetch.
 #
-# AppDaemon's own default (`ws_timeout`) is 10 s, and a day-ahead fetch goes on
+# The host's default (`ha_host.DEFAULT_WS_TIMEOUT_S`) is 10 s, and a day-ahead fetch goes on
 # to Nord Pool's API. The REST path already allows 30 s; the fallback gets the
 # same budget so the two paths do not disagree about what "too slow" means.
 SERVICE_CALL_TIMEOUT_S = 30
@@ -52,9 +52,10 @@ SERVICE_CALL_TIMEOUT_S = 30
 def _ad_status_of(response) -> Optional[str]:
     """Upper-cased ``ad_status`` from a service response, top level or nested.
 
-    AppDaemon 4.5.13 stamps it in `HassPlugin.websocket_send_json`::
+    `ha_host.HAConnection.request` stamps it, exactly where AppDaemon 4.5.13's
+    `HassPlugin.websocket_send_json` did::
 
-        result.update({"ad_status": ad_status.name, "ad_duration": travel_time})
+        response["ad_status"] = AD_STATUS_OK   # or "TIMEOUT"
 
     onto the envelope it returns, but WHERE it lands depends on the AD version
     and on whether the service declared a response: it can sit at the top level
@@ -329,7 +330,7 @@ class NordPoolPriceService:
         """*end* expressed with the same awareness as its own *start*.
 
         A record whose two fields disagree is not exotic: with no timezone
-        configured in AppDaemon, both parsers leave `start` and `end` with
+        configured, both parsers leave `start` and `end` with
         whatever awareness their own ISO strings carried, so a source
         publishing one bare and the other with an offset produces exactly this
         pair. Comparing them raised `TypeError` out of `_normalize_prices` and
@@ -676,17 +677,18 @@ class NordPoolPriceService:
     def _call_nordpool_service(self, date_str: str) -> Optional[Dict]:
         """
         Call the nordpool.get_price_indices_for_date service.
-        Tries REST API approach first, falls back to AppDaemon call_service.
+        Tries REST API approach first, falls back to the host's call_service.
         """
         # Try REST API approach (more reliable for response actions)
         result = self._call_nordpool_rest_api(date_str)
         if result:
             return result
 
-        # Fallback to AppDaemon call_service.
+        # Fallback to the host's call_service (websocket).
         #
-        # The keyword is `return_response`, and it is NOT optional trivia. In
-        # AppDaemon 4.5.13 `HassPlugin.call_plugin_service` names exactly three
+        # The keyword is `return_response`, and it is NOT optional trivia.
+        # `ha_host.HAHost.call_service` - like AppDaemon 4.5.13's
+        # `HassPlugin.call_plugin_service` before it - names exactly three
         # of its own parameters -- `hass_timeout`, `return_response`,
         # `suppress_log_messages` -- and sweeps *everything else* into the
         # websocket request's `service_data`:
@@ -700,7 +702,7 @@ class NordPoolPriceService:
         # SERVICE PARAMETER, which HA rejected outright:
         # `invalid_format: not a valid option at 'return_result'`. The
         # `return_response: True` visible at the top level of that same logged
-        # request was AppDaemon's own doing -- the block below the one quoted
+        # request was the host's own doing -- the block below the one quoted
         # forces it whenever HA's service definition declares a response -- so
         # the flag we needed was already there and the call still failed on the
         # junk parameter beside it. Every production occurrence of this fallback
@@ -721,19 +723,19 @@ class NordPoolPriceService:
         return self._unwrap_service_envelope(result, date_str)
 
     def _unwrap_service_envelope(self, result, date_str):
-        """The price payload inside AppDaemon's ``call_service`` envelope.
+        """The price payload inside the host's ``call_service`` envelope.
 
         ``None`` means NO DATA, and it is said out loud. The fallback used to
         return whatever `call_service` handed back, so the error envelope
-        AppDaemon returns for a rejected call --
+        the host returns for a rejected call --
         ``{'id', 'type', 'success', 'error', 'ad_status', 'ad_duration'}`` --
         was passed to `_parse_service_response`, which found no list under any
         area key and logged "Parsing 0 price entries" at INFO. A refused call
         and a day with no published prices produced the same line. The caller
         then fell through to the cached-price path with no reason recorded.
 
-        The success shape is the websocket envelope, documented by AppDaemon's
-        own `ADAPI.call_service` example::
+        The success shape is HA's websocket result envelope (the shape
+        AppDaemon's `ADAPI.call_service` documented and `ha_host` keeps)::
 
             events = self.call_service("calendar/get_events", ...)
                         ["result"]["response"]["calendar.home"]["events"]
@@ -750,7 +752,7 @@ class NordPoolPriceService:
         if result is None:
             self.log(
                 f"Nord Pool service call for {date_str} returned no response "
-                f"(AppDaemon is not connected, or the service produced "
+                f"(not connected to Home Assistant, or the service produced "
                 f"nothing); no prices from this path.",
                 level="WARNING",
             )
@@ -760,7 +762,7 @@ class NordPoolPriceService:
         if ad_status in UNCONFIRMED_AD_STATUSES:
             self.log(
                 f"Nord Pool service call for {date_str} did not complete: "
-                f"AppDaemon ad_status={ad_status} after "
+                f"ad_status={ad_status} after "
                 f"{SERVICE_CALL_TIMEOUT_S}s. Home Assistant may still have run "
                 f"it; no prices were received either way.",
                 level="WARNING",

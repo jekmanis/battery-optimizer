@@ -103,7 +103,7 @@ from .timezone_utils import canonical_slot_key, instant_key
 # formulation, but it multiplies the state count by the number of temperature
 # buckets, and the partial-first-slot lookahead already runs the whole DP once
 # per candidate -- the normal 132-slot horizon would go from ~125 ms to well
-# over a second on the single AppDaemon thread.
+# over a second while holding the app lock.
 #
 # Also rejected: a fixed conservative temperature. "Coldest plausible" is not a
 # valid bound over reachable conditions once SOC tapering and non-monotonic rate

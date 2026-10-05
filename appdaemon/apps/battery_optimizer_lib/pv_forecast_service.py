@@ -48,13 +48,13 @@ class PvForecastServiceConfig:
     # cache-age guard keys off the last successful fetch, so without a separate
     # attempt-based back-off a permanently broken provider was re-tried by every
     # optimize / adaptive / PV-shortfall pass — each one a blocking
-    # ``requests.get`` on an AppDaemon callback thread. Deliberately much
+    # ``requests.get`` on a callback worker thread. Deliberately much
     # shorter than ``pv_forecast_cache_minutes`` so a transient failure (HA
     # integration still loading, one HTTP hiccup) recovers quickly.
     failure_retry_minutes: int = 10
 
     # Per-call HTTP timeout for the Forecast.Solar REST API. SYNCHRONOUS and
-    # made from an AppDaemon callback thread, so it must be bounded tightly
+    # made from a callback worker thread, so it must be bounded tightly
     # (see CLAUDE.md, "Runtime constraints"). Matches the ambient service's
     # forecast timeout.
     forecast_timeout_seconds: float = 10.0
@@ -451,7 +451,7 @@ class PvForecastService:
         else:
             url = f"https://api.forecast.solar/estimate/{lat}/{lon}/{dec}/{az}/{kwp}"
 
-        # Bounded: this runs synchronously on an AppDaemon callback thread.
+        # Bounded: this runs synchronously on a callback worker thread.
         response = requests.get(url, timeout=cfg.forecast_timeout_seconds)
         response.raise_for_status()
         data = response.json()

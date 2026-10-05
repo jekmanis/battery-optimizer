@@ -290,7 +290,7 @@ class TestFailedFetchBackOff:
     ``refresh()`` is called by every full optimize, every adaptive and
     PV-shortfall recalculation and the 15-min ambient observation timer, and
     each one then re-issued a blocking ``weather/get_forecasts`` call_service on
-    an AppDaemon callback thread. Both failure paths logged at DEBUG only, so
+    a callback worker thread. Both failure paths logged at DEBUG only, so
     the cost was invisible.
     """
 
@@ -344,7 +344,7 @@ class TestFailedFetchBackOff:
 
         The back-off used to key off ``_last_fetch_attempt`` alone, which is set
         unconditionally, so the FIRST-ever failure — typically one "entity not
-        found" seconds after an AppDaemon restart, before the weather
+        found" seconds after an app restart, before the weather
         integration has loaded — suppressed every retry for a full
         ``cache_minutes`` (60). No caller passes force=True, so T_ambient(t) sat
         on the outdoor-sensor / diurnal fallback for an hour and degraded the
@@ -451,7 +451,7 @@ class TestFailedFetchBackOff:
 
 class TestForecastCallIsBounded:
     def test_call_service_passes_a_hass_timeout(self):
-        """The call is synchronous on an AppDaemon callback thread."""
+        """The call is synchronous on a callback worker thread."""
         calls = []
 
         def call_service(service, **kwargs):

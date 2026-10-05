@@ -1,7 +1,8 @@
 """
-Home Assistant host for the optimizer: the AppDaemon API surface, without AppDaemon.
+Home Assistant host for the optimizer: the app API it was written against.
 
-The orchestrator was written against AppDaemon 4.5's ``hass.Hass``. This module
+The orchestrator was written against AppDaemon 4.5's ``hass.Hass`` (its host
+until 2026-10). This module
 provides exactly the part of that API the app uses, with the same semantics,
 over Home Assistant's websocket API (state cache, events, service calls) and
 REST ``POST /api/states`` (entity publication). It runs inside the add-on; the
@@ -20,7 +21,7 @@ built and debugged against them:
   call made while disconnected returns ``None`` (unconfirmed, nothing sent);
   a send that breaks mid-write raises (confirmed: nothing reached HA).
   ``return_response`` is set automatically for services whose HA definition
-  declares a response, as AppDaemon does.
+  declares a response, as AppDaemon did.
 * ``listen_state`` callbacks receive ``(entity, attribute, old, new, kwargs)``
   and fire only when the watched value CHANGED.
 * Timer callbacks receive ``(kwargs)`` - or ``**kwargs`` when the function
@@ -29,8 +30,8 @@ built and debugged against them:
   ``replace=True``, then POSTs the result, which HA stores as given.
 * ``datetime()`` is NAIVE local time, ``datetime(aware=True)`` aware.
 
-Threading: callbacks run on a small worker pool, concurrently, exactly like
-AppDaemon with ``total_threads: 4`` and ``pin_app: false``. The host does NOT
+Threading: callbacks run on a small worker pool (``worker_threads``, default
+4), concurrently. The host does NOT
 serialize them: the app's own ``CallbackLock`` (taken by ``@_timed_callback``)
 does, and ``DirectControl``'s verification callback deliberately runs outside
 it. Adding a host-level lock would invert the documented lock order.
@@ -38,7 +39,7 @@ it. Adding a host-level lock would invert the documented lock order.
 Reconnects: the reader thread reconnects with backoff, re-authenticates,
 re-subscribes every event type, reloads the service catalogue and replaces the
 state cache with a fresh ``get_states``. Listeners and timers stay registered;
-they are not re-fired for what changed during the outage (AppDaemon does not
+they are not re-fired for what changed during the outage (AppDaemon did not
 either), the next real change reaches them.
 
 Shadow mode (``ShadowPolicy``) is enforced HERE, at the only two exits to HA,

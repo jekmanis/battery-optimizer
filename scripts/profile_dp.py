@@ -10,11 +10,13 @@ locally from the LIVE persisted data files so the predictors handed to the DP
 are the real ones (learned charge rates, load profile, PV profile, prediction
 tracker, ambient service, temperature projector).
 
-The share is only ever READ.  Copy the JSON files somewhere local first:
+The share is only ever READ.  Copy the JSON files and the add-on's options
+somewhere local first:
 
     mkdir -p "$LOCALAPPDATA/Temp/bo-profile"
-    cp //192.168.77.167/addon_configs/a0d7b954_appdaemon/{battery_learning_data,load_profile,pv_profile,prediction_tracker}.json \
+    cp //192.168.77.167/addon_configs/local_battery_optimizer/{battery_learning_data,load_profile,pv_profile,prediction_tracker}.json \
        "$LOCALAPPDATA/Temp/bo-profile/"
+    uv run python scripts/deploy_addon.py export-options "$LOCALAPPDATA/Temp/bo-profile/options.json"
 
 Usage:
     uv run --python 3.14 --extra dev --isolated python scripts/profile_dp.py
@@ -36,15 +38,13 @@ import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-TESTS_DIR = REPO_ROOT / "tests"
 APPS_DIR = REPO_ROOT / "appdaemon" / "apps"
 
 DEFAULT_DATA_DIR = Path(
     os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
 ) / "Temp" / "bo-profile"
-DEFAULT_APPS_YAML = (
-    "//192.168.77.167/addon_configs/a0d7b954_appdaemon/apps/apps.yaml"
-)
+# Add-on options (deploy_addon.py export-options); a legacy apps.yaml works too.
+DEFAULT_APPS_YAML = str(DEFAULT_DATA_DIR / "options.json")
 
 # The live case being reproduced (see the module docstring).
 LIVE_TZ = "Europe/Riga"
@@ -56,8 +56,7 @@ LIVE_MINUTES_INTO_SLOT = 2.0
 
 
 def _install_mocks():
-    sys.path.insert(0, str(TESTS_DIR))
-    import conftest  # noqa: F401  installs the appdaemon.plugins.hass mock
+    """Make the app importable (no host is needed for a solve)."""
     sys.path.insert(0, str(APPS_DIR))
 
 
@@ -66,9 +65,11 @@ def _load_config(apps_yaml: str, data_dir: Path):
     from battery_optimizer_lib.config import BatteryOptimizerConfig
 
     raw = yaml.safe_load(Path(apps_yaml).read_text(encoding="utf-8"))
+    # A legacy apps.yaml nests the app; add-on options are the mapping itself.
     app_args = next(
-        v for v in raw.values()
-        if isinstance(v, dict) and v.get("module") == "battery_optimizer"
+        (v for v in raw.values()
+         if isinstance(v, dict) and v.get("module") == "battery_optimizer"),
+        raw,
     )
     cfg = BatteryOptimizerConfig.from_args(app_args, log_func=lambda *a, **k: None)
     # Never read (or write) the share for the state files.

@@ -3,7 +3,7 @@ App-wide re-entrant callback lock with a bounded "unlocked" escape hatch.
 
 Purpose
 -------
-AppDaemon dispatches this app's callbacks from a pool of worker threads (see
+The host (`ha_host`) dispatches this app's callbacks from a pool of worker threads (see
 CLAUDE.md § Runtime constraints and `docs`/design notes on thread safety).  Every
 registered callback already funnels through the orchestrator's `_timed_callback`
 decorator, which makes that decorator a complete chokepoint: wrapping its body in
@@ -79,7 +79,7 @@ class CallbackLock:
 
     Args:
         log_func: Optional ``log(msg, level=...)`` callable.  The signature is
-            AppDaemon's ``self.log``, so ``CallbackLock(log_func=self.log)``
+            the app's ``self.log``, so ``CallbackLock(log_func=self.log)``
             works directly.  ``None`` silences the diagnostics.
         strict: When True, a ``depth == 0`` :meth:`unlocked` call raises
             ``RuntimeError`` instead of logging and degrading.  Tests only —
@@ -143,7 +143,7 @@ class CallbackLock:
         """Decorate ``func`` so every call runs under this lock.
 
         The wrapper takes ``(*args, **kwargs)`` verbatim and passes them
-        through unchanged, so AppDaemon's positional calling convention
+        through unchanged, so the host's positional calling convention
         survives — including the orchestrator's own internal calls such as
         ``execute_scheduled_mode(kwargs, force=True)``.
 

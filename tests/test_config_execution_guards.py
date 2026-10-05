@@ -6,7 +6,7 @@ Three defects, all in the orchestrator's execution path:
   current slot itself, then the quarter-hour timer applied the identical entry
   seconds later (07:30:06 -> 07:30:12, 08:30:06 -> 08:30:15). DirectControl's
   duplicate suppression absorbed the command, but the call still cost a
-  blocking `set_wit_mode` round trip on the single AppDaemon thread.
+  blocking `set_wit_mode` round trip under the app lock.
   -> `execute_dedupe_seconds`.
 * **Self-inflicted depletion recalculation.** The DP planned
   `EXPORT (until depleted) -> 10.0%` at 06:45, the battery reached min_soc as
@@ -60,7 +60,7 @@ class _FakeDirectControl:
 
 
 class ExecOptimizer(bo.BatteryOptimizer):
-    """Minimal stand-in: no AppDaemon initialize(), just the execution path."""
+    """Minimal stand-in: no initialize(), just the execution path."""
 
     def __init__(self, now, soc=50.0, **config_overrides):
         self.config = bo.BatteryOptimizerConfig(slot_minutes=15, **config_overrides)
@@ -86,7 +86,7 @@ class ExecOptimizer(bo.BatteryOptimizer):
         self.released = False
         self._direct_control = _FakeDirectControl(self)
 
-    # --- AppDaemon surface -------------------------------------------------
+    # --- host surface -------------------------------------------------------
     def log(self, message, level="INFO"):
         self.logs.append((message, level))
 
@@ -685,7 +685,7 @@ class TestCallbackDecoration:
     """Every run_in / run_every / listen_* entry point must be measured.
 
     `_on_depletion_recalc` was not: its 17.0 s overrun on 2026-09-02 appeared
-    only in AppDaemon's own generic warning, never in this app's counters.
+    only in the then-host's (AppDaemon's) generic warning, never in this app's counters.
     """
 
     @pytest.mark.parametrize(
@@ -711,7 +711,7 @@ class TestCallbackDecoration:
         func = getattr(bo.BatteryOptimizer, name)
 
         assert getattr(func, "__wrapped__", None) is not None, (
-            f"{name} is an AppDaemon callback but is not wrapped by "
+            f"{name} is a registered callback but is not wrapped by "
             f"_timed_callback"
         )
 

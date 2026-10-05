@@ -9,7 +9,7 @@ Production incident (2026-07-28 22:12, live AppDaemon):
 `BatteryOptimizer.full_optimize` and `_recalculate_remaining_schedule` compute
 the partial first slot (the DEFECT 1 fix) as `now - slot_start`, where
 
-  * `now = self.datetime()`      -> AppDaemon returns NAIVE local time
+  * `now = self.datetime()`      -> the host returns NAIVE local time
   * `slot_start = _align_to_slot(now)` -> align_to_slot() runs the value through
     ensure_local_tz(), so it comes back TZ-AWARE
 

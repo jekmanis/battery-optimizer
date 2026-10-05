@@ -1,29 +1,27 @@
 #!/usr/bin/env python
 """
-Smoke-test the battery optimizer code against a real apps.yaml.
+Smoke-test the battery optimizer code against a real configuration.
 
-The unit suite does not cover ``battery_optimizer.py`` (the AppDaemon
-orchestrator), so a config or wiring break only shows up at import time on the
-HA machine.  This helper reproduces that import in the repo:
+The unit suite covers the orchestrator only through the fake-HA shadow run, so
+a config or wiring break can still show up first at import time in the
+add-on. This helper reproduces that import in the repo:
 
-  1. imports ``battery_optimizer`` and every module in ``battery_optimizer_lib``
-     (no AppDaemon needed: the orchestrator runs on ``ha_host``),
-  2. loads the given file - an AppDaemon apps.yaml (the app whose ``module``
-     is ``battery_optimizer``) or a flat add-on options mapping - and calls
-     ``BatteryOptimizerConfig.from_args()``, then derives
-     ``AmbientServiceConfig`` and ``PvForecastServiceConfig``,
-  3. for an apps.yaml, converts it to add-on options exactly as the deploy
-     does (``scripts/addon_options.py``: schema check + Supervisor coercion),
+  1. imports ``battery_optimizer`` and every module in ``battery_optimizer_lib``,
+  2. loads the given file - add-on options (a flat mapping, e.g.
+     ``options.example.yaml``) or a legacy apps.yaml (the app whose ``module``
+     is ``battery_optimizer``) - and calls ``BatteryOptimizerConfig.from_args()``,
+     then derives ``AmbientServiceConfig`` and ``PvForecastServiceConfig``,
+  3. for a legacy apps.yaml, converts it to add-on options exactly as
+     ``scripts/addon_options.py`` does (schema check + Supervisor coercion),
      runs those through ``addon_main.options_to_args`` and requires the
-     IDENTICAL config - the proof that the add-on will run what AppDaemon ran,
+     IDENTICAL config,
   4. prints a REDACTED summary (never a token/key/password/secret).
 
-Exit code 0 = the deployed code can load that config; non-zero otherwise.
+Exit code 0 = the code can load that config; non-zero otherwise.
 
 Usage:
-    uv run python scripts/smoke_config.py <path-to-apps.yaml>
-    uv run python scripts/smoke_config.py appdaemon/apps/apps.yaml.example
     uv run python scripts/smoke_config.py addon/battery_optimizer/options.example.yaml
+    uv run python scripts/smoke_config.py <options.yaml | legacy apps.yaml>
 """
 
 import argparse
@@ -37,15 +35,18 @@ import traceback
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-TESTS_DIR = REPO_ROOT / "tests"
 APPS_DIR = REPO_ROOT / "appdaemon" / "apps"
 CONFIG_PY = APPS_DIR / "battery_optimizer_lib" / "config.py"
 
 # Any key whose NAME contains one of these is never printed.
 SECRET_HINTS = ("token", "key", "password", "secret", "passwd", "credential")
 
-# Keys AppDaemon itself consumes, so they are not "unknown" config keys.
-APPDAEMON_KEYS = {
+# Add-on options that configure the host, not the optimizer.
+ADDON_KEYS = {"shadow_mode", "entity_suffix", "log_level", "worker_threads"}
+
+# Keys a legacy apps.yaml app block carried for its host, so they are not
+# "unknown" config keys.
+LEGACY_APP_KEYS = {
     "module", "class", "dependencies", "plugin", "priority", "pin_app",
     "pin_thread", "log_level", "log", "disable", "global_dependencies",
     "constrain_days", "constrain_input_boolean", "constrain_input_select",
@@ -266,8 +267,7 @@ def main(argv=None):
     # --- 5. keys the current code does not read ---------------------------
     known = known_config_keys()
     if known:
-        recognised = known | APPDAEMON_KEYS | {"shadow_mode", "entity_suffix",
-                                                "log_level", "worker_threads"}
+        recognised = known | ADDON_KEYS | LEGACY_APP_KEYS
         unknown = sorted(k for k in app_args if k not in recognised)
         if unknown:
             print("")

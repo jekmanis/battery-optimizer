@@ -7,7 +7,7 @@ socket, so every test below runs the production `websocket-client` /
 * `listen_state` delivers (entity, attribute, old, new, kwargs) and fires only
   on a change of the watched value;
 * the `call_service` envelope is the one `direct_control` and `price_service`
-  already parse - including the AppDaemon `ad_status` stamp;
+  already parse - including the `ad_status` stamp;
 * a service that does not answer in time is UNCONFIRMED, a refused one FAILED;
 * `run_every` keeps the slot grid, `run_daily` keeps local wall time across
   DST, `run_in` / `cancel_timer` work;
@@ -57,12 +57,9 @@ def wait_until(predicate, timeout=5.0, interval=0.01):
 
 
 @pytest.fixture
-def fake():
-    ha = FakeHA().start()
-    ha.set_entity("sun.sun", "above_horizon", notify=False)
-    ha.set_entity("sensor.soc", "50", {"unit_of_measurement": "%"}, notify=False)
-    yield ha
-    ha.stop()
+def fake(fake_ha):
+    """conftest's fake HA, under a shorter name."""
+    return fake_ha
 
 
 def make_host(fake, **kwargs):
@@ -75,10 +72,9 @@ def make_host(fake, **kwargs):
 
 
 @pytest.fixture
-def host(fake):
-    h = make_host(fake)
-    yield h
-    h.stop()
+def host(ha_host):
+    """conftest's connected host, under a shorter name."""
+    return ha_host
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +168,7 @@ def test_register_verifier_reads_through_the_host(fake, host):
 
 
 def test_optional_response_service_gets_return_response_automatically(fake, host):
-    """AppDaemon auto-sets return_response for SupportsResponse.OPTIONAL;
+    """The host auto-sets return_response for SupportsResponse.OPTIONAL (as AppDaemon did);
     direct_control relies on it for set_wit_mode.
 
     The service is registered AFTER the host connected, as growatt_modbus is

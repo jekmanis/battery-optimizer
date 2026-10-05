@@ -54,7 +54,7 @@ _FALSE_STRINGS = frozenset({"", "0", "false", "no", "off", "none", "null"})
 def _bool_arg(args: dict, key: str, default: bool) -> bool:
     """``_arg`` for a boolean, honouring the strings YAML can produce.
 
-    ``bool("false")`` is ``True``. AppDaemon's apps.yaml is hand-edited, quoting
+    ``bool("false")`` is ``True``. Options are hand-edited YAML, quoting
     happens, and a key written as ``price_retry_enabled: "false"`` must not turn
     the feature ON. Real booleans and numbers pass through unchanged.
     """
@@ -67,10 +67,10 @@ def _bool_arg(args: dict, key: str, default: bool) -> bool:
 @dataclass
 class BatteryOptimizerConfig:
     """
-    Configuration for the Battery Optimizer AppDaemon app.
+    Configuration for the Battery Optimizer add-on.
 
     All fields have sensible defaults matching the original apps.yaml defaults.
-    Use `from_args()` to load from AppDaemon's args dict.
+    Use `from_args()` to load from the args dict (`addon_main.options_to_args`).
     """
 
     # =========================================================================
@@ -152,8 +152,8 @@ class BatteryOptimizerConfig:
     verify_delay_seconds: int = 90       # first check after a mode was sent
     verify_recheck_seconds: int = 60     # single re-check after a resend
     # Per-call websocket timeout for set_wit_mode. This call is SYNCHRONOUS on
-    # the AppDaemon callback thread: every second here blocks every other
-    # callback of this app. Keep it just above the handler's normal duration.
+    # a callback worker thread, under the app lock: every second here blocks
+    # every other callback of this app. Keep it just above the handler's normal duration.
     set_wit_mode_timeout_seconds: int = 15
     # Master switch for verify-after-set. Off means no check is scheduled at
     # all, whatever `verify_source` says.
@@ -168,7 +168,7 @@ class BatteryOptimizerConfig:
     #                 failure froze it at "Passthrough" indefinitely, and the
     #                 2026-09-02 log then carried 73/73 false mismatches, each
     #                 costing a blocking ~10 s resend plus a re-check on the
-    #                 single AppDaemon thread.
+    #                 then-single AppDaemon thread.
     #   "none"        no verification.
     #   "auto"        registers when device_id is set, otherwise none. It
     #                 deliberately never falls back to the mode sensor: that
@@ -342,7 +342,7 @@ class BatteryOptimizerConfig:
     # then fired seconds later and applied the identical entry again (production
     # 2026-09-02 07:30:06 -> 07:30:12). DirectControl's duplicate suppression
     # absorbed it, but each repeat is another blocking set_wit_mode on the
-    # single AppDaemon thread. The TIMER call is skipped when the same slot was
+    # app lock. The TIMER call is skipped when the same slot was
     # already applied this recently; internal calls (recalc, override resume,
     # manual "Auto") are never skipped. 0 disables.
     execute_dedupe_seconds: int = 60
@@ -396,10 +396,9 @@ class BatteryOptimizerConfig:
     # Logging
     # =========================================================================
     decision_log_level: int = 1  # 0=minimal, 1=summary, 2=verbose
-    # AppDaemon serializes an app's callbacks on its worker thread(s) and warns
-    # at 10s by default ("Excessive time spent in callback"). We measure the
-    # same thing locally so the log names the offending callback and can point
-    # at total_threads.
+    # The app lock serializes this app's callbacks, so one slow callback
+    # delays all the others. Measured per callback so the log names the
+    # offender.
     callback_warn_seconds: float = 10.0
 
     # =========================================================================
@@ -538,10 +537,10 @@ class BatteryOptimizerConfig:
     @classmethod
     def from_args(cls, args: dict, log_func=None) -> "BatteryOptimizerConfig":
         """
-        Load configuration from AppDaemon args dictionary.
+        Load configuration from the args dictionary.
 
         Args:
-            args: The args dict from AppDaemon's apps.yaml
+            args: The add-on options as args (see `addon_main.options_to_args`)
             log_func: Optional logging function for warnings
 
         Returns:

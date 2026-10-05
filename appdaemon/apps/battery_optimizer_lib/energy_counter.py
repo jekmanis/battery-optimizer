@@ -151,7 +151,7 @@ class EnergyCounterGuard:
     """Derives a plausible delta from one monotonic daily energy counter.
 
     Pure and side-effect free apart from its own two-field baseline, so it is
-    unit-testable without AppDaemon or Home Assistant.
+    unit-testable without the host or Home Assistant.
     """
 
     def __init__(

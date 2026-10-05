@@ -270,7 +270,7 @@ class TestMainSensorStaysLean:
         assert 'set_state("sensor.battery_optimizer_schedule"' in source
 
     def test_main_sensor_replaces_attributes_instead_of_merging(self):
-        """AppDaemon's set_state merges attributes by default; a removed key
+        """The host's set_state merges attributes by default; a removed key
         would survive in HA until the next HA restart. Measured on the first
         deploy: 18 550 bytes with `schedule` still present."""
         source = inspect.getsource(bo.BatteryOptimizer._update_schedule_sensor)

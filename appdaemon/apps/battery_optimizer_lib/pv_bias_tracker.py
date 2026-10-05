@@ -20,7 +20,7 @@ Two production defects motivated this module:
   ``actual / forecast`` over a sliding window.  The caller multiplies the whole
   remaining horizon by it.
 
-The module is deliberately free of Home Assistant / AppDaemon dependencies so
+The module is deliberately free of Home Assistant / host dependencies so
 it can be unit tested directly (``battery_optimizer.py`` is not unit tested).
 """
 
@@ -141,7 +141,7 @@ class PvBiasTracker:
 
         This must NOT be cached across the horizon.  The orchestrator's
         ``_get_local_timezone`` returns a **fixed-offset** ``datetime.timezone``
-        recomputed from the current wall clock (AppDaemon's ``self.datetime()``
+        recomputed from the current wall clock (the host's ``self.datetime()``
         is naive in production, so the value falls back to
         ``datetime.now().astimezone().tzinfo``).  That object is ``UTC+03:00``
         in summer and ``UTC+02:00`` in winter.
@@ -171,7 +171,7 @@ class PvBiasTracker:
     def _localize(self, dt: datetime.datetime) -> datetime.datetime:
         """Bring an externally supplied datetime into the tracker's key space.
 
-        AppDaemon's ``self.datetime()`` is **naive local time** in production
+        The host's ``self.datetime()`` is **naive local time** in production
         while every stored slot key is tz-aware (``align_to_slot`` attaches the
         HA local timezone).  Subtracting one from the other raises ``TypeError``,
         and that exception used to be swallowed: ``_prune`` then kept every
@@ -364,7 +364,7 @@ class PvBiasTracker:
         """Drop ratio observations older than ``window_minutes``.
 
         Every value is normalized through :meth:`_order` first, so a naive
-        ``now`` (AppDaemon's ``self.datetime()``) is comparable with the aware
+        ``now`` (the host's ``self.datetime()``) is comparable with the aware
         slot keys.  An entry that is *still* incomparable after normalization is
         a genuine bug: it is logged and DISCARDED rather than kept, because
         keeping it is what disabled the window in production.

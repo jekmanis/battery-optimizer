@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 """
-Convert an AppDaemon apps.yaml app block into add-on options.
+Convert a legacy apps.yaml app block (the pre-add-on format) into add-on options.
 
 The add-on reads Supervisor-validated options instead of apps.yaml. This is the
 one conversion between the two, used by the smoke test, the deploy script and
 the tests:
 
-* AppDaemon-only keys (``module``, ``class``, ``pin_app``, ``pin_thread``) and
+* host-only keys of that format (``module``, ``class``, ``pin_app``, ``pin_thread``) and
   the connection keys (``ha_url``, ``ha_token``) are dropped - inside the
   add-on the Supervisor provides the connection;
 * every other key must exist in ``addon/battery_optimizer/config.yaml``'s
@@ -35,7 +35,7 @@ from typing import Any, Dict, Optional
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ADDON_CONFIG = REPO_ROOT / "addon" / "battery_optimizer" / "config.yaml"
 
-APPDAEMON_ONLY_KEYS = frozenset({"module", "class", "pin_app", "pin_thread"})
+LEGACY_APP_KEYS = frozenset({"module", "class", "pin_app", "pin_thread"})
 CONNECTION_KEYS = frozenset({"ha_url", "ha_token"})
 SECRET_HINTS = ("token", "key", "password", "secret", "passwd", "credential")
 
@@ -109,7 +109,7 @@ def apps_yaml_to_options(app_args: Dict[str, Any], schema: Dict[str, str], *,
     options: Dict[str, Any] = {}
     unknown = []
     for key, value in app_args.items():
-        if key in APPDAEMON_ONLY_KEYS or key in CONNECTION_KEYS:
+        if key in LEGACY_APP_KEYS or key in CONNECTION_KEYS:
             continue
         if key not in schema:
             unknown.append(key)

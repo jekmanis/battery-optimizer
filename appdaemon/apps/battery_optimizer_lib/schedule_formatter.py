@@ -97,7 +97,7 @@ class ScheduleFormatter:
 
         Args:
             config: Static configuration for formatting
-            log_func: Function to call for logging (typically self.log from AppDaemon)
+            log_func: Function to call for logging (typically the app's self.log)
             learning_engine: Optional BatteryLearningEngine for charge rate predictions
             temp_projector: Optional shared thermal_model.TemperatureProjector.
                 Without it this fallback path would show a DIFFERENT temperature

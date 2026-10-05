@@ -1,7 +1,7 @@
 """
 Battery Optimizer package.
 
-This package contains helper modules for the main BatteryOptimizer AppDaemon app:
+This package contains helper modules for the main BatteryOptimizer app (Home Assistant add-on):
 - config: Configuration dataclass with typed fields and validation
 - models: Data classes and enums (BatteryMode, PricePoint, ScheduleEntry, etc.)
 - learning_engine: Self-learning battery performance tracking

@@ -80,7 +80,7 @@ class MockPvOptimizer:
             log_func=self.log,
         )
 
-    # --- AppDaemon-ish surface -------------------------------------------
+    # --- host-ish surface ------------------------------------------------
     def log(self, message, level="INFO"):
         self._log_messages.append(message)
 

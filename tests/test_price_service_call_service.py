@@ -1,4 +1,4 @@
-"""The AppDaemon ``call_service`` fallback in ``NordPoolPriceService``.
+"""The websocket ``call_service`` fallback in ``NordPoolPriceService``.
 
 Every case here is a production failure from 2026-09-08. The fallback sent
 ``return_result=True``, and AppDaemon 4.5.13 consumes only three of its own
@@ -67,7 +67,7 @@ def _service_entries(day="2026-09-06", hours=3):
 
 
 def _ad_success_envelope(response):
-    """AppDaemon's shape for a successful response-returning service call.
+    """The envelope of a successful response-returning service call (AppDaemon's shape, kept by ha_host).
 
     ``HassPlugin.websocket_send_json`` returns the whole websocket envelope and
     stamps its own bookkeeping onto it::
@@ -90,7 +90,7 @@ def _ad_success_envelope(response):
 
 
 class TestFallbackKwargs:
-    """What the fallback actually asks AppDaemon for."""
+    """What the fallback actually asks the host for."""
 
     def test_passes_return_response_and_never_return_result(self):
         mock_call_service = MagicMock(return_value=None)
@@ -101,12 +101,12 @@ class TestFallbackKwargs:
 
         _args, kwargs = mock_call_service.call_args
         assert kwargs.get("return_response") is True
-        # The whole bug: anything AppDaemon does not consume by name lands in
+        # The whole bug: anything the host does not consume by name lands in
         # service_data, and Home Assistant rejects the call for it.
         assert "return_result" not in kwargs
 
     def test_passes_a_hass_timeout(self):
-        """AppDaemon's ``ws_timeout`` default is 10s; a day-ahead fetch is slower.
+        """The host's websocket default is 10s; a day-ahead fetch is slower.
 
         ``call_plugin_service`` forwards ``hass_timeout`` as
         ``websocket_send_json(timeout=hass_timeout, ...)``, and the REST path
@@ -174,7 +174,7 @@ class TestFallbackFailureEnvelopes:
         assert any(level == "WARNING" for level, _ in logged), logged
 
     def test_timeout_envelope_returns_none_and_warns(self):
-        """``ad_status: TIMEOUT`` means AppDaemon stopped waiting.
+        """``ad_status: TIMEOUT`` means the host stopped waiting.
 
         ``websocket_send_json`` synthesises ``result = {"success": False}`` on
         ``asyncio.TimeoutError`` and stamps the status onto it, so the payload

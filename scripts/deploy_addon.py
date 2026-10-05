@@ -22,8 +22,9 @@ deploy is:
   6. verify      - read the add-on log for the version line and for
                    Traceback / ModuleNotFoundError / TypeError.
 
-Nothing here touches the AppDaemon add-on except the explicit ``stop`` /
-``start`` subcommands. The admin token is read from ~/.ha_token (first line)
+Nothing here touches the rollback add-on (``ROLLBACK_SLUG``, the stopped
+instance the add-on replaced) except the explicit ``stop`` / ``start``
+subcommands and ``seed``, which only reads its state files. The admin token is read from ~/.ha_token (first line)
 and never printed. Authentication is attempted ONCE per run: repeated 401s can
 get the client IP banned.
 
@@ -33,6 +34,7 @@ Usage:
     uv run python scripts/deploy_addon.py status
     uv run python scripts/deploy_addon.py logs [--lines 300] [--slug SLUG]
     uv run python scripts/deploy_addon.py options opts.json [--no-restart] [--watchdog on|off]
+    uv run python scripts/deploy_addon.py export-options opts.json
     uv run python scripts/deploy_addon.py start|stop|restart [--slug SLUG]
     uv run python scripts/deploy_addon.py stage --out DIR
     uv run python scripts/deploy_addon.py seed [--force]
@@ -66,7 +68,7 @@ HA_URL = os.environ.get("BO_HA_URL", f"http://{HA_HOST}:8123")
 SHARE_ROOT = Path(os.environ.get("BO_SHARE_ROOT", f"//{HA_HOST}"))
 ADDON_DIR_NAME = "battery_optimizer"
 SLUG = "local_battery_optimizer"
-APPDAEMON_SLUG = "a0d7b954_appdaemon"
+ROLLBACK_SLUG = "a0d7b954_appdaemon"
 TOKEN_FILE = Path(os.environ.get("BO_HA_TOKEN_FILE", Path.home() / ".ha_token"))
 KEEP_BACKUPS = 5
 
@@ -440,7 +442,7 @@ def cmd_deploy(args) -> int:
 def cmd_status(args) -> int:
     sup = Supervisor()
     try:
-        for slug in (SLUG, APPDAEMON_SLUG):
+        for slug in (SLUG, ROLLBACK_SLUG):
             info = sup.info(slug)
             if info is None:
                 log(f"{slug}: not installed")
@@ -487,6 +489,22 @@ def cmd_options(args) -> int:
     return 0
 
 
+def cmd_export_options(args) -> int:
+    """Write the add-on's current options to a JSON file (unredacted)."""
+    sup = Supervisor()
+    try:
+        info = sup.info(args.slug) or {}
+    finally:
+        sup.close()
+    options = info.get("options")
+    if not isinstance(options, dict):
+        raise DeployError(f"{args.slug}: no options (installed?)")
+    Path(args.file).write_text(json.dumps(options, indent=2, sort_keys=True),
+                               encoding="utf-8")
+    log(f"wrote {len(options)} options to {args.file}")
+    return 0
+
+
 def cmd_lifecycle(args) -> int:
     sup = Supervisor()
     try:
@@ -508,8 +526,8 @@ STATE_FILE_KEYS = {
 }
 
 
-def appdaemon_config_dir(share_root: Path = None) -> Path:
-    return Path(share_root or SHARE_ROOT) / "addon_configs" / APPDAEMON_SLUG
+def rollback_config_dir(share_root: Path = None) -> Path:
+    return Path(share_root or SHARE_ROOT) / "addon_configs" / ROLLBACK_SLUG
 
 
 def addon_config_dir(share_root: Path = None) -> Path:
@@ -532,7 +550,7 @@ def seed_plan(app_args: dict, share_root: Path = None):
         if not str(path).startswith("/config/"):
             raise DeployError(f"{key}={path!r} is not under /config")
         rel = str(path)[len("/config/"):]
-        plan.append((key, appdaemon_config_dir(share_root) / rel,
+        plan.append((key, rollback_config_dir(share_root) / rel,
                      addon_config_dir(share_root) / rel))
     return plan
 
@@ -540,7 +558,7 @@ def seed_plan(app_args: dict, share_root: Path = None):
 def read_live_app_args(share_root: Path = None) -> dict:
     import yaml
 
-    path = appdaemon_config_dir(share_root) / "apps" / "apps.yaml"
+    path = rollback_config_dir(share_root) / "apps" / "apps.yaml"
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     for value in raw.values():
         if isinstance(value, dict) and value.get("module") == "battery_optimizer":
@@ -549,7 +567,7 @@ def read_live_app_args(share_root: Path = None) -> dict:
 
 
 def cmd_seed(args) -> int:
-    """Copy the AppDaemon instance's JSON state into the add-on's /config."""
+    """Copy the rollback instance's JSON state into the add-on's /config."""
     plan = seed_plan(read_live_app_args())
     if not args.force:
         sup = Supervisor()
@@ -622,12 +640,17 @@ def main(argv=None) -> int:
     p.add_argument("--watchdog", choices=("on", "off"), default=None)
     p.set_defaults(func=cmd_options)
 
+    p = sub.add_parser("export-options", help="write the current options to a JSON file")
+    p.add_argument("file")
+    p.add_argument("--slug", default=SLUG)
+    p.set_defaults(func=cmd_export_options)
+
     for name in ("start", "stop", "restart"):
         p = sub.add_parser(name)
         p.add_argument("--slug", default=SLUG)
         p.set_defaults(func=cmd_lifecycle)
 
-    p = sub.add_parser("seed", help="copy AppDaemon's JSON state into the add-on")
+    p = sub.add_parser("seed", help="copy the rollback instance's JSON state into the add-on")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_seed)
 

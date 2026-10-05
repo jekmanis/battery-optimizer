@@ -76,7 +76,7 @@ cost a factor of `efficiency` on every learned observation.
 
 | Name | Meaning | Where it appears |
 | --- | --- | --- |
-| `charge_input_dc_kw` | DC power at the battery terminal, **before** retention | `charge_rate_kw` in `apps.yaml`, `SocProjectionParams.charge_rate`, the DP's per-slot rate, `|P_bat|` for the thermal model |
+| `charge_input_dc_kw` | DC power at the battery terminal, **before** retention | `charge_rate_kw` in the add-on options, `SocProjectionParams.charge_rate`, the DP's per-slot rate, `|P_bat|` for the thermal model |
 | `stored_charge_kw` | rate at which **stored** energy grows | every learning observation, persisted as-is |
 | `grid_charge_ac_kwh` | AC energy purchased to charge | the import cost |
 
@@ -461,7 +461,7 @@ SOC shortfalls against a battery that was following the planner exactly.
 
 `predict_charge_input_dc_energy` survives in the learning engine, marked
 **diagnostic only**; nothing in planning or projection calls it. Its
-`temp_threshold` argument was never an `apps.yaml` key — it was a parameter of
+`temp_threshold` argument was never a configuration key — it was a parameter of
 `project_slot_soc` with a default of 16 °C — and it has been removed from that
 signature rather than left accepted-and-ignored.
 
@@ -557,8 +557,8 @@ Two designs were rejected:
 - **Discretized temperature in the DP state.** The clearest formulation, but it
   multiplies the state count by the number of temperature buckets, and the
   partial-first-slot lookahead already runs the whole DP once per candidate. The
-  normal 132-slot horizon would go from ~140 ms to well over a second on the
-  single AppDaemon thread.
+  normal 132-slot horizon would go from ~140 ms to well over a second under
+  the app lock.
 - **A fixed conservative temperature.** "Coldest plausible" is not a valid bound
   over reachable conditions once SOC tapering and non-monotonic rate behaviour
   are in play, and it would refuse to plan the warm-pack charging the
@@ -621,7 +621,7 @@ Three things the table is there to say:
   with a partial first slot, 429 ms became 984 ms. Converging cases are
   unchanged, and the removed sensitivity probe pays for itself there. Around
   1 s at the reference installation's 1 % step in the worst case.
-- **It runs under the app callback lock**, on AppDaemon's single thread, so it
+- **It runs under the app callback lock**, so it
   delays every other callback of this app for that long. That is the argument
   against putting temperature into the DP state, and the reason
   `MAX_RATE_REFINEMENT_PASSES` is 3 rather than "until it settles".
@@ -937,7 +937,7 @@ Two things must remain true here:
    printed for the zero case. No slot is worth less than zero, so it described a
    rule that could never fire and read like a normal, working configuration.
 
-The warning does not change the schedule. The deployed `apps.yaml` has to be
+The warning does not change the schedule. The deployed configuration has to be
 changed to `"auto"`.
 
 ## PV forecast and live control
@@ -1250,8 +1250,8 @@ day needs 100. The verdict distinguishes a `gap` (data exists past the break -
 a hole in otherwise available data) from `tomorrow_missing` (nothing past the
 break, and publication was expected).
 
-That midnight is computed in a zone **with DST rules**, taken from AppDaemon's
-`get_timezone()`. `_get_local_timezone()` cannot be used for it: it falls back
+That midnight is computed in a zone **with DST rules**, taken from the host's
+`get_timezone()` (`ha_host` reports HA's configured zone as a `zoneinfo` zone). `_get_local_timezone()` cannot be used for it: it falls back
 to `datetime.now().astimezone().tzinfo`, a fixed `datetime.timezone` carrying
 today's offset, whenever `self.datetime()` is naive — and
 `combine(2024-04-01, 00:00, +02:00)` is an hour later than Riga's real midnight
@@ -1260,7 +1260,7 @@ the whole spring-transition afternoon, and an incomplete one read as complete
 every autumn. When no region zone can be resolved the app falls back to the
 offset and says so once at WARNING.
 
-The zone AppDaemon 4.5 hands over is a **pytz** zone, and pytz has its own trap:
+The zone AppDaemon 4.5 (the previous host) handed over was a **pytz** zone, and pytz has its own trap:
 a pytz zone attached with `combine(..., tzinfo=zone)` or `replace(tzinfo=zone)`
 answers with the zone's pre-standard-time local-mean-time offset — +01:37 for
 Europe/Riga — and applies the rules for the date only through `localize()`.
@@ -1476,8 +1476,8 @@ re-request whole days. `NordPoolPriceService.get_prices_for_date` remains
 available for that.
 
 The periodic adaptive pass evaluates the **last known** snapshot rather than
-fetching: a price fetch is a blocking REST call on the shared AppDaemon worker
-thread, and the retry is what pays that cost. Only when the snapshot is unusable
+fetching: a price fetch is a blocking REST call made under the app lock, and
+the retry is what pays that cost. Only when the snapshot is unusable
 - or when it is fine but the current slot has no entry, i.e. the plan ran out -
 does the adaptive pass act.
 
@@ -1518,7 +1518,7 @@ The rules, in full:
   CHARGE carrying `price_source="market"`.
 - A record whose `start` and `end` disagree about being timezone-aware is
   normalized to ONE awareness - its start's, through the local zone - before
-  anything is compared. With no timezone configured in AppDaemon both parsers
+  anything is compared. With no timezone configured both parsers
   leave each field with whatever its own ISO string carried, and comparing the
   two raised `TypeError` out of `get_prices`, losing the whole reply and the
   fetch that would have noticed the gap.
@@ -1618,7 +1618,7 @@ and actual inverter behavior before enabling hardware control.
 
 ### There is no restart override
 
-AppDaemon can restart in the middle of a CHARGE or DISCHARGE interval, and the
+The app can restart in the middle of a CHARGE or DISCHARGE interval, and the
 plan it was executing is gone. Nothing reads it back. **The DP's partial-slot
 fraction is the continuity mechanism**: the first slot of the solve is the
 remaining minutes of the interval the app woke up in, priced at that interval's

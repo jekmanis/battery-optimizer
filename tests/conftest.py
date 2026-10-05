@@ -13,20 +13,37 @@ import pytest
 APPS_DIR = Path(__file__).parent.parent / "appdaemon" / "apps"
 sys.path.insert(0, str(APPS_DIR))
 
-# Create mock appdaemon module before importing battery_optimizer
-mock_hass_module = type(sys)("appdaemon.plugins.hass.hassapi")
+
+# ---------------------------------------------------------------------------
+# Host mock: a fake Home Assistant (websocket + REST on a local socket) and an
+# `ha_host.HAHost` connected to it. The orchestrator's base class is
+# `ha_host.Hass`, which is constructible without a host, so library tests and
+# app test doubles need no module mock at all; tests that exercise the host or
+# the orchestrator end to end use these fixtures.
+# ---------------------------------------------------------------------------
 
 
-class MockHassBase:
-    """Minimal mock for Hass base class."""
-    pass
+@pytest.fixture
+def fake_ha():
+    from tests.fake_ha import FakeHA
+
+    ha = FakeHA().start()
+    ha.set_entity("sun.sun", "above_horizon", notify=False)
+    ha.set_entity("sensor.soc", "50", {"unit_of_measurement": "%"}, notify=False)
+    yield ha
+    ha.stop()
 
 
-mock_hass_module.Hass = MockHassBase
-sys.modules["appdaemon"] = type(sys)("appdaemon")
-sys.modules["appdaemon.plugins"] = type(sys)("appdaemon.plugins")
-sys.modules["appdaemon.plugins.hass"] = type(sys)("appdaemon.plugins.hass")
-sys.modules["appdaemon.plugins.hass.hassapi"] = mock_hass_module
+@pytest.fixture
+def ha_host(fake_ha):
+    from battery_optimizer_lib.ha_host import HAHost
+
+    host = HAHost(ws_url=fake_ha.ws_url, rest_url=fake_ha.rest_url,
+                  token=fake_ha.token, time_zone="Europe/Riga",
+                  reconnect_delays=(0.05,))
+    assert host.start(wait_timeout=5), "host never connected to the fake HA"
+    yield host
+    host.stop()
 
 
 class RigaTestTimezone(datetime.tzinfo):

@@ -19,7 +19,7 @@ WAIT_TIMEOUT = 2.0
 
 
 class LogRecorder:
-    """Stand-in for AppDaemon's ``self.log(msg, level=...)``."""
+    """Stand-in for the app's ``self.log(msg, level=...)``."""
 
     def __init__(self):
         self.entries = []
@@ -78,7 +78,7 @@ def test_guard_preserves_metadata_and_positional_kwargs_call():
     app = App()
     payload = {"slot": 3}
 
-    # AppDaemon's positional convention: f(kwargs_dict), plus the app's own
+    # The host's positional convention: f(kwargs_dict), plus the app's own
     # internal f(kwargs, force=True) call.
     self_obj, got_kwargs, got_force, depth_inside = guarded(app, payload, force=True)
     assert self_obj is app

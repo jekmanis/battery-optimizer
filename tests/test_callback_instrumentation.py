@@ -26,7 +26,7 @@ from battery_optimizer_lib.direct_control import ApplyOutcome
 
 
 class FakeOptimizer(bo.BatteryOptimizer):
-    """Minimal stand-in: no AppDaemon initialize(), just the added state."""
+    """Minimal stand-in: no initialize(), just the added state."""
 
     def __init__(self, **config_overrides):
         self.config = bo.BatteryOptimizerConfig(**config_overrides)
@@ -65,7 +65,7 @@ class FakeOptimizer(bo.BatteryOptimizer):
 
 
 # ---------------------------------------------------------------------------
-# The decorator must not disturb AppDaemon's calling convention
+# The decorator must not disturb the host's calling convention
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
@@ -81,14 +81,14 @@ class FakeOptimizer(bo.BatteryOptimizer):
         # was invisible in the overrun accounting.
         ("_record_ambient_observation", "(self, kwargs=None)"),
         ("_sample_pv", "(self, kwargs=None)"),
-        # The bounded price-recovery retry is a run_in callback: AppDaemon
+        # The bounded price-recovery retry is a run_in callback: the host
         # hands it the kwargs dict positionally, and its generation token is
         # read out of that dict.
         ("_price_recovery_retry", "(self, kwargs=None) -> None"),
     ],
 )
 def test_timed_callbacks_keep_their_signatures(name, expected):
-    """AppDaemon calls these positionally; functools.wraps must preserve them."""
+    """The host calls these positionally; functools.wraps must preserve them."""
     method = getattr(bo.BatteryOptimizer, name)
     assert str(inspect.signature(method)) == expected
     assert method.__name__ == name
@@ -125,7 +125,7 @@ def test_duration_is_recorded_while_the_app_lock_is_still_held():
 
     `_record_callback_duration` mutates `_callback_overrun_count`,
     `_slowest_callback` and `_threads_hint_logged`; with `pin_app: false`
-    AppDaemon runs this app's callbacks concurrently, so recording after the
+    the host runs this app's callbacks concurrently, so recording after the
     `with lock:` block exited raced every other callback.
     """
     depths = []
@@ -184,15 +184,19 @@ def test_slow_callback_warns_and_names_itself():
     assert "34.0s" in message
 
 
-def test_third_overrun_advises_more_appdaemon_threads_once():
+def test_third_overrun_advises_once():
     app = FakeOptimizer()
 
     for seconds in (12.0, 30.0, 11.0, 15.0, 20.0):
         app._record_callback_duration("full_optimize", seconds)
 
-    hints = [m for m, _l in app.logs if "total_threads" in m]
+    hints = [m for m, _l in app.logs if "Repeated slow callbacks" in m]
     assert len(hints) == 1
     assert "set_wit_mode is a blocking service call" in hints[0]
+    # The advice names the add-on's own knobs, not the old host's.
+    assert "set_wit_mode_timeout_seconds" in hints[0]
+    assert "worker_threads" in hints[0]
+    assert "total_threads" not in hints[0] and "pin_app" not in hints[0]
     assert app._callback_overrun_count == 5
 
 
@@ -325,7 +329,7 @@ def test_control_health_sensor_survives_a_broken_direct_control():
         "_record_ambient_observation",
         "_sample_pv",
         "_price_recovery_retry",
-        # AppDaemon calls terminate() on its own thread and it clears the
+        # The host calls terminate() on its own thread and it clears the
         # retry generation, so it belongs under the app lock like the rest.
         "terminate",
     ],
@@ -550,9 +554,8 @@ def test_health_sensor_exposes_the_new_counters_without_renaming_the_old():
 # ---------------------------------------------------------------------------
 # Thread safety: the app lock wired into the orchestrator
 #
-# AppDaemon 4.5.13 with `total_threads: 4` + `pin_app: false` round-robins this
-# app's callbacks across worker threads, so the accounting below is now
-# concurrent.  `_timed_callback` runs every callback under one app-wide
+# `ha_host` dispatches this app's callbacks across `worker_threads` worker
+# threads, so the accounting below is concurrent.  `_timed_callback` runs every callback under one app-wide
 # CallbackLock; `record_external_callback_duration` is the one entry point
 # reached from OUTSIDE that decorator (DirectControl's verify callbacks) and
 # has to take the lock itself.
@@ -576,9 +579,9 @@ def test_external_callback_durations_are_exact_under_concurrency():
     assert app._callback_overrun_count == 800
     # The one-shot hint is a check-then-set: without the lock several threads
     # pass the `not self._threads_hint_logged` test before any of them sets it.
-    hints = [m for m, _l in app.logs if "total_threads" in m]
+    hints = [m for m, _l in app.logs if "Repeated slow callbacks" in m]
     assert len(hints) == 1
-    assert "pin_app: false" in hints[0]
+    assert "set_wit_mode_timeout_seconds" in hints[0]
     assert app._slowest_callback == ("DirectControl._verify_mode", 15.8)
 
 
@@ -586,7 +589,7 @@ def test_the_decorator_serializes_callbacks_and_counts_the_lock_wait():
     """Two callbacks on one app never overlap, and the waiter's wait is timed.
 
     The measured duration must include time spent waiting for the app lock:
-    that wait is time the callback occupied its AppDaemon worker thread, which
+    that wait is time the callback occupied its worker thread, which
     is exactly what the overrun accounting exists to surface.
     """
     intervals = []

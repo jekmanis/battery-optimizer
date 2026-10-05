@@ -7,7 +7,7 @@ with bucket merging, which is an approximation and not a global optimum (see
 docs/scheduling-algorithm.md SS Conservative quantization). Implements adaptive
 re-optimization based on actual SOC and PV production.
 
-Author: AppDaemon Battery Optimizer
+Runs as a Home Assistant add-on on `battery_optimizer_lib.ha_host`.
 """
 
 from battery_optimizer_lib import ha_host as hass
@@ -35,7 +35,7 @@ from battery_optimizer_lib import (
     PriceHorizonMonitor,
     is_coverage_reason,
     DirectControl,
-    # App-wide callback lock (AppDaemon multi-thread dispatch)
+    # App-wide callback lock (multi-threaded callback dispatch)
     CallbackLock,
     # DP Optimizer
     DPOptimizer,
@@ -102,7 +102,7 @@ from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
 # published on sensor.battery_optimizer, so a deploy can be PROVEN to be
 # running: on 2026-09-02 the add-on silently imported the previous commit out
 # of a backup directory inside apps/ while SHA256 verification of apps/ passed.
-APP_VERSION = "2026-10-05.1"
+APP_VERSION = "2026-10-05.2"
 
 # Home Assistant's recorder refuses to store an entity's attributes once the
 # serialized blob passes this size ("State attributes for <entity> exceed
@@ -140,26 +140,24 @@ def _code_paths() -> Tuple[str, str]:
 def _timed_callback(func):
     """Measure a callback's wall time and warn when it hogs the thread.
 
-    AppDaemon runs an app's callbacks on a shared worker thread and prints
-    "Excessive time spent in callback ... (limit=10.0s)" when one overruns —
-    without naming what this app was doing. Since `set_wit_mode` is a SYNCHRONOUS
-    service call, one slow inverter write stalls every other callback of this
-    app. Measuring here names the callback and lets us advise `total_threads`.
+    Since `set_wit_mode` is a SYNCHRONOUS service call, one slow inverter write
+    holds the app lock and stalls every other callback of this app. Measuring
+    here names the callback that did it.
 
-    functools.wraps + *args/**kwargs is mandatory: AppDaemon inspects and calls
-    these with positional args (`execute_scheduled_mode(kwargs, force=True)`),
-    and the signature must survive untouched.
+    functools.wraps + *args/**kwargs is mandatory: the host inspects the
+    unwrapped signature and calls these with positional args
+    (`execute_scheduled_mode(kwargs, force=True)`), so it must survive untouched.
 
-    It is ALSO the app's thread-safety chokepoint. With `total_threads` > 1 and
-    `pin_app: false`, AppDaemon round-robins this app's callbacks across worker
-    threads, so a schedule rebuild and a slot execution can run concurrently.
+    It is ALSO the app's thread-safety chokepoint. `ha_host` dispatches this
+    app's callbacks across `worker_threads` worker threads, so a schedule
+    rebuild and a slot execution can run concurrently.
     Every registered callback carries this decorator, so running its body under
     the single app-wide `CallbackLock` restores the single-threaded semantics
     the app was written against — with exactly one deliberate escape hatch, the
     blocking `set_wit_mode` write in `_apply_mode_tracked`.
 
     `time.monotonic()` is sampled OUTSIDE the acquire on purpose: waiting for
-    the app lock is time this callback spent hogging its AppDaemon thread and
+    the app lock is time this callback spent occupying its worker thread and
     must show up in the overrun accounting.
 
     The duration is RECORDED under the same lock, from a nested try/finally
@@ -168,7 +166,7 @@ def _timed_callback(func):
     `_slowest_callback` and `_threads_hint_logged` — plain attributes read and
     then written (check-then-set) from every worker thread — so recording after
     the lock was released would lose overruns and could emit the one-shot
-    `total_threads` hint more than once. `record_external_callback_duration`
+    slow-callback hint more than once. `record_external_callback_duration`
     takes the app lock for exactly the same reason.
 
     `getattr(self, "_lock", None)` keeps the decorator usable by test doubles
@@ -206,7 +204,7 @@ def _timed_callback(func):
 # Rewriting a DP action after the fact is only sound where the DP cannot tell
 # the two actions apart. Everything below exists to establish that, per slot.
 # Module-level and pure so it can be reasoned about (and tested) without an
-# AppDaemon instance.
+# app instance.
 
 _HEDGE_VALUE_EPS = 1e-9      # EUR/kWh
 _HEDGE_ENERGY_EPS = 1e-6     # kWh
@@ -543,7 +541,7 @@ def _cloud_safe_hedge(
 
 class BatteryOptimizer(hass.Hass):
     """
-    AppDaemon app for optimizing battery charge/discharge based on Nord Pool prices.
+    Home Assistant app for optimizing battery charge/discharge based on Nord Pool prices.
 
     Features:
     - Fetches prices from Nord Pool sensor (today + tomorrow after 13:00 CET)
@@ -560,13 +558,13 @@ class BatteryOptimizer(hass.Hass):
         """Initialize the battery optimizer"""
         # FIRST statement, before anything else can be dispatched: the one
         # app-wide callback lock. `_timed_callback` looks it up with getattr,
-        # so any callback AppDaemon fires while `initialize` is still running
+        # so any callback the host fires while `initialize` is still running
         # (the startup SOC check below, the `run_in(full_optimize, 1)` armed
         # from `_init_battery_cost`) is already serialized against this frame.
         self._lock = CallbackLock(log_func=self.log)
 
-        # The rest of construction runs under the lock: on a multi-threaded
-        # AppDaemon the startup safety check and the deferred first optimize
+        # The rest of construction runs under the lock: with several worker
+        # threads the startup safety check and the deferred first optimize
         # can otherwise overlap the tail of this method and read half-built
         # state.
         with self._lock:
@@ -907,9 +905,9 @@ class BatteryOptimizer(hass.Hass):
 
     @_timed_callback
     def terminate(self):
-        """AppDaemon teardown: make every pending timer of this instance inert.
+        """Teardown: make every pending timer of this instance inert.
 
-        AppDaemon cancels an app's timers on reload, but the price retry is the
+        The host stops its scheduler on shutdown, but the price retry is the
         one callback that would otherwise re-plan and re-apply a mode on behalf
         of an app that is going away. `_terminated` is the belt to
         `_cancel_price_retry`'s braces: a callback already queued by the
@@ -945,11 +943,11 @@ class BatteryOptimizer(hass.Hass):
         callback DirectControl._verify_mode ... 15.8s") is invisible to
         ``_timed_callback``, which only wraps methods of this class. Routing
         those durations here keeps one overrun counter, one slowest-callback
-        record and one ``total_threads`` hint for the whole app.
+        record and one slow-callback hint for the whole app.
 
-        It is called from another AppDaemon worker thread (DirectControl's
+        It is called from another worker thread (DirectControl's
         verify/re-check callbacks), so it must take the app lock: the counters
-        and the one-shot ``total_threads`` hint below are plain attributes with
+        and the one-shot slow-callback hint below are plain attributes with
         check-then-set semantics. DirectControl calls this from the ``finally``
         of ``_verify_mode`` AFTER releasing both of its own locks, which is what
         keeps the lock order (app lock -> _io_lock -> _state_lock) intact.
@@ -1033,7 +1031,7 @@ class BatteryOptimizer(hass.Hass):
         self._shrink_grid_charge_window()
 
     def _record_callback_duration(self, name: str, seconds: float) -> None:
-        """Warn about a callback that blocked the AppDaemon worker thread."""
+        """Warn about a callback that held the app lock for too long."""
         limit = getattr(self.config, "callback_warn_seconds", 10.0)
         if self._slowest_callback is None or seconds > self._slowest_callback[1]:
             self._slowest_callback = (name, seconds)
@@ -1042,21 +1040,19 @@ class BatteryOptimizer(hass.Hass):
 
         self._callback_overrun_count += 1
         self.log(
-            f"Callback {name} took {seconds:.1f}s (> {limit:.0f}s) — AppDaemon "
-            f"serializes this app's callbacks, so everything else waited",
+            f"Callback {name} took {seconds:.1f}s (> {limit:.0f}s) — the app "
+            f"lock serializes this app's callbacks, so everything else waited",
             level="WARNING",
         )
         if self._callback_overrun_count >= 3 and not self._threads_hint_logged:
             self._threads_hint_logged = True
             self.log(
-                "Repeated slow callbacks: give this app more AppDaemon threads. "
-                "In appdaemon.yaml set `appdaemon: total_threads: 4` AND in "
-                "apps.yaml set `pin_app: false` on this app - total_threads "
-                "alone leaves pin_app at its default true (AppDaemon 4.5.13), "
-                "so every callback still lands on thread-0 with an 'Invalid "
-                "thread ID for pinned thread' warning. set_wit_mode is a "
-                "blocking service call; on one thread it stalls schedule "
-                "execution, SOC listeners and PV sampling alike.",
+                "Repeated slow callbacks: this app's callbacks share one app "
+                "lock, so each overrun stalled schedule execution, SOC "
+                "listeners and PV sampling alike. set_wit_mode is a blocking "
+                "service call - check set_wit_mode_timeout_seconds and how "
+                "fast the inverter integration answers; more worker_threads "
+                "only helps callbacks that do not need the app lock.",
                 level="WARNING",
             )
 
@@ -1123,7 +1119,7 @@ class BatteryOptimizer(hass.Hass):
     # left the optimizer on an old or absent plan until the next daily run.
     #
     # ONE owner: `PriceHorizonMonitor` decides *whether* coverage is usable and
-    # *how long* to wait; this section owns the AppDaemon timer, the generation
+    # *how long* to wait; this section owns the timer, the generation
     # guard, and the "at most one pending retry" rule. Recovery never invents a
     # price and never forces a mode: it re-fetches, and on success rebuilds
     # through the normal execution path so the enabled/override checks and the
@@ -1194,7 +1190,7 @@ class BatteryOptimizer(hass.Hass):
     def _cancel_price_retry(self) -> None:
         """Invalidate the pending retry (generation guard + best-effort cancel).
 
-        Clearing the token is what actually makes the callback inert: AppDaemon
+        Clearing the token is what actually makes the callback inert: the host
         may still fire an already-queued timer, and a timer registered before a
         disable/terminate must never replace a newer valid plan.
         """
@@ -1344,8 +1340,8 @@ class BatteryOptimizer(hass.Hass):
         """Periodic horizon check for `adaptive_optimize`.
 
         Deliberately evaluates the LAST KNOWN price snapshot rather than
-        fetching: a fetch is a blocking REST call on the shared AppDaemon
-        thread, and this runs every `adaptive_recalc_minutes`. When the snapshot
+        fetching: a fetch is a blocking REST call made while holding the app
+        lock, and this runs every `adaptive_recalc_minutes`. When the snapshot
         is unusable the bounded retry does the fetching.
 
         Returns True ONLY when it rebuilt the schedule, i.e. when a second pass
@@ -3012,8 +3008,8 @@ class BatteryOptimizer(hass.Hass):
             extra_charge_slots: Additional charge slots to add beyond minimum required
                                (used for catch-up charging when behind schedule)
             prices: An already-fetched and already-reviewed snapshot. A price
-                fetch is a blocking REST call on the shared AppDaemon worker
-                thread, so a caller that has just made one and judged it — the
+                fetch is a blocking REST call made under the app lock, so a
+                caller that has just made one and judged it — the
                 bounded price recovery — hands it over instead of paying for a
                 second. It is also the only way the verdict and the plan are
                 guaranteed to describe the SAME snapshot: prices can change
@@ -3137,7 +3133,7 @@ class BatteryOptimizer(hass.Hass):
         Called at the start of each slot. Sends a direct mode command to the inverter.
 
         Args:
-            kwargs: AppDaemon callback kwargs
+            kwargs: timer callback kwargs (None for internal calls)
             force: If True, skip override check (used when manual mode set to "Auto")
         """
         if not self._is_enabled():
@@ -3161,9 +3157,9 @@ class BatteryOptimizer(hass.Hass):
         # the quarter-hour timer then re-applied the identical entry seconds
         # later (production 07:30:06 -> 07:30:12, 08:30:06 -> 08:30:15).
         # DirectControl suppressed the duplicate, but the call still costs a
-        # blocking set_wit_mode round trip on the single AppDaemon thread, plus
+        # blocking set_wit_mode round trip under the app lock, plus
         # a second record_slot_start/record_slot_end pair for one slot.
-        # Only the AppDaemon timer is deduped: it is the only caller that
+        # Only the slot timer is deduped: it is the only caller that
         # passes a kwargs dict. Every internal call (recalculation, override
         # resume, manual "Auto", enable) passes None and always executes, so a
         # genuine mode change is never suppressed.
@@ -3715,8 +3711,8 @@ class BatteryOptimizer(hass.Hass):
 
         Decorated: this is a ``run_in`` callback like any other, and its 17.0 s
         overrun on 2026-09-02 was invisible to the app's own instrumentation —
-        only AppDaemon's generic "Excessive time spent in callback" line
-        recorded it.
+        only the then-host's (AppDaemon's) generic "Excessive time spent in
+        callback" line recorded it.
         """
         current_soc = self._get_current_soc()
         if current_soc is None:
@@ -4152,7 +4148,7 @@ class BatteryOptimizer(hass.Hass):
 
         self.log("Starting with fresh load profile")
         # Nothing was loaded, so no save has published the profile sensors yet.
-        # Publish once so the entities exist after an AppDaemon restart.
+        # Publish once so the entities exist after an add-on restart.
         self._update_load_profile_sensors()
 
     def _init_prediction_tracker(self):
@@ -4570,7 +4566,7 @@ class BatteryOptimizer(hass.Hass):
     def _get_region_timezone(self):
         """A timezone with real DST rules, for local-midnight arithmetic.
 
-        `_get_local_timezone()` returns `self.datetime().tzinfo` when AppDaemon
+        `_get_local_timezone()` returns `self.datetime().tzinfo` when the host
         hands over an aware datetime and otherwise falls back to
         `datetime.now().astimezone().tzinfo` - a FIXED `datetime.timezone`
         carrying today's offset. That is perfectly good for ordering instants
@@ -4579,8 +4575,9 @@ class BatteryOptimizer(hass.Hass):
         Europe/Riga's actual midnight that day, so a complete price horizon
         reads as `tomorrow_missing` all afternoon.
 
-        AppDaemon's own `get_timezone()` reports the configured zone - as a
-        **pytz** zone object on AppDaemon 4.5, a name on some builds. A pytz
+        The host's `get_timezone()` reports HA's configured zone - a
+        `zoneinfo` zone from `ha_host`; the previous host (AppDaemon 4.5)
+        returned a **pytz** zone, some builds a name. A pytz
         zone is returned as-is; the monitor attaches it with `localize`,
         because `combine(..., tzinfo=<pytz zone>)` yields the zone's
         local-mean-time offset (+01:37 for Europe/Riga), which put the required
@@ -4613,9 +4610,9 @@ class BatteryOptimizer(hass.Hass):
     def _get_local_timezone(self):
         """
         Get the local timezone reliably.
-        Tries AppDaemon's timezone first, falls back to system local timezone.
+        Tries the host's timezone first, falls back to system local timezone.
         """
-        # Try AppDaemon's timezone first
+        # Try the host's timezone first
         now = self.datetime()
         if not isinstance(now, datetime.datetime):
             try:
@@ -4847,7 +4844,7 @@ class BatteryOptimizer(hass.Hass):
             # Never truncate — say what grew instead.
             self._check_main_sensor_attr_budget(main_attributes)
 
-            # Set sensor state. `replace=True` matters: AppDaemon's set_state
+            # Set sensor state. `replace=True` matters: the host's set_state
             # MERGES the attribute dict into the entity's existing attributes
             # by default, so a key this app stops publishing (schedule,
             # load_profile_stats, temp_aware_rates on 2026-09-08) would live on
@@ -4942,7 +4939,7 @@ class BatteryOptimizer(hass.Hass):
 
         It is ~2.4 KB and changes on every observation, so it does not belong on
         the recorded main sensor. Created with set_state, so it exists only once
-        the app has published it after an HA or AppDaemon restart; the HA package
+        the app has published it after an HA or add-on restart; the HA package
         excludes it from the recorder.
         """
         try:

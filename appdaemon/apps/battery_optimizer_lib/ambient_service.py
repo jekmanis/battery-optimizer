@@ -66,7 +66,7 @@ class AmbientServiceConfig:
     cache_minutes: int = 60
     # How long to wait before retrying after a FAILED fetch. Backing a failure
     # off for the full ``cache_minutes`` punished the FIRST-ever failure as
-    # hard as a permanent one: AppDaemon restarts, full_optimize runs before
+    # hard as a permanent one: the app restarts, full_optimize runs before
     # the HA weather integration has loaded, and the single "entity not found"
     # then pinned T_ambient(t) on the outdoor-sensor / diurnal fallback for an
     # hour — degrading the DP-facing charge rates. No caller passes force=True,
@@ -76,7 +76,7 @@ class AmbientServiceConfig:
     slot_minutes: int = 15
 
     # Per-call websocket timeout for ``weather/get_forecasts``. The call is
-    # SYNCHRONOUS and made from an AppDaemon callback thread, so an unbounded
+    # SYNCHRONOUS and made from a callback worker thread, so an unbounded
     # one stalls schedule execution, the SOC listener and PV sampling alike
     # (see CLAUDE.md, "Runtime constraints").
     forecast_timeout_seconds: float = 10.0
@@ -169,7 +169,7 @@ class AmbientTemperatureService:
         # event. A fresh forecast is good for ``cache_minutes``. A FAILED
         # attempt must be retried far sooner: keying the back-off off the last
         # attempt alone made the very first failure (typically a weather
-        # integration that has not loaded yet, seconds after an AppDaemon
+        # integration that has not loaded yet, seconds after an app
         # restart) suppress every retry for a full hour, with no caller passing
         # force=True to break out.
         if not force:
@@ -351,8 +351,8 @@ class AmbientTemperatureService:
 
         Two paths, because the HA API changed: the modern
         ``weather.get_forecasts`` service and the legacy ``forecast`` attribute.
-        Both are wrapped defensively — AppDaemon's ``call_service`` return value
-        differs between versions and may raise.
+        Both are wrapped defensively — the ``call_service`` envelope can
+        carry an error instead of a response, and the call may raise.
         """
         entries = None
 
@@ -363,7 +363,7 @@ class AmbientTemperatureService:
                     entity_id=self._config.weather_entity,
                     type="hourly",
                     return_result=True,
-                    # Bounded: this runs on an AppDaemon callback thread.
+                    # Bounded: this runs on a callback worker thread.
                     hass_timeout=self._config.forecast_timeout_seconds,
                 )
                 entries = self._extract_forecast_entries(response)

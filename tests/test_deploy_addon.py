@@ -119,7 +119,7 @@ def test_seed_plan_maps_config_paths_between_containers(tmp_path):
     assert set(by_key) == {"load_profile_file", "learning_data_file",
                            "prediction_tracker_file", "pv_profile_file"}
     src, dst = by_key["learning_data_file"]
-    assert src == tmp_path / "addon_configs" / deploy.APPDAEMON_SLUG / "battery_learning_data.json"
+    assert src == tmp_path / "addon_configs" / deploy.ROLLBACK_SLUG / "battery_learning_data.json"
     assert dst == tmp_path / "addon_configs" / deploy.SLUG / "battery_learning_data.json"
 
 

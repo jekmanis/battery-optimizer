@@ -30,7 +30,7 @@ price, from the measured SOC, so a forced continuation can only duplicate its
 answer or contradict it. Whatever the DP decides for the interval the app woke
 up in is what runs.
 
-Everything here is deterministic: the settable clock and AppDaemon double from
+Everything here is deterministic: the settable clock and host double from
 ``test_price_recovery``, the REAL planner and the REAL final-plan validation.
 """
 

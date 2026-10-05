@@ -16,12 +16,11 @@ from battery_optimizer_lib.config import (
 
 
 def _example_args() -> dict:
-    """The single app block out of appdaemon/apps/apps.yaml.example."""
+    """addon/battery_optimizer/options.example.yaml - a flat options mapping."""
     import yaml
 
-    with open("appdaemon/apps/apps.yaml.example", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh)
-    return data[list(data.keys())[0]]
+    with open("addon/battery_optimizer/options.example.yaml", encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
 
 
 class TestPvRampGate:
@@ -282,7 +281,7 @@ class TestVerifySource:
 
 
 class TestSmokeConfigKeyScannerSeesBothSpellings:
-    """`scripts/smoke_config.py` reports unknown apps.yaml keys as typos.
+    """`scripts/smoke_config.py` reports unknown option keys as typos.
 
     It scrapes the key literals out of config.py, so it has to know about
     `_arg(args, "key", ...)` as well as `args.get("key", ...)`. When it did
@@ -299,7 +298,7 @@ class TestSmokeConfigKeyScannerSeesBothSpellings:
         spec = importlib.util.spec_from_file_location("_smoke_config", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return module.known_config_keys() | set(module.APPDAEMON_KEYS)
+        return module.known_config_keys() | set(module.ADDON_KEYS)
 
     def test_arg_style_keys_are_recognised(self):
         known = self._known_keys()
@@ -312,7 +311,7 @@ class TestSmokeConfigKeyScannerSeesBothSpellings:
         known = self._known_keys()
         unknown = {
             k for k in _example_args()
-            if k not in known and k not in ("module", "class")
+            if k not in known
         }
 
         assert unknown == set(), unknown

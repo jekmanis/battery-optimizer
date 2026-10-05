@@ -11,7 +11,7 @@ comparison raised ``TypeError`` - out of ``_normalize_prices``, out of
 fetching. One malformed record therefore lost the whole reply AND the fetch
 that would have noticed the missing horizon.
 
-The combination is reachable in production, not hypothetical: when AppDaemon
+The combination was reachable in production, not hypothetical: when the host
 reports no timezone, ``_parse_sensor_prices`` and ``_parse_service_prices``
 leave ``start`` and ``end`` with whatever awareness their own ISO strings had,
 so a source publishing ``start`` bare and ``end`` with an offset produces

@@ -1,6 +1,6 @@
 # Battery Optimizer for Growatt WIT Inverter
 
-An [AppDaemon](https://appdaemon.readthedocs.io/) application for Home Assistant that uses **Nord Pool** day‑ahead electricity prices (and optionally **Solcast** PV forecasts) to compute and execute a low‑cost battery **charge / hold / discharge** schedule for a Growatt **WIT** hybrid inverter.
+A Home Assistant add‑on that uses **Nord Pool** day‑ahead electricity prices (and optionally **Solcast** PV forecasts) to compute and execute a low‑cost battery **charge / hold / discharge** schedule for a Growatt **WIT** hybrid inverter.
 
 It plans with dynamic programming over SOC, learns your house load and real charge rates over time, tracks the stored‑energy cost, and drives the inverter in real time through the Growatt integration's `set_wit_mode` service.
 
@@ -35,69 +35,67 @@ The optimizer re‑plans on a schedule and adapts when reality drifts from the p
 
 ## Prerequisites
 
-- **Home Assistant** with the **AppDaemon 4** add‑on.
+- **Home Assistant OS / Supervised** (the optimizer runs as a local add‑on).
 - **Nord Pool** prices — the built‑in HA Nord Pool integration (config entry) or the [HACS Nord Pool](https://github.com/custom-components/nordpool) integration.
 - **Growatt Modbus integration with WIT `set_wit_mode` support.** The stock upstream integration does **not** include `set_wit_mode`; this optimizer depends on the WIT‑enabled fork:
   **[jekmanis/Growatt_ModbusTCP](https://github.com/jekmanis/Growatt_ModbusTCP)** (branch `main`, v1.9.6 or later). It must expose the `growatt_modbus/set_wit_mode` service.
 - *(Optional)* **Solcast PV Forecast** (HACS) for PV‑aware planning.
-- A long‑lived HA access token (used by the app to read Nord Pool prices via the REST API).
 
 ---
 
 ## Installation
 
-### 1. Install the AppDaemon add‑on
-Settings → Add‑ons → Add‑on Store → **AppDaemon 4** → Install → enable *Start on boot* and *Watchdog*.
-
-### 2. Deploy the app + library
-Copy the app **and** its `battery_optimizer_lib/` package into your AppDaemon apps directory (e.g. `/addon_configs/<appdaemon>/apps/` or `/config/appdaemon/apps/`, depending on your install):
-
-```bash
-cp -r appdaemon/apps/battery_optimizer.py \
-      appdaemon/apps/battery_optimizer_lib \
-      <your_appdaemon>/apps/
-```
-
-On an existing install use `scripts/deploy.ps1` (rehearse with `-DryRun`): it backs up the share, **stops the add‑on**, copies, verifies by SHA256, restarts and checks the running version. Stop AppDaemon yourself if you copy by hand — it hot‑reloads on every `.py` write and will import a new module against its old peers mid‑copy. See `scripts/README.md`.
-
-### 3. Configure the app
-Copy the example config and fill in your values:
+### 1. Copy the add‑on to the HA `addons` share
+`addon/battery_optimizer/` is a local Home Assistant add‑on ("app"); its image
+also needs the optimizer code, which `scripts/deploy_addon.py` stages next to
+it:
 
 ```bash
-cp appdaemon/apps/apps.yaml.example <your_appdaemon>/apps/apps.yaml
+uv run python scripts/deploy_addon.py deploy --dry-run   # checks + file list
+uv run python scripts/deploy_addon.py deploy             # copy, install, start
 ```
 
-Edit `apps.yaml` and set at minimum:
+By hand: run `scripts/deploy_addon.py stage --out DIR` and copy `DIR` to
+`\\<ha>\addons\battery_optimizer`, then Settings → Add‑ons → Add‑on Store →
+⋮ → *Check for updates* → **Battery Optimizer** (under *Local add‑ons*) →
+Install.
+
+### 2. Configure the add‑on
+Every option is the configuration key of the same name and every one is
+optional; `addon/battery_optimizer/options.example.yaml` is the annotated
+list. Set at minimum (Configuration tab, YAML mode):
 
 ```yaml
-battery_optimizer:
-  ha_url: "http://homeassistant.local:8123"
-  ha_token: "REPLACE_WITH_YOUR_HA_LONG_LIVED_TOKEN"
+nordpool_config_entry: "YOUR_NORDPOOL_CONFIG_ENTRY_ID"   # built‑in Nord Pool
+nordpool_area: LV
 
-  nordpool_config_entry: "YOUR_NORDPOOL_CONFIG_ENTRY_ID"   # built‑in Nord Pool
-  nordpool_area: LV
+# Growatt sensors (note the device‑prefixed names from integration v0.6.7+)
+soc_sensor:            sensor.growatt_battery_battery_soc
+pv_power_sensor:       sensor.growatt_solar_solar_total_power
+battery_temp_sensor:   sensor.growatt_battery_battery_temperature
+battery_charge_sensor: sensor.growatt_battery_battery_charge_today
+battery_discharge_sensor: sensor.growatt_battery_battery_discharge_today
+load_power_sensor:     sensor.growatt_load_house_consumption
 
-  # Growatt sensors (note the device‑prefixed names from integration v0.6.7+)
-  soc_sensor:            sensor.growatt_battery_battery_soc
-  pv_power_sensor:       sensor.growatt_solar_solar_total_power
-  battery_temp_sensor:   sensor.growatt_battery_battery_temperature
-  battery_charge_sensor: sensor.growatt_battery_battery_charge_today
-  battery_discharge_sensor: sensor.growatt_battery_battery_discharge_today
-  load_power_sensor:     sensor.growatt_load_house_consumption
+device_id: "YOUR_GROWATT_WIT_DEVICE_ID"   # Developer Tools → States → growatt device
 
-  device_id: "YOUR_GROWATT_WIT_DEVICE_ID"   # Developer Tools → States → growatt device
+# Match your system
+battery_capacity_kwh: 14.3
+charge_rate_kw: 4.5
+discharge_rate_kw: 5.9
 
-  # Match your system
-  battery_capacity_kwh: 14.3
-  charge_rate_kw: 4.5
-  discharge_rate_kw: 5.9
+shadow_mode: false
 ```
 
-> 🔒 `apps.yaml` holds your HA token and is **gitignored**. Only `apps.yaml.example` is committed — never commit your real `apps.yaml`.
+No URL and no token: the Supervisor provides both (`SUPERVISOR_TOKEN`,
+`http://supervisor/core`). A fresh install starts with `shadow_mode: true` —
+nothing is sent to the inverter or written to an `input_*` helper, and every
+published entity gets an `_shadow` suffix — so it can run next to another
+instance until you switch it to live. See `addon/battery_optimizer/DOCS.md`.
 
 **Finding `device_id`:** Developer Tools → States → open a `growatt_*` entity → copy the `device_id` attribute (or read it from the device page URL).
 
-### 4. Install the HA package (entities, scripts, dashboard sensors)
+### 3. Install the HA package (entities, scripts, dashboard sensors)
 ```bash
 cp homeassistant/packages/battery_optimizer.yaml /config/packages/
 ```
@@ -107,8 +105,8 @@ homeassistant:
   packages: !include_dir_named packages
 ```
 
-### 5. Restart
-Restart Home Assistant, then restart the AppDaemon add‑on. Watch **Settings → Add‑ons → AppDaemon → Log** for `Direct control enabled via growatt_modbus/set_wit_mode` and the first optimization.
+### 4. Restart
+Restart Home Assistant, then (re)start the add‑on. Watch **Settings → Add‑ons → Battery Optimizer → Log** (or `scripts/deploy_addon.py logs`) for `Battery Optimizer version …`, `Direct control enabled via growatt_modbus/set_wit_mode` and the first optimization.
 
 ---
 
@@ -153,7 +151,7 @@ dashboards.
 
 ## Configuration reference
 
-Common parameters (see `apps.yaml.example` for the full, commented list):
+Common parameters (see `addon/battery_optimizer/options.example.yaml` for the full, commented list):
 
 | Parameter | Example | Description |
 |-----------|---------|-------------|
@@ -169,7 +167,7 @@ Common parameters (see `apps.yaml.example` for the full, commented list):
 | `pv_threshold_w` | 500 | PV above which grid charging pauses |
 | `solcast_today_entity` / `_tomorrow_entity` | `sensor.solcast_*` | Optional PV forecast |
 | `device_id` | `""` | **Empty = dry‑run** (logs decisions, no inverter writes) |
-| `set_wit_mode_timeout_seconds` | 15 | Per‑call `hass_timeout`. This call **blocks the AppDaemon callback thread** — see *AppDaemon threads* |
+| `set_wit_mode_timeout_seconds` | 15 | Per‑call `hass_timeout`. This call **blocks its callback under the app lock** — see *Slow callbacks* |
 | `verify_delay_seconds` | 90 | Delay before the first verify‑after‑set read of the configured `verify_source` (holding registers by default) |
 | `verify_recheck_seconds` | 60 | Delay of the single re‑check performed after a resend |
 | `verify_source` | `auto` | `registers` / `mode_sensor` / `none` / `auto` (registers whenever `device_id` is set, otherwise none — never the mode sensor by default) |
@@ -221,10 +219,11 @@ take the charge energy the plan was chosen on at the temperatures it reaches —
 nothing published credits that energy, but the plan is no longer the cheapest
 one. It is rare and is also logged at WARNING.
 
-**Set a timezone in AppDaemon.** The "end of tomorrow" boundary needs real DST
-rules; when `get_timezone()` reports no usable zone the app falls back to the
-current UTC offset and warns once, and that boundary is an hour off on the two
-DST transition days.
+**Set a region time zone in Home Assistant** (Settings → System → General). The
+add‑on adopts HA's zone; the "end of tomorrow" boundary needs real DST rules,
+and when no usable zone is reported the app falls back to the current UTC
+offset and warns once, and that boundary is an hour off on the two DST
+transition days.
 
 ### End‑of‑horizon value (`0` = no‑salvage mode)
 
@@ -260,7 +259,7 @@ INFO terminal_energy_value_eur_kwh=0 is no-salvage mode: ...
 
 On the reference installation `"auto"` was tried and reverted: it stranded ~77% SOC at the horizon edge and skipped evening slots priced below the median, which cost more than the end-of-horizon spend it prevented.
 
-Choose per installation and record the reason next to the value in `apps.yaml`.
+Choose per installation and record the reason next to the value in your options.
 
 By default, spot prices and import fees are assumed to already use the desired
 VAT basis. `import_price_multiplier` can apply VAT to the combined variable
@@ -274,7 +273,7 @@ example values against your bill.
 > battery kWh. The package includes `battery_cost_basis_version`, which is
 > created at version 2 (current basis) — a legacy value is never converted
 > automatically. To convert a raw-spot average from a pre-landed-cost install,
-> set the helper to 1 and restart AppDaemon once: the value is conservatively
+> set the helper to 1 and restart the add‑on once: the value is conservatively
 > migrated as grid-charged energy and the helper is stamped back to 2 (look
 > for the "Migrated legacy raw battery cost" log line to confirm it ran).
 > Alternatively, just reset `input_number.battery_avg_cost` to a reasonable
@@ -285,10 +284,13 @@ example values against your bill.
 ## Architecture
 
 ```
-appdaemon/apps/
-├── battery_optimizer.py          # AppDaemon orchestrator (scheduling, execution)
-├── apps.yaml.example             # Config template (copy to apps.yaml)
+addon/battery_optimizer/           # The HA add-on: config.yaml (options schema), Dockerfile,
+                                  # run.sh, DOCS.md, options.example.yaml
+appdaemon/apps/                   # (historical name) the optimizer itself
+├── battery_optimizer.py          # Orchestrator (scheduling, execution)
 └── battery_optimizer_lib/
+    ├── ha_host.py                # Host: HA websocket + REST, scheduler, worker pool
+    ├── addon_main.py             # Add-on entry point: options -> config -> app
     ├── config.py                 # Typed config loader
     ├── callback_lock.py          # App‑wide re‑entrant lock behind every callback
     ├── models.py                 # BatteryMode, ScheduleEntry, … data types
@@ -316,7 +318,7 @@ appdaemon/apps/
 homeassistant/packages/
 └── battery_optimizer.yaml        # HA entities, scripts, automations, template sensors
 docs/                             # Algorithm & analysis notes
-tests/                            # pytest suite (library modules)
+tests/                            # pytest suite (library, host, add-on, shadow run)
 ```
 
 See [docs/scheduling-algorithm.md](docs/scheduling-algorithm.md) for the optimizer internals.
@@ -333,17 +335,17 @@ uv run pytest tests/ -v                                           # run tests
 uv run pytest tests/ --cov=appdaemon/apps --cov-report=term-missing
 ```
 
-`conftest.py` mocks the AppDaemon runtime so the `battery_optimizer_lib` modules can be tested standalone. The orchestrator (`battery_optimizer.py`) is validated via dry‑run (`device_id: ""`).
+Library modules are tested standalone. `tests/fake_ha.py` is a fake Home Assistant (websocket + REST on a local socket); `conftest.py` exposes it and a connected host as fixtures, and `tests/test_addon_shadow_run.py` runs the real orchestrator against it in shadow mode.
 
 ---
 
 ## Troubleshooting
 
-- **Logs:** Settings → Add‑ons → AppDaemon → Log.
-- **Dry‑run:** set `device_id: ""` to log decisions without touching the inverter.
+- **Logs:** Settings → Add‑ons → Battery Optimizer → Log, or `uv run python scripts/deploy_addon.py logs`.
+- **Dry‑run:** set `device_id: ""` to log decisions without touching the inverter; `shadow_mode: true` additionally blocks every helper write and suffixes the published entities.
 - **Entities `unavailable` / `not found`:** confirm the Growatt sensor names match your install (integration v0.6.7+ device‑prefixes them, e.g. `sensor.growatt_battery_battery_soc`).
 - **`set_wit_mode` not found:** you're on the stock Growatt integration — install the [WIT fork](https://github.com/jekmanis/Growatt_ModbusTCP).
-- **`set_wit_mode` timeouts:** many sequential VPP register writes on a busy Modbus link can exceed AppDaemon's default 10 s service window. The optimizer sets that per-call window from `set_wit_mode_timeout_seconds` (**default 15 s**) and inspects the service response. If AppDaemon still times out client-side (returns `None`), the mode is treated as *unconfirmed* (logged at WARNING) rather than silently assumed applied — verify-after-set covers that case, which is why a short timeout is safe and a long one is not (it blocks every other callback). A confirmed failure (the service raised) is logged at ERROR and is **not** recorded as sent, so it is retried on the next slot instead of being masked by duplicate suppression.
+- **`set_wit_mode` timeouts:** many sequential VPP register writes on a busy Modbus link can exceed the host's default 10 s service window. The optimizer sets that per-call window from `set_wit_mode_timeout_seconds` (**default 15 s**) and inspects the service response. If the call still times out client-side (`ad_status: TIMEOUT`), the mode is treated as *unconfirmed* (logged at WARNING) rather than silently assumed applied — verify-after-set covers that case, which is why a short timeout is safe and a long one is not (it blocks every other callback). A confirmed failure (the service raised) is logged at ERROR and is **not** recorded as sent, so it is retried on the next slot instead of being masked by duplicate suppression.
 
 - **Mode mismatches / "resending once":** `verify_delay_seconds` (default 90 s) after every mode change — including `passthrough` — DirectControl consults the source selected by `verify_source` (`auto` → the holding registers 30407-30410 / 30200-30201 whenever `device_id` is set; `mode_sensor` → the `inverter_mode_sensor` entity; `none` → no check). No entity is guessed: `auto` never falls back to the mode sensor. On a genuine mismatch it resends once and then re-checks **exactly once** after `verify_recheck_seconds` (default 60 s). If that second read still disagrees, the app logs an **ERROR** ("persistent mode mismatch after resend") and stops — never a third send, never a loop; the next slot retries normally.
 
@@ -357,28 +359,7 @@ uv run pytest tests/ --cov=appdaemon/apps --cov-report=term-missing
 
   The sensor is created with `set_state`, so it disappears after an HA restart until the app republishes it — alert on trends, don't rely on its history.
 
-- **AppDaemon threads — "Excessive time spent in callback (limit=10.0s)":** `set_wit_mode` is a **synchronous, blocking** service call on the AppDaemon callback thread. With the default single thread, one slow inverter write stalls schedule execution, the SOC listener and PV sampling alike (33 h of production logs: 70 overruns of 10–34 s, all on `thread-0`). Two settings are needed, not one:
-
-  ```yaml
-  # appdaemon.yaml
-  appdaemon:
-    total_threads: 4
-    thread_duration_warning_threshold: 25   # optional; a set_wit_mode write is legitimately ~15 s
-  ```
-
-  ```yaml
-  # apps.yaml
-  battery_optimizer:
-    pin_app: false        # REQUIRED alongside total_threads
-  ```
-
-  `total_threads` alone is **worse than the default**: in AppDaemon 4.5.13 an app's `pin_app` still defaults to `true`, so every callback is dispatched to thread-0 anyway — now with a `WARNING ... Invalid thread ID for pinned thread in app: battery_optimizer - assigning to thread 0` on *every* dispatch. `pin_app: false` is what lets the scheduler round-robin this app across the worker threads.
-
-  With round-robin dispatch the app's callbacks genuinely run concurrently, so the orchestrator serializes them itself: `_timed_callback` runs every callback under one app-wide re-entrant lock (`battery_optimizer_lib/callback_lock.py`), and the only region that drops it is the blocking `set_wit_mode` write in `_apply_mode_tracked`. That is the whole point — other callbacks keep running while the inverter write is in flight.
-
-  Rollback without touching `appdaemon.yaml`: set `pin_app: true` and `pin_thread: 2` (must be `< total_threads`) on the app. Do **not** set `pin_threads` in `appdaemon.yaml` — `total_threads` forces it to 0.
-
-  The app also measures its own callbacks (lock wait included) and warns above `callback_warn_seconds`, naming the offending callback and repeating the `total_threads` + `pin_app` advice after three overruns.
+- **Slow callbacks:** `set_wit_mode` is a **synchronous, blocking** service call made from a callback. The add-on runs callbacks on `worker_threads` threads (default 4), and the orchestrator serializes them itself: `_timed_callback` runs every callback under one app-wide re-entrant lock (`battery_optimizer_lib/callback_lock.py`), and the only region that drops it is the blocking `set_wit_mode` write in `_apply_mode_tracked` — so other callbacks keep running while the inverter write is in flight. The app measures its own callbacks (lock wait included), warns above `callback_warn_seconds` naming the offending callback, and after three overruns points at `set_wit_mode_timeout_seconds` and the inverter integration.
 
 ---
 

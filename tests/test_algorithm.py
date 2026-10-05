@@ -2,7 +2,7 @@
 Tests for the find_optimal_schedule algorithm.
 
 These tests verify the core dynamic programming optimization algorithm
-without requiring AppDaemon or Home Assistant.
+without requiring Home Assistant.
 """
 
 from __future__ import annotations

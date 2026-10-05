@@ -15,7 +15,7 @@ One owner for two questions the orchestrator used to answer nowhere:
 
 Everything here is deterministic and pure with respect to time: the caller
 passes `now`.  Timer registration stays in the orchestrator, because that is
-where AppDaemon's `run_in` and the app lock live.
+where the host's `run_in` and the app lock live.
 
 Canonical instants, never slot counts
 -------------------------------------
@@ -137,7 +137,7 @@ class PriceHorizonMonitor:
             get_zone_func: a timezone WITH DST RULES, used only for local
                 midnight arithmetic. `BatteryOptimizer._get_local_timezone()`
                 degrades to `datetime.now().astimezone().tzinfo` - a fixed
-                `datetime.timezone` - whenever AppDaemon hands the app a naive
+                `datetime.timezone` - whenever the host hands the app a naive
                 `self.datetime()`, and combining a date with a fixed offset puts
                 the midnight on the far side of a DST transition an hour wrong.
                 Defaults to `get_timezone_func`, with a one-shot warning when
@@ -219,8 +219,8 @@ class PriceHorizonMonitor:
             self._log(
                 f"Price horizon boundary uses a timezone without DST rules "
                 f"({zone}); the required horizon end can be an hour off on the "
-                f"two DST transition days. Set a timezone in AppDaemon so "
-                f"get_timezone() reports a region name.",
+                f"two DST transition days. Set a region time zone in Home "
+                f"Assistant so get_timezone() reports one.",
                 level="WARNING",
             )
 
@@ -241,7 +241,8 @@ class PriceHorizonMonitor:
         +02:00)` is an hour later than Europe/Riga's actual midnight that day.
 
         And it is attached with the zone's own `localize` when the zone has
-        one.  AppDaemon's `get_timezone()` returns a **pytz** zone, and a pytz
+        one.  AppDaemon's `get_timezone()` (the previous host) returned a
+        **pytz** zone, and a pytz
         zone handed to `datetime.combine(..., tzinfo=zone)` (or `replace`)
         answers with the zone's local-mean-time offset from before standard
         time existed - Europe/Riga's is +01:37 - never with the rules in force

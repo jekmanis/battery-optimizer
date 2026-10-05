@@ -1,7 +1,7 @@
 """Tests for DirectControl set_wit_mode reliability behavior.
 
 Covers:
-- AppDaemon 4.5.x timeout classification: an ``ad_status: TIMEOUT`` response is
+- timeout classification: an ``ad_status: TIMEOUT`` response (ha_host, as AppDaemon 4.5 before it) is
   UNCONFIRMED, not a confirmed failure (the request was already on the wire)
 - confirmed failure (exception or a genuine success=False) -> returns False,
   does NOT record last-sent, schedules no verification
@@ -43,7 +43,7 @@ from battery_optimizer_lib.models import BatteryMode, ScheduleEntry
 
 
 class FakeApp:
-    """Minimal AppDaemon app double exposing the methods DirectControl uses."""
+    """Minimal app double exposing the methods DirectControl uses."""
 
     def __init__(self):
         # call_service behavior
@@ -51,7 +51,7 @@ class FakeApp:
         self.call_service_raise = None  # set to an Exception instance to raise
         self.service_calls = []  # list of (service, kwargs)
 
-        # Concurrency instrumentation. AppDaemon dispatches this app's
+        # Concurrency instrumentation. The host dispatches this app's
         # callbacks across worker threads, so the double has to be able to
         # model a slow, overlapping inverter write.
         self.sleep_seconds = 0.0        # how long call_service blocks
@@ -70,7 +70,7 @@ class FakeApp:
         # logging
         self.logs = []  # list of (message, level)
 
-    # --- AppDaemon API surface used by DirectControl ---
+    # --- app API surface used by DirectControl ---
     def call_service(self, service, **kwargs):
         started = time.monotonic()
         with self._bookkeeping:
@@ -178,7 +178,7 @@ def test_timeout_none_is_unconfirmed_but_records_and_schedules():
     assert result is True
     # hass_timeout was passed on the service call, at the CONFIGURED value.
     # It is deliberately not hard-coded any more: the call is synchronous on the
-    # AppDaemon callback thread, so the timeout is a blocking budget.
+    # callback worker thread, so the timeout is a blocking budget.
     assert app.service_calls[0][1].get("hass_timeout") == dc._set_mode_timeout
     assert dc._set_mode_timeout == BatteryOptimizerConfig().set_wit_mode_timeout_seconds
     # last-sent recorded so the schedule isn't spammed
@@ -237,7 +237,7 @@ def test_service_call_kwargs_only_hass_timeout_plus_schema_fields():
     assert kwargs.get("hass_timeout") == dc._set_mode_timeout
     # Everything else must be a field the set_wit_mode voluptuous schema allows.
     allowed = {
-        "hass_timeout",  # AppDaemon HASS plugin formal parameter
+        "hass_timeout",  # HAHost.call_service formal parameter
         "device_id", "mode", "power_percent", "duration_minutes",
         "export_rate", "ac_charge_mode", "charge_cutoff_soc",
         "discharge_cutoff_soc",
@@ -881,7 +881,7 @@ def test_verify_duration_reported_even_when_verification_raises():
 
 
 # ---------------------------------------------------------------------------
-# Defect B: AppDaemon 4.5.x timeout classification
+# Defect B: timeout classification (found under AppDaemon 4.5.x)
 #
 # HassPlugin.websocket_send_json awaits the response future AFTER writing the
 # request to the websocket. On asyncio.TimeoutError it logs
@@ -924,7 +924,7 @@ def test_ad_status_timeout_records_last_sent_and_verifies():
 
 
 def test_ad_status_terminating_is_unconfirmed():
-    """Cancelled during AppDaemon shutdown — the request was still on the wire."""
+    """Cancelled during host shutdown — the request was still on the wire."""
     dc, app = make_dc()
     app.call_service_return = {"success": False, "ad_status": "TERMINATING"}
 
@@ -1153,7 +1153,7 @@ class FakeRegisterApp(FakeApp):
         start = kwargs["start_address"]
         count = kwargs["count"]
         values = [self.registers.get(start + i, 0) for i in range(count)]
-        # Home Assistant websocket envelope as AppDaemon hands it back.
+        # Home Assistant websocket envelope as the host hands it back.
         return {
             "success": True,
             "ad_status": "OK",

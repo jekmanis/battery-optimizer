@@ -6,9 +6,9 @@
 
 ## Overview
 
-The `BatteryOptimizer` class is an AppDaemon application that orchestrates battery charge/discharge scheduling based on Nord Pool electricity prices. While the core algorithms have been extracted to the `battery_optimizer_lib` package, this file remains the integration layer responsible for:
+The `BatteryOptimizer` class is the Home Assistant add-on application (an AppDaemon app when this analysis was written) that orchestrates battery charge/discharge scheduling based on Nord Pool electricity prices. While the core algorithms have been extracted to the `battery_optimizer_lib` package, this file remains the integration layer responsible for:
 
-- AppDaemon lifecycle management
+- App lifecycle management (host: `ha_host`)
 - Home Assistant entity interactions
 - Configuration loading
 - Scheduled task orchestration
@@ -21,8 +21,8 @@ The `BatteryOptimizer` class is an AppDaemon application that orchestrates batte
 │                      BatteryOptimizer (hass.Hass)                   │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Initialization & Config (~300 lines)                               │
-│  ├── initialize() - AppDaemon entry point                           │
-│  └── _load_config() - Configuration from apps.yaml                  │
+│  ├── initialize() - app entry point                                 │
+│  └── _load_config() - Configuration from the add-on options         │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Optimization Algorithm (~320 lines)                                │
 │  ├── get_prices() - Delegates to NordPoolPriceService               │
@@ -138,7 +138,7 @@ execute_scheduled_mode()
 
 ## Configuration Properties
 
-### Static (apps.yaml)
+### Static (add-on options)
 - `battery_capacity_kwh`, `charge_rate_kw`, `discharge_rate_kw`, `efficiency`
 - `slot_minutes`, `adaptive_recalc_minutes`, `load_observation_minutes`
 - `grid_fee_eur_kwh`, `battery_wear_cost_eur_kwh`
@@ -194,14 +194,14 @@ The `requests` library and `REQUESTS_AVAILABLE` flag were never used. All HTTP f
 
 ### 3. Intentionally Unused Parameters
 
-The following `kwargs` parameters are unused but required by AppDaemon's callback interface:
+The following `kwargs` parameters are unused but required by the host's callback interface:
 
 - `full_optimize(self, kwargs=None)` - Line 852
 - `adaptive_optimize(self, kwargs=None)` - Line 939
 - `execute_scheduled_mode(self, kwargs, force=False)` - Line 1088
 - `record_load_observation(self, kwargs=None)` - Line 1806
 
-**Recommendation:** Keep these as-is; they're part of the AppDaemon contract.
+**Recommendation:** Keep these as-is; they're part of the host's callback contract.
 
 ### 4. Methods That Appear Unused But Are Wrappers
 

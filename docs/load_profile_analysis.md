@@ -58,7 +58,7 @@ def _get_load_power(self) -> Optional[float]:
 
 ### 3.1 Recording Schedule
 
-Observations are recorded on a fixed interval via AppDaemon's `run_every` scheduler:
+Observations are recorded on a fixed interval via the host's `run_every` scheduler:
 
 ```python
 # battery_optimizer.py:246-248

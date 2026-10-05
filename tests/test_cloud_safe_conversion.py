@@ -182,7 +182,7 @@ class HedgeOptimizer:
 
         self._pv_forecast_service = _NoPvForecast()
 
-    # --- AppDaemon / app surface ------------------------------------------
+    # --- host / app surface -----------------------------------------------
     @property
     def _temp_projector(self):
         return TemperatureProjector(

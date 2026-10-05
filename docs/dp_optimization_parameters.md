@@ -2,7 +2,7 @@
 
 This document lists every parameter that influences the dynamic programming (DP)
 battery scheduling optimizer, its default value, your configured value (from
-`apps.yaml`), and how it enters the cost/revenue calculations.
+the add-on options), and how it enters the cost/revenue calculations.
 
 ---
 
@@ -22,7 +22,7 @@ separately via `grid_fee` and `grid_export_fee`.
 
 These are the core parameters that model your grid contract economics.
 
-| Parameter | `apps.yaml` key | Default | **Your Value** | Unit | Used In |
+| Parameter | option key | Default | **Your Value** | Unit | Used In |
 |---|---|---|---|---|---|
 | Grid buy fee | `grid_fee_eur_kwh` | 0.052 | **0.052** | EUR/kWh | Added to spot price for every kWh purchased from grid |
 | Grid export fee | `grid_export_fee_eur_kwh` | 0.02 | **0.02** | EUR/kWh | Subtracted from spot price when selling to grid |
@@ -36,7 +36,7 @@ buy_price  = nordpool_spot + grid_fee           # cost per kWh to BUY from grid
 sell_price = nordpool_spot * export_rate_multiplier - grid_export_fee   # revenue per kWh when SELLING to grid
 ```
 
-**Grid fee breakdown** (from apps.yaml comment):
+**Grid fee breakdown** (from the options example):
 - Trading margin: 0.01238 EUR/kWh
 - Distribution fee: 0.03962 EUR/kWh
 - Total: **0.052 EUR/kWh**
@@ -66,7 +66,7 @@ Review these against your actual electricity contract to see if anything is miss
 
 ## 4. Battery Physical Parameters
 
-| Parameter | `apps.yaml` key | Default | **Your Value** | Unit | Role in DP |
+| Parameter | option key | Default | **Your Value** | Unit | Role in DP |
 |---|---|---|---|---|---|
 | Battery capacity | `battery_capacity_kwh` | 14.3 | **14.3** | kWh | Defines SOC energy range |
 | Charge rate | `charge_rate_kw` | 4.5 | **4.5** | kW | Max grid charge power (per-slot, may be reduced by learning engine for SOC/temp) |
@@ -100,7 +100,7 @@ finer one is CPU (a 132-slot horizon with a partial first slot: 1 % -> ~250 ms,
 
 ## 5. Schedule Resolution
 
-| Parameter | `apps.yaml` key | Default | **Your Value** | Unit |
+| Parameter | option key | Default | **Your Value** | Unit |
 |---|---|---|---|---|
 | Slot duration | `slot_minutes` | 15 | **15** | minutes |
 | Derived slot hours | (computed) | — | **0.25** | hours |
@@ -110,7 +110,7 @@ finer one is CPU (a 132-slot horizon with a partial first slot: 1 % -> ~250 ms,
 
 ## 6. Load Prediction Parameters
 
-| Parameter | `apps.yaml` key | Default | **Your Value** | Role |
+| Parameter | option key | Default | **Your Value** | Role |
 |---|---|---|---|---|
 | Load quantile | `load_quantile` | 0.75 | **0.75** | Statistical percentile for load forecast (conservative — assumes higher-than-median load) |
 | Base consumption | `base_consumption_w` | 500 | **500** | Fallback W when no load profile available |
@@ -125,7 +125,7 @@ finer one is CPU (a 132-slot horizon with a partial first slot: 1 % -> ~250 ms,
 
 ## 7. PV Prediction Parameters
 
-| Parameter | `apps.yaml` key | Default | **Your Value** | Role |
+| Parameter | option key | Default | **Your Value** | Role |
 |---|---|---|---|---|
 | PV quantile | `pv_quantile` | 0.5 | **0.5** | Percentile for PV profile forecast |
 | PV forecast source | `solcast_today_entity` | — | (configured) | Solcast forecast sensor |
@@ -311,7 +311,7 @@ affects all actions equally.
 ### Wear Cost Calculation Discrepancy
 
 ```
-apps.yaml uses:   1524.03 / (8000 × 14.3 × 0.80 DOD) = 0.017 EUR/kWh
+the options use:   1524.03 / (8000 × 14.3 × 0.80 DOD) = 0.017 EUR/kWh
 Datasheet says:   1524.03 / (6000 × 14.3 × 0.93 DOD) = 0.019 EUR/kWh
 ```
 

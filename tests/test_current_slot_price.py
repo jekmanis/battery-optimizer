@@ -30,9 +30,9 @@ Policy under test
 3. `execute_scheduled_mode` refuses to send any non-HOLD current-slot entry
    that carries no real-price provenance.
 
-Everything here is deterministic: the settable clock and AppDaemon double from
+Everything here is deterministic: the settable clock and host double from
 `test_price_recovery`, the REAL planner, and the real `NordPoolPriceService`
-driven from scripted HA responses.  No AppDaemon, no HA, no network.
+driven from scripted HA responses.  No host, no HA, no network.
 """
 
 from __future__ import annotations

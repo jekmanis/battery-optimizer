@@ -3,7 +3,7 @@ Home Assistant helper functions for the Battery Optimizer.
 
 Provides functions for safely reading and parsing HA entity states.
 These are pure functions that take a get_state callable to remain
-testable and decoupled from AppDaemon.
+testable and decoupled from the host.
 """
 
 from typing import Callable, Optional, Any

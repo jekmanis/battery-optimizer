@@ -1,6 +1,6 @@
 """The real orchestrator, in shadow mode, against a fake Home Assistant.
 
-Shadow mode is the parallel run next to the live AppDaemon instance, so it
+Shadow mode is the parallel run next to the live instance, so it
 must be impossible for it to act: no inverter command, no write to a shared
 `input_*` helper, nothing published under a name the live instance owns.
 

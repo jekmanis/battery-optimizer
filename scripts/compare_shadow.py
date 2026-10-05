@@ -2,7 +2,7 @@
 """
 Compare the live plan with the shadow add-on's plan, side by side.
 
-Reads ``sensor.battery_optimizer_schedule`` (live, AppDaemon) and
+Reads ``sensor.battery_optimizer_schedule`` (the live instance) and
 ``sensor.battery_optimizer_schedule<suffix>`` (shadow add-on) plus both main
 sensors from HA's REST API with the admin token (~/.ha_token, never printed),
 and checks the S5 acceptance criteria:

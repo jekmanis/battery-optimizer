@@ -462,11 +462,11 @@ class TestMedianHelper:
 
 
 # ---------------------------------------------------------------------------
-# NAIVE ``now`` from AppDaemon (production defect)
+# NAIVE ``now`` from the host (production defect)
 # ---------------------------------------------------------------------------
 
 def _naive(hour, minute=0, second=0, day=27):
-    """A NAIVE local timestamp — exactly what AppDaemon's self.datetime() returns."""
+    """A NAIVE local timestamp — exactly what the host's self.datetime() returns."""
     return datetime.datetime(2026, 7, day, hour, minute, second)
 
 
@@ -580,7 +580,7 @@ class TestDstOffsetChange:
     """The alignment function's timezone changes offset at a DST transition.
 
     ``battery_optimizer._get_local_timezone`` returns a **fixed-offset**
-    ``datetime.timezone`` recomputed from the current wall clock (AppDaemon's
+    ``datetime.timezone`` recomputed from the current wall clock (the host's
     ``self.datetime()`` is naive in production).  It is ``+03:00`` in summer and
     ``+02:00`` in winter.
 
@@ -638,7 +638,7 @@ class TestDstOffsetChange:
         winter_slot = datetime.datetime(2026, 11, 15, 12, 0, tzinfo=TZ_PLUS2)
         # Aware path (orchestrator's now_slot).
         t.ensure_slot_forecast(winter_slot, 4.0)
-        # Naive path (AppDaemon's self.datetime()), same wall-clock slot.
+        # Naive path (the host's self.datetime()), same wall-clock slot.
         for i in range(5):
             t.add_sample(datetime.datetime(2026, 11, 15, 12, i + 1), 0.4)
 

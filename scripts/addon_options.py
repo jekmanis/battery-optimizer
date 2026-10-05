@@ -13,7 +13,8 @@ the tests:
   schema, and its value is coerced the way the Supervisor will coerce it
   (``int`` would TRUNCATE 0.25, so a fractional value under an int type is an
   error here, not a silent change);
-* ``shadow_mode`` / ``entity_suffix`` are added on request.
+* ``shadow_mode`` / ``entity_suffix`` are added on request, and a shadow
+  conversion blanks ``device_id`` (dry run).
 
 Usage:
     uv run python scripts/addon_options.py <apps.yaml> [--live] [--out FILE]
@@ -121,6 +122,9 @@ def apps_yaml_to_options(app_args: Dict[str, Any], schema: Dict[str, str], *,
     options["shadow_mode"] = bool(shadow)
     if shadow:
         options["entity_suffix"] = entity_suffix
+        # Dry run, stated in the options themselves. addon_main forces the
+        # same whatever the options say; this makes the Supervisor UI agree.
+        options["device_id"] = ""
     return options
 
 

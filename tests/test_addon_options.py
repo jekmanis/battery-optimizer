@@ -163,7 +163,9 @@ def test_conversion_drops_appdaemon_and_connection_keys():
     options = ADDON_OPTIONS.apps_yaml_to_options(
         {"module": "battery_optimizer", "class": "BatteryOptimizer",
          "pin_app": False, "ha_url": "http://x", "ha_token": "secret",
-         "efficiency": 0.92, "terminal_energy_value_eur_kwh": 0},
+         "efficiency": 0.92, "terminal_energy_value_eur_kwh": 0,
+         "device_id": "05005d2c"},
         _schema(), shadow=True)
     assert options == {"efficiency": 0.92, "terminal_energy_value_eur_kwh": "0",
-                       "shadow_mode": True, "entity_suffix": "_shadow"}
+                       "shadow_mode": True, "entity_suffix": "_shadow",
+                       "device_id": ""}

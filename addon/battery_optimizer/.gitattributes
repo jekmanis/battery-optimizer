@@ -1,0 +1,3 @@
+# Executed inside a Linux container: never check these out with CRLF.
+*.sh       text eol=lf
+Dockerfile text eol=lf

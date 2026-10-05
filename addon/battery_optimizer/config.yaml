@@ -1,0 +1,174 @@
+# Home Assistant add-on ("app") manifest for the battery optimizer.
+#
+# Every optimizer key is OPTIONAL (`?`): an absent key means "the code's
+# default", exactly like a key missing from the old apps.yaml. The keys and
+# their meaning are the apps.yaml keys documented in options.example.yaml;
+# tests/test_addon_options.py checks that every key BatteryOptimizerConfig
+# reads is here and that the example yields the identical config.
+#
+# The connection is NOT an option: SUPERVISOR_TOKEN + http://supervisor/core
+# replace ha_url/ha_token (homeassistant_api below).
+name: Battery Optimizer
+version: "2026.10.5-1"
+slug: battery_optimizer
+description: Nord Pool price-driven charge/discharge planner for a Growatt WIT battery
+arch:
+  - amd64
+  - aarch64
+init: false
+startup: application
+boot: auto
+homeassistant_api: true
+# /config inside the container = /addon_configs/local_battery_optimizer on the
+# host (SMB: \\<ha>\addon_configs\local_battery_optimizer). The learning,
+# load-profile, PV-profile and prediction JSON files live here, under the same
+# /config/... paths apps.yaml used, and are part of every HA backup.
+map:
+  - addon_config:rw
+
+options:
+  # Parallel-run guard. true: nothing is ever sent to the inverter or written
+  # to an input_* helper, and every published entity gets `entity_suffix`.
+  shadow_mode: true
+  entity_suffix: "_shadow"
+  log_level: info
+
+schema:
+  # --- add-on ---------------------------------------------------------------
+  shadow_mode: bool
+  entity_suffix: str?
+  log_level: list(debug|info|warning|error)?
+  worker_threads: int(1,16)?
+
+  # --- Nord Pool ------------------------------------------------------------
+  nordpool_config_entry: str?
+  nordpool_area: str?
+  nordpool_sensor: str?
+  tomorrow_prices_hour: int(0,23)?
+  price_retry_enabled: bool?
+  # Seconds, comma-separated, e.g. "30,120,300".
+  price_retry_delays_seconds: str?
+  price_retry_max_seconds: int?
+  price_retain_max_age_hours: float?
+
+  # --- sensors --------------------------------------------------------------
+  soc_sensor: str?
+  pv_power_sensor: str?
+  battery_temp_sensor: str?
+  battery_charge_sensor: str?
+  battery_discharge_sensor: str?
+  use_inverter_energy_sensors: bool?
+  load_power_sensor: str?
+  inverter_mode_sensor: str?
+  outdoor_temp_sensor: str?
+  ambient_weather_entity: str?
+
+  # --- ambient / thermal ----------------------------------------------------
+  ambient_diurnal_amplitude_c: float?
+  ambient_diurnal_peak_hour: float?
+  ambient_forecast_cache_minutes: int?
+  ambient_forecast_failure_retry_minutes: int?
+  thermal_default_cooling_rate_per_min: float?
+  thermal_default_heating_c_per_kwh: float?
+
+  # --- cost attribution -----------------------------------------------------
+  cost_pv_attribution_min_w: float?
+  cost_grid_charge_grace_seconds: int?
+  battery_cost_entity: str?
+  battery_cost_basis_version_entity: str?
+
+  # --- device control -------------------------------------------------------
+  # Empty = dry run. Forced empty while shadow_mode is true.
+  device_id: str?
+  default_power_percent: int(0,100)?
+  direct_control_buffer_minutes: int?
+  set_wit_mode_timeout_seconds: int?
+  verify_source: list(auto|registers|mode_sensor|none)?
+  verify_enabled: bool?
+  verify_delay_seconds: int?
+  verify_recheck_seconds: int?
+  callback_warn_seconds: float?
+  execute_dedupe_seconds: int?
+
+  # --- battery --------------------------------------------------------------
+  battery_capacity_kwh: float?
+  charge_rate_kw: float?
+  discharge_rate_kw: float?
+  export_discharge_rate_kw: float?
+  min_soc: float?
+  max_soc: float?
+  efficiency: float?
+  inverter_efficiency: float?
+  base_consumption_w: float?
+
+  # --- planning -------------------------------------------------------------
+  slot_minutes: int?
+  adaptive_recalc_minutes: int?
+  load_observation_minutes: int?
+  load_quantile: float?
+  pv_quantile: float?
+  soc_step_percent: float?
+  soc_deviation_threshold: float?
+  soc_shortfall_recalc_threshold: float?
+  planned_depletion_margin_percent: float?
+  decision_log_level: int(0,3)?
+  # "auto" or a number in EUR/kWh ("0" = no-salvage mode).
+  terminal_energy_value_eur_kwh: str?
+
+  # --- persistence ----------------------------------------------------------
+  load_profile_file: str?
+  learning_data_file: str?
+  prediction_tracker_file: str?
+  pv_profile_file: str?
+  load_profile_entity: str?
+  load_profile_max_samples: int?
+  load_profile_min_samples: int?
+  pv_profile_max_samples: int?
+  pv_profile_min_samples: int?
+  load_profile_last_observation_entity: str?
+  load_profile_observation_count_entity: str?
+  load_zero_floor_w: float?
+
+  # --- tariff ---------------------------------------------------------------
+  grid_fee_eur_kwh: float?
+  import_price_multiplier: float?
+  grid_export_fee_eur_kwh: float?
+  export_rate_multiplier: float?
+  battery_wear_cost_eur_kwh: float?
+
+  # --- PV forecast ----------------------------------------------------------
+  pv_threshold_w: float?
+  solcast_today_entity: str?
+  solcast_tomorrow_entity: str?
+  solcast_estimate_field: str?
+  pv_forecast_sensor: str?
+  pv_forecast_unit: str?
+  pv_forecast_cache_minutes: int?
+  pv_forecast_failure_retry_minutes: int?
+  forecast_solar_api_key: password?
+  forecast_solar_lat: float?
+  forecast_solar_lon: float?
+  forecast_solar_declination: float?
+  forecast_solar_azimuth: float?
+  forecast_solar_kwp: float?
+  pv_reactive_threshold: float?
+  pv_reactive_min_forecast_w: float?
+  pv_reactive_consecutive_slots: int?
+  pv_reactive_min_samples: int?
+  pv_sample_seconds: int?
+  pv_bias_enabled: bool?
+  pv_bias_window_minutes: int?
+  pv_bias_min_slots: int?
+  pv_bias_min_factor: float?
+  pv_bias_max_factor: float?
+  pv_bias_decay_slots: int?
+  pv_bias_next_day_weight: float?
+  pv_bias_next_day_min_factor: float?
+
+  # --- HA control entities --------------------------------------------------
+  enabled_entity: str?
+  override_entity: str?
+  manual_mode_entity: str?
+  min_soc_entity: str?
+  max_soc_entity: str?
+  pv_threshold_entity: str?

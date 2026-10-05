@@ -6,12 +6,16 @@ The unit suite does not cover ``battery_optimizer.py`` (the AppDaemon
 orchestrator), so a config or wiring break only shows up at import time on the
 HA machine.  This helper reproduces that import in the repo:
 
-  1. installs the ``appdaemon.plugins.hass.hassapi`` mock exactly the way
-     ``tests/conftest.py`` does (by importing conftest),
-  2. imports ``battery_optimizer`` and every module in ``battery_optimizer_lib``,
-  3. loads the given apps.yaml, finds the app whose ``module`` is
-     ``battery_optimizer`` and calls ``BatteryOptimizerConfig.from_args()``,
-     then derives ``AmbientServiceConfig`` and ``PvForecastServiceConfig``,
+  1. imports ``battery_optimizer`` and every module in ``battery_optimizer_lib``
+     (no AppDaemon needed: the orchestrator runs on ``ha_host``),
+  2. loads the given file - an AppDaemon apps.yaml (the app whose ``module``
+     is ``battery_optimizer``) or a flat add-on options mapping - and calls
+     ``BatteryOptimizerConfig.from_args()``, then derives
+     ``AmbientServiceConfig`` and ``PvForecastServiceConfig``,
+  3. for an apps.yaml, converts it to add-on options exactly as the deploy
+     does (``scripts/addon_options.py``: schema check + Supervisor coercion),
+     runs those through ``addon_main.options_to_args`` and requires the
+     IDENTICAL config - the proof that the add-on will run what AppDaemon ran,
   4. prints a REDACTED summary (never a token/key/password/secret).
 
 Exit code 0 = the deployed code can load that config; non-zero otherwise.
@@ -19,10 +23,13 @@ Exit code 0 = the deployed code can load that config; non-zero otherwise.
 Usage:
     uv run python scripts/smoke_config.py <path-to-apps.yaml>
     uv run python scripts/smoke_config.py appdaemon/apps/apps.yaml.example
+    uv run python scripts/smoke_config.py addon/battery_optimizer/options.example.yaml
 """
 
 import argparse
+import dataclasses
 import importlib
+import importlib.util
 import pkgutil
 import re
 import sys
@@ -109,17 +116,7 @@ def main(argv=None):
     print("  apps.yaml : %s" % apps_yaml)
     print("  python    : %s" % sys.version.split()[0])
 
-    # --- 1. hassapi mock, exactly as tests/conftest.py installs it ----------
-    sys.path.insert(0, str(TESTS_DIR))
-    try:
-        import conftest  # noqa: F401  (installs the appdaemon mock modules)
-    except Exception as exc:
-        return fail("could not import tests/conftest.py (hassapi mock): %r" % exc, exc)
-    if "appdaemon.plugins.hass.hassapi" not in sys.modules:
-        return fail("tests/conftest.py did not install the hassapi mock")
-    print("  hassapi mock installed via tests/conftest.py")
-
-    # --- 2. import the orchestrator and every library module ---------------
+    # --- 1. import the orchestrator and every library module ---------------
     sys.path.insert(0, str(APPS_DIR))
     try:
         import yaml
@@ -146,7 +143,7 @@ def main(argv=None):
     print("  imported %d modules (orchestrator + battery_optimizer_lib)"
           % len(imported))
 
-    # --- 3. load the YAML and build the config -----------------------------
+    # --- 2. load the YAML and build the config -----------------------------
     try:
         raw = yaml.safe_load(apps_yaml.read_text(encoding="utf-8"))
     except Exception as exc:
@@ -161,16 +158,27 @@ def main(argv=None):
             if isinstance(value, dict) and value.get("module") == "battery_optimizer"
         ]
         if not candidates:
-            return fail("no app entry with module: battery_optimizer found")
-        if len(candidates) > 1:
+            app_name = ""  # a flat add-on options mapping
+        elif len(candidates) > 1:
             print("  NOTE: %d battery_optimizer entries, using '%s'"
                   % (len(candidates), candidates[0]))
         app_name = candidates[0]
-    if app_name not in raw or not isinstance(raw[app_name], dict):
-        return fail("app '%s' not found in %s" % (app_name, apps_yaml))
+    from battery_optimizer_lib.addon_main import (
+        SUPERVISOR_CORE_URL,
+        options_to_args,
+    )
 
-    app_args = raw[app_name]
-    print("  app entry : %s (class=%s)" % (app_name, app_args.get("class")))
+    if app_name == "":
+        options_mode = True
+        app_args = options_to_args(raw, supervisor_token="<supervisor>")
+        print("  format    : add-on options (shadow_mode=%s)"
+              % raw.get("shadow_mode", False))
+    else:
+        options_mode = False
+        if app_name not in raw or not isinstance(raw[app_name], dict):
+            return fail("app '%s' not found in %s" % (app_name, apps_yaml))
+        app_args = raw[app_name]
+        print("  app entry : %s (class=%s)" % (app_name, app_args.get("class")))
 
     messages = []
 
@@ -190,6 +198,32 @@ def main(argv=None):
         pv_cfg = PvForecastServiceConfig.from_main_config(cfg)
     except Exception as exc:
         return fail("derived service config failed: %r" % exc, exc)
+
+    # --- 3. apps.yaml -> add-on options -> the identical config -----------
+    if not options_mode:
+        spec = importlib.util.spec_from_file_location(
+            "addon_options", REPO_ROOT / "scripts" / "addon_options.py")
+        addon_options = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(addon_options)
+        try:
+            schema = addon_options.load_manifest()["schema"]
+            options = addon_options.apps_yaml_to_options(
+                app_args, schema, shadow=False)
+        except Exception as exc:
+            return fail("apps.yaml does not convert to add-on options: %s" % exc)
+        token = "<supervisor>"
+        via_addon = BatteryOptimizerConfig.from_args(
+            options_to_args(options, supervisor_token=token))
+        expected_args = dict(app_args)
+        expected_args["ha_url"] = SUPERVISOR_CORE_URL
+        expected_args["ha_token"] = token
+        expected = BatteryOptimizerConfig.from_args(expected_args)
+        a, b = dataclasses.asdict(via_addon), dataclasses.asdict(expected)
+        differing = sorted(k for k in a if a[k] != b.get(k))
+        if differing:
+            return fail("the add-on options give a DIFFERENT config: %s"
+                        % ", ".join(differing))
+        print("  add-on    : %d options -> identical config" % len(options))
 
     # --- 4. redacted summary ----------------------------------------------
     print("")
@@ -231,7 +265,8 @@ def main(argv=None):
     # --- 5. keys the current code does not read ---------------------------
     known = known_config_keys()
     if known:
-        recognised = known | APPDAEMON_KEYS
+        recognised = known | APPDAEMON_KEYS | {"shadow_mode", "entity_suffix",
+                                                "log_level", "worker_threads"}
         unknown = sorted(k for k in app_args if k not in recognised)
         if unknown:
             print("")

@@ -10,7 +10,7 @@ re-optimization based on actual SOC and PV production.
 Author: AppDaemon Battery Optimizer
 """
 
-import appdaemon.plugins.hass.hassapi as hass
+from battery_optimizer_lib import ha_host as hass
 import datetime
 import functools
 import json
@@ -102,7 +102,7 @@ from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
 # published on sensor.battery_optimizer, so a deploy can be PROVEN to be
 # running: on 2026-09-02 the add-on silently imported the previous commit out
 # of a backup directory inside apps/ while SHA256 verification of apps/ passed.
-APP_VERSION = "2026-09-08.3"
+APP_VERSION = "2026-10-05.1"
 
 # Home Assistant's recorder refuses to store an entity's attributes once the
 # serialized blob passes this size ("State attributes for <entity> exceed

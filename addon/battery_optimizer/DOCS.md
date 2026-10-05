@@ -60,7 +60,8 @@ as a failure; register verification decides.
    shadow run kept its own).
 3. Set the options with `shadow_mode: false` and the real `device_id`
    (`scripts/addon_options.py <live apps.yaml> --live --out live.json`, then
-   `scripts/deploy_addon.py options live.json`).
+   `scripts/deploy_addon.py options live.json --watchdog on`; the
+   Supervisor watchdog restarts the container if it crashes).
 4. Check: `sensor.battery_optimizer` shows this add-on's `app_version`;
    `sensor.battery_inverter_control_health` shows register matches and no
    `persistent_mismatch_count`; the log has no Traceback.

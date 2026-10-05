@@ -19,7 +19,7 @@ uv run python scripts/deploy_addon.py stop --slug a0d7b954_appdaemon    # stays 
 uv run python scripts/deploy_addon.py seed                              # fresh JSON state
 # live options from a temp copy of the live apps.yaml (copy deleted after):
 uv run python scripts/addon_options.py <copy of apps.yaml> --live --out <tmp>/live.json
-uv run python scripts/deploy_addon.py options <tmp>/live.json --no-restart
+uv run python scripts/deploy_addon.py options <tmp>/live.json --no-restart --watchdog on
 uv run python scripts/deploy_addon.py start
 ```
 

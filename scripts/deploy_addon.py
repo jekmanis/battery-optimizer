@@ -32,7 +32,7 @@ Usage:
     uv run python scripts/deploy_addon.py deploy [--options opts.json] [--skip-tests]
     uv run python scripts/deploy_addon.py status
     uv run python scripts/deploy_addon.py logs [--lines 300] [--slug SLUG]
-    uv run python scripts/deploy_addon.py options opts.json [--no-restart]
+    uv run python scripts/deploy_addon.py options opts.json [--no-restart] [--watchdog on|off]
     uv run python scripts/deploy_addon.py start|stop|restart [--slug SLUG]
     uv run python scripts/deploy_addon.py stage --out DIR
     uv run python scripts/deploy_addon.py seed [--force]
@@ -472,6 +472,12 @@ def cmd_options(args) -> int:
     try:
         set_options(sup, options)
         log(f"options set ({len(options)} keys, shadow_mode={options.get('shadow_mode')})")
+        if args.watchdog is not None:
+            # Supervisor restarts a crashed container only with the watchdog
+            # on - the AppDaemon add-on this replaces ran with it.
+            sup.api(f"/addons/{SLUG}/options", "post",
+                    data={"watchdog": args.watchdog == "on"})
+            log(f"watchdog {args.watchdog}")
         if not args.no_restart:
             sup.api(f"/addons/{SLUG}/restart", "post")
             sup.wait_state(SLUG, "started")
@@ -613,6 +619,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("options")
     p.add_argument("file")
     p.add_argument("--no-restart", action="store_true")
+    p.add_argument("--watchdog", choices=("on", "off"), default=None)
     p.set_defaults(func=cmd_options)
 
     for name in ("start", "stop", "restart"):

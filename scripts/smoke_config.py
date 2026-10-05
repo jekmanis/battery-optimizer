@@ -159,10 +159,11 @@ def main(argv=None):
         ]
         if not candidates:
             app_name = ""  # a flat add-on options mapping
-        elif len(candidates) > 1:
-            print("  NOTE: %d battery_optimizer entries, using '%s'"
-                  % (len(candidates), candidates[0]))
-        app_name = candidates[0]
+        else:
+            if len(candidates) > 1:
+                print("  NOTE: %d battery_optimizer entries, using '%s'"
+                      % (len(candidates), candidates[0]))
+            app_name = candidates[0]
     from battery_optimizer_lib.addon_main import (
         SUPERVISOR_CORE_URL,
         options_to_args,

@@ -169,3 +169,10 @@ def test_conversion_drops_appdaemon_and_connection_keys():
     assert options == {"efficiency": 0.92, "terminal_energy_value_eur_kwh": "0",
                        "shadow_mode": True, "entity_suffix": "_shadow",
                        "device_id": ""}
+
+
+def test_smoke_config_accepts_a_flat_options_file(tmp_path, capsys):
+    path = tmp_path / "options.yaml"
+    path.write_text("shadow_mode: true\nefficiency: 0.92\n", encoding="utf-8")
+    assert _load_script("smoke_config").main([str(path)]) == 0
+    assert "SMOKE TEST PASSED" in capsys.readouterr().out

@@ -36,6 +36,7 @@ Usage:
     uv run python scripts/deploy_addon.py options opts.json [--no-restart] [--watchdog on|off]
     uv run python scripts/deploy_addon.py export-options opts.json
     uv run python scripts/deploy_addon.py start|stop|restart [--slug SLUG]
+    uv run python scripts/deploy_addon.py boot auto|manual [--slug SLUG]
     uv run python scripts/deploy_addon.py stage --out DIR
     uv run python scripts/deploy_addon.py seed [--force]
     uv run python scripts/deploy_addon.py restore <backup-dir>
@@ -505,6 +506,18 @@ def cmd_export_options(args) -> int:
     return 0
 
 
+def cmd_boot(args) -> int:
+    """Start-on-boot for one add-on. Exactly one instance may boot with HA."""
+    sup = Supervisor()
+    try:
+        sup.api(f"/addons/{args.slug}/options", "post", data={"boot": args.mode})
+        info = sup.info(args.slug) or {}
+        log(f"{args.slug}: boot={info.get('boot')} state={info.get('state')}")
+    finally:
+        sup.close()
+    return 0
+
+
 def cmd_lifecycle(args) -> int:
     sup = Supervisor()
     try:
@@ -644,6 +657,11 @@ def main(argv=None) -> int:
     p.add_argument("file")
     p.add_argument("--slug", default=SLUG)
     p.set_defaults(func=cmd_export_options)
+
+    p = sub.add_parser("boot", help="start-on-boot: auto|manual")
+    p.add_argument("mode", choices=("auto", "manual"))
+    p.add_argument("--slug", default=SLUG)
+    p.set_defaults(func=cmd_boot)
 
     for name in ("start", "stop", "restart"):
         p = sub.add_parser(name)

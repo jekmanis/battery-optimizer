@@ -573,10 +573,12 @@ host suppresses every service except the read-only ones (no inverter command,
 no `input_*` write), `device_id` is forced empty, and every published entity
 gets the suffix. `scripts/compare_shadow.py` compares the two plans.
 
-**Rollback:** the AppDaemon add-on `a0d7b954_appdaemon` stays installed and
-stopped, with its `apps/` (APP_VERSION 2026-09-08.3) and its JSON files as of
-the cutover. `deploy_addon.py stop`, then
-`deploy_addon.py start --slug a0d7b954_appdaemon`; copy the four JSON files
+**Rollback:** the AppDaemon add-on `a0d7b954_appdaemon` stays installed,
+stopped and `boot: manual` (with `auto` an HA reboot would start a second
+instance commanding the inverter), with its `apps/` (APP_VERSION 2026-09-08.3)
+and its JSON files as of the cutover. `deploy_addon.py stop` +
+`deploy_addon.py boot manual`, then `deploy_addon.py boot auto --slug
+a0d7b954_appdaemon` + `deploy_addon.py start --slug a0d7b954_appdaemon`; copy the four JSON files
 back into `//192.168.77.167/addon_configs/a0d7b954_appdaemon/` first if the
 learned data should survive. Never uninstall it or delete its config dir.
 

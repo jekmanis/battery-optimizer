@@ -54,7 +54,8 @@ as a failure; register verification decides.
 
 ## Cutover from AppDaemon
 
-1. Stop the AppDaemon add-on (keep it installed: it is the rollback).
+1. Stop the AppDaemon add-on and set its boot to manual (keep it installed:
+   it is the rollback; with boot auto an HA reboot would start two instances).
 2. Copy the four JSON files from `\\<ha>\addon_configs\a0d7b954_appdaemon\`
    into `\\<ha>\addon_configs\local_battery_optimizer\` (fresh copies - the
    shadow run kept its own).
@@ -70,11 +71,13 @@ as a failure; register verification decides.
 
 ## Rollback
 
-One command each way, nothing to copy back:
+Two commands each way, nothing to copy back:
 
-1. `uv run python scripts/deploy_addon.py stop` (this add-on), or set
+1. `uv run python scripts/deploy_addon.py stop` and
+   `uv run python scripts/deploy_addon.py boot manual` (this add-on), or set
    `shadow_mode: true` to keep it running as a shadow.
-2. `uv run python scripts/deploy_addon.py start --slug a0d7b954_appdaemon`.
+2. `uv run python scripts/deploy_addon.py boot auto --slug a0d7b954_appdaemon`
+   and `uv run python scripts/deploy_addon.py start --slug a0d7b954_appdaemon`.
 
 AppDaemon resumes from its own JSON files, which are older than this add-on's
 by the length of the live run; the learning engine catches up within a day.

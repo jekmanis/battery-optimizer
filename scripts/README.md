@@ -20,6 +20,7 @@ uv run python scripts/deploy_addon.py logs [--lines 300] [--slug SLUG]
 uv run python scripts/deploy_addon.py options o.json          # set options + restart
 uv run python scripts/deploy_addon.py export-options o.json   # current options -> file
 uv run python scripts/deploy_addon.py start|stop|restart [--slug SLUG]
+uv run python scripts/deploy_addon.py boot auto|manual [--slug SLUG]  # exactly one instance boots with HA
 uv run python scripts/deploy_addon.py seed [--force]          # copy the rollback instance's JSON state in
 uv run python scripts/deploy_addon.py restore <backup-dir>
 uv run python scripts/deploy_addon.py stage --out DIR         # build context only (e.g. for `docker build`)

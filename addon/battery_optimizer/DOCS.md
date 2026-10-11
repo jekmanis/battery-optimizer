@@ -14,6 +14,10 @@ prices, load and PV forecasts, and executes it through
   `sensor.battery_optimizer_schedule_markdown`,
   `sensor.battery_inverter_control_health`, ...). Same names as before, so the
   dashboards and `homeassistant/packages/battery_optimizer.yaml` are unchanged.
+  HA does not keep these across its own restart, so the add-on republishes
+  them from memory after every websocket reconnect and on
+  `homeassistant_started`. Nothing is re-planned and nothing is sent to the
+  inverter; the log shows "Republished N entities after ...".
 - Authentication is the Supervisor's `SUPERVISOR_TOKEN`; no long-lived token
   is configured anywhere.
 

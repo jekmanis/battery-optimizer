@@ -85,6 +85,9 @@ class FakeOptimizer(bo.BatteryOptimizer):
         # hands it the kwargs dict positionally, and its generation token is
         # read out of that dict.
         ("_price_recovery_retry", "(self, kwargs=None) -> None"),
+        # Event-shaped: bound both to `homeassistant_started` and to the host's
+        # `listen_connected`, which use the same (event, data, kwargs) call.
+        ("_republish_entities", "(self, event_name, data, kwargs)"),
     ],
 )
 def test_timed_callbacks_keep_their_signatures(name, expected):
@@ -329,6 +332,9 @@ def test_control_health_sensor_survives_a_broken_direct_control():
         "_record_ambient_observation",
         "_sample_pv",
         "_price_recovery_retry",
+        # Runs the publishers after an HA restart; they read the plan, the
+        # trackers and DirectControl's diagnostics, so it needs the app lock.
+        "_republish_entities",
         # The host calls terminate() on its own thread and it clears the
         # retry generation, so it belongs under the app lock like the rest.
         "terminate",

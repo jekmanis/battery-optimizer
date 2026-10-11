@@ -376,7 +376,22 @@ against them:
 - Reconnect: backoff (1/2/5/10/30 s; 60 s after a refused token), re-auth,
   re-subscribe, reload the catalogue, replace the state cache with a fresh
   `get_states`. Listeners and timers stay registered and nothing is re-fired
-  for what changed during the outage.
+  for what changed during the outage. The one exception is
+  `listen_connected`: its callbacks go to the worker pool after every
+  handshake, as `(HOST_CONNECTED_EVENT, {"connection": n}, kwargs)`.
+- **HA forgets every state created through `POST /api/states` when it
+  restarts.** On 2026-10-11 HA restarted at 21:21, the host reconnected at
+  21:22:29 (connection #3) and kept executing slots, but
+  `sensor.battery_optimizer` and every other app-published entity answered
+  "Entity not found" until the next re-plan published them. The app now
+  republishes them from memory in `_republish_entities` (`@_timed_callback`,
+  app lock), bound to `listen_connected` (connection #2 onward; #1 is the
+  startup, which `initialize` publishes after) and to `homeassistant_started`,
+  because the socket can come back while HA is still starting. It only calls
+  the existing publishers: nothing is re-planned, no service is called (no
+  inverter command, no `input_*` write - those persist in HA), and it logs
+  one "Republished N entities after ..." line. `tests/test_republish_after_ha_restart.py`
+  replays the restart against the fake HA.
 
 **Callbacks run concurrently.** `ha_host` dispatches every timer, state and
 event callback to a pool of `worker_threads` threads (add-on option, default

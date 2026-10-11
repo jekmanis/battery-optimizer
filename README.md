@@ -357,7 +357,7 @@ Library modules are tested standalone. `tests/fake_ha.py` is a fake Home Assista
   | Inverter really drops the override | `persistent_mismatch_count` growing | Inverter/firmware/config, not timing |
   | Service itself failing | `resend_failed_count` growing | Check the Modbus connection |
 
-  The sensor is created with `set_state`, so it disappears after an HA restart until the app republishes it — alert on trends, don't rely on its history.
+  The sensor is created with `set_state`, so HA drops it on restart; the app republishes it (with every other entity it publishes) as soon as it reconnects and again on `homeassistant_started`. Its counters are in-memory and reset with the add-on — alert on trends, don't rely on its history.
 
 - **Slow callbacks:** `set_wit_mode` is a **synchronous, blocking** service call made from a callback. The add-on runs callbacks on `worker_threads` threads (default 4), and the orchestrator serializes them itself: `_timed_callback` runs every callback under one app-wide re-entrant lock (`battery_optimizer_lib/callback_lock.py`), and the only region that drops it is the blocking `set_wit_mode` write in `_apply_mode_tracked` — so other callbacks keep running while the inverter write is in flight. The app measures its own callbacks (lock wait included), warns above `callback_warn_seconds` naming the offending callback, and after three overruns points at `set_wit_mode_timeout_seconds` and the inverter integration.
 

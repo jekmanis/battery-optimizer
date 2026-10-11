@@ -102,7 +102,7 @@ from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
 # published on sensor.battery_optimizer, so a deploy can be PROVEN to be
 # running: on 2026-09-02 the add-on silently imported the previous commit out
 # of a backup directory inside apps/ while SHA256 verification of apps/ passed.
-APP_VERSION = "2026-10-05.2"
+APP_VERSION = "2026-10-11.1"
 
 # Home Assistant's recorder refuses to store an entity's attributes once the
 # serialized blob passes this size ("State attributes for <entity> exceed
@@ -877,6 +877,15 @@ class BatteryOptimizer(hass.Hass):
                 self.listen_state(self._on_energy_sensor_change, self.config.battery_discharge_sensor)
                 self.log(f"Listening to energy sensors: {self.config.battery_charge_sensor}, {self.config.battery_discharge_sensor}")
 
+            # HA does not persist states created through POST /api/states:
+            # every entity below is gone after an HA restart (2026-10-11) while
+            # this process keeps running. Republish them from memory after
+            # every websocket reconnect, and again on `homeassistant_started`,
+            # because the socket can come back while HA is still starting.
+            # Publication only - see `_republish_entities`.
+            self.listen_connected(self._republish_entities)
+            self.listen_event(self._republish_entities, "homeassistant_started")
+
             # Initialize SOC tracking state on startup (the listener only fires
             # on changes).
             startup_soc = self._get_current_soc()
@@ -901,7 +910,81 @@ class BatteryOptimizer(hass.Hass):
             if startup_soc is not None:
                 self._check_soc_boundaries(startup_soc)
 
+            # Everything `_republish_entities` reads exists from here on.
+            self._republish_ready = True
             self.log("Battery Optimizer initialized successfully")
+
+    def set_state(self, entity_id, **kwargs):
+        """`Hass.set_state`, tallied while `_republish_entities` is running.
+
+        The tally only exists inside that callback (under the app lock); it
+        lets the republish log say how many entities HA actually accepted
+        without the publishers having to return anything.
+        """
+        result = super().set_state(entity_id, **kwargs)
+        tally = getattr(self, "_republish_tally", None)
+        if tally is not None:
+            tally.append((entity_id, result is not None))
+        return result
+
+    @_timed_callback
+    def _republish_entities(self, event_name, data, kwargs):
+        """Re-create every entity this app publishes, from in-memory state.
+
+        HA keeps a state created through `POST /api/states` only until its own
+        restart. On 2026-10-11 HA restarted at 21:21, the host reconnected at
+        21:22:29 and kept executing slots, but `sensor.battery_optimizer` and
+        every other app-published entity stayed "Entity not found" until the
+        next re-plan happened to publish them again.
+
+        Fired by the host after every (re)connect (`listen_connected`) and by
+        HA's `homeassistant_started` event. The first connect is skipped:
+        `initialize` publishes. This method ONLY calls the existing publishers:
+        nothing is re-planned, no service is called (so no inverter command
+        and no `input_*` write - those persist in HA anyway), and no listener
+        or tracker state changes. Running it twice in a row is harmless.
+        """
+        if not getattr(self, "_republish_ready", False):
+            return
+        if getattr(self, "_terminated", False):
+            return
+        if event_name == hass.HOST_CONNECTED_EVENT:
+            connection = int((data or {}).get("connection") or 0)
+            if connection <= 1:
+                return
+            trigger = f"HA reconnect #{connection}"
+        else:
+            trigger = f"{event_name} event"
+
+        self._republish_tally = []
+        try:
+            # sensor.battery_optimizer, _schedule, _schedule_markdown
+            self._update_schedule_sensor()
+            # sensor.battery_inverter_control_health (DirectControl state lock
+            # only, taken under the app lock: the documented order)
+            self._update_control_health_sensor()
+            # load_profile_count/last_obs entities + sensor.battery_optimizer_load_profile
+            self._update_load_profile_sensors()
+            # sensor.battery_prediction_accuracy
+            self._update_prediction_accuracy_sensor()
+            # sensor.battery_learning_stats
+            self._update_learning_sensor()
+        finally:
+            tally, self._republish_tally = self._republish_tally, None
+
+        accepted = [entity for entity, ok in tally if ok]
+        failed = [entity for entity, ok in tally if not ok]
+        message = (
+            f"Republished {len(accepted)} entities after {trigger} "
+            f"(from memory: nothing re-planned, nothing sent)"
+        )
+        if failed:
+            self.log(
+                f"{message}; {len(failed)} not accepted by HA: {', '.join(failed)}",
+                level="WARNING",
+            )
+        else:
+            self.log(message)
 
     @_timed_callback
     def terminate(self):

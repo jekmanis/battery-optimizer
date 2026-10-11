@@ -40,7 +40,12 @@ Reconnects: the reader thread reconnects with backoff, re-authenticates,
 re-subscribes every event type, reloads the service catalogue and replaces the
 state cache with a fresh ``get_states``. Listeners and timers stay registered;
 they are not re-fired for what changed during the outage (AppDaemon did not
-either), the next real change reaches them.
+either), the next real change reaches them. ``listen_connected`` is the one
+exception: its callbacks are dispatched to the worker pool after EVERY
+successful handshake (``(event, data, kwargs)`` with
+``event == HOST_CONNECTED_EVENT`` and ``data == {"connection": n}``), because
+HA does not persist states created through ``POST /api/states`` across its own
+restart and the app must republish them.
 
 Shadow mode (``ShadowPolicy``) is enforced HERE, at the only two exits to HA,
 so no caller can forget it: every ``set_state`` entity gets a suffix and every
@@ -77,6 +82,9 @@ except ImportError:  # pragma: no cover - Python < 3.9 is not supported anyway
 DEFAULT_WS_TIMEOUT_S = 10.0
 # REST calls (set_state) - AppDaemon's http_method default.
 DEFAULT_REST_TIMEOUT_S = 10.0
+# Pseudo event name handed to `listen_connected` callbacks, so they share the
+# event-callback signature `(event, data, kwargs)`. Never subscribed at HA.
+HOST_CONNECTED_EVENT = "ha_host_connected"
 # Reconnect backoff. Bounded and never faster than 1 s: a refused token must
 # not hammer HA (repeated auth failures can get the client IP banned).
 RECONNECT_DELAYS_S: Tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 30.0)
@@ -727,12 +735,14 @@ class HAHost:
         self._listen_lock = threading.Lock()
         self._state_listeners: Dict[str, Tuple[str, Optional[str], Callable, dict]] = {}
         self._event_listeners: Dict[str, Tuple[str, Callable, dict]] = {}
+        self._connect_listeners: Dict[str, Tuple[Callable, dict]] = {}
 
         self.connection = HAConnection(
             ws_url, token,
             log=self.log,
             on_state_changed=self._on_state_changed,
             on_event=self._on_event,
+            on_connected=self._on_connected,
             ws_factory=ws_factory,
             reconnect_delays=reconnect_delays,
             heartbeat_idle=heartbeat_idle,
@@ -937,6 +947,32 @@ class HAHost:
         with self._listen_lock:
             return self._event_listeners.pop(handle, None) is not None
 
+    def listen_connected(self, callback: Callable, **kwargs) -> str:
+        """Call *callback* on a worker after every completed (re)connect.
+
+        Signature is the event-callback one, ``(event, data, kwargs)``, with
+        ``event == HOST_CONNECTED_EVENT`` and ``data == {"connection": n}``
+        (``n`` counts handshakes, 1 = the first). Fires once the fresh state
+        cache is in place. Only connects AFTER registration are reported: the
+        add-on's first handshake happens in ``start()``, before the app exists.
+        """
+        handle = uuid.uuid4().hex
+        with self._listen_lock:
+            self._connect_listeners[handle] = (callback, kwargs)
+        return handle
+
+    def cancel_listen_connected(self, handle) -> bool:
+        with self._listen_lock:
+            return self._connect_listeners.pop(handle, None) is not None
+
+    def _on_connected(self) -> None:
+        """Connection-thread hook: hand listeners to the pool, never block."""
+        data = {"connection": self.connection.connect_count}
+        with self._listen_lock:
+            listeners = list(self._connect_listeners.values())
+        for callback, kwargs in listeners:
+            self._submit(callback, (HOST_CONNECTED_EVENT, dict(data)), dict(kwargs))
+
     @staticmethod
     def _value_of(state: Optional[dict], attribute: Optional[str]):
         if state is None:
@@ -1123,6 +1159,12 @@ class Hass:
 
     def cancel_listen_event(self, handle):
         return self._require_host().cancel_listen_event(handle)
+
+    def listen_connected(self, callback, **kwargs):
+        return self._require_host().listen_connected(callback, **kwargs)
+
+    def cancel_listen_connected(self, handle):
+        return self._require_host().cancel_listen_connected(handle)
 
     # timers
     def run_in(self, callback, delay, *args, **kwargs):
